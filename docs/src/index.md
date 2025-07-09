@@ -12,7 +12,7 @@ format.
 
 We currently have a few demos up at:
 
-- [https://pin.37soloist.com/](https://pin.37soloist.com/)
+- [https://pin.slassgear.com/](https://pin.slassgear.com/)
 - [https://pinry-demo.lapo.it/](https://pinry-demo.lapo.it/)
 
 If you'd like to showcase your Pinry website toss us a link!
