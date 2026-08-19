@@ -115,6 +115,39 @@ class Pin(models.Model):
         return '%s - %s' % (self.submitter, self.published)
 
 
+class BatchImportItem(models.Model):
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    STATE_CHOICES = (
+        (PENDING, PENDING),
+        (SUCCEEDED, SUCCEEDED),
+        (FAILED, FAILED),
+    )
+
+    submitter = models.ForeignKey(User, on_delete=models.CASCADE)
+    batch_id = models.UUIDField()
+    client_item_id = models.UUIDField()
+    request_fingerprint = models.CharField(max_length=64)
+    state = models.CharField(max_length=16, choices=STATE_CHOICES)
+    pin = models.ForeignKey(
+        Pin,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    error_code = models.CharField(max_length=64, null=True, blank=True)
+    retryable = models.NullBooleanField()
+    lease_uuid = models.UUIDField(null=True, blank=True)
+    lease_generation = models.PositiveIntegerField(default=0)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = (("submitter", "client_item_id"),)
+
+
 @receiver(models.signals.post_delete, sender=Pin)
 def delete_unreferenced_pin_image(sender, instance, **kwargs):
     image_id = instance.image_id
