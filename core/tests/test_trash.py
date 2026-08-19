@@ -388,6 +388,30 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
     def test_last_storage_failure_is_journaled_without_stopping_cleanup(self):
         self._assert_permanent_delete_continues_after_storage_error(4)
 
+    def test_malformed_legacy_name_cannot_delete_unrelated_file(self):
+        target = Path(self.temporary_media.name, "target.dat")
+        target.write_bytes(b"unrelated-target")
+        image = Image.objects.create(
+            image="safe/../target.dat",
+            original_filename="legacy.dat",
+            width=32,
+            height=32,
+        )
+        pin = create_pin(self.owner, image, [])
+        self._move_to_trash(pin)
+
+        response = self.client.delete(self._permanent_url(pin))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertEqual(target.read_bytes(), b"unrelated-target")
+        pending = self._pending_deletions().get(
+            kind="original", name="safe/../target.dat"
+        )
+        self.assertEqual(pending.attempts, 1)
+        self.assertEqual(pending.last_error, "InvalidMediaName")
+
     def test_queryset_delete_preserves_media_while_reference_remains(self):
         image = create_image()
         first_pin = create_pin(self.owner, image, [])

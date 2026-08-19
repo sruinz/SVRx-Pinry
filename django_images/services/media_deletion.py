@@ -1,4 +1,5 @@
 import logging
+import unicodedata
 
 from django.db.models import F
 from django.utils import timezone
@@ -7,6 +8,19 @@ from django_images.models import Image, PendingMediaDeletion, Thumbnail
 
 
 logger = logging.getLogger(__name__)
+
+
+class InvalidMediaName(ValueError):
+    pass
+
+
+def _validate_storage_name(name):
+    if not name or name.startswith("/") or "\\" in name:
+        raise InvalidMediaName
+    if any(unicodedata.category(character) == "Cc" for character in name):
+        raise InvalidMediaName
+    if any(component in ("", ".", "..") for component in name.split("/")):
+        raise InvalidMediaName
 
 
 def _storage_for_kind(kind):
@@ -29,6 +43,7 @@ def process_pending_media_deletion(pending_id, using=None):
         return False
 
     try:
+        _validate_storage_name(pending.name)
         storage = _storage_for_kind(pending.kind)
         if storage.exists(pending.name):
             storage.delete(pending.name)

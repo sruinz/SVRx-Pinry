@@ -1,4 +1,5 @@
 from django.core.management.base import BaseCommand, CommandError
+from django.db import DEFAULT_DB_ALIAS, connections
 
 from django_images.models import PendingMediaDeletion
 from django_images.services.media_deletion import (
@@ -21,13 +22,24 @@ class Command(BaseCommand):
             default=None,
             help="maximum number of pending rows to inspect",
         )
+        parser.add_argument(
+            "--database",
+            default=DEFAULT_DB_ALIAS,
+            help="database alias containing the pending journal",
+        )
 
     def handle(self, *args, **options):
         limit = options["limit"]
+        database = options["database"]
         if limit is not None and limit <= 0:
             raise CommandError("invalid_limit")
+        if database not in connections:
+            raise CommandError(
+                "unknown_database_alias: {}".format(database)
+            )
 
-        queryset = PendingMediaDeletion.objects.order_by("id")
+        pending_deletions = PendingMediaDeletion.objects.using(database)
+        queryset = pending_deletions.order_by("id")
         if limit is not None:
             queryset = queryset[:limit]
         pending_rows = list(
@@ -45,13 +57,15 @@ class Command(BaseCommand):
         processed = 0
         if options["execute"]:
             for pending in pending_rows:
-                if process_pending_media_deletion(pending["id"]):
+                if process_pending_media_deletion(
+                    pending["id"], using=database
+                ):
                     processed += 1
 
         self.stdout.write(
             "pending={} processed={} remaining={}".format(
                 len(pending_rows),
                 processed,
-                PendingMediaDeletion.objects.count(),
+                pending_deletions.count(),
             )
         )
