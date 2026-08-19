@@ -15,7 +15,11 @@
             custom-size="mdi-24px">
          </b-icon>
       </span>
-      <span class="icon-container" @click="deletePin" v-if="isOwner">
+      <span
+        class="icon-container"
+        data-test="delete-pin"
+        @click="deletePin"
+        v-if="isOwner">
          <b-icon
            type="is-light"
            icon="delete"
@@ -104,16 +108,16 @@ export default {
     },
     deletePin() {
       this.$buefy.dialog.confirm({
-        message: 'Delete this Pin?',
+        message: this.$t('pinMoveToTrashConfirm'),
         onConfirm: () => {
           API.Pin.deleteById(this.pin.id).then(
             () => {
-              this.$buefy.toast.open('Pin deleted');
+              this.$buefy.toast.open(this.$t('pinMovedToTrash'));
               this.$emit('pin-delete-succeed', this.pin.id);
             },
             () => {
               this.$buefy.toast.open(
-                { type: 'is-danger', message: 'Failed to delete Pin' },
+                { type: 'is-danger', message: this.$t('pinMoveToTrashError') },
               );
             },
           );

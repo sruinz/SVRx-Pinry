@@ -79,5 +79,20 @@
   "imageSourceLabel": "图片来源",
   "tagsLabel": "标签",
   "descriptionLabel": "描述",
-  "selectBoardLabel": "选择画板"
+  "selectBoardLabel": "选择画板",
+  "trashLink": "回收站",
+  "trashTitle": "回收站",
+  "trashLoading": "正在加载回收站…",
+  "trashEmpty": "回收站为空。",
+  "trashLoadError": "无法加载回收站。",
+  "trashRestoreButton": "恢复",
+  "trashPermanentDeleteButton": "永久删除",
+  "trashRestoreSuccess": "Pin 已恢复",
+  "trashRestoreError": "无法恢复 Pin",
+  "trashPermanentDeleteConfirm": "永久删除此 Pin？下次扫描后，原始文件可能会从 Pinry 和 Immich 外部库中消失。",
+  "trashPermanentDeleteSuccess": "Pin 已永久删除",
+  "trashPermanentDeleteError": "无法永久删除 Pin",
+  "pinMoveToTrashConfirm": "将此 Pin 移至回收站？",
+  "pinMovedToTrash": "Pin 已移至回收站",
+  "pinMoveToTrashError": "无法将 Pin 移至回收站"
 }

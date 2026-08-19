@@ -9,6 +9,7 @@ import Boards4User from '../views/Boards4User.vue';
 import Profile4User from '../views/Profile4User.vue';
 import PinCreate from '../views/PinCreate.vue';
 import Search from '../views/Search.vue';
+import Trash from '../views/Trash.vue';
 import PageNotFound from '../views/PageNotFound.vue';
 
 Vue.use(VueRouter);
@@ -58,6 +59,11 @@ const routes = [
     path: '/search',
     name: 'search',
     component: Search,
+  },
+  {
+    path: '/trash',
+    name: 'trash',
+    component: Trash,
   },
   {
     path: '*',

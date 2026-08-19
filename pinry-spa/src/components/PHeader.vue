@@ -61,6 +61,12 @@
                   class="navbar-item">
                   {{ $t("profileLink") }}
                 </router-link>
+                <router-link
+                  :to="{ name: 'trash' }"
+                  class="navbar-item"
+                  data-test="trash-link">
+                  {{ $t("trashLink") }}
+                </router-link>
               </div>
             </div>
             <div class="navbar-item has-dropdown is-hoverable">

@@ -101,6 +101,20 @@ const Pin = {
       url,
     );
   },
+  fetchTrash(offset = 0) {
+    const url = `${API_PREFIX}pins/trash/`;
+    return axios.get(url, {
+      params: { ordering: '-id', limit: 30, offset },
+    });
+  },
+  restore(pinId) {
+    const url = `${API_PREFIX}pins/${pinId}/restore/`;
+    return axios.post(url);
+  },
+  deletePermanently(pinId) {
+    const url = `${API_PREFIX}pins/${pinId}/permanent/`;
+    return axios.delete(url);
+  },
   updateById(pinId, data) {
     const url = `${API_PREFIX}pins/${pinId}/`;
     return axios.patch(
