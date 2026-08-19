@@ -27,9 +27,8 @@ class MediaDirectory(object):
         return self.descriptors[-1]
 
     def fsync_publish(self):
-        os.fsync(self.descriptor)
-        if len(self.descriptors) > 1:
-            os.fsync(self.descriptors[-2])
+        for descriptor in reversed(self.descriptors):
+            os.fsync(descriptor)
 
     def close(self):
         while self.descriptors:

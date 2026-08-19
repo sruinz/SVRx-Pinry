@@ -212,6 +212,124 @@ class MediaMigrationCommandTest(TransactionTestCase):
                 content,
             )
 
+    def _assert_retry_fsyncs_media_root_before_database_update(self, reused):
+        self.image.thumbnail_set.all().delete()
+        canonical = self._canonical_paths()["original"]
+        destination = Path(self.temporary_media.name, canonical)
+        media_root_stat = Path(self.temporary_media.name).stat()
+        media_root_identity = (
+            media_root_stat.st_dev,
+            media_root_stat.st_ino,
+        )
+        database_before = self._database_paths()
+        real_fsync = file_ops.os.fsync
+        failed_root_fsync = []
+
+        def fail_first_media_root_fsync(descriptor):
+            file_stat = os.fstat(descriptor)
+            identity = (file_stat.st_dev, file_stat.st_ino)
+            if identity == media_root_identity and not failed_root_fsync:
+                failed_root_fsync.append(True)
+                raise OSError("injected media root fsync failure")
+            return real_fsync(descriptor)
+
+        with mock.patch(
+            "django_images.file_ops.os.fsync",
+            side_effect=fail_first_media_root_fsync,
+        ):
+            with self.assertRaisesRegex(OSError, "injected media root"):
+                call_command(
+                    "migrate_media",
+                    execute=True,
+                    manifest=self.manifest_path,
+                )
+
+        self.assertTrue(Path(self.temporary_media.name, "originals").is_dir())
+        self.assertFalse(destination.exists())
+        self.assertEqual(self._database_paths(), database_before)
+        self.assertEqual(
+            Path(self.temporary_media.name, self.old_original).read_bytes(),
+            self.old_files[self.old_original],
+        )
+
+        reused_inode = None
+        if reused:
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(self.old_files[self.old_original])
+            reused_inode = destination.stat().st_ino
+
+        events = []
+        real_update = MediaMigrator._update_paths_with_queryset_update
+
+        def record_fsync(descriptor):
+            file_stat = os.fstat(descriptor)
+            events.append(("fsync", file_stat.st_dev, file_stat.st_ino))
+            return real_fsync(descriptor)
+
+        def record_update(migrator, plans):
+            events.append(("database_update",))
+            return real_update(migrator, plans)
+
+        with mock.patch(
+            "django_images.file_ops.os.fsync",
+            side_effect=record_fsync,
+        ):
+            with mock.patch.object(
+                MediaMigrator,
+                "_update_paths_with_queryset_update",
+                autospec=True,
+                side_effect=record_update,
+            ):
+                call_command(
+                    "migrate_media",
+                    execute=True,
+                    manifest=self.manifest_path,
+                )
+
+        file_identity = (
+            "fsync",
+            destination.stat().st_dev,
+            destination.stat().st_ino,
+        )
+        uuid_identity = (
+            "fsync",
+            destination.parent.stat().st_dev,
+            destination.parent.stat().st_ino,
+        )
+        top_identity = (
+            "fsync",
+            destination.parent.parent.stat().st_dev,
+            destination.parent.parent.stat().st_ino,
+        )
+        root_identity = ("fsync",) + media_root_identity
+        file_index = events.index(file_identity)
+        uuid_index = events.index(uuid_identity, file_index + 1)
+        top_index = events.index(top_identity, uuid_index + 1)
+        database_index = events.index(("database_update",))
+        self.assertIn(root_identity, events[top_index + 1:database_index])
+        root_index = events.index(root_identity, top_index + 1)
+        self.assertLess(file_index, uuid_index)
+        self.assertLess(uuid_index, top_index)
+        self.assertLess(top_index, root_index)
+        self.assertLess(root_index, database_index)
+        self.assertEqual(self._database_paths()["original"], canonical)
+        self.assertEqual(
+            Path(self.temporary_media.name, self.old_original).read_bytes(),
+            self.old_files[self.old_original],
+        )
+        if reused:
+            self.assertEqual(destination.stat().st_ino, reused_inode)
+
+    def test_retry_after_failed_media_root_fsync_publishes_before_db_switch(
+        self,
+    ):
+        self._assert_retry_fsyncs_media_root_before_database_update(False)
+
+    def test_retry_after_failed_media_root_fsync_reuses_before_db_switch(
+        self,
+    ):
+        self._assert_retry_fsyncs_media_root_before_database_update(True)
+
     def test_resume_uses_new_staging_after_crash_just_after_create(self):
         self._assert_crash_window_resumes("after_staging_create")
 
