@@ -67,6 +67,16 @@ function pinWithId(id) {
   return { ...trashedPin, id };
 }
 
+function trashState(vm) {
+  return {
+    pinIds: vm.pins.map(pin => pin.id),
+    busyPinIds: Object.keys(vm.busyPins).sort(),
+    mutationInFlight: vm.mutationInFlight,
+    fetchQueued: vm.fetchQueued,
+    status: { ...vm.status },
+  };
+}
+
 function mountTrash(options = {}) {
   const localVue = createLocalVue();
   localVue.use(VueI18n);
@@ -164,6 +174,115 @@ describe('TrashPins', () => {
       window.removeEventListener('scroll', handler);
     });
   });
+
+  it('does not start a page fetch after destruction', async () => {
+    jest.spyOn(API.Pin, 'fetchTrash').mockResolvedValue({
+      data: {
+        count: 2,
+        results: [trashedPin],
+        next: '/api/v2/pins/trash/?limit=30&offset=1',
+        previous: null,
+      },
+    });
+
+    const { wrapper } = mountTrash();
+    await flushPromises();
+    wrapper.destroy();
+    const stateAfterDestroy = trashState(wrapper.vm);
+    API.Pin.fetchTrash.mockClear();
+
+    wrapper.vm.fetchMore();
+
+    expect(API.Pin.fetchTrash).not.toHaveBeenCalled();
+    expect(trashState(wrapper.vm)).toEqual(stateAfterDestroy);
+    expect(wrapper.vm.disposed).toBe(true);
+  });
+
+  it.each(['resolve', 'reject'])(
+    'ignores an in-flight page fetch %s after destruction',
+    async (settle) => {
+      const pageRequest = deferred();
+      jest.spyOn(API.Pin, 'fetchTrash').mockReturnValue(pageRequest.promise);
+
+      const { wrapper, buefy } = mountTrash();
+      expect(API.Pin.fetchTrash).toHaveBeenCalledTimes(1);
+      wrapper.destroy();
+      const stateAfterDestroy = trashState(wrapper.vm);
+
+      if (settle === 'resolve') {
+        pageRequest.resolve({
+          data: {
+            count: 1,
+            results: [trashedPin],
+            next: null,
+            previous: null,
+          },
+        });
+      } else {
+        pageRequest.reject(new Error('fetch failed'));
+      }
+      await flushPromises();
+
+      expect(API.Pin.fetchTrash).toHaveBeenCalledTimes(1);
+      expect(buefy.toast.open).not.toHaveBeenCalled();
+      expect(buefy.dialog.confirm).not.toHaveBeenCalled();
+      expect(trashState(wrapper.vm)).toEqual(stateAfterDestroy);
+      expect(wrapper.vm.disposed).toBe(true);
+      expect(wrapper.vm.fetchQueued).toBe(false);
+    },
+  );
+
+  it.each([
+    ['restore', 'resolve'],
+    ['restore', 'reject'],
+    ['permanent delete', 'resolve'],
+    ['permanent delete', 'reject'],
+  ])(
+    'ignores queued fetch and UI updates when %s %s settles after destruction',
+    async (action, settle) => {
+      const mutationRequest = deferred();
+      jest.spyOn(API.Pin, 'fetchTrash').mockResolvedValue({
+        data: {
+          count: 2,
+          results: [trashedPin, pinWithId(40)],
+          next: '/api/v2/pins/trash/?limit=30&offset=2',
+          previous: null,
+        },
+      });
+      jest.spyOn(API.Pin, 'restore').mockReturnValue(mutationRequest.promise);
+      jest.spyOn(API.Pin, 'deletePermanently').mockReturnValue(mutationRequest.promise);
+
+      const { wrapper, buefy } = mountTrash();
+      await flushPromises();
+      if (action === 'restore') {
+        wrapper.vm.restore(trashedPin);
+      } else {
+        wrapper.vm.confirmPermanentDelete(trashedPin);
+        buefy.dialog.confirm.mock.calls[0][0].onConfirm();
+      }
+      wrapper.vm.fetchMore();
+      expect(wrapper.vm.fetchQueued).toBe(true);
+
+      wrapper.destroy();
+      const stateAfterDestroy = trashState(wrapper.vm);
+      const dialogCallsAfterDestroy = buefy.dialog.confirm.mock.calls.length;
+      API.Pin.fetchTrash.mockClear();
+
+      if (settle === 'resolve') {
+        mutationRequest.resolve(action === 'restore' ? { data: activePin } : { status: 204 });
+      } else {
+        mutationRequest.reject(new Error(`${action} failed`));
+      }
+      await flushPromises();
+
+      expect(API.Pin.fetchTrash).not.toHaveBeenCalled();
+      expect(buefy.toast.open).not.toHaveBeenCalled();
+      expect(buefy.dialog.confirm).toHaveBeenCalledTimes(dialogCallsAfterDestroy);
+      expect(trashState(wrapper.vm)).toEqual(stateAfterDestroy);
+      expect(wrapper.vm.disposed).toBe(true);
+      expect(wrapper.vm.fetchQueued).toBe(false);
+    },
+  );
 
   it('blocks restore and permanent delete while a page fetch is in flight', async () => {
     const pageRequest = deferred();

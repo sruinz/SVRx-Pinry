@@ -73,6 +73,7 @@ export default {
       mutationInFlight: false,
       fetchQueued: false,
       unbindScroll: null,
+      disposed: false,
       status: {
         loading: false,
         error: false,
@@ -88,7 +89,7 @@ export default {
       });
     },
     fetchMore() {
-      if (!this.status.hasNext) {
+      if (this.disposed || !this.status.hasNext) {
         return;
       }
       if (this.mutationInFlight) {
@@ -102,6 +103,9 @@ export default {
       this.status.error = false;
       API.Pin.fetchTrash(this.status.offset).then(
         (resp) => {
+          if (this.disposed) {
+            return;
+          }
           const { results, next } = resp.data;
           this.pins = this.pins.concat(results);
           this.status.offset += results.length;
@@ -109,6 +113,9 @@ export default {
           this.status.loading = false;
         },
         () => {
+          if (this.disposed) {
+            return;
+          }
           this.status.loading = false;
           this.status.error = true;
         },
@@ -116,7 +123,8 @@ export default {
     },
     isBusy(pinId) {
       return (
-        this.status.loading
+        this.disposed
+        || this.status.loading
         || this.mutationInFlight
         || this.busyPins[pinId] === true
       );
@@ -129,7 +137,7 @@ export default {
       }
     },
     beginMutation(pinId) {
-      if (this.status.loading || this.mutationInFlight) {
+      if (this.disposed || this.status.loading || this.mutationInFlight) {
         return false;
       }
       this.mutationInFlight = true;
@@ -137,6 +145,9 @@ export default {
       return true;
     },
     finishMutation(pinId) {
+      if (this.disposed) {
+        return;
+      }
       this.setBusy(pinId, false);
       this.mutationInFlight = false;
       if (this.fetchQueued) {
@@ -154,11 +165,17 @@ export default {
       }
       API.Pin.restore(pin.id).then(
         () => {
+          if (this.disposed) {
+            return;
+          }
           this.removePin(pin.id);
           this.$buefy.toast.open(this.$t('trashRestoreSuccess'));
           this.finishMutation(pin.id);
         },
         () => {
+          if (this.disposed) {
+            return;
+          }
           this.$buefy.toast.open({
             type: 'is-danger',
             message: this.$t('trashRestoreError'),
@@ -184,11 +201,17 @@ export default {
       }
       API.Pin.deletePermanently(pin.id).then(
         () => {
+          if (this.disposed) {
+            return;
+          }
           this.removePin(pin.id);
           this.$buefy.toast.open(this.$t('trashPermanentDeleteSuccess'));
           this.finishMutation(pin.id);
         },
         () => {
+          if (this.disposed) {
+            return;
+          }
           this.$buefy.toast.open({
             type: 'is-danger',
             message: this.$t('trashPermanentDeleteError'),
@@ -203,6 +226,8 @@ export default {
     this.fetchMore();
   },
   beforeDestroy() {
+    this.disposed = true;
+    this.fetchQueued = false;
     if (this.unbindScroll !== null) {
       this.unbindScroll();
       this.unbindScroll = null;
