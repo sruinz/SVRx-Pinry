@@ -5,15 +5,22 @@ import sys
 
 def _configure_settings_module(argv):
     settings_module = None
-    for index, argument in enumerate(argv):
+    arguments = argv[1:]
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == '--':
+            break
         if argument.startswith('--settings='):
-            settings_module = argument.split('=', 1)[1]
-            break
-        if argument == '--settings' and index + 1 < len(argv):
-            candidate = argv[index + 1]
-            if not candidate.startswith('-'):
+            candidate = argument.split('=', 1)[1]
+            if candidate:
                 settings_module = candidate
-            break
+        elif argument == '--settings' and index + 1 < len(arguments):
+            candidate = arguments[index + 1]
+            if candidate and not candidate.startswith('-'):
+                settings_module = candidate
+                index += 1
+        index += 1
 
     if settings_module:
         os.environ['DJANGO_SETTINGS_MODULE'] = settings_module

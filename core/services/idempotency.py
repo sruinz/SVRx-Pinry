@@ -9,9 +9,10 @@ from dataclasses import dataclass
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
-from core.models import BatchImportItem
+from core.models import BatchImportItem, Pin
 
 
 _ERROR_CODE_PATTERN = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
@@ -110,7 +111,7 @@ class IdempotencyStore:
 
         for _attempt in range(_CAS_REEVALUATION_LIMIT):
             try:
-                row = BatchImportItem.objects.get(
+                row = self._existing_rows().get(
                     submitter=user,
                     client_item_id=client_item_id,
                 )
@@ -149,8 +150,14 @@ class IdempotencyStore:
         current_now = self._current_now()
         if pin.pk is None:
             return False
-        owned = self._owned_pending(claim, current_now).filter(
-            submitter_id=pin.submitter_id,
+        database_pin = Pin.objects.filter(
+            pk=pin.pk,
+            submitter_id=OuterRef("submitter_id"),
+        )
+        owned = self._owned_pending(claim, current_now).annotate(
+            pin_owned_by_submitter=Exists(database_pin),
+        ).filter(
+            pin_owned_by_submitter=True,
         )
         return owned.update(
             state=BatchImportItem.SUCCEEDED,
@@ -292,10 +299,24 @@ class IdempotencyStore:
     def _valid_succeeded(cls, row):
         return (
             cls._valid_generation(row)
+            and (
+                row.pin_id is None
+                or row.pin_owned_by_submitter
+            )
             and row.error_code is None
             and row.retryable is None
             and row.lease_uuid is None
             and row.lease_expires_at is None
+        )
+
+    @staticmethod
+    def _existing_rows():
+        database_pin = Pin.objects.filter(
+            pk=OuterRef("pin_id"),
+            submitter_id=OuterRef("submitter_id"),
+        )
+        return BatchImportItem.objects.annotate(
+            pin_owned_by_submitter=Exists(database_pin),
         )
 
     @classmethod

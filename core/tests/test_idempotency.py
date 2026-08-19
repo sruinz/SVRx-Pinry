@@ -1,7 +1,11 @@
 import copy
 import datetime
+import importlib
 import os
 import queue
+import subprocess
+import sys
+import tempfile
 import threading
 import uuid
 from unittest import mock
@@ -32,6 +36,29 @@ class MutableWallClock:
 
     def __call__(self):
         return self.current
+
+
+class AlwaysLosesReclaimStore(IdempotencyStore):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reclaim_attempts = 0
+
+    def _reclaim(self, row, now, expected_state):
+        self.reclaim_attempts += 1
+        return None
+
+
+class CoordinatedReclaimStore(IdempotencyStore):
+    def __init__(self, reclaim_barrier, reclaim_events, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reclaim_barrier = reclaim_barrier
+        self.reclaim_events = reclaim_events
+
+    def _reclaim(self, row, now, expected_state):
+        self.reclaim_barrier.wait(timeout=5)
+        result = super()._reclaim(row, now, expected_state)
+        self.reclaim_events.put(None if result is None else result.kind)
+        return result
 
 
 class ManageSettingsArgumentTests(SimpleTestCase):
@@ -111,6 +138,158 @@ class ManageSettingsArgumentTests(SimpleTestCase):
                 os.environ["DJANGO_SETTINGS_MODULE"],
                 "pinry.settings.production",
             )
+
+    def test_last_settings_before_option_terminator_wins(self):
+        with mock.patch.dict(
+            os.environ,
+            {"DJANGO_SETTINGS_MODULE": "pinry.settings.production"},
+            clear=True,
+        ):
+            manage._configure_settings_module(
+                [
+                    "manage.py",
+                    "test",
+                    "--settings=pinry.settings.development",
+                    "--settings",
+                    "pinry.settings.test_sqlite_file",
+                    "--",
+                    "--settings=pinry.settings.production",
+                ]
+            )
+            self.assertEqual(
+                os.environ["DJANGO_SETTINGS_MODULE"],
+                "pinry.settings.test_sqlite_file",
+            )
+
+    def test_settings_after_option_terminator_is_ignored(self):
+        with mock.patch.dict(
+            os.environ,
+            {"DJANGO_SETTINGS_MODULE": "pinry.settings.production"},
+            clear=True,
+        ):
+            manage._configure_settings_module(
+                [
+                    "manage.py",
+                    "test",
+                    "--",
+                    "--settings=pinry.settings.test_sqlite_file",
+                ]
+            )
+            self.assertEqual(
+                os.environ["DJANGO_SETTINGS_MODULE"],
+                "pinry.settings.production",
+            )
+
+    def test_invalid_settings_preserves_django_parser_error(self):
+        environment = os.environ.copy()
+        environment["DJANGO_SETTINGS_MODULE"] = "pinry.settings.development"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                manage.__file__,
+                "test",
+                "--settings",
+                "--verbosity=1",
+            ],
+            cwd=os.path.dirname(manage.__file__),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=20,
+        )
+
+        self.assertEqual(completed.returncode, 2, completed.stdout)
+        self.assertIn(
+            "argument --settings: expected one argument",
+            completed.stdout,
+        )
+        self.assertNotIn("ImproperlyConfigured", completed.stdout)
+
+    def test_repeated_settings_subprocess_uses_last_file_database(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            requested_name = os.path.join(
+                temporary_directory,
+                "repeated-settings.sqlite3",
+            )
+            environment = os.environ.copy()
+            environment["DJANGO_SETTINGS_MODULE"] = (
+                "pinry.settings.development"
+            )
+            environment["PINRY_TEST_DB_PATH"] = requested_name
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    manage.__file__,
+                    "test",
+                    (
+                        "core.tests.test_idempotency."
+                        "IdempotencyConcurrencyTests"
+                    ),
+                    "--settings=pinry.settings.development",
+                    "--settings=pinry.settings.test_sqlite_file",
+                    "-v",
+                    "1",
+                ],
+                cwd=os.path.dirname(manage.__file__),
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                timeout=20,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("Ran 2 tests", completed.stdout)
+            self.assertNotIn("skipped", completed.stdout)
+            self.assertFalse(os.path.exists(requested_name))
+
+
+class TestSqliteFileSettingsTests(SimpleTestCase):
+    def test_database_configuration_ignores_development_database_override(self):
+        from pinry.settings import development, test_sqlite_file
+
+        inherited_database = {
+            "default": {
+                "ENGINE": "django.db.backends.postgresql",
+                "NAME": "private-production-database",
+                "USER": "private-user",
+                "OPTIONS": {"sslmode": "require"},
+                "TEST": {"MIRROR": "private-replica"},
+            }
+        }
+        requested_name = os.path.join(
+            tempfile.gettempdir(),
+            "pinry-review-requested.sqlite3",
+        )
+        try:
+            with mock.patch.object(
+                development,
+                "DATABASES",
+                inherited_database,
+            ), mock.patch.dict(
+                os.environ,
+                {"PINRY_TEST_DB_PATH": requested_name},
+            ):
+                reloaded = importlib.reload(test_sqlite_file)
+                database = copy.deepcopy(reloaded.DATABASES["default"])
+        finally:
+            importlib.reload(test_sqlite_file)
+
+        self.assertEqual(database["ENGINE"], "django.db.backends.sqlite3")
+        self.assertEqual(database["TEST"], {"NAME": requested_name})
+        self.assertEqual(database["OPTIONS"], {"timeout": 0.5})
+        self.assertEqual(
+            os.path.dirname(database["NAME"]),
+            tempfile.gettempdir(),
+        )
+        self.assertTrue(
+            os.path.basename(database["NAME"]).startswith(
+                "pinry-custom-base-"
+            )
+        )
+        self.assertNotEqual(database["NAME"], requested_name)
+        self.assertNotIn("USER", database)
 
 
 class FingerprintRequestTests(SimpleTestCase):
@@ -459,6 +638,33 @@ class IdempotencyStoreTests(TestCase):
         self.assertEqual(row.submitter_id, self.user.pk)
         self.assertIsNone(row.pin_id)
 
+    def test_record_success_rejects_forged_pin_with_other_database_owner(self):
+        claim = self._claim()
+        other_pin = self._create_pin(user=self.other_user)
+        forged_pin = Pin(
+            pk=other_pin.pk,
+            submitter_id=self.user.pk,
+        )
+        self.assertTrue(forged_pin._state.adding)
+
+        self.assertFalse(self.store.record_success(claim, forged_pin))
+
+        row = BatchImportItem.objects.get(pk=claim.row_id)
+        self.assertEqual(row.state, BatchImportItem.PENDING)
+        self.assertIsNone(row.pin_id)
+
+    def test_record_success_rejects_stale_pin_after_database_owner_change(self):
+        claim = self._claim()
+        pin = self._create_pin()
+        stale_pin = Pin.objects.get(pk=pin.pk)
+        Pin.objects.filter(pk=pin.pk).update(submitter=self.other_user)
+
+        self.assertFalse(self.store.record_success(claim, stale_pin))
+
+        row = BatchImportItem.objects.get(pk=claim.row_id)
+        self.assertEqual(row.state, BatchImportItem.PENDING)
+        self.assertIsNone(row.pin_id)
+
     def test_record_success_rejects_unsaved_pin(self):
         claim = self._claim()
         image = Image.objects.create(
@@ -472,6 +678,27 @@ class IdempotencyStoreTests(TestCase):
         row = BatchImportItem.objects.get(pk=claim.row_id)
         self.assertEqual(row.state, BatchImportItem.PENDING)
         self.assertIsNone(row.pin_id)
+
+    def test_cross_user_succeeded_row_fails_closed_instead_of_replaying(self):
+        claim = self._claim()
+        other_pin = self._create_pin(user=self.other_user)
+        BatchImportItem.objects.filter(pk=claim.row_id).update(
+            state=BatchImportItem.SUCCEEDED,
+            pin=other_pin,
+            error_code=None,
+            retryable=None,
+            lease_uuid=None,
+            lease_expires_at=None,
+        )
+
+        result = self._claim()
+
+        self.assertEqual(result.kind, "failed")
+        self.assertEqual(
+            result.error,
+            StoredError("internal_error", False),
+        )
+        self.assertIsNone(result.replay_pin_id)
 
     def test_mismatched_fingerprint_wins_before_all_state_handling(self):
         claim = self._claim()
@@ -579,6 +806,34 @@ class IdempotencyStoreTests(TestCase):
         self.assertFalse(self.store.record_success(first, pin))
         self.assertTrue(self.store.fence(second))
 
+    def test_four_reclaim_cas_losses_return_retryable_internal_error(self):
+        first = self._claim()
+        BatchImportItem.objects.filter(pk=first.row_id).update(
+            lease_expires_at=self.now - datetime.timedelta(seconds=1)
+        )
+        losing_store = AlwaysLosesReclaimStore(
+            wall_clock=self.clock,
+            lease_seconds=300,
+        )
+
+        result = losing_store.claim(
+            self.user,
+            self.batch_id,
+            self.item_id,
+            self.fingerprint,
+            self.now,
+        )
+
+        self.assertEqual(result.kind, "failed")
+        self.assertEqual(
+            result.error,
+            StoredError("internal_error", True),
+        )
+        self.assertEqual(losing_store.reclaim_attempts, 4)
+        row = BatchImportItem.objects.get(pk=first.row_id)
+        self.assertEqual(row.lease_generation, 1)
+        self.assertEqual(row.lease_uuid, first.lease_uuid)
+
     def test_claim_and_wall_clock_reject_naive_datetimes(self):
         naive = datetime.datetime(2026, 8, 20, 1, 2, 3)
 
@@ -680,10 +935,21 @@ class IdempotencyConcurrencyTests(TransactionTestCase):
     reset_sequences = True
 
     def setUp(self):
+        if connection.vendor != "sqlite":
+            self.skipTest("This concurrency contract requires SQLite.")
         if connection.creation.is_in_memory_db(
             connection.settings_dict["NAME"]
         ):
             self.skipTest("This concurrency contract requires file SQLite.")
+        database_name = connection.settings_dict["NAME"]
+        self.assertEqual(connection.vendor, "sqlite")
+        self.assertTrue(os.path.isfile(database_name))
+        requested_name = os.environ.get("PINRY_TEST_DB_PATH")
+        if requested_name:
+            self.assertEqual(
+                os.path.realpath(database_name),
+                os.path.realpath(requested_name),
+            )
         self.user = User.objects.create_user(
             username="concurrent-owner",
             email="concurrent@example.com",
@@ -697,7 +963,7 @@ class IdempotencyConcurrencyTests(TransactionTestCase):
             {"url": "https://example.com/concurrent.png"}
         )
 
-    def _run_concurrent_claims(self):
+    def _run_concurrent_claims(self, store_factory=None):
         barrier = threading.Barrier(2)
         events = queue.Queue()
 
@@ -705,10 +971,13 @@ class IdempotencyConcurrencyTests(TransactionTestCase):
             close_old_connections()
             try:
                 user = User.objects.get(pk=self.user.pk)
-                store = IdempotencyStore(
-                    wall_clock=lambda: self.now,
-                    lease_seconds=300,
-                )
+                if store_factory is None:
+                    store = IdempotencyStore(
+                        wall_clock=lambda: self.now,
+                        lease_seconds=300,
+                    )
+                else:
+                    store = store_factory()
                 barrier.wait(timeout=5)
                 result = store.claim(
                     user,
@@ -773,13 +1042,26 @@ class IdempotencyConcurrencyTests(TransactionTestCase):
         BatchImportItem.objects.filter(pk=first.row_id).update(
             lease_expires_at=self.now - datetime.timedelta(seconds=1)
         )
+        reclaim_barrier = threading.Barrier(2)
+        reclaim_events = queue.Queue()
 
-        results = self._run_concurrent_claims()
+        def store_factory():
+            return CoordinatedReclaimStore(
+                reclaim_barrier,
+                reclaim_events,
+                wall_clock=lambda: self.now,
+                lease_seconds=300,
+            )
+
+        results = self._run_concurrent_claims(store_factory=store_factory)
 
         self.assertEqual(
             sorted(result.kind for result in results),
             ["claimed", "in_progress"],
         )
+        reclaim_outcomes = [reclaim_events.get(timeout=1) for _ in range(2)]
+        self.assertEqual(reclaim_outcomes.count("claimed"), 1)
+        self.assertEqual(reclaim_outcomes.count(None), 1)
         row = BatchImportItem.objects.get(pk=first.row_id)
         self.assertEqual(row.lease_generation, 2)
         claimed = [result for result in results if result.kind == "claimed"]
