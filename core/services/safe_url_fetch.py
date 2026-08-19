@@ -85,7 +85,7 @@ class _UrlPolicy:
             self._normalize_allowlist(allowlist)
         )
 
-    def resolve_and_validate(self, url):
+    def resolve_and_validate(self, url, deadline):
         parsed = self._parse_url(url)
         hostname = parsed[1]
         literal_address = self._ip_address(hostname)
@@ -96,7 +96,9 @@ class _UrlPolicy:
             return self._target(parsed, normalized_address)
 
         try:
-            resolved = self.resolver.resolve(hostname, parsed[2])
+            resolved = self.resolver.resolve(
+                hostname, parsed[2], deadline
+            )
             addresses = [
                 ipaddress.ip_address(str(address).split("%", 1)[0])
                 for address in resolved
@@ -331,7 +333,9 @@ class SafeUrlFetcher:
         current_url = url
         for redirect_count in range(self.limits.max_redirects + 1):
             self._check_deadline(deadline)
-            target = self.policy.resolve_and_validate(current_url)
+            target = self.policy.resolve_and_validate(
+                current_url, deadline
+            )
             self._check_deadline(deadline)
             response = self._request(target, safe_referer, deadline)
             try:

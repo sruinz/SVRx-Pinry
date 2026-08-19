@@ -47,9 +47,11 @@ class FakeResolver:
         self.results = results
         self.after_resolve = after_resolve
         self.calls = []
+        self.deadlines = []
 
-    def resolve(self, hostname, port):
+    def resolve(self, hostname, port, deadline=None):
         self.calls.append((hostname, port))
+        self.deadlines.append(deadline)
         result = self.results[hostname]
         if isinstance(result, Exception):
             raise result
@@ -684,6 +686,7 @@ class SafeUrlFetcherPolicyTests(SimpleTestCase):
         )
 
         self.assertEqual(transport.calls[0]["deadline"], 112.0)
+        self.assertEqual(resolver.deadlines, [112.0])
 
     def test_preserves_earlier_caller_deadline(self):
         clock = ManualClock(100.0)
