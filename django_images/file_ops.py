@@ -3,7 +3,9 @@ import errno
 import hashlib
 import os
 from pathlib import PurePosixPath
+import stat
 import sys
+import uuid
 
 
 class MediaPathError(Exception):
@@ -19,6 +21,18 @@ class PublishResult(object):
 def sha256_path(path):
     digest = hashlib.sha256()
     with open(path, "rb") as file_obj:
+        while True:
+            chunk = file_obj.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_file_descriptor(file_descriptor):
+    digest = hashlib.sha256()
+    with os.fdopen(os.dup(file_descriptor), "rb") as file_obj:
+        file_obj.seek(0)
         while True:
             chunk = file_obj.read(1024 * 1024)
             if not chunk:
@@ -78,18 +92,9 @@ def migration_lock_path(data_root):
     )
 
 
-def _fsync_directory(path):
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _rename_noreplace(part_path, destination):
+def _rename_noreplace(
+    source_directory, source_name, destination_directory, destination_name
+):
     if not sys.platform.startswith("linux"):
         return False
     libc = ctypes.CDLL(None, use_errno=True)
@@ -105,10 +110,10 @@ def _rename_noreplace(part_path, destination):
     )
     renameat2.restype = ctypes.c_int
     result = renameat2(
-        -100,
-        os.fsencode(part_path),
-        -100,
-        os.fsencode(destination),
+        source_directory,
+        os.fsencode(source_name),
+        destination_directory,
+        os.fsencode(destination_name),
         1,
     )
     if result == 0:
@@ -121,18 +126,191 @@ def _rename_noreplace(part_path, destination):
     raise OSError(error_number, os.strerror(error_number))
 
 
-def publish_noreplace(part_path, destination, expected_sha256):
-    if sha256_path(part_path) != expected_sha256:
-        raise MediaPathError("part_hash_mismatch")
+def open_staging_noreplace(part_path):
+    parent = os.path.dirname(part_path)
+    name = os.path.basename(part_path)
+    parent_descriptor = _open_directory(parent)
     try:
-        if not _rename_noreplace(part_path, destination):
-            os.link(part_path, destination)
-            os.unlink(part_path)
-        _fsync_directory(os.path.dirname(destination))
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                name, flags, 0o600, dir_fd=parent_descriptor
+            )
+        except FileExistsError:
+            raise MediaPathError("unsafe_staging_file")
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            os.close(descriptor)
+            raise MediaPathError("unsafe_staging_file")
+        return descriptor
+    finally:
+        os.close(parent_descriptor)
+
+
+def publish_noreplace(
+    part_path, destination, expected_sha256, part_descriptor=None
+):
+    part_parent = os.path.realpath(os.path.dirname(part_path))
+    destination_parent = os.path.realpath(os.path.dirname(destination))
+    if part_parent != destination_parent:
+        raise MediaPathError("unsafe_staging_file")
+    part_name = os.path.basename(part_path)
+    destination_name = os.path.basename(destination)
+    parent_descriptor = _open_directory(destination_parent)
+    opened_part = False
+    alias_name = ".publish-{}".format(uuid.uuid4())
+    alias_exists = False
+    try:
+        if part_descriptor is None:
+            part_descriptor = _open_regular_nofollow(
+                parent_descriptor, part_name
+            )
+            opened_part = True
+        part_stat = os.fstat(part_descriptor)
+        _require_owned_name(parent_descriptor, part_name, part_stat)
+        if sha256_file_descriptor(part_descriptor) != expected_sha256:
+            raise MediaPathError("part_hash_mismatch")
+        _link_descriptor_alias(
+            part_descriptor,
+            parent_descriptor,
+            part_name,
+            alias_name,
+            part_stat,
+        )
+        alias_exists = True
+        try:
+            created = _publish_alias(
+                parent_descriptor, alias_name, destination_name
+            )
+            alias_exists = not created
+        except FileExistsError:
+            if _sha256_name(parent_descriptor, destination_name) != expected_sha256:
+                raise MediaPathError("media_path_conflict")
+            _unlink_owned_name(parent_descriptor, alias_name, part_stat)
+            alias_exists = False
+            _unlink_owned_name(parent_descriptor, part_name, part_stat)
+            os.fsync(parent_descriptor)
+            return PublishResult(reused=True)
+        _unlink_owned_name(parent_descriptor, part_name, part_stat)
+        os.fsync(parent_descriptor)
         return PublishResult(created=True)
-    except FileExistsError:
-        if sha256_path(destination) != expected_sha256:
-            raise MediaPathError("media_path_conflict")
-        os.unlink(part_path)
-        _fsync_directory(os.path.dirname(destination))
-        return PublishResult(reused=True)
+    finally:
+        if alias_exists:
+            _unlink_owned_name(parent_descriptor, alias_name, part_stat)
+        if opened_part:
+            os.close(part_descriptor)
+        os.close(parent_descriptor)
+
+
+def _open_directory(path):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return os.open(path, flags)
+
+
+def _open_regular_nofollow(directory_descriptor, name):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+    except OSError as error:
+        raise MediaPathError("unsafe_staging_file") from error
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise MediaPathError("unsafe_staging_file")
+    return descriptor
+
+
+def _identity(file_stat):
+    return file_stat.st_dev, file_stat.st_ino
+
+
+def _require_owned_name(directory_descriptor, name, expected_stat):
+    try:
+        current = os.stat(
+            name, dir_fd=directory_descriptor, follow_symlinks=False
+        )
+    except OSError as error:
+        raise MediaPathError("unsafe_staging_file") from error
+    if not stat.S_ISREG(current.st_mode) or _identity(current) != _identity(
+        expected_stat
+    ):
+        raise MediaPathError("unsafe_staging_file")
+
+
+def _link_descriptor_alias(
+    file_descriptor,
+    directory_descriptor,
+    source_name,
+    alias_name,
+    expected_stat,
+):
+    linked = False
+    if sys.platform.startswith("linux"):
+        try:
+            os.link(
+                "/proc/self/fd/{}".format(file_descriptor),
+                alias_name,
+                dst_dir_fd=directory_descriptor,
+                follow_symlinks=True,
+            )
+            linked = True
+        except OSError:
+            linked = False
+    if not linked:
+        _require_owned_name(
+            directory_descriptor, source_name, expected_stat
+        )
+        os.link(
+            source_name,
+            alias_name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    alias_descriptor = _open_regular_nofollow(
+        directory_descriptor, alias_name
+    )
+    try:
+        if _identity(os.fstat(alias_descriptor)) != _identity(expected_stat):
+            raise MediaPathError("unsafe_staging_file")
+    finally:
+        os.close(alias_descriptor)
+
+
+def _publish_alias(directory_descriptor, alias_name, destination_name):
+    if _rename_noreplace(
+        directory_descriptor,
+        alias_name,
+        directory_descriptor,
+        destination_name,
+    ):
+        return True
+    os.link(
+        alias_name,
+        destination_name,
+        src_dir_fd=directory_descriptor,
+        dst_dir_fd=directory_descriptor,
+        follow_symlinks=False,
+    )
+    os.unlink(alias_name, dir_fd=directory_descriptor)
+    return True
+
+
+def _sha256_name(directory_descriptor, name):
+    descriptor = _open_regular_nofollow(directory_descriptor, name)
+    try:
+        return sha256_file_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _unlink_owned_name(directory_descriptor, name, expected_stat):
+    _require_owned_name(directory_descriptor, name, expected_stat)
+    os.unlink(name, dir_fd=directory_descriptor)

@@ -13,8 +13,10 @@ from PIL import Image as PILImage
 
 from django_images.file_ops import (
     MediaPathError,
+    open_staging_noreplace,
     publish_noreplace,
     resolve_media_path,
+    sha256_file_descriptor,
     sha256_path,
 )
 from django_images.models import Image, Thumbnail
@@ -156,11 +158,16 @@ class MigrationPlan(object):
 class ManifestState(object):
     run_id: str = None
     latest_by_image: dict = None
+    initial_plan_by_image: dict = None
     events: list = None
+    torn_tail: bytes = None
+    torn_offset: int = None
 
     def __post_init__(self):
         if self.latest_by_image is None:
             self.latest_by_image = {}
+        if self.initial_plan_by_image is None:
+            self.initial_plan_by_image = {}
         if self.events is None:
             self.events = []
 
@@ -180,11 +187,16 @@ class ManifestLog(object):
         state = ManifestState()
         if not os.path.exists(path):
             return state
-        with open(path, encoding="utf-8") as manifest:
+        offset = 0
+        with open(path, "rb") as manifest:
             for line_number, line in enumerate(manifest, 1):
+                if not line.endswith(b"\n"):
+                    state.torn_tail = line
+                    state.torn_offset = offset
+                    break
                 try:
                     event = json.loads(line)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, UnicodeDecodeError):
                     raise CommandError(
                         "invalid_media_manifest_line:{}".format(line_number)
                     )
@@ -192,12 +204,46 @@ class ManifestLog(object):
                 run_id = event.get("run_id")
                 if state.run_id is not None and state.run_id != run_id:
                     raise CommandError("manifest_run_id_mismatch")
+                _validate_manifest_sequence(state, event, line_number)
                 state.run_id = run_id
                 state.events.append(event)
                 state.latest_by_image[event["image_id"]] = event
+                offset += len(line)
         return state
 
+    def repair_torn_tail(self):
+        if self.state.torn_tail is None:
+            return None
+        with open(self.path, "r+b") as manifest:
+            manifest.seek(self.state.torn_offset)
+            if manifest.read() != self.state.torn_tail:
+                raise CommandError("media_manifest_changed")
+            quarantine_path = "{}.torn-{}".format(
+                self.path, uuid.uuid4()
+            )
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(quarantine_path, flags, 0o600)
+            try:
+                with os.fdopen(descriptor, "wb", closefd=False) as quarantine:
+                    quarantine.write(self.state.torn_tail)
+                    quarantine.flush()
+                    os.fsync(quarantine.fileno())
+            finally:
+                os.close(descriptor)
+            manifest.seek(self.state.torn_offset)
+            manifest.truncate()
+            manifest.flush()
+            os.fsync(manifest.fileno())
+        _fsync_directory(os.path.dirname(self.path))
+        self.state.torn_tail = None
+        self.state.torn_offset = None
+        return quarantine_path
+
     def record(self, event_name, plan, batch_id, execute):
+        if self.state.torn_tail is not None:
+            raise CommandError("media_manifest_torn_tail_requires_execute")
         event = {
             "schema_version": 1,
             "run_id": self.run_id,
@@ -207,6 +253,12 @@ class ManifestLog(object):
             "recorded_at": datetime.now(timezone.utc).isoformat(),
         }
         event.update(plan.as_event_fields())
+        _validate_manifest_sequence(
+            self.state,
+            event,
+            len(self.state.events) + 1,
+            remember_initial=False,
+        )
         directory = os.path.dirname(self.path)
         os.makedirs(directory, exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as manifest:
@@ -214,6 +266,8 @@ class ManifestLog(object):
             manifest.flush()
             os.fsync(manifest.fileno())
         self.state.run_id = self.run_id
+        if plan.image_id not in self.state.initial_plan_by_image:
+            self.state.initial_plan_by_image[plan.image_id] = plan
         self.state.events.append(event)
         self.state.latest_by_image[plan.image_id] = event
         return event
@@ -337,6 +391,34 @@ def _valid_manifest_file(file_info, original):
     )
 
 
+def _validate_manifest_sequence(
+    state, event, line_number, remember_initial=True
+):
+    image_id = event["image_id"]
+    plan = MigrationPlan.from_event(event)
+    initial = state.initial_plan_by_image.get(image_id)
+    previous = state.latest_by_image.get(image_id)
+    if initial is None:
+        if event["event"] not in ("planned", "already_current"):
+            raise CommandError(
+                "manifest_state_transition:{}".format(line_number)
+            )
+        if remember_initial:
+            state.initial_plan_by_image[image_id] = plan
+        return
+    if plan != initial:
+        raise CommandError("manifest_plan_mismatch:{}".format(line_number))
+    transitions = {
+        "planned": {"copied", "recovered_commit"},
+        "copied": {"copied", "committed", "recovered_commit"},
+    }
+    allowed = transitions.get(previous["event"], set())
+    if event["event"] not in allowed:
+        raise CommandError(
+            "manifest_state_transition:{}".format(line_number)
+        )
+
+
 def _inspect_absolute_image(path):
     size = os.path.getsize(path)
     digest = sha256_path(path)
@@ -347,6 +429,17 @@ def _inspect_absolute_image(path):
         with PILImage.open(path) as image:
             image.load()
     return size, digest
+
+
+def _fsync_directory(path):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _inspect_image_path(relative_name):
@@ -367,12 +460,15 @@ class MediaMigrator(object):
         self.summary = MigrationSummary()
 
     def run(self, execute=False):
+        if execute:
+            self.manifest.repair_torn_tail()
         for batch_id, images in self._batches():
             pending = []
             for image in images:
                 latest = self.manifest.state.latest_by_image.get(image.pk)
                 if latest is not None:
                     plan = MigrationPlan.from_event(latest)
+                    self._validate_manifest_plan(image, plan)
                     action = self._resume_action(image, plan, latest)
                     if action == "skip":
                         continue
@@ -449,6 +545,13 @@ class MediaMigrator(object):
             return "continue"
         raise CommandError("mixed_media_state")
 
+    def _validate_manifest_plan(self, image, manifest_plan):
+        current_plan = MigrationPlan.for_image(image)
+        if _canonical_plan_signature(manifest_plan) != _canonical_plan_signature(
+            current_plan
+        ):
+            raise CommandError("manifest_plan_mismatch")
+
     def _verify_sources(self, plan):
         for file_plan in plan.files:
             self._verify_file(file_plan, file_plan.old_path)
@@ -479,24 +582,46 @@ class MediaMigrator(object):
             os.makedirs(parent, exist_ok=True)
             destination = self._resolve_media(file_plan.new_path)
             part_path = destination + ".part-" + self.manifest.run_id
-            if not os.path.exists(part_path):
-                with open(source, "rb") as source_file:
-                    with open(part_path, "xb") as part_file:
+            try:
+                part_descriptor = open_staging_noreplace(part_path)
+            except MediaPathError as error:
+                raise CommandError(str(error))
+            try:
+                source_flags = os.O_RDONLY
+                if hasattr(os, "O_NOFOLLOW"):
+                    source_flags |= os.O_NOFOLLOW
+                source_descriptor = os.open(source, source_flags)
+                with os.fdopen(source_descriptor, "rb") as source_file:
+                    with os.fdopen(
+                        os.dup(part_descriptor), "wb"
+                    ) as part_file:
                         shutil.copyfileobj(source_file, part_file)
                         part_file.flush()
                         os.fsync(part_file.fileno())
-            self._verify_absolute_part(file_plan, part_path)
-            try:
+                self._verify_part_descriptor(file_plan, part_descriptor)
                 publish_noreplace(
-                    part_path, destination, file_plan.sha256
+                    part_path,
+                    destination,
+                    file_plan.sha256,
+                    part_descriptor=part_descriptor,
                 )
             except MediaPathError as error:
                 raise CommandError(str(error))
+            finally:
+                os.close(part_descriptor)
             self._verify_file(file_plan, file_plan.new_path)
 
-    def _verify_absolute_part(self, file_plan, part_path):
+    def _verify_part_descriptor(self, file_plan, part_descriptor):
         try:
-            size, digest = _inspect_absolute_image(part_path)
+            size = os.fstat(part_descriptor).st_size
+            digest = sha256_file_descriptor(part_descriptor)
+            with os.fdopen(os.dup(part_descriptor), "rb") as part_file:
+                part_file.seek(0)
+                with PILImage.open(part_file) as image:
+                    image.verify()
+                part_file.seek(0)
+                with PILImage.open(part_file) as image:
+                    image.load()
         except (OSError, PILImage.UnidentifiedImageError, Warning) as error:
             raise CommandError("media_verification_failed: {}".format(error))
         if size != file_plan.size or digest != file_plan.sha256:
@@ -537,3 +662,19 @@ def _current_paths(image):
         }
     )
     return current
+
+
+def _canonical_plan_signature(plan):
+    return (
+        plan.image_id,
+        plan.new_original,
+        tuple(
+            (
+                file_plan.kind,
+                file_plan.new_path,
+                file_plan.thumbnail_id,
+                file_plan.derivative_size,
+            )
+            for file_plan in plan.files
+        ),
+    )

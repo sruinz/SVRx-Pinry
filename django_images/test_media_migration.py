@@ -15,6 +15,7 @@ from PIL import Image as PILImage
 from django_images.file_ops import (
     MediaPathError,
     migration_lock_path,
+    open_staging_noreplace,
     publish_noreplace,
     resolve_media_path,
 )
@@ -114,6 +115,18 @@ class MediaMigrationCommandTest(TransactionTestCase):
         )
         return paths
 
+    def _database_paths(self, image=None):
+        image = image or self.image
+        image.refresh_from_db()
+        paths = {"original": image.image.name}
+        paths.update(
+            {
+                thumbnail.size: thumbnail.image.name
+                for thumbnail in image.thumbnail_set.order_by("id")
+            }
+        )
+        return paths
+
     def test_dry_run_writes_plan_but_changes_no_database_or_media(self):
         call_command("migrate_media", manifest=self.manifest_path)
         self.image.refresh_from_db()
@@ -199,6 +212,36 @@ class MediaMigrationCommandTest(TransactionTestCase):
         for old_path, content in self.old_files.items():
             self.assertEqual(files[old_path], content)
 
+    def test_preexisting_staging_symlink_is_rejected_without_consuming_it(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_path = Path(outside.name, "outside.png")
+        outside_content = self.old_files[self.old_original]
+        outside_path.write_bytes(outside_content)
+        manifest = ManifestLog(self.manifest_path)
+        destination = Path(
+            self.temporary_media.name,
+            self._canonical_paths()["original"],
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        part_path = Path(str(destination) + ".part-" + manifest.run_id)
+        part_path.symlink_to(outside_path)
+        database_before = self._database_paths()
+
+        with self.assertRaisesRegex(CommandError, "unsafe_staging_file"):
+            MediaMigrator(default_storage, manifest).run(execute=True)
+
+        self.assertEqual(self._database_paths(), database_before)
+        self.assertTrue(part_path.is_symlink())
+        self.assertEqual(os.readlink(str(part_path)), str(outside_path))
+        self.assertEqual(outside_path.read_bytes(), outside_content)
+        self.assertFalse(destination.exists())
+        for old_path, content in self.old_files.items():
+            self.assertEqual(
+                Path(self.temporary_media.name, old_path).read_bytes(),
+                content,
+            )
+
     def test_second_copy_failure_keeps_entire_batch_database_unchanged(self):
         second = self._create_legacy_image("second")
         second_old_original = second.image.name
@@ -248,6 +291,78 @@ class MediaMigrationCommandTest(TransactionTestCase):
             self.assertEqual(
                 hashlib.sha256(content).hexdigest(), file_info["sha256"]
             )
+
+    def test_torn_commit_event_tail_is_quarantined_before_recovery(self):
+        manifest = ManifestLog(self.manifest_path)
+
+        def interrupt(point):
+            if point == "after_database_commit":
+                raise InjectedInterruption()
+
+        with self.assertRaises(InjectedInterruption):
+            MediaMigrator(
+                default_storage,
+                manifest,
+                fault_injector=interrupt,
+            ).run(execute=True)
+        torn_tail = b'{"schema_version": 1, "event": "comm'
+        with open(self.manifest_path, "ab") as manifest_file:
+            manifest_file.write(torn_tail)
+
+        call_command(
+            "migrate_media", execute=True, manifest=self.manifest_path
+        )
+
+        manifest_bytes = Path(self.manifest_path).read_bytes()
+        self.assertTrue(manifest_bytes.endswith(b"\n"))
+        self.assertNotIn(torn_tail, manifest_bytes)
+        self.assertEqual(self._manifest_events()[-1]["event"], "recovered_commit")
+        quarantined = list(
+            Path(self.manifest_path).parent.glob("test.jsonl.torn-*")
+        )
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_bytes(), torn_tail)
+
+    def test_complete_invalid_json_tail_remains_fail_closed(self):
+        call_command("migrate_media", manifest=self.manifest_path)
+        with open(self.manifest_path, "ab") as manifest_file:
+            manifest_file.write(b'{"schema_version":\n')
+        files_before = self._all_media_files()
+
+        with self.assertRaisesRegex(
+            CommandError, "invalid_media_manifest_line:2"
+        ):
+            call_command(
+                "migrate_media", execute=True, manifest=self.manifest_path
+            )
+
+        self.assertEqual(self._all_media_files(), files_before)
+
+    def test_invalid_json_in_middle_of_manifest_remains_fail_closed(self):
+        call_command("migrate_media", manifest=self.manifest_path)
+        valid_line = Path(self.manifest_path).read_bytes()
+        Path(self.manifest_path).write_bytes(
+            valid_line + b'{"schema_version":\n' + valid_line
+        )
+
+        with self.assertRaisesRegex(
+            CommandError, "invalid_media_manifest_line:2"
+        ):
+            ManifestLog.load(self.manifest_path)
+
+    def test_dry_run_does_not_repair_torn_manifest_tail(self):
+        call_command("migrate_media", manifest=self.manifest_path)
+        torn_tail = b'{"schema_version": 1'
+        with open(self.manifest_path, "ab") as manifest_file:
+            manifest_file.write(torn_tail)
+        manifest_before = Path(self.manifest_path).read_bytes()
+
+        call_command("migrate_media", manifest=self.manifest_path)
+
+        self.assertEqual(Path(self.manifest_path).read_bytes(), manifest_before)
+        self.assertFalse(
+            list(Path(self.manifest_path).parent.glob("test.jsonl.torn-*"))
+        )
 
     def test_interrupted_commit_with_mixed_database_paths_aborts(self):
         manifest = ManifestLog(self.manifest_path)
@@ -465,6 +580,65 @@ class MediaMigrationCommandTest(TransactionTestCase):
 
         self.assertEqual(self._all_media_files(), files_before)
 
+    def test_manifest_noncanonical_destination_is_rejected_before_copy(self):
+        call_command("migrate_media", manifest=self.manifest_path)
+        event = self._manifest_events()[0]
+        noncanonical = "quarantine/{}/original.png".format(self.image.pk)
+        event["new_original"] = noncanonical
+        event["files"][0]["new_path"] = noncanonical
+        Path(self.manifest_path).write_text(json.dumps(event) + "\n")
+        database_before = self._database_paths()
+        files_before = self._all_media_files()
+
+        with self.assertRaisesRegex(CommandError, "manifest_plan_mismatch"):
+            call_command(
+                "migrate_media", execute=True, manifest=self.manifest_path
+            )
+
+        self.assertEqual(self._database_paths(), database_before)
+        self.assertEqual(self._all_media_files(), files_before)
+        self.assertFalse(
+            Path(self.temporary_media.name, noncanonical).exists()
+        )
+
+    def test_followup_event_must_keep_initial_plan(self):
+        call_command("migrate_media", manifest=self.manifest_path)
+        planned = self._manifest_events()[0]
+        copied = json.loads(json.dumps(planned))
+        copied["event"] = "copied"
+        copied["new_original"] = "quarantine/original.png"
+        copied["files"][0]["new_path"] = copied["new_original"]
+        with open(self.manifest_path, "a") as manifest_file:
+            manifest_file.write(json.dumps(copied) + "\n")
+
+        with self.assertRaisesRegex(CommandError, "manifest_plan_mismatch"):
+            ManifestLog.load(self.manifest_path)
+
+    def test_followup_event_must_follow_valid_state_transition(self):
+        call_command("migrate_media", manifest=self.manifest_path)
+        planned = self._manifest_events()[0]
+        committed = dict(planned, event="committed", execute=True)
+        with open(self.manifest_path, "a") as manifest_file:
+            manifest_file.write(json.dumps(committed) + "\n")
+
+        with self.assertRaisesRegex(CommandError, "manifest_state_transition"):
+            ManifestLog.load(self.manifest_path)
+
+    def test_manifest_derivative_closure_must_match_current_database(self):
+        call_command("migrate_media", manifest=self.manifest_path)
+        event = self._manifest_events()[0]
+        derivative = event["files"][1]
+        derivative["derivative_size"] = "standard"
+        derivative["new_path"] = derivative["new_path"].replace(
+            "thumbnail.png", "standard.png"
+        )
+        Path(self.manifest_path).write_text(json.dumps(event) + "\n")
+
+        with self.assertRaisesRegex(CommandError, "manifest_plan_mismatch"):
+            call_command(
+                "migrate_media", execute=True, manifest=self.manifest_path
+            )
+
     def test_execute_lock_is_nonblocking_but_dry_run_does_not_take_it(self):
         lock_path = migration_lock_path(self.temporary_data.name)
         self.assertEqual(
@@ -568,3 +742,30 @@ class MediaFileOperationTest(TestCase):
 
         self.assertEqual(Path(destination).read_bytes(), destination_bytes)
         self.assertEqual(Path(part).read_bytes(), part_bytes)
+
+    def test_publish_rejects_part_name_replaced_after_open(self):
+        destination = os.path.join(self.root.name, "destination.png")
+        part = os.path.join(self.root.name, "candidate.part")
+        expected = make_image_bytes("red")
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_path = Path(outside.name, "outside.png")
+        outside_path.write_bytes(expected)
+        part_descriptor = open_staging_noreplace(part)
+        self.addCleanup(os.close, part_descriptor)
+        os.write(part_descriptor, expected)
+        os.fsync(part_descriptor)
+        os.unlink(part)
+        Path(part).symlink_to(outside_path)
+
+        with self.assertRaisesRegex(MediaPathError, "unsafe_staging_file"):
+            publish_noreplace(
+                part,
+                destination,
+                hashlib.sha256(expected).hexdigest(),
+                part_descriptor=part_descriptor,
+            )
+
+        self.assertTrue(Path(part).is_symlink())
+        self.assertEqual(outside_path.read_bytes(), expected)
+        self.assertFalse(os.path.exists(destination))
