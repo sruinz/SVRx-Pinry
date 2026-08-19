@@ -2,7 +2,7 @@ import hashlib
 import os.path
 import uuid
 
-from django.db import models
+from django.db import models, transaction
 from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.dispatch import receiver
 
@@ -117,6 +117,25 @@ class Thumbnail(models.Model):
         return self.image.url
 
 
+class PendingMediaDeletion(models.Model):
+    ORIGINAL = "original"
+    THUMBNAIL = "thumbnail"
+    KIND_CHOICES = (
+        (ORIGINAL, "original"),
+        (THUMBNAIL, "thumbnail"),
+    )
+
+    kind = models.CharField(max_length=16, choices=KIND_CHOICES)
+    name = models.CharField(max_length=255)
+    attempts = models.PositiveIntegerField(default=0)
+    last_error = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ("kind", "name")
+
+
 @receiver(models.signals.post_save)
 def original_changed(sender, instance, created, **kwargs):
     if isinstance(instance, Image):
@@ -126,5 +145,26 @@ def original_changed(sender, instance, created, **kwargs):
 @receiver(models.signals.post_delete)
 def delete_image_files(sender, instance, **kwargs):
     if isinstance(instance, (Image, Thumbnail)) and IMAGE_AUTO_DELETE:
-        if instance.image.storage.exists(instance.image.name):
-            instance.image.delete(save=False)
+        name = instance.image.name
+        if not name:
+            return
+        kind = (
+            PendingMediaDeletion.ORIGINAL
+            if isinstance(instance, Image)
+            else PendingMediaDeletion.THUMBNAIL
+        )
+        using = kwargs.get("using")
+        pending, _ = PendingMediaDeletion.objects.using(using).get_or_create(
+            kind=kind,
+            name=name,
+        )
+        pending_id = pending.pk
+
+        def delete_after_commit():
+            from django_images.services.media_deletion import (
+                process_pending_media_deletion,
+            )
+
+            process_pending_media_deletion(pending_id, using=using)
+
+        transaction.on_commit(delete_after_commit, using=using)

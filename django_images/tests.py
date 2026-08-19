@@ -2,7 +2,7 @@ from io import BytesIO
 
 import mock
 import qrcode
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.core.files.images import ImageFile
 from django.conf import settings
 from django_images.models import Image, Thumbnail
@@ -95,7 +95,9 @@ class PostSaveSignalOriginalChangedTestCase(TemporaryMediaMixin, TestCase):
         self.assertFalse(Thumbnail.objects.exists())
 
 
-class PostDeleteSignalDeleteImageFileTest(TemporaryMediaMixin, TestCase):
+class PostDeleteSignalDeleteImageFileTest(
+    TemporaryMediaMixin, TransactionTestCase
+):
     def setUp(self):
         super(PostDeleteSignalDeleteImageFileTest, self).setUp()
         image_obj = BytesIO()

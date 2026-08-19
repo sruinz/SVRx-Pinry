@@ -1,9 +1,12 @@
+from io import StringIO
 from pathlib import Path
 import threading
 from unittest import skipUnless
 
 import mock
+from django.apps import apps
 from django.contrib import admin
+from django.core.management import call_command
 from django.db import close_old_connections, connection, connections
 from django.db import OperationalError, transaction
 from django.db.models.query import QuerySet
@@ -244,6 +247,58 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
 
+    @staticmethod
+    def _pending_deletions():
+        return apps.get_model(
+            "django_images", "PendingMediaDeletion"
+        ).objects
+
+    def _assert_permanent_delete_continues_after_storage_error(
+        self, fail_at
+    ):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        files_before = self._assert_four_image_files(image)
+        original_name = image.image.name
+        storage = image.image.storage
+        real_delete = storage.delete
+        attempted = []
+
+        def fail_one_delete(name):
+            attempted.append(name)
+            if len(attempted) == fail_at:
+                raise OSError("secret storage location")
+            return real_delete(name)
+
+        self._move_to_trash(pin)
+        with mock.patch.object(
+            storage, "delete", side_effect=fail_one_delete
+        ):
+            response = self.client.delete(self._permanent_url(pin))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(
+            Thumbnail.objects.filter(original_id=image.pk).exists()
+        )
+        self.assertEqual(len(attempted), 4)
+        self.assertEqual(set(attempted), set(files_before))
+        failed_name = attempted[fail_at - 1]
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name),
+            {failed_name: files_before[failed_name]},
+        )
+        pending = self._pending_deletions().get()
+        self.assertEqual(pending.name, failed_name)
+        self.assertEqual(
+            pending.kind,
+            "original" if failed_name == original_name else "thumbnail",
+        )
+        self.assertEqual(pending.attempts, 1)
+        self.assertEqual(pending.last_error, "OSError")
+        return pending
+
     def test_permanent_delete_preserves_shared_image_rows_and_file_bytes(self):
         image = create_image()
         owner_pin = create_pin(self.owner, image, [])
@@ -268,6 +323,7 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(
             media_snapshot(self.temporary_media.name), files_before
         )
+        self.assertFalse(self._pending_deletions().exists())
 
     def test_permanent_delete_of_last_reference_removes_rows_and_files(self):
         image = create_image()
@@ -284,6 +340,53 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
             Thumbnail.objects.filter(original_id=image.pk).exists()
         )
         self.assertEqual(media_snapshot(self.temporary_media.name), {})
+
+    def test_first_storage_failure_is_journaled_without_stopping_cleanup(self):
+        self._assert_permanent_delete_continues_after_storage_error(1)
+
+    def test_middle_storage_failure_is_retried_by_management_command(self):
+        pending = (
+            self._assert_permanent_delete_continues_after_storage_error(2)
+        )
+        expected_pending = list(
+            self._pending_deletions().values_list(
+                "kind", "name", "attempts", "last_error"
+            )
+        )
+        files_before_dry_run = media_snapshot(self.temporary_media.name)
+        dry_run = StringIO()
+
+        call_command("retry_media_deletions", stdout=dry_run)
+
+        self.assertEqual(
+            list(
+                self._pending_deletions().values_list(
+                    "kind", "name", "attempts", "last_error"
+                )
+            ),
+            expected_pending,
+        )
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name), files_before_dry_run
+        )
+        self.assertIn("pending=1 processed=0 remaining=1", dry_run.getvalue())
+
+        execute = StringIO()
+        call_command(
+            "retry_media_deletions", execute=True, stdout=execute
+        )
+
+        self.assertFalse(self._pending_deletions().exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+        storage_model = (
+            BaseImage if pending.kind == "original" else Thumbnail
+        )
+        storage = storage_model._meta.get_field("image").storage
+        self.assertFalse(storage.exists(pending.name))
+        self.assertIn("pending=1 processed=1 remaining=0", execute.getvalue())
+
+    def test_last_storage_failure_is_journaled_without_stopping_cleanup(self):
+        self._assert_permanent_delete_continues_after_storage_error(4)
 
     def test_queryset_delete_preserves_media_while_reference_remains(self):
         image = create_image()

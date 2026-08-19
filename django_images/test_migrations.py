@@ -11,6 +11,7 @@ from django.test import TransactionTestCase, override_settings
 class AssetMetadataMigrationTests(TransactionTestCase):
     migrate_from = ("django_images", "0002_auto_20180826_0814")
     migrate_to = ("django_images", "0005_enforce_image_asset_metadata")
+    migrate_latest = ("django_images", "0006_pending_media_deletion")
 
     def setUp(self):
         super(AssetMetadataMigrationTests, self).setUp()
@@ -19,7 +20,7 @@ class AssetMetadataMigrationTests(TransactionTestCase):
         self.media_override.enable()
 
     def tearDown(self):
-        self._migrate(self.migrate_to)
+        self._migrate(self.migrate_latest)
         self.media_override.disable()
         shutil.rmtree(self.media_root)
         super(AssetMetadataMigrationTests, self).tearDown()
