@@ -17,7 +17,9 @@ def filter_private_pin(request, query):
         query = query.exclude(~Q(submitter=request.user), private=True)
     else:
         query = query.exclude(private=True)
-    return query.select_related('image', 'submitter')
+    return query.filter(trashed_at__isnull=True).select_related(
+        'image', 'submitter'
+    )
 
 
 def filter_private_board(request, query):
@@ -227,7 +229,8 @@ class BoardSerializer(serializers.HyperlinkedModelSerializer):
         return query.count()
 
     def get_cover(self, instance: Board) -> dict or None:
-        pin = instance.pins.first()
+        request = self.context['request']
+        pin = filter_private_pin(request, instance.pins.all()).first()
         if pin is None:
             return None
         return PinSerializer(pin, context=self.context).data

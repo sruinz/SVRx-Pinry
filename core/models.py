@@ -5,7 +5,7 @@ from io import BytesIO
 
 from django.conf import settings
 from django.core.files.uploadedfile import InMemoryUploadedFile
-from django.db import models
+from django.db import models, transaction
 from django.dispatch import receiver
 
 from django_images.models import Image as BaseImage, Thumbnail
@@ -105,6 +105,7 @@ class Pin(models.Model):
     description = models.TextField(blank=True, null=True)
     image = models.ForeignKey(Image, related_name='pin', on_delete=models.CASCADE)
     published = models.DateTimeField(auto_now_add=True)
+    trashed_at = models.DateTimeField(blank=True, null=True)
     tags = TaggableManager()
 
     def tag_list(self):
@@ -115,8 +116,11 @@ class Pin(models.Model):
 
 
 @receiver(models.signals.post_delete, sender=Pin)
-def delete_pin_images(sender, instance, **kwargs):
-    try:
-        instance.image.delete()
-    except Image.DoesNotExist:
-        pass
+def delete_unreferenced_pin_image(sender, instance, **kwargs):
+    image_id = instance.image_id
+
+    def delete_after_pin_commit():
+        if not Pin.objects.filter(image_id=image_id).exists():
+            Image.objects.filter(pk=image_id).delete()
+
+    transaction.on_commit(delete_after_pin_commit)
