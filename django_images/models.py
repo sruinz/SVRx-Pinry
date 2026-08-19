@@ -1,5 +1,6 @@
 import hashlib
 import os.path
+import uuid
 
 from django.db import models
 from django.core.files.uploadedfile import InMemoryUploadedFile
@@ -47,6 +48,9 @@ class Image(models.Model):
     image = models.ImageField(upload_to=upload_to,
                               height_field='height', width_field='width',
                               max_length=255)
+    asset_uuid = models.UUIDField(default=uuid.uuid4, editable=False,
+                                  unique=True)
+    original_filename = models.CharField(editable=False, max_length=255)
     height = models.PositiveIntegerField(default=0, editable=False)
     width = models.PositiveIntegerField(default=0, editable=False)
 
