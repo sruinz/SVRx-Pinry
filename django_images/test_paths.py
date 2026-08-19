@@ -1,5 +1,6 @@
 from io import BytesIO
 import os
+from pathlib import Path
 import unicodedata
 
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -17,6 +18,15 @@ def make_image_bytes(image_format):
     image = BytesIO()
     PILImage.new("RGB", (32, 32), "red").save(image, format=image_format)
     return image.getvalue()
+
+
+def media_snapshot(media_root):
+    root = Path(media_root)
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 class CanonicalExtensionTest(SimpleTestCase):
@@ -60,7 +70,7 @@ class AssetStoragePathTest(TemporaryMediaMixin, TransactionTestCase):
     def setUp(self):
         super(AssetStoragePathTest, self).setUp()
         image = BytesIO()
-        PILImage.new("RGB", (32, 32), "red").save(image, format="PNG")
+        PILImage.new("RGB", (640, 480), "red").save(image, format="PNG")
         self.png_bytes = image.getvalue()
 
     def test_png_bytes_with_jpg_name_use_uuid_png_path(self):
@@ -69,28 +79,50 @@ class AssetStoragePathTest(TemporaryMediaMixin, TransactionTestCase):
         Thumbnail.objects.get_or_create_at_sizes(
             image, ["thumbnail", "standard", "square"]
         )
+        image.refresh_from_db()
 
-        self.assertEqual(
-            image.image.name,
-            "originals/{}/original.png".format(image.asset_uuid),
+        original_path = "originals/{}/original.png".format(
+            image.asset_uuid
         )
+        derivative_paths = {
+            "thumbnail": "derivatives/{}/thumbnail.png".format(
+                image.asset_uuid
+            ),
+            "standard": "derivatives/{}/standard.png".format(
+                image.asset_uuid
+            ),
+            "square": "derivatives/{}/square.png".format(
+                image.asset_uuid
+            ),
+        }
+
+        self.assertEqual(image.image.name, original_path)
+        self.assertEqual(image.original_filename, "photo.jpg")
         self.assertEqual(
             {
                 thumb.size: thumb.image.name
                 for thumb in image.thumbnail_set.all()
             },
-            {
-                "thumbnail": "derivatives/{}/thumbnail.png".format(
-                    image.asset_uuid
-                ),
-                "standard": "derivatives/{}/standard.png".format(
-                    image.asset_uuid
-                ),
-                "square": "derivatives/{}/square.png".format(
-                    image.asset_uuid
-                ),
-            },
+            derivative_paths,
         )
+        stored_files = media_snapshot(self.temporary_media.name)
+        self.assertEqual(
+            set(stored_files),
+            {original_path, *derivative_paths.values()},
+        )
+        self.assertEqual(stored_files[original_path], self.png_bytes)
+
+        expected_sizes = {
+            "thumbnail": (240, 180),
+            "standard": (600, 450),
+            "square": (125, 125),
+        }
+        for size, path in derivative_paths.items():
+            with self.subTest(size=size):
+                with PILImage.open(BytesIO(stored_files[path])) as derivative:
+                    derivative.load()
+                    self.assertEqual(derivative.format, "PNG")
+                    self.assertEqual(derivative.size, expected_sizes[size])
 
     def test_original_filename_is_sanitized_before_it_is_stored(self):
         filename = "../../{}\x00.png".format(
@@ -99,6 +131,7 @@ class AssetStoragePathTest(TemporaryMediaMixin, TransactionTestCase):
         upload = SimpleUploadedFile(filename, self.png_bytes)
 
         image = Image.objects.create(image=upload)
+        image.refresh_from_db()
 
         self.assertEqual(image.original_filename, "사진.png")
 
