@@ -1,4 +1,5 @@
 from io import BytesIO
+from concurrent.futures import ThreadPoolExecutor
 import gzip
 import os
 from pathlib import Path
@@ -8,7 +9,7 @@ import ssl
 import subprocess
 import tempfile
 import threading
-from time import monotonic
+from time import monotonic, sleep
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import sys
@@ -85,6 +86,14 @@ class RecordingSocket:
         self.timeouts.append(timeout)
 
 
+class RecordingPool:
+    def __init__(self):
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
+
+
 class RecordingRaw:
     def __init__(self, chunks, sock, after_read=None):
         self._connection = mock.Mock(sock=sock)
@@ -99,6 +108,17 @@ class RecordingRaw:
         if self.after_read is not None:
             self.after_read()
         return chunk
+
+
+class ResponseOwnedRaw(RecordingRaw):
+    def __init__(self, chunks, sock, private_socket_name="_sock"):
+        super(ResponseOwnedRaw, self).__init__(chunks, None)
+        self._connection = mock.Mock(sock=None)
+        socket_io = mock.Mock(spec=[])
+        setattr(socket_io, private_socket_name, sock)
+        self._fp = mock.Mock(
+            fp=mock.Mock(raw=socket_io)
+        )
 
 
 class RecordingRequestsResponse:
@@ -229,6 +249,37 @@ class PinnedHTTPTransportTests(SimpleTestCase):
             ],
         )
 
+    def test_pinned_pool_cache_evicts_and_closes_oldest_pool(self):
+        pools = []
+
+        def pool_factory(scheme, hostname, port, ip_address):
+            del scheme, hostname, port, ip_address
+            pool = RecordingPool()
+            pools.append(pool)
+            return pool
+
+        adapter = PinnedHTTPAdapter(
+            pool_factory=pool_factory,
+            pool_connections=2,
+        )
+        self.addCleanup(adapter.close)
+        targets = (
+            make_target(hostname="one.test", ip_address="203.0.113.1"),
+            make_target(hostname="two.test", ip_address="203.0.113.2"),
+            make_target(hostname="three.test", ip_address="203.0.113.3"),
+        )
+
+        for target in targets:
+            with adapter.target(target):
+                adapter.get_connection(
+                    "https://{}/image.png".format(target.hostname)
+                )
+
+        self.assertEqual(len(adapter._pinned_pools), 2)
+        self.assertEqual(
+            [pool.close_calls for pool in pools], [1, 0, 0]
+        )
+
     def test_ipv6_connect_address_is_not_bracketed_but_host_is(self):
         adapter = PinnedHTTPAdapter()
         target = make_target(
@@ -299,6 +350,41 @@ class PinnedHTTPTransportTests(SimpleTestCase):
         self.assertFalse(raw.decode_content)
         self.assertEqual(sock.timeouts, [2.0, 1.25, 0.5])
 
+    def test_response_owned_socket_keeps_peer_check_and_read_deadline(self):
+        clock = ManualClock(90.0)
+        sock = RecordingSocket()
+        raw = ResponseOwnedRaw([b"body", b""], sock)
+        transport, session = self.make_transport(
+            RecordingRequestsResponse(raw),
+            clock=clock,
+        )
+
+        response = transport.request(
+            make_target(), None, 3, 8, deadline=92.0
+        )
+        chunks = list(response.iter_content())
+
+        self.assertEqual(chunks, [b"body"])
+        self.assertEqual(response.peer_ip, LOOPBACK)
+        self.assertEqual(sock.timeouts, [2.0, 2.0])
+
+    def test_unrecognized_response_socket_chain_fails_closed(self):
+        raw = ResponseOwnedRaw(
+            [b"body"], RecordingSocket(), private_socket_name="socket"
+        )
+        response = RecordingRequestsResponse(raw)
+        transport, session = self.make_transport(response)
+
+        with self.assertRaises(SafeFetchError) as caught:
+            transport.request(
+                make_target(), None, 3, 8, monotonic() + 12
+            )
+
+        self.assertEqual(caught.exception.code, "image_download_failed")
+        self.assertTrue(caught.exception.retryable)
+        self.assertTrue(response.closed)
+        self.assertEqual(raw.read_calls, [])
+
     def test_expired_deadline_opens_no_request(self):
         clock = ManualClock(10.0)
         raw = RecordingRaw([], RecordingSocket())
@@ -360,6 +446,33 @@ class PinnedHTTPTransportTests(SimpleTestCase):
             session_factory.assert_not_called()
             adapter_factory.assert_not_called()
 
+    def test_direct_adapter_stack_mismatch_creates_no_io_objects(self):
+        with mock.patch.object(
+            pinned_http.requests,
+            "__version__",
+            "9.9.9",
+        ), mock.patch.object(
+            pinned_http.urllib3,
+            "__version__",
+            "9.9.9",
+        ), mock.patch.object(
+            pinned_http.requests, "Session"
+        ) as session_factory, mock.patch.object(
+            pinned_http.requests.adapters, "PoolManager"
+        ) as pool_manager, mock.patch.object(
+            pinned_http.connection, "create_connection"
+        ) as create_connection:
+            with self.assertRaises(SafeFetchError) as caught:
+                PinnedHTTPAdapter()
+
+        self.assertEqual(
+            caught.exception.code, "unsupported_http_stack"
+        )
+        self.assertFalse(caught.exception.retryable)
+        session_factory.assert_not_called()
+        pool_manager.assert_not_called()
+        create_connection.assert_not_called()
+
     def test_import_creates_no_session_or_pool(self):
         script = (
             "import requests, urllib3\n"
@@ -407,6 +520,39 @@ class _TLSHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.requests.append((self.path, self.headers.get("Host")))
+        if self.path == "/close":
+            self.protocol_version = "HTTP/1.0"
+            body = self.server.image_body
+            self.send_response(200)
+            self.send_header("Connection", "close")
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+            return
+        if self.path == "/blocked-body":
+            body = self.server.image_body
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.flush()
+            self.server.response_started.set()
+            self.server.release_body.wait(timeout=5)
+            self.wfile.write(body)
+            return
+        if self.path == "/slow-drip":
+            body = b"abcde"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            for index, byte in enumerate(body):
+                self.wfile.write(bytes([byte]))
+                self.wfile.flush()
+                if index < len(body) - 1:
+                    sleep(0.08)
+            return
         if self.path == "/redirect":
             location = "https://redirect.test:{}/image.png".format(
                 self.server.server_port
@@ -468,9 +614,20 @@ class PinnedHTTPSIntegrationTests(SimpleTestCase):
         )
         cls.server_thread.daemon = True
         cls.server_thread.start()
+        cls.http_server = _ThreadingHTTPServer((LOOPBACK, 0), _TLSHandler)
+        cls.http_server.requests = []
+        cls.http_server.image_body = cls.server.image_body
+        cls.http_server_thread = threading.Thread(
+            target=cls.http_server.serve_forever
+        )
+        cls.http_server_thread.daemon = True
+        cls.http_server_thread.start()
 
     @classmethod
     def tearDownClass(cls):
+        cls.http_server.shutdown()
+        cls.http_server.server_close()
+        cls.http_server_thread.join(timeout=2)
         cls.server.shutdown()
         cls.server.server_close()
         cls.server_thread.join(timeout=2)
@@ -583,6 +740,133 @@ class PinnedHTTPSIntegrationTests(SimpleTestCase):
     def setUp(self):
         self.server.requests[:] = []
         self.server.server_names[:] = []
+        self.http_server.requests[:] = []
+        self.http_server.response_started = threading.Event()
+        self.http_server.release_body = threading.Event()
+
+    def test_pool_eviction_does_not_break_checked_out_response(self):
+        adapter = PinnedHTTPAdapter(pool_connections=1)
+        transport = PinnedHTTPTransport(
+            adapter_factory=lambda: adapter
+        )
+        self.addCleanup(transport.close)
+        resolver = CountingResolver()
+        fetcher = SafeUrlFetcher(
+            resolver,
+            transport,
+            limits=FetchLimits(private_allowlist=["images.test"]),
+        )
+        port = self.http_server.server_port
+        first_target = make_target(
+            hostname="images.test",
+            port=port,
+            request_target="/blocked-body",
+            scheme="http",
+        )
+        with adapter.target(first_target):
+            first_pool = adapter.get_connection(
+                "http://images.test:{}/blocked-body".format(port)
+            )
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(executor.shutdown, wait=True)
+        self.addCleanup(self.http_server.release_body.set)
+        future = executor.submit(
+            fetcher.fetch,
+            "http://images.test:{}/blocked-body".format(port),
+        )
+        self.assertTrue(
+            self.http_server.response_started.wait(timeout=2)
+        )
+        second_target = make_target(
+            hostname="other.test",
+            port=port,
+            request_target="/image.png",
+            scheme="http",
+        )
+        with adapter.target(second_target):
+            adapter.get_connection(
+                "http://other.test:{}/image.png".format(port)
+            )
+
+        self.assertEqual(len(adapter._pinned_pools), 1)
+        self.assertIsNone(first_pool.pool)
+        self.http_server.release_body.set()
+        fetched = future.result(timeout=2)
+
+        self.assertEqual(fetched.content, self.http_server.image_body)
+
+    def test_public_fetch_slow_drip_returns_stable_cooperative_timeout(self):
+        transport = PinnedHTTPTransport()
+        self.addCleanup(transport.close)
+        fetcher = SafeUrlFetcher(
+            CountingResolver(),
+            transport,
+            limits=FetchLimits(
+                connect_timeout=1,
+                read_timeout=1,
+                total_timeout=0.2,
+                private_allowlist=["images.test"],
+            ),
+        )
+        url = "http://images.test:{}/slow-drip".format(
+            self.http_server.server_port
+        )
+
+        with self.assertRaises(SafeFetchError) as caught:
+            fetcher.fetch(url)
+
+        self.assertEqual(caught.exception.code, "image_fetch_timeout")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(
+            caught.exception.message,
+            "The image download timed out.",
+        )
+
+    def test_real_http10_close_response_is_fetched_over_pinned_http(self):
+        fetcher, resolver, transport = self.make_fetcher(["images.test"])
+        url = "http://images.test:{}/close".format(
+            self.http_server.server_port
+        )
+
+        fetched = fetcher.fetch(url)
+
+        self.assertEqual(fetched.content, self.http_server.image_body)
+        self.assertEqual(len(resolver.calls), 1)
+        self.assertEqual(
+            self.http_server.requests,
+            [
+                (
+                    "/close",
+                    "images.test:{}".format(
+                        self.http_server.server_port
+                    ),
+                )
+            ],
+        )
+        transport.close()
+
+    def test_real_https_http10_close_response_preserves_tls_identity(self):
+        fetcher, resolver, transport = self.make_fetcher(["images.test"])
+        url = "https://images.test:{}/close".format(
+            self.server.server_port
+        )
+
+        fetched = fetcher.fetch(url)
+
+        self.assertEqual(fetched.content, self.server.image_body)
+        self.assertEqual(len(resolver.calls), 1)
+        self.assertEqual(self.server.server_names, ["images.test"])
+        self.assertEqual(
+            self.server.requests,
+            [
+                (
+                    "/close",
+                    "images.test:{}".format(self.server.server_port),
+                )
+            ],
+        )
+        transport.close()
 
     def test_real_tls_pins_tcp_and_preserves_host_sni_and_hostname(self):
         fetcher, resolver, transport = self.make_fetcher(["images.test"])

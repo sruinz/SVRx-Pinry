@@ -85,7 +85,7 @@ class BoundedResolver:
         except Exception:
             pass
         try:
-            process.communicate()
+            process.communicate(timeout=self.terminate_timeout)
         except Exception:
             pass
 

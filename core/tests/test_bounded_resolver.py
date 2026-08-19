@@ -52,6 +52,12 @@ class TimeoutProcess(CompletedProcess):
         return None, None
 
 
+class NeverExitsProcess(CompletedProcess):
+    def communicate(self, timeout=None):
+        self.communicate_calls.append(timeout)
+        raise subprocess.TimeoutExpired("resolver", timeout)
+
+
 class RecordingPopenFactory:
     def __init__(self, process):
         self.process = process
@@ -135,7 +141,25 @@ class BoundedResolverTests(SimpleTestCase):
         self.assertTrue(process.killed)
         self.assertEqual(
             process.communicate_calls,
-            [0.009999999999999787, 0.05, None],
+            [0.009999999999999787, 0.05, 0.05],
+        )
+
+    def test_sigkill_cleanup_never_uses_unbounded_communicate(self):
+        process = NeverExitsProcess(b"")
+        resolver = BoundedResolver(
+            popen_factory=RecordingPopenFactory(process),
+            clock=lambda: 10.0,
+            terminate_timeout=0.05,
+        )
+
+        with self.assertRaises(TimeoutError):
+            resolver.resolve("images.test", 443, deadline=10.01)
+
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.killed)
+        self.assertEqual(
+            process.communicate_calls,
+            [0.009999999999999787, 0.05, 0.05],
         )
 
     def test_deadline_consumed_during_spawn_terminates_child(self):

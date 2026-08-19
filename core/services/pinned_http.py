@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 import requests
 from requests.adapters import HTTPAdapter
 import urllib3
+from urllib3._collections import RecentlyUsedContainer
 from urllib3.connection import HTTPConnection, HTTPSConnection
 from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.exceptions import (
@@ -66,7 +67,12 @@ class _PinnedConnectionPoolMixin:
             conn, method, url, **kwargs
         )
         try:
-            peer_ip = _peer_ip(conn.sock)
+            response_socket = getattr(conn, "sock", None)
+            if response_socket is None:
+                response_socket = _http_client_response_socket(response)
+            if response_socket is None:
+                raise ValueError("The response socket was unavailable.")
+            peer_ip = _peer_ip(response_socket)
             if ipaddress.ip_address(peer_ip) != ipaddress.ip_address(
                 self.connect_ip
             ):
@@ -84,6 +90,7 @@ class _PinnedConnectionPoolMixin:
                 True,
             ) from None
         response._pinry_peer_ip = peer_ip
+        response._pinry_response_socket = response_socket
         return response
 
 
@@ -119,11 +126,15 @@ class _PinnedHTTPSConnectionPool(
 
 class PinnedHTTPAdapter(HTTPAdapter):
     def __init__(self, pool_factory=None, *args, **kwargs):
-        self._pinned_pools = {}
+        _validate_http_stack()
         self._pinned_pools_lock = threading.Lock()
         self._request_target = threading.local()
         self._pool_factory = pool_factory
         super(PinnedHTTPAdapter, self).__init__(*args, **kwargs)
+        self._pinned_pools = RecentlyUsedContainer(
+            maxsize=self._pool_connections,
+            dispose_func=_close_pool,
+        )
 
     @contextmanager
     def target(self, target):
@@ -162,13 +173,7 @@ class PinnedHTTPAdapter(HTTPAdapter):
 
     def close(self):
         with self._pinned_pools_lock:
-            pools = list(self._pinned_pools.values())
             self._pinned_pools.clear()
-        for pool in pools:
-            try:
-                pool.close()
-            except Exception:
-                pass
         super(PinnedHTTPAdapter, self).close()
 
     def _new_pinned_pool(self, scheme, hostname, port, ip_address):
@@ -328,7 +333,11 @@ class PinnedHTTPTransport:
         try:
             response.raw.decode_content = False
             peer_ip = _recorded_peer_ip(response)
-            response_socket = _response_socket(response, required=False)
+            response_socket = _recorded_response_socket(response)
+            if response_socket is None:
+                response_socket = _response_socket(
+                    response, required=False
+                )
             if peer_ip is None:
                 if response_socket is None:
                     raise SafeFetchError(
@@ -424,6 +433,9 @@ def _origin_url(target):
 def _response_socket(response, required=True):
     raw_connection = getattr(response.raw, "_connection", None)
     response_socket = getattr(raw_connection, "sock", None)
+    if response_socket is None:
+        http_response = getattr(response.raw, "_fp", None)
+        response_socket = _http_client_response_socket(http_response)
     if response_socket is None and required:
         raise SafeFetchError(
             "image_download_failed",
@@ -436,6 +448,19 @@ def _response_socket(response, required=True):
 def _recorded_peer_ip(response):
     original_response = getattr(response.raw, "_original_response", None)
     return getattr(original_response, "_pinry_peer_ip", None)
+
+
+def _recorded_response_socket(response):
+    original_response = getattr(response.raw, "_original_response", None)
+    return getattr(
+        original_response, "_pinry_response_socket", None
+    )
+
+
+def _http_client_response_socket(response):
+    response_file = getattr(response, "fp", None)
+    socket_io = getattr(response_file, "raw", None)
+    return getattr(socket_io, "_sock", None)
 
 
 def _peer_ip(response_socket):
@@ -451,3 +476,10 @@ def _peer_mismatch():
         "The connected address did not match the validated address.",
         False,
     )
+
+
+def _close_pool(pool):
+    try:
+        pool.close()
+    except Exception:
+        pass
