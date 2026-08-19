@@ -1,7 +1,12 @@
 from pathlib import Path
+import threading
+from unittest import skipUnless
 
+import mock
 from django.contrib import admin
-from django.db import transaction
+from django.db import close_old_connections, connection, connections
+from django.db import OperationalError, transaction
+from django.db.models.query import QuerySet
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITransactionTestCase
@@ -9,7 +14,7 @@ from rest_framework.test import APITransactionTestCase
 from core.admin import PinAdmin
 from core.models import Board, Image, Pin
 from core.tests.helpers import TEST_IMAGE_PATH, create_image, create_pin, create_user
-from django_images.models import Thumbnail
+from django_images.models import Image as BaseImage, Thumbnail
 from django_images.test_helpers import TemporaryMediaMixin
 
 
@@ -351,3 +356,130 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(
             media_snapshot(self.temporary_media.name), files_before
         )
+
+    @skipUnless(
+        connection.vendor == "sqlite",
+        "SQLite lock/write serialization observation",
+    )
+    def test_sqlite_serializes_reference_insert_after_empty_check(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        image_id = image.pk
+        pin_id = pin.pk
+        reference_checked = threading.Event()
+        writer_finished = threading.Event()
+        writer_result = {}
+        original_exists = QuerySet.exists
+
+        def pause_after_empty_reference_check(queryset):
+            result = original_exists(queryset)
+            if queryset.model is Pin and not result:
+                reference_checked.set()
+                if not writer_finished.wait(2):
+                    raise AssertionError("concurrent Pin writer did not finish")
+            return result
+
+        def create_reference_on_separate_connection():
+            close_old_connections()
+            writer_connection = connections["default"]
+            try:
+                if not reference_checked.wait(2):
+                    raise AssertionError("reference check did not run")
+                with writer_connection.cursor() as cursor:
+                    cursor.execute("PRAGMA busy_timeout = 100")
+                replacement = Pin.objects.create(
+                    submitter_id=self.other_user.pk,
+                    image_id=image_id,
+                )
+                writer_result["committed"] = True
+                writer_result["pin_id"] = replacement.pk
+            except Exception as error:
+                writer_result["committed"] = False
+                writer_result["error"] = error
+            finally:
+                writer_connection.close()
+                writer_finished.set()
+
+        writer = threading.Thread(
+            target=create_reference_on_separate_connection
+        )
+        writer.start()
+        self.addCleanup(writer.join, 2)
+
+        with mock.patch.object(
+            QuerySet,
+            "exists",
+            new=pause_after_empty_reference_check,
+        ):
+            Pin.objects.get(pk=pin_id).delete()
+        writer.join(2)
+
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(writer_result["committed"])
+        self.assertIsInstance(writer_result["error"], OperationalError)
+        self.assertFalse(Image.objects.filter(pk=image_id).exists())
+
+    def test_cleanup_locks_image_before_recheck_and_instance_delete(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        image_id = image.pk
+        events = []
+        original_select_for_update = BaseImage.objects.select_for_update
+        original_pin_filter = Pin.objects.filter
+        original_image_delete = BaseImage.delete
+
+        def observe_lock(*args, **kwargs):
+            events.append(("lock", connection.in_atomic_block))
+            return original_select_for_update(*args, **kwargs)
+
+        def observe_reference_check(*args, **kwargs):
+            if kwargs == {"image_id": image_id}:
+                events.append(("reference_check", connection.in_atomic_block))
+            return original_pin_filter(*args, **kwargs)
+
+        def observe_instance_delete(instance, *args, **kwargs):
+            if instance.pk == image_id:
+                events.append(("instance_delete", connection.in_atomic_block))
+            return original_image_delete(instance, *args, **kwargs)
+
+        with mock.patch.object(
+            BaseImage.objects,
+            "select_for_update",
+            side_effect=observe_lock,
+        ), mock.patch.object(
+            Pin.objects,
+            "filter",
+            side_effect=observe_reference_check,
+        ), mock.patch.object(
+            BaseImage,
+            "delete",
+            new=observe_instance_delete,
+        ):
+            pin.delete()
+
+        self.assertEqual(
+            events,
+            [
+                ("lock", True),
+                ("reference_check", True),
+                ("instance_delete", True),
+            ],
+        )
+        self.assertFalse(Image.objects.filter(pk=image_id).exists())
+
+    def test_multiple_callbacks_treat_already_deleted_image_as_noop(self):
+        image = create_image()
+        first_pin = create_pin(self.owner, image, [])
+        second_pin = create_pin(self.other_user, image, [])
+        image_id = image.pk
+        pin_ids = [first_pin.pk, second_pin.pk]
+        self._assert_four_image_files(image)
+
+        Pin.objects.filter(pk__in=pin_ids).delete()
+
+        self.assertFalse(Pin.objects.filter(pk__in=pin_ids).exists())
+        self.assertFalse(Image.objects.filter(pk=image_id).exists())
+        self.assertFalse(
+            Thumbnail.objects.filter(original_id=image_id).exists()
+        )
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})

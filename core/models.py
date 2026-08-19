@@ -118,9 +118,20 @@ class Pin(models.Model):
 @receiver(models.signals.post_delete, sender=Pin)
 def delete_unreferenced_pin_image(sender, instance, **kwargs):
     image_id = instance.image_id
+    using = kwargs.get("using")
 
     def delete_after_pin_commit():
-        if not Pin.objects.filter(image_id=image_id).exists():
-            Image.objects.filter(pk=image_id).delete()
+        with transaction.atomic(using=using):
+            image = (
+                BaseImage.objects.select_for_update()
+                .using(using)
+                .filter(pk=image_id)
+                .first()
+            )
+            if image is None:
+                return
+            if Pin.objects.filter(image_id=image_id).using(using).exists():
+                return
+            image.delete(using=using)
 
-    transaction.on_commit(delete_after_pin_commit)
+    transaction.on_commit(delete_after_pin_commit, using=using)
