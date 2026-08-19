@@ -284,6 +284,83 @@ class LegacyMediaCleanupCommandTest(
                 (moved_root / canonical_path).read_bytes(), content
             )
 
+    def test_legacy_cleanup_validates_the_opened_root_after_path_swap(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        media_root = Path(self.temporary_media.name)
+        moved_root = Path(outside.name, "opened-root")
+        replacement_root = Path(outside.name, "replacement-root")
+        replacement_root.mkdir()
+        for relative_path, content in self.canonical_files.items():
+            replacement = replacement_root / relative_path
+            replacement.parent.mkdir(parents=True, exist_ok=True)
+            replacement.write_bytes(content)
+        for relative_path in self.legacy_paths:
+            replacement = replacement_root / relative_path
+            replacement.parent.mkdir(parents=True, exist_ok=True)
+            os.link(media_root / relative_path, replacement)
+        for relative_path in self.canonical_files:
+            (media_root / relative_path).unlink()
+
+        opened_files_before = self._media_files()
+        replacement_files_before = {
+            path.relative_to(replacement_root).as_posix(): path.read_bytes()
+            for path in replacement_root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        database_before = tuple(
+            Image.objects.values_list("id", "image", "asset_uuid")
+        ), tuple(Thumbnail.objects.values_list("id", "image"))
+        real_open_root = media_cleanup._open_media_root
+
+        def restore_root():
+            if media_root.is_symlink():
+                media_root.unlink()
+            if moved_root.exists():
+                moved_root.rename(media_root)
+
+        self.addCleanup(restore_root)
+
+        def open_root_then_swap(path):
+            descriptor = real_open_root(path)
+            media_root.rename(moved_root)
+            media_root.symlink_to(replacement_root, target_is_directory=True)
+            return descriptor
+
+        with mock.patch(
+            "django_images.services.media_cleanup._open_media_root",
+            side_effect=open_root_then_swap,
+        ):
+            with self.assertRaises(CommandError):
+                call_command(
+                    "cleanup_legacy_media", **self._execute_options()
+                )
+
+        self.assertTrue(media_root.is_symlink())
+        self.assertEqual(
+            {
+                path.relative_to(moved_root).as_posix(): path.read_bytes()
+                for path in moved_root.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            },
+            opened_files_before,
+        )
+        self.assertEqual(
+            {
+                path.relative_to(replacement_root).as_posix(): path.read_bytes()
+                for path in replacement_root.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            },
+            replacement_files_before,
+        )
+        self.assertEqual(
+            (
+                tuple(Image.objects.values_list("id", "image", "asset_uuid")),
+                tuple(Thumbnail.objects.values_list("id", "image")),
+            ),
+            database_before,
+        )
+
     def test_legacy_cleanup_hash_mismatch_deletes_nothing(self):
         canonical_original = self.database_paths["original"]
         self._write_media(canonical_original, make_image_bytes("purple"))
@@ -634,6 +711,95 @@ class OrphanMediaCleanupCommandTest(
             ),
             database_before,
         )
+
+    def test_orphan_cleanup_scans_the_opened_root_after_path_swap(self):
+        for path in Path(self.temporary_media.name).rglob("*"):
+            os.utime(path, None)
+        swapped_uuid = uuid.UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+        opened_old = self._write_media(
+            "originals/{}/original.png".format(swapped_uuid),
+            make_image_bytes("black"),
+        )
+        opened_young = self._write_media(
+            "originals/{}/young.keep".format(swapped_uuid), b"young"
+        )
+        self._set_old(opened_old)
+
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        media_root = Path(self.temporary_media.name)
+        moved_root = Path(outside.name, "opened-root")
+        replacement_root = Path(outside.name, "replacement-root")
+        replacement_old = replacement_root / opened_old.relative_to(media_root)
+        replacement_old.parent.mkdir(parents=True)
+        os.link(opened_old, replacement_old)
+        self._set_old(replacement_old.parent)
+
+        opened_files_before = self._media_files()
+        replacement_files_before = {
+            replacement_old.relative_to(replacement_root).as_posix():
+                replacement_old.read_bytes()
+        }
+        database_before = tuple(
+            Image.objects.values_list("id", "image", "asset_uuid")
+        ), tuple(Thumbnail.objects.values_list("id", "image"))
+        real_open_root = media_cleanup._open_media_root
+
+        def restore_root():
+            if media_root.is_symlink():
+                media_root.unlink()
+            if moved_root.exists():
+                moved_root.rename(media_root)
+
+        self.addCleanup(restore_root)
+
+        def open_root_then_swap(path):
+            descriptor = real_open_root(path)
+            media_root.rename(moved_root)
+            media_root.symlink_to(replacement_root, target_is_directory=True)
+            return descriptor
+
+        command_error = None
+        with mock.patch(
+            "django_images.services.media_cleanup._open_media_root",
+            side_effect=open_root_then_swap,
+        ):
+            try:
+                call_command(
+                    "cleanup_orphan_media", execute=True, stdout=StringIO()
+                )
+            except CommandError as error:
+                command_error = error
+
+        self.assertTrue(media_root.is_symlink())
+        self.assertEqual(
+            {
+                path.relative_to(moved_root).as_posix(): path.read_bytes()
+                for path in moved_root.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            },
+            opened_files_before,
+        )
+        self.assertEqual(
+            {
+                path.relative_to(replacement_root).as_posix(): path.read_bytes()
+                for path in replacement_root.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            },
+            replacement_files_before,
+        )
+        self.assertEqual(
+            (moved_root / opened_young.relative_to(media_root)).read_bytes(),
+            b"young",
+        )
+        self.assertEqual(
+            (
+                tuple(Image.objects.values_list("id", "image", "asset_uuid")),
+                tuple(Thumbnail.objects.values_list("id", "image")),
+            ),
+            database_before,
+        )
+        self.assertIsNone(command_error)
 
     def test_orphan_cleanup_rejects_age_below_twenty_four_hours(self):
         files_before = self._media_files()
