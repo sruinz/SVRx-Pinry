@@ -7,6 +7,7 @@ from taggit.models import Tag
 from core.models import Image, Board
 from core.models import Pin
 from django_images.models import Thumbnail
+from django_images.paths import UnsupportedImageFormat
 from users.serializers import UserSerializer
 from users.models import User
 
@@ -59,7 +60,12 @@ class ImageSerializer(serializers.ModelSerializer):
     square = ThumbnailSerializer(read_only=True)
 
     def create(self, validated_data):
-        image = super(ImageSerializer, self).create(validated_data)
+        try:
+            image = super(ImageSerializer, self).create(validated_data)
+        except UnsupportedImageFormat:
+            raise ValidationError(
+                {"image": ["unsupported_image_format"]}
+            )
         Thumbnail.objects.get_or_create_at_sizes(image, settings.IMAGE_SIZES.keys())
         return image
 
@@ -126,10 +132,15 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
         submitter = self.context['request'].user
         if 'url' in validated_data and validated_data['url']:
             url = validated_data['url']
-            image = Image.objects.create_for_url(
-                url,
-                validated_data.get('referer', url),
-            )
+            try:
+                image = Image.objects.create_for_url(
+                    url,
+                    validated_data.get('referer', url),
+                )
+            except UnsupportedImageFormat:
+                raise ValidationError(
+                    {"url": ["unsupported_image_format"]}
+                )
             if not image:
                 raise ValidationError({"url": "invalid image content"})
         else:

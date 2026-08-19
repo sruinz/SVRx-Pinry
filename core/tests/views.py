@@ -2,14 +2,16 @@ from django.test import TestCase
 
 from core.models import Image
 from core.tests import create_user, reverse
+from django_images.test_helpers import TemporaryMediaMixin
 from users.models import User
 
 
 __all__ = ['CreateImageTest']
 
 
-class CreateImageTest(TestCase):
+class CreateImageTest(TemporaryMediaMixin, TestCase):
     def setUp(self):
+        super(CreateImageTest, self).setUp()
         self.user = create_user("default")
         self.client.login(username=self.user.username, password='password')
 

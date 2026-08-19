@@ -9,6 +9,7 @@ from taggit.models import Tag
 
 from .helpers import create_image, create_user, create_pin
 from core.models import Pin, Image, Board
+from django_images.test_helpers import TemporaryMediaMixin
 
 
 def _teardown_models():
@@ -28,7 +29,7 @@ def mock_requests_get_with_non_image_content(url, **kwargs):
     return response
 
 
-class ImageTests(APITestCase):
+class ImageTests(TemporaryMediaMixin, APITestCase):
     def test_post_create_unsupported(self):
         url = reverse("image-list")
         data = {}
@@ -40,7 +41,7 @@ class ImageTests(APITestCase):
         self.assertEqual(response.status_code, 401, response.data)
 
 
-class BoardPrivacyTests(APITestCase):
+class BoardPrivacyTests(TemporaryMediaMixin, APITestCase):
 
     def setUp(self):
         super(BoardPrivacyTests, self).setUp()
@@ -116,7 +117,7 @@ class BoardPrivacyTests(APITestCase):
         self.assertEqual(resp.json()['total_pins'], 1, resp.json())
 
 
-class PinPrivacyTests(APITestCase):
+class PinPrivacyTests(TemporaryMediaMixin, APITestCase):
 
     def setUp(self):
         super(PinPrivacyTests, self).setUp()
@@ -169,7 +170,7 @@ class PinPrivacyTests(APITestCase):
         self.assertEqual(resp.status_code, 404)
 
 
-class PinTests(APITestCase):
+class PinTests(TemporaryMediaMixin, APITestCase):
     _JSON_TYPE = "application/json"
 
     def setUp(self):

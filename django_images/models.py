@@ -90,8 +90,7 @@ class ThumbnailManager(models.Manager):
             ]
             for size, buf in zip(sizes_to_create, bufs):
                 # and save to storage
-                original_dir, original_file = os.path.split(image.image.name)
-                thumb_file = InMemoryUploadedFile(buf, "image", original_file,
+                thumb_file = InMemoryUploadedFile(buf, "image", size,
                                                   None, buf.tell(), None)
                 sized[size], created = image.thumbnail_set.get_or_create(
                     size=size, defaults={'image': thumb_file})

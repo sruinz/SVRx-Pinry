@@ -7,12 +7,14 @@ from django.core.files.images import ImageFile
 from django.conf import settings
 from django_images.models import Image, Thumbnail
 from django_images.templatetags.images import at_size
+from django_images.test_helpers import TemporaryMediaMixin
 from django_images.utils import scale_and_crop_single
 from PIL import Image as PILImage
 
 
-class ImageModelTest(TestCase):
+class ImageModelTest(TemporaryMediaMixin, TestCase):
     def setUp(self):
+        super(ImageModelTest, self).setUp()
         image_obj = BytesIO()
         qrcode_obj = qrcode.make('https://mirumee.com/')
         qrcode_obj.save(image_obj)
@@ -34,8 +36,9 @@ class ImageModelTest(TestCase):
         self.assertEqual(url, thumb.image.url)
 
 
-class ThumbnailManagerModelTest(TestCase):
+class ThumbnailManagerModelTest(TemporaryMediaMixin, TestCase):
     def setUp(self):
+        super(ThumbnailManagerModelTest, self).setUp()
         image_obj = BytesIO()
         qrcode_obj = qrcode.make('https://mirumee.com/')
         qrcode_obj.save(image_obj)
@@ -58,8 +61,9 @@ class ThumbnailManagerModelTest(TestCase):
         self.assertEqual(thumb.id, thumb2.id)
 
 
-class ThumbnailModelTest(TestCase):
+class ThumbnailModelTest(TemporaryMediaMixin, TestCase):
     def setUp(self):
+        super(ThumbnailModelTest, self).setUp()
         image_obj = BytesIO()
         qrcode_obj = qrcode.make('https://mirumee.com/')
         qrcode_obj.save(image_obj)
@@ -73,8 +77,9 @@ class ThumbnailModelTest(TestCase):
         self.assertEqual(url, self.thumb.image.url)
 
 
-class PostSaveSignalOriginalChangedTestCase(TestCase):
+class PostSaveSignalOriginalChangedTestCase(TemporaryMediaMixin, TestCase):
     def setUp(self):
+        super(PostSaveSignalOriginalChangedTestCase, self).setUp()
         image_obj = BytesIO()
         qrcode_obj = qrcode.make('https://mirumee.com/')
         qrcode_obj.save(image_obj)
@@ -90,8 +95,9 @@ class PostSaveSignalOriginalChangedTestCase(TestCase):
         self.assertFalse(Thumbnail.objects.exists())
 
 
-class PostDeleteSignalDeleteImageFileTest(TestCase):
+class PostDeleteSignalDeleteImageFileTest(TemporaryMediaMixin, TestCase):
     def setUp(self):
+        super(PostDeleteSignalDeleteImageFileTest, self).setUp()
         image_obj = BytesIO()
         qrcode_obj = qrcode.make('https://mirumee.com/')
         qrcode_obj.save(image_obj)
@@ -124,8 +130,9 @@ class PostDeleteSignalDeleteImageFileTest(TestCase):
         self.assertTrue(storage.exists(thumb_name))
 
 
-class AtSizeTemplateTagTest(TestCase):
+class AtSizeTemplateTagTest(TemporaryMediaMixin, TestCase):
     def setUp(self):
+        super(AtSizeTemplateTagTest, self).setUp()
         image_obj = BytesIO()
         qrcode_obj = qrcode.make('https://mirumee.com/')
         qrcode_obj.save(image_obj)
