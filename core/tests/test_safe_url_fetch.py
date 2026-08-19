@@ -43,8 +43,9 @@ def make_oversized_png_header(width, height):
 
 
 class FakeResolver:
-    def __init__(self, results):
+    def __init__(self, results, after_resolve=None):
         self.results = results
+        self.after_resolve = after_resolve
         self.calls = []
 
     def resolve(self, hostname, port):
@@ -52,6 +53,8 @@ class FakeResolver:
         result = self.results[hostname]
         if isinstance(result, Exception):
             raise result
+        if self.after_resolve is not None:
+            self.after_resolve()
         return result
 
 
@@ -99,12 +102,15 @@ class FakeTransport:
         return response
 
 
-class SequenceClock:
-    def __init__(self, values):
-        self.values = iter(values)
+class ManualClock:
+    def __init__(self, now):
+        self.now = now
 
     def __call__(self):
-        return next(self.values)
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
 
 
 class SafeUrlFetcherPolicyTests(SimpleTestCase):
@@ -388,6 +394,68 @@ class SafeUrlFetcherPolicyTests(SimpleTestCase):
         self.assertEqual(len(transport.calls), 1)
         self.assertTrue(redirect.closed)
 
+    def test_rejects_invalid_redirect_location_before_another_request(self):
+        invalid_locations = (
+            None,
+            b"/next.png",
+            "",
+            "\t/next.png",
+            "/next.png\n",
+            "/next image.png",
+            "/next\\image.png",
+            "https://[broken",
+            "https://",
+            "//",
+        )
+
+        for location in invalid_locations:
+            with self.subTest(location=location):
+                redirect = FakeResponse(
+                    status_code=302,
+                    location=location,
+                )
+                fetcher, resolver, transport = self.make_fetcher(
+                    responses=[redirect]
+                )
+
+                try:
+                    fetcher.fetch("https://images.example/image.png")
+                except Exception as caught:
+                    error = caught
+                else:
+                    self.fail("invalid redirect location was accepted")
+
+                self.assertIsInstance(error, SafeFetchError)
+                self.assertEqual(error.code, "invalid_url_policy")
+                self.assertFalse(error.retryable)
+                self.assertEqual(
+                    resolver.calls, [("images.example", 443)]
+                )
+                self.assertEqual(len(transport.calls), 1)
+                self.assertTrue(redirect.closed)
+                self.assertNotIn(repr(location), repr(error.as_dict()))
+
+    def test_follows_valid_relative_redirect(self):
+        redirect = FakeResponse(status_code=302, location="/next.png?x=1")
+        final_response = FakeResponse()
+        fetcher, resolver, transport = self.make_fetcher(
+            responses=[redirect, final_response]
+        )
+
+        fetched = fetcher.fetch("https://images.example/image.png")
+
+        self.assertEqual(
+            fetched.final_url,
+            "https://images.example/next.png?x=1",
+        )
+        self.assertEqual(
+            resolver.calls,
+            [("images.example", 443), ("images.example", 443)],
+        )
+        self.assertEqual(len(transport.calls), 2)
+        self.assertTrue(redirect.closed)
+        self.assertTrue(final_response.closed)
+
     def test_rejects_peer_ip_that_differs_from_selected_address(self):
         response = FakeResponse(peer_ip="1.1.1.1")
         fetcher, resolver, transport = self.make_fetcher(
@@ -562,7 +630,7 @@ class SafeUrlFetcherPolicyTests(SimpleTestCase):
 
     def test_expired_deadline_stops_before_resolution(self):
         fetcher, resolver, transport = self.make_fetcher(
-            clock=SequenceClock([2.0])
+            clock=ManualClock(2.0)
         )
 
         self.assert_fetch_error(
@@ -577,8 +645,16 @@ class SafeUrlFetcherPolicyTests(SimpleTestCase):
         self.assertEqual(transport.calls, [])
 
     def test_deadline_is_rechecked_after_resolution(self):
-        fetcher, resolver, transport = self.make_fetcher(
-            clock=SequenceClock([0.0, 2.0])
+        clock = ManualClock(0.0)
+        resolver = FakeResolver(
+            {"images.example": [PUBLIC_IP]},
+            after_resolve=lambda: clock.advance(2.0),
+        )
+        transport = FakeTransport([FakeResponse()])
+        fetcher = SafeUrlFetcher(
+            resolver=resolver,
+            transport=transport,
+            clock=clock,
         )
 
         self.assert_fetch_error(
@@ -593,6 +669,36 @@ class SafeUrlFetcherPolicyTests(SimpleTestCase):
             resolver.calls, [("images.example", 443)]
         )
         self.assertEqual(transport.calls, [])
+
+    def test_total_timeout_clamps_later_caller_deadline(self):
+        clock = ManualClock(100.0)
+        limits = FetchLimits(total_timeout=12)
+        fetcher, resolver, transport = self.make_fetcher(
+            limits=limits,
+            clock=clock,
+        )
+
+        fetcher.fetch(
+            "https://images.example/image.png",
+            deadline=1000.0,
+        )
+
+        self.assertEqual(transport.calls[0]["deadline"], 112.0)
+
+    def test_preserves_earlier_caller_deadline(self):
+        clock = ManualClock(100.0)
+        limits = FetchLimits(total_timeout=12)
+        fetcher, resolver, transport = self.make_fetcher(
+            limits=limits,
+            clock=clock,
+        )
+
+        fetcher.fetch(
+            "https://images.example/image.png",
+            deadline=105.0,
+        )
+
+        self.assertEqual(transport.calls[0]["deadline"], 105.0)
 
     def test_invalid_referer_is_omitted_and_valid_referer_is_forwarded(self):
         invalid_referers = (

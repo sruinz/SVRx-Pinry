@@ -132,6 +132,27 @@ class _UrlPolicy:
                 False,
             )
 
+    def redirect_url(self, current_url, location):
+        if (
+            not isinstance(location, str)
+            or not location
+            or self._has_unsafe_text(location)
+        ):
+            raise self._invalid_url()
+        try:
+            raw_parts = urlsplit(location)
+            if raw_parts.scheme and not raw_parts.netloc:
+                raise self._invalid_url()
+            if location.startswith("//") and not raw_parts.netloc:
+                raise self._invalid_url()
+            redirect_url = urljoin(current_url, location)
+        except SafeFetchError:
+            raise
+        except (TypeError, ValueError):
+            raise self._invalid_url() from None
+        self._parse_url(redirect_url)
+        return redirect_url
+
     @classmethod
     def sanitize_referer(cls, referer):
         if not isinstance(referer, str) or cls._has_unsafe_text(referer):
@@ -300,8 +321,12 @@ class SafeUrlFetcher:
         )
 
     def fetch(self, url, referer=None, deadline=None):
+        started_at = self.clock()
+        fetch_deadline = started_at + self.limits.total_timeout
         if deadline is None:
-            deadline = self.clock() + self.limits.total_timeout
+            deadline = fetch_deadline
+        else:
+            deadline = min(deadline, fetch_deadline)
         safe_referer = self.policy.sanitize_referer(referer)
         current_url = url
         for redirect_count in range(self.limits.max_redirects + 1):
@@ -319,7 +344,9 @@ class SafeUrlFetcher:
                             "The image URL redirected too many times.",
                             False,
                         )
-                    current_url = urljoin(current_url, response.location)
+                    current_url = self.policy.redirect_url(
+                        current_url, response.location
+                    )
                     self._check_deadline(deadline)
                     continue
                 self._verify_status(response.status_code)
