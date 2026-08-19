@@ -12,6 +12,7 @@ from django.core.management import CommandError, call_command
 from django.test import TestCase, TransactionTestCase, override_settings
 from PIL import Image as PILImage
 
+from django_images import file_ops
 from django_images.file_ops import (
     MediaPathError,
     migration_lock_path,
@@ -236,6 +237,81 @@ class MediaMigrationCommandTest(TransactionTestCase):
         self.assertEqual(os.readlink(str(part_path)), str(outside_path))
         self.assertEqual(outside_path.read_bytes(), outside_content)
         self.assertFalse(destination.exists())
+        for old_path, content in self.old_files.items():
+            self.assertEqual(
+                Path(self.temporary_media.name, old_path).read_bytes(),
+                content,
+            )
+
+    def test_publish_alias_swap_cannot_publish_foreign_inode_or_switch_database(
+        self,
+    ):
+        manifest = ManifestLog(self.manifest_path)
+        destination = Path(
+            self.temporary_media.name,
+            self._canonical_paths()["original"],
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        part_path = Path(str(destination) + ".part-" + manifest.run_id)
+        attacker_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(attacker_directory.cleanup)
+        attacker_path = Path(attacker_directory.name, "attacker.png")
+        retained_path = Path(attacker_directory.name, "retained.png")
+        attacker_path.write_bytes(self.old_files[self.old_original])
+        os.link(attacker_path, retained_path)
+        attacker_inode = attacker_path.stat().st_ino
+        database_before = self._database_paths()
+        real_link = os.link
+        real_unlink_owned_name = file_ops._unlink_owned_name
+
+        def swap_alias_before_publish(source, target, *args, **kwargs):
+            if (
+                isinstance(source, str)
+                and source.startswith(".publish-")
+                and target == destination.name
+            ):
+                alias_path = destination.parent / source
+                alias_path.unlink()
+                real_link(attacker_path, alias_path)
+            return real_link(source, target, *args, **kwargs)
+
+        def interrupt_before_part_cleanup(
+            directory_descriptor, name, expected_stat
+        ):
+            if name == part_path.name:
+                raise InjectedInterruption()
+            return real_unlink_owned_name(
+                directory_descriptor, name, expected_stat
+            )
+
+        with mock.patch("django_images.file_ops.sys.platform", "darwin"):
+            with mock.patch(
+                "django_images.file_ops.os.link",
+                side_effect=swap_alias_before_publish,
+            ):
+                with mock.patch(
+                    "django_images.file_ops._unlink_owned_name",
+                    side_effect=interrupt_before_part_cleanup,
+                ):
+                    with self.assertRaises(InjectedInterruption):
+                        MediaMigrator(default_storage, manifest).run(
+                            execute=True
+                        )
+
+        self.assertEqual(self._database_paths(), database_before)
+        self.assertTrue(attacker_path.exists())
+        self.assertTrue(retained_path.exists())
+        self.assertEqual(attacker_path.stat().st_ino, attacker_inode)
+        self.assertEqual(retained_path.stat().st_ino, attacker_inode)
+        self.assertTrue(destination.exists())
+        self.assertEqual(
+            destination.read_bytes(), self.old_files[self.old_original]
+        )
+        self.assertNotEqual(destination.stat().st_ino, attacker_inode)
+        self.assertTrue(part_path.exists())
+        self.assertEqual(
+            part_path.read_bytes(), self.old_files[self.old_original]
+        )
         for old_path, content in self.old_files.items():
             self.assertEqual(
                 Path(self.temporary_media.name, old_path).read_bytes(),
@@ -705,7 +781,7 @@ class MediaFileOperationTest(TestCase):
         ):
             migration_lock_path(self.root.name)
 
-    def test_publish_link_fallback_reuses_only_identical_destination(self):
+    def test_publish_darwin_fd_clone_reuses_only_identical_destination(self):
         destination = os.path.join(self.root.name, "destination.png")
         expected = make_image_bytes("red")
         first_part = os.path.join(self.root.name, "first.part")
@@ -723,6 +799,33 @@ class MediaFileOperationTest(TestCase):
         self.assertEqual(Path(destination).read_bytes(), expected)
         self.assertFalse(os.path.exists(first_part))
         self.assertFalse(os.path.exists(second_part))
+
+    def test_unsupported_fd_publish_fails_closed_without_consuming_names(self):
+        destination = os.path.join(self.root.name, "destination.png")
+        part = os.path.join(self.root.name, "candidate.part")
+        unrelated = os.path.join(self.root.name, "unrelated.png")
+        expected = make_image_bytes("red")
+        Path(part).write_bytes(expected)
+        Path(unrelated).write_bytes(expected)
+
+        with mock.patch("django_images.file_ops.sys.platform", "darwin"):
+            with mock.patch(
+                "django_images.file_ops._clone_descriptor_noreplace",
+                return_value=False,
+                create=True,
+            ):
+                with self.assertRaisesRegex(
+                    MediaPathError, "atomic_publish_unsupported"
+                ):
+                    publish_noreplace(
+                        part,
+                        destination,
+                        hashlib.sha256(expected).hexdigest(),
+                    )
+
+        self.assertEqual(Path(part).read_bytes(), expected)
+        self.assertEqual(Path(unrelated).read_bytes(), expected)
+        self.assertFalse(Path(destination).exists())
 
     def test_publish_conflict_preserves_destination_and_part(self):
         destination = os.path.join(self.root.name, "destination.png")
