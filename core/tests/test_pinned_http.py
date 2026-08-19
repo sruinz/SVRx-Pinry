@@ -796,6 +796,61 @@ class PinnedHTTPSIntegrationTests(SimpleTestCase):
 
         self.assertEqual(fetched.content, self.http_server.image_body)
 
+    def test_send_checkout_is_not_evicted_after_get_connection(self):
+        adapter = PinnedHTTPAdapter(pool_connections=1)
+        transport = PinnedHTTPTransport(
+            adapter_factory=lambda: adapter
+        )
+        self.addCleanup(transport.close)
+        fetcher = SafeUrlFetcher(
+            CountingResolver(),
+            transport,
+            limits=FetchLimits(
+                private_allowlist=["one.test", "two.test"]
+            ),
+        )
+        first_at_cert_verify = threading.Event()
+        second_at_cert_verify = threading.Event()
+        release_first = threading.Event()
+        first_pools = []
+        original_cert_verify = adapter.cert_verify
+
+        def controlled_cert_verify(conn, url, verify, cert):
+            if conn.host == "one.test":
+                first_pools.append(conn)
+                first_at_cert_verify.set()
+                if not release_first.wait(timeout=3):
+                    raise AssertionError("first request was not released")
+            elif conn.host == "two.test":
+                second_at_cert_verify.set()
+            return original_cert_verify(conn, url, verify, cert)
+
+        adapter.cert_verify = controlled_cert_verify
+        port = self.http_server.server_port
+        executor = ThreadPoolExecutor(max_workers=2)
+        self.addCleanup(executor.shutdown, wait=True)
+        self.addCleanup(release_first.set)
+        first = executor.submit(
+            fetcher.fetch,
+            "http://one.test:{}/image.png".format(port),
+        )
+        self.assertTrue(first_at_cert_verify.wait(timeout=2))
+        second = executor.submit(
+            fetcher.fetch,
+            "http://two.test:{}/image.png".format(port),
+        )
+        second_at_cert_verify.wait(timeout=0.5)
+        release_first.set()
+
+        first_fetched = first.result(timeout=3)
+        second_fetched = second.result(timeout=3)
+
+        self.assertEqual(first_fetched.content, self.http_server.image_body)
+        self.assertEqual(second_fetched.content, self.http_server.image_body)
+        self.assertEqual(len(adapter._pinned_pools), 1)
+        self.assertEqual(len(first_pools), 1)
+        self.assertIsNone(first_pools[0].pool)
+
     def test_public_fetch_slow_drip_returns_stable_cooperative_timeout(self):
         transport = PinnedHTTPTransport()
         self.addCleanup(transport.close)

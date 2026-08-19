@@ -127,7 +127,7 @@ class _PinnedHTTPSConnectionPool(
 class PinnedHTTPAdapter(HTTPAdapter):
     def __init__(self, pool_factory=None, *args, **kwargs):
         _validate_http_stack()
-        self._pinned_pools_lock = threading.Lock()
+        self._pinned_pools_lock = threading.RLock()
         self._request_target = threading.local()
         self._pool_factory = pool_factory
         super(PinnedHTTPAdapter, self).__init__(*args, **kwargs)
@@ -150,6 +150,25 @@ class PinnedHTTPAdapter(HTTPAdapter):
                     pass
             else:
                 self._request_target.value = previous
+
+    def send(
+        self,
+        request,
+        stream=False,
+        timeout=None,
+        verify=True,
+        cert=None,
+        proxies=None,
+    ):
+        with self._pinned_pools_lock:
+            return super(PinnedHTTPAdapter, self).send(
+                request,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                proxies=proxies,
+            )
 
     def get_connection(self, url, proxies=None):
         target = getattr(self._request_target, "value", None)
