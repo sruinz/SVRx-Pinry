@@ -13,6 +13,7 @@ from django.test import TransactionTestCase, override_settings
 from PIL import Image as PILImage
 
 from django_images.models import Image, Thumbnail
+from django_images.services import media_cleanup
 
 
 def make_image_bytes(color):
@@ -163,6 +164,124 @@ class LegacyMediaCleanupCommandTest(
         for path, content in self.canonical_files.items():
             self.assertEqual(
                 Path(self.temporary_media.name, path).read_bytes(), content
+            )
+
+    def test_legacy_cleanup_parent_swap_cannot_unlink_outside_root(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        original_parent = Path(self.temporary_media.name, "legacy")
+        moved_parent = Path(outside.name, "moved-legacy")
+        database_before = tuple(
+            Image.objects.values_list("id", "image", "asset_uuid")
+        ), tuple(Thumbnail.objects.values_list("id", "image"))
+        real_unlink = media_cleanup._unlink_file
+        swapped = {"done": False}
+
+        def restore_parent():
+            if original_parent.is_symlink():
+                original_parent.unlink()
+            if moved_parent.exists():
+                moved_parent.rename(original_parent)
+
+        self.addCleanup(restore_parent)
+
+        def swap_parent_then_unlink(*args):
+            if not swapped["done"]:
+                original_parent.rename(moved_parent)
+                original_parent.symlink_to(
+                    moved_parent, target_is_directory=True
+                )
+                swapped["done"] = True
+            return real_unlink(*args)
+
+        with mock.patch(
+            "django_images.services.media_cleanup._unlink_file",
+            side_effect=swap_parent_then_unlink,
+        ):
+            with self.assertRaisesRegex(CommandError, "unsafe_media_file"):
+                call_command("cleanup_legacy_media", **self._execute_options())
+
+        self.assertTrue(original_parent.is_symlink())
+        self.assertEqual(
+            (
+                tuple(Image.objects.values_list("id", "image", "asset_uuid")),
+                tuple(Thumbnail.objects.values_list("id", "image")),
+            ),
+            database_before,
+        )
+        for old_path, content in self.legacy_files.items():
+            outside_path = moved_parent / Path(old_path).relative_to("legacy")
+            self.assertEqual(outside_path.read_bytes(), content)
+        for canonical_path, content in self.canonical_files.items():
+            self.assertEqual(
+                Path(self.temporary_media.name, canonical_path).read_bytes(),
+                content,
+            )
+        self.assertEqual(
+            {
+                path: content
+                for path, content in self._media_files().items()
+                if path in self.canonical_files
+            },
+            self.canonical_files,
+        )
+
+    def test_legacy_cleanup_root_swap_does_not_follow_replacement(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        media_root = Path(self.temporary_media.name)
+        moved_root = Path(outside.name, "original-root")
+        replacement_root = Path(outside.name, "replacement-root")
+        replacement_root.mkdir()
+        for old_path in self.legacy_paths:
+            replacement = replacement_root / old_path
+            replacement.parent.mkdir(parents=True, exist_ok=True)
+            os.link(media_root / old_path, replacement)
+        database_before = tuple(
+            Image.objects.values_list("id", "image", "asset_uuid")
+        ), tuple(Thumbnail.objects.values_list("id", "image"))
+        real_unlink = media_cleanup._unlink_file
+        swapped = {"done": False}
+
+        def restore_root():
+            if media_root.is_symlink():
+                media_root.unlink()
+            if moved_root.exists():
+                moved_root.rename(media_root)
+
+        self.addCleanup(restore_root)
+
+        def swap_root_then_unlink(*args):
+            if not swapped["done"]:
+                media_root.rename(moved_root)
+                media_root.symlink_to(
+                    replacement_root, target_is_directory=True
+                )
+                swapped["done"] = True
+            return real_unlink(*args)
+
+        with mock.patch(
+            "django_images.services.media_cleanup._unlink_file",
+            side_effect=swap_root_then_unlink,
+        ):
+            call_command("cleanup_legacy_media", **self._execute_options())
+
+        self.assertTrue(media_root.is_symlink())
+        self.assertEqual(
+            (
+                tuple(Image.objects.values_list("id", "image", "asset_uuid")),
+                tuple(Thumbnail.objects.values_list("id", "image")),
+            ),
+            database_before,
+        )
+        for old_path, content in self.legacy_files.items():
+            self.assertEqual(
+                (replacement_root / old_path).read_bytes(), content
+            )
+            self.assertFalse((moved_root / old_path).exists())
+        for canonical_path, content in self.canonical_files.items():
+            self.assertEqual(
+                (moved_root / canonical_path).read_bytes(), content
             )
 
     def test_legacy_cleanup_hash_mismatch_deletes_nothing(self):
@@ -392,6 +511,129 @@ class OrphanMediaCleanupCommandTest(
         self.assertTrue(self.mixed_original.exists())
         self.assertTrue(self.mixed_derivative.exists())
         self.assertTrue(self.legacy_path.exists())
+
+    def test_orphan_cleanup_parent_swap_cannot_unlink_outside_root(self):
+        asset_parent = Path(self.temporary_media.name, ".staging", "asset")
+        nested = asset_parent / "nested"
+        nested.mkdir(parents=True)
+        nested_file = nested / "old.part"
+        nested_file.write_bytes(b"nested old")
+        self._set_old(nested_file)
+        self._set_old(nested)
+        self._set_old(asset_parent)
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        moved_parent = Path(outside.name, "moved-asset")
+        files_before = self._media_files()
+        database_before = tuple(
+            Image.objects.values_list("id", "image", "asset_uuid")
+        ), tuple(Thumbnail.objects.values_list("id", "image"))
+        real_unlink = media_cleanup._unlink_file
+        swapped = {"done": False}
+
+        def restore_parent():
+            if asset_parent.is_symlink():
+                asset_parent.unlink()
+            if moved_parent.exists():
+                moved_parent.rename(asset_parent)
+
+        self.addCleanup(restore_parent)
+
+        def swap_parent_then_unlink(*args):
+            if not swapped["done"]:
+                asset_parent.rename(moved_parent)
+                asset_parent.symlink_to(
+                    moved_parent, target_is_directory=True
+                )
+                swapped["done"] = True
+            return real_unlink(*args)
+
+        with mock.patch(
+            "django_images.services.media_cleanup._unlink_file",
+            side_effect=swap_parent_then_unlink,
+        ):
+            with self.assertRaisesRegex(CommandError, "unsafe_media_file"):
+                call_command(
+                    "cleanup_orphan_media", execute=True, stdout=StringIO()
+                )
+
+        self.assertTrue(asset_parent.is_symlink())
+        self.assertEqual(
+            (moved_parent / "nested" / "old.part").read_bytes(),
+            b"nested old",
+        )
+        other_files = dict(files_before)
+        del other_files[".staging/asset/nested/old.part"]
+        self.assertEqual(self._media_files(), other_files)
+        self.assertEqual(
+            (
+                tuple(Image.objects.values_list("id", "image", "asset_uuid")),
+                tuple(Thumbnail.objects.values_list("id", "image")),
+            ),
+            database_before,
+        )
+        self.assertEqual(self.old_staging.read_bytes(), b"old")
+        self.assertTrue(self.orphan_original.exists())
+        self.assertTrue(self.orphan_derivative.exists())
+        self.assertTrue(self.legacy_path.exists())
+
+    def test_orphan_cleanup_parent_swap_cannot_remove_outside_directory(self):
+        for path in Path(self.temporary_media.name).rglob("*"):
+            if path.is_file():
+                os.utime(path, None)
+        asset_parent = Path(self.temporary_media.name, ".staging", "asset")
+        nested = asset_parent / "nested"
+        empty_directory = nested / "empty"
+        empty_directory.mkdir(parents=True)
+        self._set_old(empty_directory)
+        self._set_old(nested)
+        self._set_old(asset_parent)
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        moved_parent = Path(outside.name, "moved-asset")
+        files_before = self._media_files()
+        database_before = tuple(
+            Image.objects.values_list("id", "image", "asset_uuid")
+        ), tuple(Thumbnail.objects.values_list("id", "image"))
+        real_remove = media_cleanup._remove_empty_directory
+        swapped = {"done": False}
+
+        def restore_parent():
+            if asset_parent.is_symlink():
+                asset_parent.unlink()
+            if moved_parent.exists():
+                moved_parent.rename(asset_parent)
+
+        self.addCleanup(restore_parent)
+
+        def swap_parent_then_remove(*args):
+            if not swapped["done"]:
+                asset_parent.rename(moved_parent)
+                asset_parent.symlink_to(
+                    moved_parent, target_is_directory=True
+                )
+                swapped["done"] = True
+            return real_remove(*args)
+
+        with mock.patch(
+            "django_images.services.media_cleanup._remove_empty_directory",
+            side_effect=swap_parent_then_remove,
+        ):
+            with self.assertRaisesRegex(CommandError, "unsafe_orphan_entry"):
+                call_command(
+                    "cleanup_orphan_media", execute=True, stdout=StringIO()
+                )
+
+        self.assertTrue(asset_parent.is_symlink())
+        self.assertTrue((moved_parent / "nested" / "empty").is_dir())
+        self.assertEqual(self._media_files(), files_before)
+        self.assertEqual(
+            (
+                tuple(Image.objects.values_list("id", "image", "asset_uuid")),
+                tuple(Thumbnail.objects.values_list("id", "image")),
+            ),
+            database_before,
+        )
 
     def test_orphan_cleanup_rejects_age_below_twenty_four_hours(self):
         files_before = self._media_files()

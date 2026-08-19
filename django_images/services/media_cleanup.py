@@ -12,6 +12,7 @@ from django_images.file_ops import (
     MediaPathError,
     _open_directory,
     _open_regular_nofollow,
+    _relative_components,
     _unlink_owned_name,
     resolve_media_path,
     sha256_file_descriptor,
@@ -69,16 +70,20 @@ class LegacyMediaCleaner(object):
         self.media_root = media_root or settings.MEDIA_ROOT
 
     def run(self, execute=False):
-        candidates = self._validated_candidates()
-        if execute:
-            for candidate in candidates:
-                _unlink_file(candidate)
-        return CleanupSummary(
-            candidate_paths=tuple(
-                candidate.relative_path for candidate in candidates
-            ),
-            deleted=len(candidates) if execute else 0,
-        )
+        root_descriptor = _open_media_root(self.media_root)
+        try:
+            candidates = self._validated_candidates()
+            if execute:
+                for candidate in candidates:
+                    _unlink_file(root_descriptor, candidate)
+            return CleanupSummary(
+                candidate_paths=tuple(
+                    candidate.relative_path for candidate in candidates
+                ),
+                deleted=len(candidates) if execute else 0,
+            )
+        finally:
+            os.close(root_descriptor)
 
     def _validated_candidates(self):
         state = self.manifest.state
@@ -171,20 +176,24 @@ class OrphanMediaCleaner(object):
     def run(self, execute=False, older_than=MINIMUM_AGE):
         if older_than < MINIMUM_AGE:
             raise CommandError("orphan_age_too_short")
-        cutoff = time.time() - older_than.total_seconds()
-        files, directories = self._validated_candidates(cutoff)
-        if execute:
-            for candidate in files:
-                _unlink_file(candidate)
-            for candidate in directories:
-                _remove_empty_directory(candidate)
-        paths = tuple(
-            candidate.relative_path for candidate in files + directories
-        )
-        return CleanupSummary(
-            candidate_paths=paths,
-            deleted=len(paths) if execute else 0,
-        )
+        root_descriptor = _open_media_root(self.media_root)
+        try:
+            cutoff = time.time() - older_than.total_seconds()
+            files, directories = self._validated_candidates(cutoff)
+            if execute:
+                for candidate in files:
+                    _unlink_file(root_descriptor, candidate)
+                for candidate in directories:
+                    _remove_empty_directory(root_descriptor, candidate)
+            paths = tuple(
+                candidate.relative_path for candidate in files + directories
+            )
+            return CleanupSummary(
+                candidate_paths=paths,
+                deleted=len(paths) if execute else 0,
+            )
+        finally:
+            os.close(root_descriptor)
 
     def _validated_candidates(self, cutoff):
         references = _current_media_references(self.media_root)
@@ -425,36 +434,76 @@ def _same_identity(first, second):
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
-def _unlink_file(candidate):
+def _open_media_root(media_root):
+    try:
+        return _open_directory(os.path.realpath(media_root))
+    except OSError as error:
+        raise CommandError("unsafe_media_root: {}".format(error))
+
+
+def _open_trusted_parent(root_descriptor, relative_path):
+    try:
+        components = _relative_components(relative_path)
+    except MediaPathError as error:
+        raise CommandError(str(error))
+    current = os.dup(root_descriptor)
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        for component in components[:-1]:
+            next_descriptor = os.open(
+                component, flags, dir_fd=current
+            )
+            os.close(current)
+            current = next_descriptor
+        return current, components[-1]
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _unlink_file(root_descriptor, candidate):
     parent_descriptor = None
     try:
-        parent_descriptor = _open_directory(
-            os.path.dirname(candidate.absolute_path)
+        parent_descriptor, name = _open_trusted_parent(
+            root_descriptor, candidate.relative_path
         )
         _unlink_owned_name(
             parent_descriptor,
-            os.path.basename(candidate.absolute_path),
+            name,
             candidate.file_stat,
         )
-    except (MediaPathError, OSError) as error:
+    except (CommandError, MediaPathError, OSError) as error:
         raise CommandError("unsafe_media_file: {}".format(error))
     finally:
         if parent_descriptor is not None:
             os.close(parent_descriptor)
 
 
-def _remove_empty_directory(candidate):
+def _remove_empty_directory(root_descriptor, candidate):
+    parent_descriptor = None
     try:
-        current = os.lstat(candidate.absolute_path)
+        parent_descriptor, name = _open_trusted_parent(
+            root_descriptor, candidate.relative_path
+        )
+        current = os.stat(
+            name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
         if not stat.S_ISDIR(current.st_mode) or not _same_identity(
             current, candidate.file_stat
         ):
             raise CommandError("unsafe_orphan_entry")
-        os.rmdir(candidate.absolute_path)
+        os.rmdir(name, dir_fd=parent_descriptor)
     except CommandError:
         raise
     except OSError as error:
         raise CommandError("unsafe_orphan_entry: {}".format(error))
+    finally:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
 
 
 def _is_canonical_uuid(value):
