@@ -69,6 +69,8 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 
 MEDIA_ROOT = os.path.join(STATIC_ROOT, 'media')
 
+PINRY_DATA_ROOT = '/data'
+
 WSGI_APPLICATION = 'pinry.wsgi.application'
 
 # Password validation
