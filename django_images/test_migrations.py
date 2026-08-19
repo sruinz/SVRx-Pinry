@@ -80,6 +80,25 @@ class AssetMetadataMigrationTests(TransactionTestCase):
         self.assertTrue(all(row.asset_uuid is not None for row in rows))
         self.assertEqual(self._media_snapshot(), self.legacy_media_snapshot)
 
+    def test_backfill_uses_last_component_for_mixed_path_separators(self):
+        self._migrate(self.migrate_from)
+        OldImage = self.executor.loader.project_state(
+            [self.migrate_from]
+        ).apps.get_model("django_images", "Image")
+        image = OldImage.objects.create(
+            image="legacy\\windows/mixed\\photo.jpg",
+            width=10,
+            height=10,
+        )
+
+        apps = self._migrate(self.migrate_to)
+        Image = apps.get_model("django_images", "Image")
+
+        self.assertEqual(
+            Image.objects.get(pk=image.pk).original_filename,
+            "photo.jpg",
+        )
+
     def test_resumes_partial_backfill_without_replacing_existing_values(self):
         decomposed_name = "\u110b\u1175\u1106\u1175\u110c\u1175.png"
         preserved_uuid = uuid.UUID("12345678-1234-5678-1234-567812345678")

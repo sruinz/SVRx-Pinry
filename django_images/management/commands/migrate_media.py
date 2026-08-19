@@ -66,13 +66,14 @@ class Command(BaseCommand):
         except MediaPathError as error:
             raise CommandError(str(error))
 
+        self.stdout.write(manifest_path)
+        getattr(self.stdout, "_out", self.stdout).flush()
         execute = options["execute"]
         if execute:
             with migration_lock(data_root):
                 self._run(manifest_path, options, run_id)
         else:
             self._run(manifest_path, options, run_id)
-        self.stdout.write(manifest_path)
 
     def _run(self, manifest_path, options, run_id):
         manifest = ManifestLog(manifest_path, run_id=run_id)

@@ -65,6 +65,13 @@ class OriginalFilenameTest(SimpleTestCase):
             "x" * 255,
         )
 
+    def test_filename_uses_last_component_for_mixed_path_separators(self):
+        filename = "C:\\fakepath/mixed\\{}\x00.png".format(
+            unicodedata.normalize("NFD", "사진")
+        )
+
+        self.assertEqual(sanitize_original_filename(filename), "사진.png")
+
 
 class AssetStoragePathTest(TemporaryMediaMixin, TransactionTestCase):
     def setUp(self):

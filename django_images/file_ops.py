@@ -5,6 +5,7 @@ import os
 from pathlib import PurePosixPath
 import stat
 import sys
+import uuid
 
 
 class MediaPathError(Exception):
@@ -15,6 +16,45 @@ class PublishResult(object):
     def __init__(self, created=False, reused=False):
         self.created = created
         self.reused = reused
+
+
+class MediaDirectory(object):
+    def __init__(self, descriptors):
+        self.descriptors = descriptors
+
+    @property
+    def descriptor(self):
+        return self.descriptors[-1]
+
+    def fsync_publish(self):
+        os.fsync(self.descriptor)
+        if len(self.descriptors) > 1:
+            os.fsync(self.descriptors[-2])
+
+    def close(self):
+        while self.descriptors:
+            os.close(self.descriptors.pop())
+
+
+class OwnedStagingFile(object):
+    def __init__(self, directory, name, descriptor, file_stat, path):
+        self.directory = directory
+        self.name = name
+        self.descriptor = descriptor
+        self.file_stat = file_stat
+        self.path = path
+
+    def cleanup(self):
+        _unlink_owned_name(
+            self.directory.descriptor,
+            self.name,
+            self.file_stat,
+        )
+        os.fsync(self.directory.descriptor)
+
+    def close(self):
+        os.close(self.descriptor)
+        self.directory.close()
 
 
 def sha256_path(path):
@@ -89,6 +129,102 @@ def migration_lock_path(data_root):
         data_root,
         error_code="migration_lock_path_escape",
     )
+
+
+def open_or_create_media_directory(media_root, relative_directory):
+    components = _relative_components(relative_directory)
+    descriptors = [_open_directory(os.path.realpath(media_root))]
+    try:
+        for name in components:
+            parent_descriptor = descriptors[-1]
+            created = False
+            try:
+                named_stat = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(name, 0o755, dir_fd=parent_descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+                named_stat = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            if stat.S_ISLNK(named_stat.st_mode):
+                raise MediaPathError("media_path_escape")
+            if not stat.S_ISDIR(named_stat.st_mode):
+                raise MediaPathError("unsafe_media_directory")
+            child_descriptor = _open_child_directory_nofollow(
+                parent_descriptor,
+                name,
+                named_stat,
+            )
+            descriptors.append(child_descriptor)
+            if created:
+                os.fsync(child_descriptor)
+                os.fsync(parent_descriptor)
+        return MediaDirectory(descriptors)
+    except BaseException:
+        while descriptors:
+            os.close(descriptors.pop())
+        raise
+
+
+def create_unique_staging_file(media_root):
+    directory = open_or_create_media_directory(media_root, ".staging")
+    name = "media-migration-{}.part".format(uuid.uuid4())
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = None
+    file_stat = None
+    try:
+        descriptor = os.open(
+            name,
+            flags,
+            0o600,
+            dir_fd=directory.descriptor,
+        )
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise MediaPathError("unsafe_staging_file")
+        os.fsync(directory.descriptor)
+        path = os.path.join(
+            os.path.realpath(media_root),
+            ".staging",
+            name,
+        )
+        return OwnedStagingFile(
+            directory,
+            name,
+            descriptor,
+            file_stat,
+            path,
+        )
+    except Exception:
+        try:
+            if descriptor is not None and file_stat is not None:
+                _unlink_owned_name(
+                    directory.descriptor,
+                    name,
+                    file_stat,
+                )
+                os.fsync(directory.descriptor)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            directory.close()
+        raise
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        directory.close()
+        raise
 
 
 def _link_descriptor_empty_path(
@@ -241,38 +377,70 @@ def open_staging_noreplace(part_path):
 
 
 def publish_noreplace(
-    part_path, destination, expected_sha256, part_descriptor=None
+    part_path,
+    destination,
+    expected_sha256,
+    part_descriptor=None,
+    part_directory_descriptor=None,
+    destination_directory=None,
 ):
-    part_parent = os.path.realpath(os.path.dirname(part_path))
-    destination_parent = os.path.realpath(os.path.dirname(destination))
-    if part_parent != destination_parent:
-        raise MediaPathError("unsafe_staging_file")
     part_name = os.path.basename(part_path)
     destination_name = os.path.basename(destination)
-    parent_descriptor = _open_directory(destination_parent)
+    opened_part_directory = False
+    if part_directory_descriptor is None:
+        part_directory_descriptor = _open_directory(
+            os.path.realpath(os.path.dirname(part_path))
+        )
+        opened_part_directory = True
+    opened_destination_directory = False
+    if destination_directory is None:
+        destination_directory_descriptor = _open_directory(
+            os.path.realpath(os.path.dirname(destination))
+        )
+        opened_destination_directory = True
+    else:
+        destination_directory_descriptor = destination_directory.descriptor
     opened_part = False
     try:
         if part_descriptor is None:
             part_descriptor = _open_regular_nofollow(
-                parent_descriptor, part_name
+                part_directory_descriptor, part_name
             )
             opened_part = True
         part_stat = os.fstat(part_descriptor)
-        _require_owned_name(parent_descriptor, part_name, part_stat)
+        _require_owned_name(
+            part_directory_descriptor,
+            part_name,
+            part_stat,
+        )
         if sha256_file_descriptor(part_descriptor) != expected_sha256:
             raise MediaPathError("part_hash_mismatch")
         try:
             _publish_descriptor(
-                part_descriptor, parent_descriptor, destination_name
+                part_descriptor,
+                destination_directory_descriptor,
+                destination_name,
             )
         except FileExistsError:
-            if _sha256_name(parent_descriptor, destination_name) != expected_sha256:
-                raise MediaPathError("media_path_conflict")
-            _unlink_owned_name(parent_descriptor, part_name, part_stat)
-            os.fsync(parent_descriptor)
+            _verify_existing_destination(
+                destination_directory_descriptor,
+                destination_name,
+                expected_sha256,
+            )
+            if destination_directory is None:
+                os.fsync(destination_directory_descriptor)
+            else:
+                destination_directory.fsync_publish()
+            _unlink_owned_name(
+                part_directory_descriptor,
+                part_name,
+                part_stat,
+            )
+            os.fsync(part_directory_descriptor)
             return PublishResult(reused=True)
         destination_descriptor = _open_regular_nofollow(
-            parent_descriptor, destination_name
+            destination_directory_descriptor,
+            destination_name,
         )
         try:
             if (
@@ -283,13 +451,24 @@ def publish_noreplace(
             os.fsync(destination_descriptor)
         finally:
             os.close(destination_descriptor)
-        _unlink_owned_name(parent_descriptor, part_name, part_stat)
-        os.fsync(parent_descriptor)
+        if destination_directory is None:
+            os.fsync(destination_directory_descriptor)
+        else:
+            destination_directory.fsync_publish()
+        _unlink_owned_name(
+            part_directory_descriptor,
+            part_name,
+            part_stat,
+        )
+        os.fsync(part_directory_descriptor)
         return PublishResult(created=True)
     finally:
         if opened_part:
             os.close(part_descriptor)
-        os.close(parent_descriptor)
+        if opened_destination_directory:
+            os.close(destination_directory_descriptor)
+        if opened_part_directory:
+            os.close(part_directory_descriptor)
 
 
 def _open_directory(path):
@@ -299,6 +478,34 @@ def _open_directory(path):
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     return os.open(path, flags)
+
+
+def _open_child_directory_nofollow(
+    parent_descriptor, name, named_stat
+):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = None
+    try:
+        descriptor = os.open(
+            name,
+            flags,
+            dir_fd=parent_descriptor,
+        )
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened_stat.st_mode)
+            or _identity(opened_stat) != _identity(named_stat)
+        ):
+            raise MediaPathError("unsafe_media_directory")
+        return descriptor
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
 
 
 def _open_regular_nofollow(directory_descriptor, name):
@@ -332,10 +539,14 @@ def _require_owned_name(directory_descriptor, name, expected_stat):
         raise MediaPathError("unsafe_staging_file")
 
 
-def _sha256_name(directory_descriptor, name):
+def _verify_existing_destination(
+    directory_descriptor, name, expected_sha256
+):
     descriptor = _open_regular_nofollow(directory_descriptor, name)
     try:
-        return sha256_file_descriptor(descriptor)
+        if sha256_file_descriptor(descriptor) != expected_sha256:
+            raise MediaPathError("media_path_conflict")
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
 

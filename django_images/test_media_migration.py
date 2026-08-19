@@ -34,6 +34,20 @@ class InjectedInterruption(Exception):
     pass
 
 
+class SimulatedProcessCrash(BaseException):
+    pass
+
+
+class FlushRecordingIO(StringIO):
+    def __init__(self):
+        super(FlushRecordingIO, self).__init__()
+        self.flush_count = 0
+
+    def flush(self):
+        self.flush_count += 1
+        return super(FlushRecordingIO, self).flush()
+
+
 class MediaMigrationCommandTest(TransactionTestCase):
     def setUp(self):
         super(MediaMigrationCommandTest, self).setUp()
@@ -97,7 +111,10 @@ class MediaMigrationCommandTest(TransactionTestCase):
         }
 
     def _manifest_events(self):
-        with open(self.manifest_path, encoding="utf-8") as manifest:
+        return self._manifest_events_for(self.manifest_path)
+
+    def _manifest_events_for(self, path):
+        with open(path, encoding="utf-8") as manifest:
             return [json.loads(line) for line in manifest]
 
     def _canonical_paths(self, image=None):
@@ -127,6 +144,110 @@ class MediaMigrationCommandTest(TransactionTestCase):
             }
         )
         return paths
+
+    def _staging_files(self):
+        staging = Path(self.temporary_media.name, ".staging")
+        if not staging.exists():
+            return []
+        return sorted(
+            path for path in staging.rglob("*") if path.is_file()
+        )
+
+    def _assert_crash_window_resumes(self, crash_point):
+        if crash_point == "after_partial_copy":
+            noisy = BytesIO()
+            pixels = os.urandom(512 * 512 * 3)
+            PILImage.frombytes("RGB", (512, 512), pixels).save(
+                noisy,
+                format="PNG",
+            )
+            source_bytes = noisy.getvalue()
+            Path(
+                self.temporary_media.name,
+                self.old_original,
+            ).write_bytes(source_bytes)
+            self.old_files[self.old_original] = source_bytes
+        manifest = ManifestLog(self.manifest_path)
+        database_before = self._database_paths()
+
+        def crash(point):
+            if point == crash_point:
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            MediaMigrator(
+                default_storage,
+                manifest,
+                fault_injector=crash,
+            ).run(execute=True)
+
+        self.assertEqual(self._database_paths(), database_before)
+        residue = self._staging_files()
+        self.assertEqual(len(residue), 1)
+        self.assertEqual(
+            residue[0].relative_to(self.temporary_media.name).parts[0],
+            ".staging",
+        )
+        if crash_point == "after_partial_copy":
+            self.assertLess(
+                residue[0].stat().st_size,
+                len(self.old_files[self.old_original]),
+            )
+        self.assertEqual(self._manifest_events()[-1]["event"], "planned")
+        residue_stat = residue[0].stat()
+
+        call_command(
+            "migrate_media", execute=True, manifest=self.manifest_path
+        )
+
+        self.assertEqual(
+            self._database_paths()["original"],
+            self._canonical_paths()["original"],
+        )
+        self.assertTrue(residue[0].exists())
+        self.assertEqual(residue[0].stat().st_ino, residue_stat.st_ino)
+        for old_path, content in self.old_files.items():
+            self.assertEqual(
+                Path(self.temporary_media.name, old_path).read_bytes(),
+                content,
+            )
+
+    def test_resume_uses_new_staging_after_crash_just_after_create(self):
+        self._assert_crash_window_resumes("after_staging_create")
+
+    def test_resume_uses_new_staging_after_crash_during_partial_copy(self):
+        self._assert_crash_window_resumes("after_partial_copy")
+
+    def test_resume_uses_new_staging_after_crash_after_file_fsync(self):
+        self._assert_crash_window_resumes("after_staging_fsync")
+
+    def test_resume_uses_new_staging_after_crash_after_image_verify(self):
+        self._assert_crash_window_resumes("after_staging_verify")
+
+    def test_handled_copy_error_removes_only_current_owned_staging(self):
+        preserved = Path(
+            self.temporary_media.name, ".staging", "preserved.part"
+        )
+        preserved.parent.mkdir()
+        preserved.write_bytes(b"previous crash")
+        preserved_stat = preserved.stat()
+        manifest = ManifestLog(self.manifest_path)
+
+        def interrupt(point):
+            if point == "after_partial_copy":
+                raise InjectedInterruption()
+
+        with self.assertRaises(InjectedInterruption):
+            MediaMigrator(
+                default_storage,
+                manifest,
+                fault_injector=interrupt,
+            ).run(execute=True)
+
+        self.assertEqual(self._staging_files(), [preserved])
+        self.assertEqual(preserved.read_bytes(), b"previous crash")
+        self.assertEqual(preserved.stat().st_ino, preserved_stat.st_ino)
+        self.assertEqual(self._database_paths()["original"], self.old_original)
 
     def test_dry_run_writes_plan_but_changes_no_database_or_media(self):
         call_command("migrate_media", manifest=self.manifest_path)
@@ -184,6 +305,129 @@ class MediaMigrationCommandTest(TransactionTestCase):
         )
         self.assertFalse(any(".part-" in name for name in files))
 
+    def test_file_and_directory_fsync_chain_precedes_database_update(self):
+        events = []
+        real_fsync = file_ops.os.fsync
+        real_update = MediaMigrator._update_paths_with_queryset_update
+
+        def record_fsync(descriptor):
+            file_stat = os.fstat(descriptor)
+            events.append(
+                ("fsync", file_stat.st_dev, file_stat.st_ino)
+            )
+            return real_fsync(descriptor)
+
+        def record_update(migrator, plans):
+            events.append(("database_update",))
+            return real_update(migrator, plans)
+
+        with mock.patch(
+            "django_images.file_ops.os.fsync",
+            side_effect=record_fsync,
+        ):
+            with mock.patch.object(
+                MediaMigrator,
+                "_update_paths_with_queryset_update",
+                autospec=True,
+                side_effect=record_update,
+            ):
+                call_command(
+                    "migrate_media",
+                    execute=True,
+                    manifest=self.manifest_path,
+                )
+
+        database_index = events.index(("database_update",))
+        for kind in ("original", "thumbnail"):
+            destination = Path(
+                self.temporary_media.name,
+                self._canonical_paths()[kind],
+            )
+            uuid_directory = destination.parent
+            top_directory = uuid_directory.parent
+            file_identity = (
+                "fsync",
+                destination.stat().st_dev,
+                destination.stat().st_ino,
+            )
+            uuid_identity = (
+                "fsync",
+                uuid_directory.stat().st_dev,
+                uuid_directory.stat().st_ino,
+            )
+            top_identity = (
+                "fsync",
+                top_directory.stat().st_dev,
+                top_directory.stat().st_ino,
+            )
+            file_index = events.index(file_identity)
+            uuid_index = events.index(uuid_identity, file_index + 1)
+            top_index = events.index(top_identity, uuid_index + 1)
+            self.assertLess(file_index, uuid_index)
+            self.assertLess(uuid_index, top_index)
+            self.assertLess(top_index, database_index)
+
+    def test_reused_destination_fsync_chain_precedes_database_update(self):
+        destination = Path(
+            self.temporary_media.name,
+            self._canonical_paths()["original"],
+        )
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(self.old_files[self.old_original])
+        events = []
+        real_fsync = file_ops.os.fsync
+        real_update = MediaMigrator._update_paths_with_queryset_update
+
+        def record_fsync(descriptor):
+            file_stat = os.fstat(descriptor)
+            events.append(
+                ("fsync", file_stat.st_dev, file_stat.st_ino)
+            )
+            return real_fsync(descriptor)
+
+        def record_update(migrator, plans):
+            events.append(("database_update",))
+            return real_update(migrator, plans)
+
+        with mock.patch(
+            "django_images.file_ops.os.fsync",
+            side_effect=record_fsync,
+        ):
+            with mock.patch.object(
+                MediaMigrator,
+                "_update_paths_with_queryset_update",
+                autospec=True,
+                side_effect=record_update,
+            ):
+                call_command(
+                    "migrate_media",
+                    execute=True,
+                    manifest=self.manifest_path,
+                )
+
+        file_identity = (
+            "fsync",
+            destination.stat().st_dev,
+            destination.stat().st_ino,
+        )
+        uuid_identity = (
+            "fsync",
+            destination.parent.stat().st_dev,
+            destination.parent.stat().st_ino,
+        )
+        top_identity = (
+            "fsync",
+            destination.parent.parent.stat().st_dev,
+            destination.parent.parent.stat().st_ino,
+        )
+        file_index = events.index(file_identity)
+        uuid_index = events.index(uuid_identity, file_index + 1)
+        top_index = events.index(top_identity, uuid_index + 1)
+        database_index = events.index(("database_update",))
+        self.assertLess(file_index, uuid_index)
+        self.assertLess(uuid_index, top_index)
+        self.assertLess(top_index, database_index)
+
     def test_destination_conflict_keeps_batch_db_and_all_sources_unchanged(self):
         canonical = self._canonical_paths()
         conflict_path = canonical["square"]
@@ -213,28 +457,27 @@ class MediaMigrationCommandTest(TransactionTestCase):
         for old_path, content in self.old_files.items():
             self.assertEqual(files[old_path], content)
 
-    def test_preexisting_staging_symlink_is_rejected_without_consuming_it(self):
+    def test_symlinked_staging_namespace_is_rejected_without_consuming_it(self):
         outside = tempfile.TemporaryDirectory()
         self.addCleanup(outside.cleanup)
         outside_path = Path(outside.name, "outside.png")
         outside_content = self.old_files[self.old_original]
         outside_path.write_bytes(outside_content)
         manifest = ManifestLog(self.manifest_path)
+        staging_path = Path(self.temporary_media.name, ".staging")
+        staging_path.symlink_to(outside.name, target_is_directory=True)
         destination = Path(
             self.temporary_media.name,
             self._canonical_paths()["original"],
         )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        part_path = Path(str(destination) + ".part-" + manifest.run_id)
-        part_path.symlink_to(outside_path)
         database_before = self._database_paths()
 
-        with self.assertRaisesRegex(CommandError, "unsafe_staging_file"):
+        with self.assertRaisesRegex(CommandError, "media_path_escape"):
             MediaMigrator(default_storage, manifest).run(execute=True)
 
         self.assertEqual(self._database_paths(), database_before)
-        self.assertTrue(part_path.is_symlink())
-        self.assertEqual(os.readlink(str(part_path)), str(outside_path))
+        self.assertTrue(staging_path.is_symlink())
+        self.assertEqual(os.readlink(str(staging_path)), outside.name)
         self.assertEqual(outside_path.read_bytes(), outside_content)
         self.assertFalse(destination.exists())
         for old_path, content in self.old_files.items():
@@ -251,8 +494,6 @@ class MediaMigrationCommandTest(TransactionTestCase):
             self.temporary_media.name,
             self._canonical_paths()["original"],
         )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        part_path = Path(str(destination) + ".part-" + manifest.run_id)
         attacker_directory = tempfile.TemporaryDirectory()
         self.addCleanup(attacker_directory.cleanup)
         attacker_path = Path(attacker_directory.name, "attacker.png")
@@ -278,7 +519,7 @@ class MediaMigrationCommandTest(TransactionTestCase):
         def interrupt_before_part_cleanup(
             directory_descriptor, name, expected_stat
         ):
-            if name == part_path.name:
+            if name.startswith("media-migration-"):
                 raise InjectedInterruption()
             return real_unlink_owned_name(
                 directory_descriptor, name, expected_stat
@@ -308,9 +549,11 @@ class MediaMigrationCommandTest(TransactionTestCase):
             destination.read_bytes(), self.old_files[self.old_original]
         )
         self.assertNotEqual(destination.stat().st_ino, attacker_inode)
-        self.assertTrue(part_path.exists())
+        staging_files = self._staging_files()
+        self.assertEqual(len(staging_files), 1)
         self.assertEqual(
-            part_path.read_bytes(), self.old_files[self.old_original]
+            staging_files[0].read_bytes(),
+            self.old_files[self.old_original],
         )
         for old_path, content in self.old_files.items():
             self.assertEqual(
@@ -751,6 +994,54 @@ class MediaMigrationCommandTest(TransactionTestCase):
         events = [json.loads(line) for line in Path(output).read_text().splitlines()]
         self.assertIn(events[0]["run_id"], os.path.basename(output))
 
+    def test_automatic_manifest_path_is_flushed_before_interrupted_work(self):
+        stdout = FlushRecordingIO()
+
+        with mock.patch.object(
+            MediaMigrator,
+            "run",
+            side_effect=InjectedInterruption(),
+        ):
+            with self.assertRaises(InjectedInterruption):
+                call_command("migrate_media", execute=True, stdout=stdout)
+
+        manifest_path = stdout.getvalue().strip()
+        self.assertTrue(
+            manifest_path.startswith(
+                os.path.realpath(self.temporary_data.name) + os.sep
+            ),
+            repr(manifest_path),
+        )
+        self.assertTrue(manifest_path.endswith(".jsonl"))
+        self.assertGreater(stdout.flush_count, 0)
+
+        call_command("migrate_media", manifest=manifest_path)
+
+        self.assertTrue(Path(manifest_path).is_file())
+        self.assertEqual(self._manifest_events_for(manifest_path)[0]["event"], "planned")
+
+    def test_explicit_manifest_path_is_flushed_before_interrupted_work(self):
+        stdout = FlushRecordingIO()
+
+        with mock.patch.object(
+            MediaMigrator,
+            "run",
+            side_effect=InjectedInterruption(),
+        ):
+            with self.assertRaises(InjectedInterruption):
+                call_command(
+                    "migrate_media",
+                    execute=True,
+                    manifest=self.manifest_path,
+                    stdout=stdout,
+                )
+
+        self.assertEqual(
+            stdout.getvalue().strip(),
+            os.path.realpath(self.manifest_path),
+        )
+        self.assertGreater(stdout.flush_count, 0)
+
 
 class MediaFileOperationTest(TestCase):
     def setUp(self):
@@ -782,10 +1073,14 @@ class MediaFileOperationTest(TestCase):
             migration_lock_path(self.root.name)
 
     def test_publish_darwin_fd_clone_reuses_only_identical_destination(self):
-        destination = os.path.join(self.root.name, "destination.png")
+        staging = Path(self.root.name, ".staging")
+        destination_parent = Path(self.root.name, "originals", "asset")
+        staging.mkdir()
+        destination_parent.mkdir(parents=True)
+        destination = str(destination_parent / "destination.png")
         expected = make_image_bytes("red")
-        first_part = os.path.join(self.root.name, "first.part")
-        second_part = os.path.join(self.root.name, "second.part")
+        first_part = str(staging / "first.part")
+        second_part = str(staging / "second.part")
         Path(first_part).write_bytes(expected)
         Path(second_part).write_bytes(expected)
         digest = hashlib.sha256(expected).hexdigest()
@@ -800,9 +1095,61 @@ class MediaFileOperationTest(TestCase):
         self.assertFalse(os.path.exists(first_part))
         self.assertFalse(os.path.exists(second_part))
 
+    def test_staging_creation_fsync_error_removes_only_created_inode(self):
+        staging = Path(self.root.name, ".staging")
+        staging.mkdir()
+        real_fsync = file_ops.os.fsync
+        fsync_calls = []
+
+        def fail_first_fsync(descriptor):
+            fsync_calls.append(descriptor)
+            if len(fsync_calls) == 1:
+                raise OSError("injected staging directory fsync failure")
+            return real_fsync(descriptor)
+
+        with mock.patch(
+            "django_images.file_ops.os.fsync",
+            side_effect=fail_first_fsync,
+        ):
+            with self.assertRaisesRegex(OSError, "injected staging"):
+                file_ops.create_unique_staging_file(self.root.name)
+
+        self.assertEqual(list(staging.iterdir()), [])
+
+    def test_publish_descriptor_supports_staging_and_destination_parents(
+        self,
+    ):
+        staging = Path(self.root.name, ".staging")
+        destination_parent = Path(
+            self.root.name,
+            "originals",
+            "12345678-1234-5678-1234-567812345678",
+        )
+        staging.mkdir()
+        destination_parent.mkdir(parents=True)
+        part = staging / "attempt.part"
+        destination = destination_parent / "original.png"
+        expected = make_image_bytes("red")
+        part.write_bytes(expected)
+
+        with mock.patch("django_images.file_ops.sys.platform", "darwin"):
+            result = publish_noreplace(
+                str(part),
+                str(destination),
+                hashlib.sha256(expected).hexdigest(),
+            )
+
+        self.assertTrue(result.created)
+        self.assertEqual(destination.read_bytes(), expected)
+        self.assertFalse(part.exists())
+
     def test_unsupported_fd_publish_fails_closed_without_consuming_names(self):
-        destination = os.path.join(self.root.name, "destination.png")
-        part = os.path.join(self.root.name, "candidate.part")
+        staging = Path(self.root.name, ".staging")
+        destination_parent = Path(self.root.name, "originals", "asset")
+        staging.mkdir()
+        destination_parent.mkdir(parents=True)
+        destination = str(destination_parent / "destination.png")
+        part = str(staging / "candidate.part")
         unrelated = os.path.join(self.root.name, "unrelated.png")
         expected = make_image_bytes("red")
         Path(part).write_bytes(expected)
@@ -828,10 +1175,14 @@ class MediaFileOperationTest(TestCase):
         self.assertFalse(Path(destination).exists())
 
     def test_publish_conflict_preserves_destination_and_part(self):
-        destination = os.path.join(self.root.name, "destination.png")
+        staging = Path(self.root.name, ".staging")
+        destination_parent = Path(self.root.name, "originals", "asset")
+        staging.mkdir()
+        destination_parent.mkdir(parents=True)
+        destination = str(destination_parent / "destination.png")
         destination_bytes = make_image_bytes("red")
         part_bytes = make_image_bytes("blue")
-        part = os.path.join(self.root.name, "candidate.part")
+        part = str(staging / "candidate.part")
         Path(destination).write_bytes(destination_bytes)
         Path(part).write_bytes(part_bytes)
 
@@ -847,8 +1198,12 @@ class MediaFileOperationTest(TestCase):
         self.assertEqual(Path(part).read_bytes(), part_bytes)
 
     def test_publish_rejects_part_name_replaced_after_open(self):
-        destination = os.path.join(self.root.name, "destination.png")
-        part = os.path.join(self.root.name, "candidate.part")
+        staging = Path(self.root.name, ".staging")
+        destination_parent = Path(self.root.name, "originals", "asset")
+        staging.mkdir()
+        destination_parent.mkdir(parents=True)
+        destination = str(destination_parent / "destination.png")
+        part = str(staging / "candidate.part")
         expected = make_image_bytes("red")
         outside = tempfile.TemporaryDirectory()
         self.addCleanup(outside.cleanup)

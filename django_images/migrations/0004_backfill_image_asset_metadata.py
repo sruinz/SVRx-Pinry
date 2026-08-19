@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
 
-import os.path
 import unicodedata
 import uuid
 
@@ -9,7 +8,7 @@ from django.db import migrations, models
 
 
 def _legacy_filename(image_name):
-    basename = os.path.basename(image_name or '')
+    basename = (image_name or '').replace('\\', '/').rsplit('/', 1)[-1]
     normalized = unicodedata.normalize('NFC', basename)
     return ''.join(
         character

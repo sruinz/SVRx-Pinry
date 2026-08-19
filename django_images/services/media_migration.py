@@ -2,7 +2,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
-import shutil
 import uuid
 import warnings
 
@@ -12,8 +11,9 @@ from django.db import transaction
 from PIL import Image as PILImage
 
 from django_images.file_ops import (
+    create_unique_staging_file,
     MediaPathError,
-    open_staging_noreplace,
+    open_or_create_media_directory,
     publish_noreplace,
     resolve_media_path,
     sha256_file_descriptor,
@@ -578,37 +578,66 @@ class MediaMigrator(object):
         for file_plan in plan.files:
             source = self._resolve_media(file_plan.old_path)
             destination = self._resolve_media(file_plan.new_path)
-            parent = os.path.dirname(destination)
-            os.makedirs(parent, exist_ok=True)
-            destination = self._resolve_media(file_plan.new_path)
-            part_path = destination + ".part-" + self.manifest.run_id
             try:
-                part_descriptor = open_staging_noreplace(part_path)
+                destination_directory = open_or_create_media_directory(
+                    settings.MEDIA_ROOT,
+                    file_plan.new_path.rsplit("/", 1)[0],
+                )
             except MediaPathError as error:
                 raise CommandError(str(error))
+            staging = None
+            published = False
             try:
+                staging = create_unique_staging_file(settings.MEDIA_ROOT)
+                self._inject_fault("after_staging_create")
                 source_flags = os.O_RDONLY
                 if hasattr(os, "O_NOFOLLOW"):
                     source_flags |= os.O_NOFOLLOW
                 source_descriptor = os.open(source, source_flags)
                 with os.fdopen(source_descriptor, "rb") as source_file:
                     with os.fdopen(
-                        os.dup(part_descriptor), "wb"
+                        os.dup(staging.descriptor), "wb"
                     ) as part_file:
-                        shutil.copyfileobj(source_file, part_file)
+                        first_chunk = True
+                        while True:
+                            chunk = source_file.read(64 * 1024)
+                            if not chunk:
+                                break
+                            part_file.write(chunk)
+                            if first_chunk:
+                                self._inject_fault("after_partial_copy")
+                                first_chunk = False
                         part_file.flush()
                         os.fsync(part_file.fileno())
-                self._verify_part_descriptor(file_plan, part_descriptor)
+                        self._inject_fault("after_staging_fsync")
+                self._verify_part_descriptor(
+                    file_plan,
+                    staging.descriptor,
+                )
+                self._inject_fault("after_staging_verify")
                 publish_noreplace(
-                    part_path,
+                    staging.path,
                     destination,
                     file_plan.sha256,
-                    part_descriptor=part_descriptor,
+                    part_descriptor=staging.descriptor,
+                    part_directory_descriptor=(
+                        staging.directory.descriptor
+                    ),
+                    destination_directory=destination_directory,
                 )
+                published = True
             except MediaPathError as error:
+                if staging is not None and not published:
+                    staging.cleanup()
                 raise CommandError(str(error))
+            except Exception:
+                if staging is not None and not published:
+                    staging.cleanup()
+                raise
             finally:
-                os.close(part_descriptor)
+                if staging is not None:
+                    staging.close()
+                destination_directory.close()
             self._verify_file(file_plan, file_plan.new_path)
 
     def _verify_part_descriptor(self, file_plan, part_descriptor):

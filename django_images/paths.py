@@ -1,4 +1,3 @@
-import os
 import unicodedata
 
 from PIL import Image as PILImage
@@ -20,7 +19,7 @@ class UnsupportedImageFormat(Exception):
 
 
 def sanitize_original_filename(filename: str) -> str:
-    basename = os.path.basename(filename)
+    basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
     basename = unicodedata.normalize("NFC", basename)
     basename = "".join(
         character
