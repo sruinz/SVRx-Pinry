@@ -52,6 +52,20 @@ const trashedPin = {
 
 const activePin = { ...trashedPin };
 const messages = { en, fr, zh };
+const mountedWrappers = [];
+
+function deferred() {
+  const request = {};
+  request.promise = new Promise((resolve, reject) => {
+    request.resolve = resolve;
+    request.reject = reject;
+  });
+  return request;
+}
+
+function pinWithId(id) {
+  return { ...trashedPin, id };
+}
 
 function mountTrash(options = {}) {
   const localVue = createLocalVue();
@@ -74,8 +88,15 @@ function mountTrash(options = {}) {
     i18n,
     mocks: { $buefy: buefy },
   });
+  mountedWrappers.push(wrapper);
   return { wrapper, buefy };
 }
+
+afterEach(() => {
+  mountedWrappers.splice(0).forEach((wrapper) => {
+    wrapper.destroy();
+  });
+});
 
 describe('trash API contract', () => {
   beforeEach(() => {
@@ -102,6 +123,182 @@ describe('trash API contract', () => {
 describe('TrashPins', () => {
   beforeEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it('removes the old scroll listener before a remount handles bottom scroll', async () => {
+    const scrollHandlers = [];
+    const addEventListener = window.addEventListener.bind(window);
+    jest.spyOn(window, 'addEventListener').mockImplementation((type, handler, options) => {
+      if (type === 'scroll') {
+        scrollHandlers.push(handler);
+      }
+      addEventListener(type, handler, options);
+    });
+    jest.spyOn(API.Pin, 'fetchTrash').mockImplementation(offset => Promise.resolve({
+      data: {
+        count: 3,
+        results: [pinWithId(offset === 0 ? 41 : 40)],
+        next: '/api/v2/pins/trash/?limit=30&offset=2',
+        previous: null,
+      },
+    }));
+
+    const oldWrapper = mountTrash().wrapper;
+    await flushPromises();
+    const oldFetch = jest.spyOn(oldWrapper.vm, 'fetchMore');
+    oldWrapper.destroy();
+
+    const currentWrapper = mountTrash().wrapper;
+    await flushPromises();
+    const currentFetch = jest.spyOn(currentWrapper.vm, 'fetchMore');
+    API.Pin.fetchTrash.mockClear();
+
+    window.dispatchEvent(new Event('scroll'));
+    await flushPromises();
+
+    expect(oldFetch).not.toHaveBeenCalled();
+    expect(currentFetch).toHaveBeenCalledTimes(1);
+    expect(API.Pin.fetchTrash).toHaveBeenCalledTimes(1);
+
+    scrollHandlers.forEach((handler) => {
+      window.removeEventListener('scroll', handler);
+    });
+  });
+
+  it('blocks restore and permanent delete while a page fetch is in flight', async () => {
+    const pageRequest = deferred();
+    jest.spyOn(API.Pin, 'fetchTrash')
+      .mockImplementation(offset => (offset === 0 ? Promise.resolve({
+        data: {
+          count: 3,
+          results: [trashedPin, pinWithId(40)],
+          next: '/api/v2/pins/trash/?limit=30&offset=2',
+          previous: null,
+        },
+      }) : pageRequest.promise));
+    jest.spyOn(API.Pin, 'restore').mockReturnValue(deferred().promise);
+    jest.spyOn(API.Pin, 'deletePermanently').mockReturnValue(deferred().promise);
+
+    const { wrapper } = mountTrash();
+    await flushPromises();
+    wrapper.vm.fetchMore();
+    wrapper.vm.restore(trashedPin);
+    wrapper.vm.deletePermanently(pinWithId(40));
+    await wrapper.vm.$nextTick();
+
+    expect(API.Pin.restore).not.toHaveBeenCalled();
+    expect(API.Pin.deletePermanently).not.toHaveBeenCalled();
+    wrapper.findAll('[data-test="restore"]').wrappers.forEach((button) => {
+      expect(button.attributes('disabled')).toBe('disabled');
+    });
+
+    pageRequest.resolve({
+      data: {
+        count: 3,
+        results: [pinWithId(39)],
+        next: null,
+        previous: '/api/v2/pins/trash/?limit=30&offset=0',
+      },
+    });
+    await flushPromises();
+    expect(wrapper.find('[data-test="restore"]').attributes('disabled')).toBeUndefined();
+  });
+
+  it('queues one page fetch until restore succeeds and uses the reduced offset', async () => {
+    const restoreRequest = deferred();
+    const pageRequest = deferred();
+    jest.spyOn(API.Pin, 'fetchTrash')
+      .mockImplementation(offset => (offset === 0 ? Promise.resolve({
+        data: {
+          count: 3,
+          results: [trashedPin, pinWithId(40)],
+          next: '/api/v2/pins/trash/?limit=30&offset=2',
+          previous: null,
+        },
+      }) : pageRequest.promise));
+    jest.spyOn(API.Pin, 'restore').mockReturnValue(restoreRequest.promise);
+
+    const { wrapper } = mountTrash();
+    await flushPromises();
+    expect(API.Pin.fetchTrash.mock.calls).toEqual([[0]]);
+    expect(wrapper.vm.status).toMatchObject({
+      loading: false,
+      hasNext: true,
+      offset: 2,
+    });
+    wrapper.vm.restore(trashedPin);
+    expect(wrapper.vm.status.loading).toBe(false);
+    wrapper.vm.fetchMore();
+    wrapper.vm.fetchMore();
+
+    expect(API.Pin.restore).toHaveBeenCalledTimes(1);
+    expect(API.Pin.fetchTrash.mock.calls).toEqual([[0]]);
+
+    restoreRequest.resolve({ data: activePin });
+    await flushPromises();
+    expect(API.Pin.fetchTrash.mock.calls).toEqual([[0], [1]]);
+
+    pageRequest.resolve({
+      data: {
+        count: 2,
+        results: [pinWithId(39)],
+        next: null,
+        previous: '/api/v2/pins/trash/?limit=30&offset=0',
+      },
+    });
+    await flushPromises();
+
+    const ids = wrapper.findAll('[data-pin-id]').wrappers
+      .map(card => Number(card.attributes('data-pin-id')));
+    expect(ids).toEqual([40, 39]);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(wrapper.vm.status.offset).toBe(2);
+    expect(wrapper.find('[data-test="restore"]').attributes('disabled')).toBeUndefined();
+  });
+
+  it('queues one page fetch until permanent delete fails without changing offset', async () => {
+    const deleteRequest = deferred();
+    const pageRequest = deferred();
+    jest.spyOn(API.Pin, 'fetchTrash')
+      .mockImplementation(offset => (offset === 0 ? Promise.resolve({
+        data: {
+          count: 3,
+          results: [trashedPin, pinWithId(40)],
+          next: '/api/v2/pins/trash/?limit=30&offset=2',
+          previous: null,
+        },
+      }) : pageRequest.promise));
+    jest.spyOn(API.Pin, 'deletePermanently').mockReturnValue(deleteRequest.promise);
+
+    const { wrapper } = mountTrash();
+    await flushPromises();
+    wrapper.vm.deletePermanently(trashedPin);
+    wrapper.vm.fetchMore();
+    wrapper.vm.fetchMore();
+
+    expect(API.Pin.deletePermanently).toHaveBeenCalledTimes(1);
+    expect(API.Pin.fetchTrash.mock.calls).toEqual([[0]]);
+
+    deleteRequest.reject(new Error('delete failed'));
+    await flushPromises();
+    expect(API.Pin.fetchTrash.mock.calls).toEqual([[0], [2]]);
+
+    pageRequest.resolve({
+      data: {
+        count: 3,
+        results: [pinWithId(39)],
+        next: null,
+        previous: '/api/v2/pins/trash/?limit=30&offset=0',
+      },
+    });
+    await flushPromises();
+
+    const ids = wrapper.findAll('[data-pin-id]').wrappers
+      .map(card => Number(card.attributes('data-pin-id')));
+    expect(ids).toEqual([41, 40, 39]);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(wrapper.vm.status.offset).toBe(3);
+    expect(wrapper.find('[data-test="restore"]').attributes('disabled')).toBeUndefined();
   });
 
   it('restores one pin and removes it from the trash list', async () => {

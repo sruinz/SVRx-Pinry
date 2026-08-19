@@ -14,12 +14,13 @@ function onScroll2Bottom(callback) {
 }
 
 function bindScroll2Bottom(callback) {
-  window.addEventListener(
-    'scroll',
-    () => {
-      onScroll2Bottom(callback);
-    },
-  );
+  const handler = () => {
+    onScroll2Bottom(callback);
+  };
+  window.addEventListener('scroll', handler);
+  return () => {
+    window.removeEventListener('scroll', handler);
+  };
 }
 
 export default {

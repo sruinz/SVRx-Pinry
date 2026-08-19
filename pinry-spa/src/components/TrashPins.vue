@@ -70,6 +70,9 @@ export default {
     return {
       pins: [],
       busyPins: {},
+      mutationInFlight: false,
+      fetchQueued: false,
+      unbindScroll: null,
       status: {
         loading: false,
         error: false,
@@ -80,12 +83,19 @@ export default {
   },
   methods: {
     registerScrollEvent() {
-      scroll.bindScroll2Bottom(() => {
+      this.unbindScroll = scroll.bindScroll2Bottom(() => {
         this.fetchMore();
       });
     },
     fetchMore() {
-      if (this.status.loading || !this.status.hasNext) {
+      if (!this.status.hasNext) {
+        return;
+      }
+      if (this.mutationInFlight) {
+        this.fetchQueued = true;
+        return;
+      }
+      if (this.status.loading) {
         return;
       }
       this.status.loading = true;
@@ -105,7 +115,11 @@ export default {
       );
     },
     isBusy(pinId) {
-      return this.busyPins[pinId] === true;
+      return (
+        this.status.loading
+        || this.mutationInFlight
+        || this.busyPins[pinId] === true
+      );
     },
     setBusy(pinId, busy) {
       if (busy) {
@@ -114,27 +128,42 @@ export default {
         this.$delete(this.busyPins, pinId);
       }
     },
+    beginMutation(pinId) {
+      if (this.status.loading || this.mutationInFlight) {
+        return false;
+      }
+      this.mutationInFlight = true;
+      this.setBusy(pinId, true);
+      return true;
+    },
+    finishMutation(pinId) {
+      this.setBusy(pinId, false);
+      this.mutationInFlight = false;
+      if (this.fetchQueued) {
+        this.fetchQueued = false;
+        this.fetchMore();
+      }
+    },
     removePin(pinId) {
       this.pins = this.pins.filter(pin => pin.id !== pinId);
       this.status.offset = Math.max(0, this.status.offset - 1);
     },
     restore(pin) {
-      if (this.isBusy(pin.id)) {
+      if (!this.beginMutation(pin.id)) {
         return;
       }
-      this.setBusy(pin.id, true);
       API.Pin.restore(pin.id).then(
         () => {
           this.removePin(pin.id);
           this.$buefy.toast.open(this.$t('trashRestoreSuccess'));
-          this.setBusy(pin.id, false);
+          this.finishMutation(pin.id);
         },
         () => {
           this.$buefy.toast.open({
             type: 'is-danger',
             message: this.$t('trashRestoreError'),
           });
-          this.setBusy(pin.id, false);
+          this.finishMutation(pin.id);
         },
       );
     },
@@ -150,22 +179,21 @@ export default {
       });
     },
     deletePermanently(pin) {
-      if (this.isBusy(pin.id)) {
+      if (!this.beginMutation(pin.id)) {
         return;
       }
-      this.setBusy(pin.id, true);
       API.Pin.deletePermanently(pin.id).then(
         () => {
           this.removePin(pin.id);
           this.$buefy.toast.open(this.$t('trashPermanentDeleteSuccess'));
-          this.setBusy(pin.id, false);
+          this.finishMutation(pin.id);
         },
         () => {
           this.$buefy.toast.open({
             type: 'is-danger',
             message: this.$t('trashPermanentDeleteError'),
           });
-          this.setBusy(pin.id, false);
+          this.finishMutation(pin.id);
         },
       );
     },
@@ -173,6 +201,12 @@ export default {
   created() {
     this.registerScrollEvent();
     this.fetchMore();
+  },
+  beforeDestroy() {
+    if (this.unbindScroll !== null) {
+      this.unbindScroll();
+      this.unbindScroll = null;
+    }
   },
 };
 </script>
