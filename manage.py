@@ -13,13 +13,17 @@ def _configure_settings_module(argv):
             break
         if argument.startswith('--settings='):
             candidate = argument.split('=', 1)[1]
-            if candidate:
-                settings_module = candidate
-        elif argument == '--settings' and index + 1 < len(arguments):
+            settings_module = candidate
+        elif argument == '--settings':
+            settings_module = None
+            if index + 1 >= len(arguments):
+                break
             candidate = arguments[index + 1]
-            if candidate and not candidate.startswith('-'):
+            if not candidate.startswith('-'):
                 settings_module = candidate
                 index += 1
+            else:
+                break
         index += 1
 
     if settings_module:

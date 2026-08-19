@@ -206,6 +206,72 @@ class ManageSettingsArgumentTests(SimpleTestCase):
         )
         self.assertNotIn("ImproperlyConfigured", completed.stdout)
 
+    def test_last_empty_settings_preserves_existing_environment(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            requested_name = os.path.join(
+                temporary_directory,
+                "empty-last-settings.sqlite3",
+            )
+            environment = os.environ.copy()
+            environment["DJANGO_SETTINGS_MODULE"] = (
+                "pinry.settings.development"
+            )
+            environment["PINRY_TEST_DB_PATH"] = requested_name
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    manage.__file__,
+                    "test",
+                    (
+                        "core.tests.test_idempotency."
+                        "IdempotencyConcurrencyTests"
+                    ),
+                    "--settings=pinry.settings.test_sqlite_file",
+                    "--settings=",
+                    "-v",
+                    "1",
+                ],
+                cwd=os.path.dirname(manage.__file__),
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                timeout=20,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("Ran 2 tests", completed.stdout)
+            self.assertIn("OK (skipped=2)", completed.stdout)
+            self.assertFalse(os.path.exists(requested_name))
+
+    def test_last_missing_settings_preserves_django_parser_error(self):
+        environment = os.environ.copy()
+        environment["DJANGO_SETTINGS_MODULE"] = "pinry.settings.development"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                manage.__file__,
+                "test",
+                "--settings=pinry.settings.does_not_exist",
+                "--settings",
+                "--verbosity=1",
+            ],
+            cwd=os.path.dirname(manage.__file__),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            timeout=20,
+        )
+
+        self.assertEqual(completed.returncode, 2, completed.stdout)
+        self.assertIn(
+            "argument --settings: expected one argument",
+            completed.stdout,
+        )
+        self.assertNotIn("ModuleNotFoundError", completed.stdout)
+        self.assertNotIn("Traceback", completed.stdout)
+
     def test_repeated_settings_subprocess_uses_last_file_database(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             requested_name = os.path.join(
