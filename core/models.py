@@ -12,6 +12,19 @@ from users.models import User
 logger = logging.getLogger(__name__)
 
 
+def _log_pin_image_cleanup_failure(image_id, error):
+    try:
+        logger.warning(
+            "pin_image_cleanup_failed",
+            extra={
+                "image_id": image_id,
+                "media_error": error.__class__.__name__,
+            },
+        )
+    except Exception:
+        pass
+
+
 class Image(BaseImage):
     class Sizes:
         standard = "standard"
@@ -123,12 +136,6 @@ def delete_unreferenced_pin_image(sender, instance, **kwargs):
                     return
                 image.delete(using=using)
         except Exception as error:
-            logger.warning(
-                "pin_image_cleanup_failed",
-                extra={
-                    "image_id": image_id,
-                    "media_error": error.__class__.__name__,
-                },
-            )
+            _log_pin_image_cleanup_failure(image_id, error)
 
     transaction.on_commit(delete_after_pin_commit, using=using)

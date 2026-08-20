@@ -138,6 +138,28 @@ class PinDeletionAPITest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertNotIn(secret, output)
         self.assertNotIn(secret, captured.records[0].getMessage())
 
+    def test_cleanup_and_logger_errors_do_not_flip_delete_success(self):
+        with mock.patch.object(
+            BaseImage,
+            "delete",
+            side_effect=RuntimeError("secret cleanup"),
+        ), mock.patch(
+            "core.models.logger.warning",
+            side_effect=RuntimeError("secret logger"),
+        ):
+            response = self.client.delete(
+                reverse("pin-detail", args=[self.pin.pk])
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Pin.objects.filter(pk=self.pin.pk).exists())
+        self.assertTrue(BaseImage.objects.filter(pk=self.image.pk).exists())
+        self.assertFalse(
+            apps.get_model(
+                "django_images", "PendingMediaDeletion"
+            ).objects.exists()
+        )
+
 
 class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
     def setUp(self):

@@ -522,6 +522,8 @@ def remove_media_file(root_directory, relative_name):
             except FileNotFoundError:
                 os.fsync(directory_descriptor)
                 return True
+            if not stat.S_ISREG(leaf_stat.st_mode):
+                raise MediaPathError("unsafe_media_file")
             leaf_descriptor = _open_regular_nofollow(
                 directory_descriptor,
                 leaf_name,
@@ -1498,6 +1500,8 @@ def _open_regular_nofollow(directory_descriptor, name):
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
         descriptor = os.open(name, flags, dir_fd=directory_descriptor)
     except OSError as error:

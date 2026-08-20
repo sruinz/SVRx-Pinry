@@ -1,13 +1,16 @@
 from io import StringIO
 import errno
+import os
 from pathlib import Path
 import tempfile
+import threading
 import uuid
+from unittest import skipUnless
 
 import mock
 from django.apps import apps
 from django.core.management import CommandError, call_command
-from django.db import connections, transaction
+from django.db import close_old_connections, connections, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.test import SimpleTestCase, TransactionTestCase
 
@@ -17,6 +20,7 @@ from django_images.file_ops import (
     media_lifecycle_lock,
     open_media_root,
     remove_empty_media_directory,
+    remove_media_file,
 )
 from django_images.models import Image, PendingMediaDeletion, Thumbnail
 from django_images.services.media_deletion import (
@@ -203,6 +207,39 @@ class EmptyMediaDirectoryRemovalTest(SimpleTestCase):
         self.assertEqual(caught.exception.errno, errno.EIO)
         self.assertFalse(self.leaf.exists())
         self._assert_kind_roots_preserved()
+
+    def test_remove_media_file_fsyncs_exact_uuid_directory(self):
+        leaf = self.leaf / "original.png"
+        leaf.parent.mkdir(parents=True)
+        leaf.write_bytes(b"original")
+        expected_identity = (
+            leaf.parent.stat().st_dev,
+            leaf.parent.stat().st_ino,
+        )
+        fsynced = []
+        real_fsync = file_ops.os.fsync
+
+        def record_fsync(descriptor):
+            file_stat = os.fstat(descriptor)
+            fsynced.append((file_stat.st_dev, file_stat.st_ino))
+            return real_fsync(descriptor)
+
+        root = open_media_root(self.temporary_media.name)
+        try:
+            with mock.patch(
+                "django_images.file_ops.os.fsync",
+                side_effect=record_fsync,
+            ):
+                removed = remove_media_file(
+                    root,
+                    "{}/original.png".format(self.relative_directory),
+                )
+        finally:
+            root.close()
+
+        self.assertTrue(removed)
+        self.assertFalse(leaf.exists())
+        self.assertEqual(fsynced, [expected_identity])
 
 
 class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
@@ -611,6 +648,116 @@ class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
 
         self.assertTrue(parent.is_dir())
         self.assertFalse(self._pending_deletions().exists())
+
+    def test_original_kind_mismatch_preserves_live_thumbnail_exact_path(self):
+        asset_uuid, name = self._canonical_name(kind="thumbnail")
+        self._write_file(name, b"live-thumbnail")
+        image = Image.objects.create(
+            image="legacy/live.png",
+            asset_uuid=asset_uuid,
+            original_filename="live.png",
+            width=32,
+            height=32,
+        )
+        thumbnail = Thumbnail.objects.create(
+            original=image,
+            image=name,
+            size="thumbnail",
+            width=32,
+            height=32,
+        )
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertTrue(processed)
+        self.assertTrue(Thumbnail.objects.filter(pk=thumbnail.pk).exists())
+        self.assertEqual(
+            Path(self.temporary_media.name, name).read_bytes(),
+            b"live-thumbnail",
+        )
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_thumbnail_kind_mismatch_preserves_live_image_exact_path(self):
+        asset_uuid, name = self._canonical_name()
+        self._write_file(name, b"live-original")
+        image = Image.objects.create(
+            image=name,
+            asset_uuid=asset_uuid,
+            original_filename="live.png",
+            width=32,
+            height=32,
+        )
+        pending = self._pending_deletions().create(
+            kind="thumbnail", name=name
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertTrue(processed)
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertEqual(
+            Path(self.temporary_media.name, name).read_bytes(),
+            b"live-original",
+        )
+        self.assertFalse(self._pending_deletions().exists())
+
+    @skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "FIFO and nonblocking open support required",
+    )
+    def test_canonical_fifo_leaf_fails_without_blocking_worker(self):
+        _asset_uuid, name = self._canonical_name()
+        leaf = Path(self.temporary_media.name, name)
+        leaf.parent.mkdir(parents=True)
+        os.mkfifo(str(leaf))
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        started = threading.Event()
+        finished = threading.Event()
+        result = {}
+        errors = []
+
+        def process_fifo():
+            close_old_connections()
+            try:
+                started.set()
+                result["processed"] = process_pending_media_deletion(
+                    pending.pk
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+                finished.set()
+
+        worker = threading.Thread(target=process_fifo)
+        worker.daemon = True
+        worker.start()
+        self.assertTrue(started.wait(1))
+        completed_without_unblock = finished.wait(1)
+        unblock_descriptor = None
+        try:
+            if not completed_without_unblock:
+                unblock_descriptor = os.open(
+                    str(leaf), os.O_RDWR | os.O_NONBLOCK
+                )
+            worker.join(2)
+        finally:
+            if unblock_descriptor is not None:
+                os.close(unblock_descriptor)
+
+        self.assertTrue(completed_without_unblock)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertFalse(result["processed"])
+        self.assertTrue(leaf.is_fifo())
+        pending.refresh_from_db()
+        self.assertEqual(pending.attempts, 1)
+        self.assertEqual(pending.last_error, "MediaPathError")
 
     def test_non_filesystem_storage_skips_local_directory_cleanup(self):
         asset_uuid, name = self._canonical_name()
@@ -1234,3 +1381,54 @@ class MediaDeletionDatabaseAliasTest(
             media_snapshot(self.temporary_media.name),
             {default.name: default_bytes},
         )
+
+    def test_other_database_canonical_exact_path_reference_is_preserved(self):
+        asset_uuid = uuid.uuid4()
+        name = "originals/{}/live.png".format(asset_uuid)
+        self._write_file(name, b"other-live")
+        pending = self._pending_deletions("other").create(
+            kind="original", name=name
+        )
+        Image.objects.using("other").create(
+            image=name,
+            asset_uuid=asset_uuid,
+            original_filename="live.png",
+            width=32,
+            height=32,
+        )
+
+        processed = process_pending_media_deletion(
+            pending.pk, using="other"
+        )
+
+        self.assertTrue(processed)
+        self.assertEqual(
+            Path(self.temporary_media.name, name).read_bytes(),
+            b"other-live",
+        )
+        self.assertFalse(self._pending_deletions("other").exists())
+
+    def test_other_database_same_uuid_owner_preserves_empty_directory(self):
+        asset_uuid = uuid.uuid4()
+        name = "originals/{}/stale.png".format(asset_uuid)
+        directory = Path(self.temporary_media.name, "originals", str(asset_uuid))
+        self._write_file(name, b"other-stale")
+        pending = self._pending_deletions("other").create(
+            kind="original", name=name
+        )
+        Image.objects.using("other").create(
+            image="legacy/current.png",
+            asset_uuid=asset_uuid,
+            original_filename="current.png",
+            width=32,
+            height=32,
+        )
+
+        processed = process_pending_media_deletion(
+            pending.pk, using="other"
+        )
+
+        self.assertTrue(processed)
+        self.assertFalse(Path(self.temporary_media.name, name).exists())
+        self.assertTrue(directory.is_dir())
+        self.assertFalse(self._pending_deletions("other").exists())

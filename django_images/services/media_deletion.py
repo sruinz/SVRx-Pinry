@@ -134,6 +134,8 @@ def _delete_canonical_media(
 
 def _process_pending(pending, using):
     _validate_storage_name(pending.name)
+    if _media_path_is_referenced(pending.name, using):
+        return
     storage = _storage_for_kind(pending.kind)
     canonical = _canonical_asset_directory(pending.kind, pending.name)
     media_root = _filesystem_media_root(storage)
