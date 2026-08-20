@@ -53,6 +53,20 @@ class Image(BaseImage):
         )
 
 
+class MediaAsset(models.Model):
+    submitter = models.ForeignKey(User, on_delete=models.CASCADE)
+    image = models.OneToOneField(
+        BaseImage,
+        related_name="media_asset",
+        on_delete=models.CASCADE,
+    )
+    content_sha256 = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = (("submitter", "content_sha256"),)
+
+
 class Board(models.Model):
     class Meta:
         unique_together = ("submitter", "name")

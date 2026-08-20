@@ -1,5 +1,6 @@
 import errno
 import fcntl
+import multiprocessing
 import os
 from pathlib import Path
 import tempfile
@@ -9,6 +10,25 @@ from django.test import SimpleTestCase
 import mock
 
 from django_images import file_ops
+
+
+def _acquire_dedup_lock_in_process(
+    media_root, submitter_id, content_sha256, entered, release, errors
+):
+    root_directory = file_ops.open_media_root(media_root)
+    try:
+        with file_ops.media_dedup_lock(
+            root_directory,
+            submitter_id,
+            content_sha256,
+            deadline=file_ops.time.monotonic() + 5,
+        ):
+            entered.set()
+            release.wait(5)
+    except BaseException as error:
+        errors.put((error.__class__.__name__, str(error)))
+    finally:
+        root_directory.close()
 
 
 class _Clock(object):
@@ -615,3 +635,313 @@ class MediaLifecycleLockTests(SimpleTestCase):
                     raise primary
 
         self.assertIs(caught.exception, primary)
+
+
+class MediaDedupLockTests(SimpleTestCase):
+    CONTENT_HASH = "0" * 64
+    OTHER_CONTENT_HASH = "1" * 64
+
+    def setUp(self):
+        self.temporary_root = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_root.cleanup)
+        self.root_path = Path(self.temporary_root.name)
+        self.root_directory = file_ops.open_media_root(
+            self.temporary_root.name
+        )
+        self.addCleanup(self.root_directory.close)
+
+    @property
+    def lock_directory_path(self):
+        return self.root_path / ".pinry-locks"
+
+    @property
+    def lock_path(self):
+        return self.lock_directory_path / "media-dedup-7c.lock"
+
+    def _assert_lock_error(self, expected_code, callable_):
+        with self.assertRaises(file_ops.MediaLifecycleLockError) as caught:
+            callable_()
+        self.assertEqual(caught.exception.code, expected_code)
+        return caught.exception
+
+    def _create_lock_file(self):
+        self.lock_directory_path.mkdir(mode=0o700, exist_ok=True)
+        self.lock_path.touch(mode=0o600)
+        os.chmod(str(self.lock_path), 0o600)
+
+    def test_known_key_uses_descriptor_anchored_fixed_stripe_name(self):
+        with file_ops.media_dedup_lock(
+            self.root_directory,
+            1,
+            self.CONTENT_HASH,
+            deadline=file_ops.time.monotonic() + 1,
+        ):
+            self.assertTrue(self.lock_path.is_file())
+
+    def test_generalized_lock_rejects_names_outside_fixed_set(self):
+        escaped_path = self.root_path / "escaped.lock"
+        lifecycle_lock = file_ops.MediaLifecycleLock(
+            self.root_directory,
+            exclusive=True,
+            lock_filename="../escaped.lock",
+        )
+
+        self._assert_lock_error(
+            "media_lifecycle_lock_failed",
+            lifecycle_lock.__enter__,
+        )
+        self.assertFalse(escaped_path.exists())
+
+    def test_all_created_names_are_the_fixed_256_stripe_set(self):
+        for submitter_id in range(1, 3001):
+            with file_ops.media_dedup_lock(
+                self.root_directory,
+                submitter_id,
+                self.CONTENT_HASH,
+                deadline=file_ops.time.monotonic() + 2,
+            ):
+                pass
+
+        expected = {
+            "media-dedup-{:02x}.lock".format(index)
+            for index in range(256)
+        }
+        actual = {
+            path.name for path in self.lock_directory_path.iterdir()
+        }
+        self.assertEqual(actual, expected)
+
+    def test_same_key_serializes_threads(self):
+        entered = threading.Event()
+        errors = []
+
+        def acquire_same_key():
+            try:
+                with file_ops.media_dedup_lock(
+                    self.root_directory,
+                    1,
+                    self.CONTENT_HASH,
+                    deadline=file_ops.time.monotonic() + 2,
+                ):
+                    entered.set()
+            except BaseException as error:
+                errors.append(error)
+
+        with file_ops.media_dedup_lock(
+            self.root_directory,
+            1,
+            self.CONTENT_HASH,
+            deadline=file_ops.time.monotonic() + 2,
+        ):
+            thread = threading.Thread(target=acquire_same_key)
+            thread.start()
+            self.assertFalse(entered.wait(0.05))
+
+        self.assertTrue(entered.wait(1))
+        thread.join(1)
+        self.assertEqual(errors, [])
+        self.assertFalse(thread.is_alive())
+
+    def test_same_key_serializes_processes(self):
+        context = multiprocessing.get_context("fork")
+        entered = context.Event()
+        release = context.Event()
+        errors = context.Queue()
+
+        with file_ops.media_dedup_lock(
+            self.root_directory,
+            1,
+            self.CONTENT_HASH,
+            deadline=file_ops.time.monotonic() + 5,
+        ):
+            process = context.Process(
+                target=_acquire_dedup_lock_in_process,
+                args=(
+                    self.temporary_root.name,
+                    1,
+                    self.CONTENT_HASH,
+                    entered,
+                    release,
+                    errors,
+                ),
+            )
+            process.start()
+            self.assertFalse(entered.wait(0.1))
+
+        self.assertTrue(entered.wait(2))
+        release.set()
+        process.join(2)
+        self.assertFalse(process.is_alive())
+        self.assertEqual(process.exitcode, 0)
+        self.assertTrue(errors.empty())
+
+    def test_different_stripes_enter_concurrently(self):
+        entered = threading.Event()
+        errors = []
+
+        def acquire_other_stripe():
+            try:
+                with file_ops.media_dedup_lock(
+                    self.root_directory,
+                    1,
+                    self.OTHER_CONTENT_HASH,
+                    deadline=file_ops.time.monotonic() + 1,
+                ):
+                    entered.set()
+            except BaseException as error:
+                errors.append(error)
+
+        with file_ops.media_dedup_lock(
+            self.root_directory,
+            1,
+            self.CONTENT_HASH,
+            deadline=file_ops.time.monotonic() + 1,
+        ):
+            thread = threading.Thread(target=acquire_other_stripe)
+            thread.start()
+            self.assertTrue(entered.wait(0.5))
+
+        thread.join(1)
+        self.assertEqual(errors, [])
+
+    def test_rejects_invalid_submitter_and_hash_without_creating_files(self):
+        invalid_values = (
+            (0, self.CONTENT_HASH),
+            (-1, self.CONTENT_HASH),
+            (True, self.CONTENT_HASH),
+            ("1", self.CONTENT_HASH),
+            (1, "a" * 63),
+            (1, "A" * 64),
+            (1, "g" * 64),
+            (1, b"a" * 64),
+        )
+        for submitter_id, content_sha256 in invalid_values:
+            with self.subTest(
+                submitter_id=submitter_id,
+                content_sha256=content_sha256,
+            ):
+                error = self._assert_lock_error(
+                    "media_lifecycle_lock_failed",
+                    lambda: file_ops.media_dedup_lock(
+                        self.root_directory,
+                        submitter_id,
+                        content_sha256,
+                    ),
+                )
+                self.assertFalse(error.retryable)
+        self.assertFalse(self.lock_directory_path.exists())
+
+    def test_exact_deadline_is_retryable_and_creates_no_lock_path(self):
+        error = self._assert_lock_error(
+            "media_lifecycle_busy",
+            lambda: file_ops.media_dedup_lock(
+                self.root_directory,
+                1,
+                self.CONTENT_HASH,
+                deadline=10.0,
+                clock=lambda: 10.0,
+            ).__enter__(),
+        )
+        self.assertTrue(error.retryable)
+        self.assertFalse(self.lock_directory_path.exists())
+
+    def test_unbounded_contention_fails_fast_with_retryable_busy_code(self):
+        self._create_lock_file()
+        blocker = os.open(str(self.lock_path), os.O_RDWR)
+        try:
+            fcntl.flock(blocker, fcntl.LOCK_EX)
+            error = self._assert_lock_error(
+                "media_lifecycle_busy",
+                lambda: file_ops.media_dedup_lock(
+                    self.root_directory,
+                    1,
+                    self.CONTENT_HASH,
+                ).__enter__(),
+            )
+        finally:
+            fcntl.flock(blocker, fcntl.LOCK_UN)
+            os.close(blocker)
+
+        self.assertTrue(error.retryable)
+
+    def test_unsafe_lock_entries_fail_closed_and_are_nonretryable(self):
+        outside = self.root_path.with_name(self.root_path.name + "-outside")
+        outside.write_bytes(b"outside")
+        self.addCleanup(lambda: outside.exists() and outside.unlink())
+
+        for case in ("symlink", "fifo", "hardlink", "mode"):
+            with self.subTest(case=case):
+                if self.lock_directory_path.exists():
+                    for child in self.lock_directory_path.iterdir():
+                        child.unlink()
+                    self.lock_directory_path.rmdir()
+                self.lock_directory_path.mkdir(mode=0o700)
+                if case == "symlink":
+                    self.lock_path.symlink_to(outside)
+                elif case == "fifo":
+                    os.mkfifo(str(self.lock_path), 0o600)
+                else:
+                    self._create_lock_file()
+                    if case == "hardlink":
+                        os.link(
+                            str(self.lock_path),
+                            str(self.lock_directory_path / "second-link"),
+                        )
+                    else:
+                        os.chmod(str(self.lock_path), 0o640)
+
+                error = self._assert_lock_error(
+                    "media_lifecycle_lock_failed",
+                    lambda: file_ops.media_dedup_lock(
+                        self.root_directory,
+                        1,
+                        self.CONTENT_HASH,
+                        deadline=file_ops.time.monotonic() + 1,
+                    ).__enter__(),
+                )
+                self.assertFalse(error.retryable)
+                self.assertEqual(outside.read_bytes(), b"outside")
+
+    def test_postflock_error_closes_all_open_descriptors(self):
+        opened_descriptors = []
+        original_open = file_ops._open_media_lifecycle_lock
+
+        def capture_descriptors(root_directory, lock_filename):
+            descriptors = original_open(root_directory, lock_filename)
+            opened_descriptors.extend(descriptors)
+            return descriptors
+
+        dedup_lock = file_ops.media_dedup_lock(
+            self.root_directory,
+            1,
+            self.CONTENT_HASH,
+            deadline=file_ops.time.monotonic() + 1,
+        )
+        with mock.patch(
+            "django_images.file_ops._open_media_lifecycle_lock",
+            side_effect=capture_descriptors,
+        ), mock.patch(
+            "django_images.file_ops._verify_held_media_lifecycle_lock",
+            side_effect=file_ops.MediaPathError("postverify-primary"),
+        ):
+            with self.assertRaisesRegex(
+                file_ops.MediaPathError, "postverify-primary"
+            ):
+                dedup_lock.__enter__()
+
+        self.assertEqual(len(opened_descriptors), 2)
+        for descriptor in opened_descriptors:
+            with self.assertRaises(OSError) as caught:
+                os.fstat(descriptor)
+            self.assertEqual(caught.exception.errno, errno.EBADF)
+
+    def test_raw_root_descriptor_is_unsupported_and_nonretryable(self):
+        error = self._assert_lock_error(
+            "media_lifecycle_lock_unsupported",
+            lambda: file_ops.media_dedup_lock(
+                self.root_directory.descriptor,
+                1,
+                self.CONTENT_HASH,
+            ).__enter__(),
+        )
+        self.assertFalse(error.retryable)

@@ -56,22 +56,31 @@ class MediaLifecycleLock(object):
         deadline=None,
         clock=None,
         sleeper=None,
+        lock_filename="media-lifecycle.lock",
     ):
         self.root_directory = root_directory
         self.exclusive = exclusive
         self.deadline = deadline
         self.clock = time.monotonic if clock is None else clock
         self.sleeper = time.sleep if sleeper is None else sleeper
+        self.lock_filename = lock_filename
         self._directory_descriptor = None
         self._lock_descriptor = None
         self._held = False
 
     def __enter__(self):
         try:
+            lock_filename = self.lock_filename
+            _require_lifecycle_lock_filename(lock_filename)
             self._check_deadline()
-            self._directory_descriptor, self._lock_descriptor = (
-                _open_media_lifecycle_lock(self.root_directory)
-            )
+            if lock_filename == "media-lifecycle.lock":
+                opened = _open_media_lifecycle_lock(self.root_directory)
+            else:
+                opened = _open_media_lifecycle_lock(
+                    self.root_directory,
+                    lock_filename,
+                )
+            self._directory_descriptor, self._lock_descriptor = opened
             operation = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
             while True:
                 self._check_deadline()
@@ -101,11 +110,19 @@ class MediaLifecycleLock(object):
                     continue
                 self._held = True
                 self._check_deadline()
-                _verify_held_media_lifecycle_lock(
-                    self.root_directory,
-                    self._directory_descriptor,
-                    self._lock_descriptor,
-                )
+                if lock_filename == "media-lifecycle.lock":
+                    _verify_held_media_lifecycle_lock(
+                        self.root_directory,
+                        self._directory_descriptor,
+                        self._lock_descriptor,
+                    )
+                else:
+                    _verify_held_media_lifecycle_lock(
+                        self.root_directory,
+                        self._directory_descriptor,
+                        self._lock_descriptor,
+                        lock_filename,
+                    )
                 self._check_deadline()
                 return self
         except BaseException:
@@ -176,6 +193,38 @@ def media_lifecycle_lock(
         deadline=deadline,
         clock=clock,
         sleeper=sleeper,
+    )
+
+
+def media_dedup_lock(
+    root_directory,
+    submitter_id,
+    content_sha256,
+    deadline=None,
+    clock=None,
+    sleeper=None,
+):
+    if (
+        type(submitter_id) is not int
+        or submitter_id <= 0
+        or not isinstance(content_sha256, str)
+        or len(content_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in content_sha256
+        )
+    ):
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+    key = "{}:{}".format(submitter_id, content_sha256).encode("ascii")
+    stripe = hashlib.sha256(key).digest()[0]
+    lock_filename = "media-dedup-{:02x}.lock".format(stripe)
+    return MediaLifecycleLock(
+        root_directory,
+        exclusive=True,
+        deadline=deadline,
+        clock=clock,
+        sleeper=sleeper,
+        lock_filename=lock_filename,
     )
 
 
@@ -642,6 +691,26 @@ def _lifecycle_lock_error(code, retryable=False):
     return MediaLifecycleLockError(code, retryable=retryable)
 
 
+def _require_lifecycle_lock_filename(lock_filename):
+    dedup_prefix = "media-dedup-"
+    dedup_suffix = ".lock"
+    if lock_filename == "media-lifecycle.lock":
+        return
+    if not isinstance(lock_filename, str):
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+    if not (
+        lock_filename.startswith(dedup_prefix)
+        and lock_filename.endswith(dedup_suffix)
+    ):
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+    stripe = lock_filename[len(dedup_prefix):-len(dedup_suffix)]
+    if (
+        len(stripe) != 2
+        or any(character not in "0123456789abcdef" for character in stripe)
+    ):
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+
+
 def _require_lifecycle_lock_support():
     required_flags = (
         getattr(os, "O_DIRECTORY", None),
@@ -661,7 +730,9 @@ def _require_lifecycle_lock_support():
         raise _lifecycle_lock_error("media_lifecycle_lock_unsupported")
 
 
-def _open_media_lifecycle_lock(root_directory):  # noqa: C901
+def _open_media_lifecycle_lock(  # noqa: C901
+    root_directory, lock_filename="media-lifecycle.lock"
+):
     _require_lifecycle_lock_support()
     if not isinstance(root_directory, MediaDirectory):
         raise _lifecycle_lock_error("media_lifecycle_lock_unsupported")
@@ -710,10 +781,13 @@ def _open_media_lifecycle_lock(root_directory):  # noqa: C901
             raise _lifecycle_lock_error("media_lifecycle_lock_failed")
         _verify_lifecycle_lock_directory(opened_directory_stat)
 
-        lock_descriptor = _open_lifecycle_lock_file(directory_descriptor)
+        lock_descriptor = _open_lifecycle_lock_file(
+            directory_descriptor,
+            lock_filename,
+        )
         opened_lock_stat = os.fstat(lock_descriptor)
         named_lock_stat = os.stat(
-            "media-lifecycle.lock",
+            lock_filename,
             dir_fd=directory_descriptor,
             follow_symlinks=False,
         )
@@ -739,20 +813,22 @@ def _open_media_lifecycle_lock(root_directory):  # noqa: C901
         raise _lifecycle_lock_error("media_lifecycle_lock_failed") from error
 
 
-def _open_lifecycle_lock_file(directory_descriptor):
+def _open_lifecycle_lock_file(
+    directory_descriptor, lock_filename="media-lifecycle.lock"
+):
     existing_flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
     create_flags = existing_flags | os.O_CREAT | os.O_EXCL
     for _attempt in range(3):
         try:
             return os.open(
-                "media-lifecycle.lock",
+                lock_filename,
                 existing_flags,
                 dir_fd=directory_descriptor,
             )
         except FileNotFoundError:
             try:
                 return os.open(
-                    "media-lifecycle.lock",
+                    lock_filename,
                     create_flags,
                     0o600,
                     dir_fd=directory_descriptor,
@@ -782,7 +858,10 @@ def _verify_lifecycle_lock_file(file_stat):
 
 
 def _verify_held_media_lifecycle_lock(
-    root_directory, directory_descriptor, lock_descriptor
+    root_directory,
+    directory_descriptor,
+    lock_descriptor,
+    lock_filename="media-lifecycle.lock",
 ):
     try:
         root_directory.verify_current()
@@ -794,7 +873,7 @@ def _verify_held_media_lifecycle_lock(
             follow_symlinks=False,
         )
         named_lock = os.stat(
-            "media-lifecycle.lock",
+            lock_filename,
             dir_fd=directory_descriptor,
             follow_symlinks=False,
         )
