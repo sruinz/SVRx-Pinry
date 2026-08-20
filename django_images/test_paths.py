@@ -159,6 +159,16 @@ class CanonicalOriginalPathTest(SimpleTestCase):
             unicodedata.normalize("NFD", "사진.png"),
         ))
 
+    def test_leaf_validator_accepts_nfd_form_of_max_length_nfc_leaf(self):
+        nfc_leaf = ("가" * 83) + "ab.png"
+        nfd_leaf = unicodedata.normalize("NFD", nfc_leaf)
+
+        self.assertEqual(len(nfc_leaf.encode("utf-8")), 255)
+        self.assertGreater(len(nfd_leaf.encode("utf-8")), 255)
+        self.assertTrue(
+            is_valid_original_leaf(self.asset_uuid, nfd_leaf)
+        )
+
 
 class AssetStoragePathTest(TemporaryMediaMixin, TransactionTestCase):
     def setUp(self):

@@ -131,7 +131,7 @@ def is_valid_original_leaf(asset_uuid, leaf):
     )
     return (
         len(relative_path) <= _IMAGE_FIELD_MAX_LENGTH
-        and len(leaf.encode("utf-8")) <= _LEAF_MAX_BYTES
+        and len(normalized_leaf.encode("utf-8")) <= _LEAF_MAX_BYTES
     )
 
 
