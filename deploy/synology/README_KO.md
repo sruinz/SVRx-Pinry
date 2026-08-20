@@ -55,7 +55,7 @@ chmod +x build-image.sh
 
 ## 이미지 빌드
 
-기본 이미지 이름은 `BUILD_INFO`에 기록된 `pinry-custom:<커밋>`이다.
+기본 이미지 이름은 `BUILD_INFO`에 기록된 `pinry-custom:latest`이다.
 
 ```sh
 ./build-image.sh
@@ -67,7 +67,9 @@ chmod +x build-image.sh
 ./build-image.sh registry.local/pinry-custom:nas
 ```
 
-사용자 지정 태그로 빌드했다면 아래 환경설정 단계에서 `.env`의 `PINRY_IMAGE`도 같은 값으로 변경한다.
+기본 태그를 사용하면 `.env`는 처음 한 번만 `pinry-custom:latest`로 설정하고 이후 빌드에서는 교체하지 않는다. 기존 `.env`가 `pinry-custom:<커밋>`을 가리키고 있다면 이번 한 번만 `pinry-custom:latest`로 변경한다.
+
+사용자 지정 태그로 빌드한 경우에만 아래 환경설정 단계에서 `.env`의 `PINRY_IMAGE`도 같은 값으로 변경한다.
 
 Docker 소켓 권한이 없는 환경에서는 다음과 같이 실행한다.
 
@@ -91,7 +93,7 @@ cp .env.example .env
 
 기본값은 다음과 같다.
 
-- 이미지: 이번 산출물의 커밋 태그
+- 이미지: `pinry-custom:latest`
 - 컨테이너 이름: `pinry-custom`
 - 접속 포트: `2048`
 - 데이터 경로: `/volume1/docker/pinry-custom/data`
@@ -114,10 +116,16 @@ DSM Container Manager의 Compose 플러그인을 사용하는 경우 다음 명�
 docker compose --env-file .env up -d
 ```
 
+같은 `latest` 태그로 이미지를 다시 빌드한 뒤에는 새 이미지로 컨테이너를 확실히 교체한다.
+
+```sh
+docker compose --env-file .env up -d --force-recreate
+```
+
 구형 DSM에서 명령이 없으면 다음 형식을 사용한다.
 
 ```sh
-docker-compose --env-file .env up -d
+docker-compose --env-file .env up -d --force-recreate
 ```
 
 상태와 로그는 다음 명령으로 확인한다.

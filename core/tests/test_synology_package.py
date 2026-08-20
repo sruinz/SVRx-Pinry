@@ -159,9 +159,7 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertEqual(
             (self.package_directory / "BUILD_INFO").read_text(),
             "source_commit={}\n"
-            "default_image=pinry-custom:{}\n".format(
-                self.full_sha, self.short_sha
-            ),
+            "default_image=pinry-custom:latest\n".format(self.full_sha),
         )
         self.assertFalse((self.package_directory / ".env").exists())
         self.assertEqual(
@@ -169,7 +167,7 @@ class SynologyPackageTests(unittest.TestCase):
                 (self.package_directory / ".env.example").read_text()
             ),
             {
-                "PINRY_IMAGE": "pinry-custom:{}".format(self.short_sha),
+                "PINRY_IMAGE": "pinry-custom:latest",
                 "PINRY_CONTAINER_NAME": "pinry-custom",
                 "PINRY_HTTP_PORT": "2048",
                 "PINRY_DATA_PATH": "/volume1/docker/pinry-custom/data",
@@ -344,7 +342,7 @@ class SynologyPackageTests(unittest.TestCase):
                 "--file",
                 "Dockerfile.autobuild",
                 "--tag",
-                "pinry-custom:{}".format(self.short_sha),
+                "pinry-custom:latest",
                 ".",
             ],
         )
