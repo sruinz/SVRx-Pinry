@@ -24,7 +24,11 @@ from django_images.file_ops import (
     sha256_file_descriptor,
 )
 from django_images.models import Image, Thumbnail
-from django_images.paths import DERIVATIVE_NAMES, FORMAT_EXTENSIONS
+from django_images.paths import (
+    DERIVATIVE_NAMES,
+    FORMAT_EXTENSIONS,
+    is_valid_original_leaf,
+)
 from django_images.services.media_migration import MigrationPlan, _current_paths
 
 
@@ -430,16 +434,20 @@ def _scan_final_files(root_name, asset_uuid, directory_descriptor):
         if not stat.S_ISREG(entry_stat.st_mode):
             raise CommandError("unsafe_orphan_entry")
         stem, extension = os.path.splitext(entry_name)
-        valid_slot = (
-            stem == "original"
-            if root_name == "originals"
-            else stem in DERIVATIVE_NAMES
-        )
-        if not valid_slot or extension not in _FINAL_EXTENSIONS:
+        if root_name == "originals":
+            if not is_valid_original_leaf(asset_uuid, entry_name):
+                raise CommandError("unsafe_orphan_entry")
+            slot = "original"
+        else:
+            if (
+                stem not in DERIVATIVE_NAMES
+                or extension not in _FINAL_EXTENSIONS
+            ):
+                raise CommandError("unsafe_orphan_entry")
+            slot = stem
+        if slot in slots:
             raise CommandError("unsafe_orphan_entry")
-        if stem in slots:
-            raise CommandError("unsafe_orphan_entry")
-        slots.add(stem)
+        slots.add(slot)
         files.append(_FileCandidate(
             "{}/{}/{}".format(root_name, asset_uuid, entry_name),
             entry_stat,

@@ -1158,6 +1158,17 @@ class OrphanMediaCleanupClosureContractTests(
         timestamp = time.time() - timedelta(hours=25).total_seconds()
         os.utime(path, (timestamp, timestamp))
 
+    def _write_named_original(self, asset_uuid, leaf):
+        directory = Path(
+            self.temporary_media.name, "originals", str(asset_uuid)
+        )
+        directory.mkdir(parents=True)
+        path = directory / leaf
+        path.write_bytes(b"original")
+        self._set_old(path)
+        self._set_old(directory)
+        return directory, path
+
     def _write_nested_subset(self, run_uuid, asset_uuid, count):
         asset_directory = Path(
             self.temporary_media.name,
@@ -1256,6 +1267,22 @@ class OrphanMediaCleanupClosureContractTests(
             if derivatives is not None:
                 self.assertFalse(derivatives.exists())
 
+    def test_legacy_and_named_original_closures_both_converge(self):
+        legacy_directory, legacy_file = self._write_named_original(
+            uuid.UUID(int=601), "original.png"
+        )
+        named_directory, named_file = self._write_named_original(
+            uuid.UUID(int=602), "여행 사진.png"
+        )
+
+        summary = media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertEqual(summary.deleted, 4)
+        self.assertFalse(legacy_file.exists())
+        self.assertFalse(named_file.exists())
+        self.assertFalse(legacy_directory.exists())
+        self.assertFalse(named_directory.exists())
+
     def test_old_empty_run_left_before_asset_creation_converges(self):
         run_directory = Path(
             self.temporary_media.name,
@@ -1271,7 +1298,7 @@ class OrphanMediaCleanupClosureContractTests(
         self.assertFalse(run_directory.exists())
 
     def test_final_unknown_deep_and_duplicate_slots_abort_before_deletion(self):
-        cases = ("unknown", "deep", "duplicate")
+        cases = ("unknown", "deep", "duplicate", "reserved", "uppercase")
         for index, case in enumerate(cases):
             with self.subTest(case=case):
                 temporary_media = tempfile.TemporaryDirectory()
@@ -1292,6 +1319,10 @@ class OrphanMediaCleanupClosureContractTests(
                     invalid_paths = [directory / "token=secret.bin"]
                 elif case == "deep":
                     invalid_paths = [directory / "nested" / "original.png"]
+                elif case == "reserved":
+                    invalid_paths = [directory / "CON.png"]
+                elif case == "uppercase":
+                    invalid_paths = [directory / "photo.PNG"]
                 else:
                     invalid_paths = [
                         directory / "original.png",
@@ -1318,6 +1349,21 @@ class OrphanMediaCleanupClosureContractTests(
                 self.assertTrue(staging.exists())
                 for invalid in invalid_paths:
                     self.assertTrue(invalid.exists())
+
+    def test_two_original_leaves_abort_before_any_deletion(self):
+        asset_uuid = uuid.UUID(int=603)
+        directory, legacy = self._write_named_original(
+            asset_uuid, "original.png"
+        )
+        named = directory / "photo.png"
+        named.write_bytes(b"second")
+        self._set_old(named)
+
+        with self.assertRaisesRegex(CommandError, "unsafe_orphan_entry"):
+            media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertTrue(legacy.exists())
+        self.assertTrue(named.exists())
 
     def test_missing_staging_slot_database_reference_protects_present_subset(self):
         run_uuid = uuid.UUID("22222222-2222-4222-8222-222222222222")
