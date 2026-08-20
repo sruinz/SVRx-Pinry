@@ -116,10 +116,27 @@ _URL_CLIENT_ERROR_CODES = frozenset((
     "image_too_large",
     "image_too_many_pixels",
 ))
+_URL_RETRYABLE_ERROR_CODES = frozenset((
+    "image_fetch_timeout",
+    "image_download_failed",
+    "image_processing_timeout",
+    "media_storage_failed",
+))
+_URL_INTERNAL_ERROR_CODES = frozenset((
+    "internal_error",
+    "unsupported_http_stack",
+    "media_path_conflict",
+    "image_processing_failed",
+    "media_configuration_error",
+    "media_publish_changed",
+    "media_storage_unsupported",
+))
 
 
 def raise_url_import_error(error):
     code = getattr(error, "code", "internal_error")
+    if type(code) is not str:
+        raise URLImportInternalError({"url": ["internal_error"]})
     detail = {"url": [code]}
     if code == "invalid_image_content":
         raise ValidationError({"url": "invalid image content"})
@@ -129,9 +146,11 @@ def raise_url_import_error(error):
         raise ValidationError(detail)
     if code in ("lease_lost", "board_access_changed"):
         raise URLImportConflict(detail)
-    if getattr(error, "retryable", False):
+    if code in _URL_RETRYABLE_ERROR_CODES:
         raise URLImportUnavailable(detail)
-    raise URLImportInternalError(detail)
+    if code in _URL_INTERNAL_ERROR_CODES:
+        raise URLImportInternalError(detail)
+    raise URLImportInternalError({"url": ["internal_error"]})
 
 
 class PinSerializer(serializers.HyperlinkedModelSerializer):

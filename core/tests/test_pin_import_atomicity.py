@@ -1597,6 +1597,45 @@ class PinImportRealVerticalTests(
         self.assertEqual(Image.objects.count(), 0)
         self.assertEqual(_file_snapshot(self.temporary_media.name), {})
 
+    def test_single_prepare_timeout_retries_actual_retained_descriptor(self):
+        prepared_assets = []
+        real_prepare = self.storage.prepare
+
+        def capture_prepared(*args, **kwargs):
+            prepared = real_prepare(*args, **kwargs)
+            prepared_assets.append(prepared)
+            return prepared
+
+        service = PinImportService(
+            fetcher=self.fetcher,
+            media_storage=self.storage,
+            idempotency=self.idempotency,
+            clock=lambda: 20.0,
+        )
+        with mock.patch.object(
+            self.storage,
+            "prepare",
+            side_effect=capture_prepared,
+        ), mock.patch.object(
+            self.storage,
+            "publish",
+            wraps=self.storage.publish,
+        ) as publish, self._fail_first_descriptor_close():
+            with self.assertRaises(PinImportError) as caught:
+                service.prepare_url(
+                    self.metadata.url,
+                    self.metadata.referer,
+                    deadline=20.0,
+                )
+
+        self.assertEqual(caught.exception.code, "image_processing_timeout")
+        self.assertEqual(len(prepared_assets), 1)
+        self.assertFalse(prepared_assets[0].is_open)
+        self.assertEqual(publish.call_count, 0)
+        self.assertEqual(Pin.objects.count(), 0)
+        self.assertEqual(Image.objects.count(), 0)
+        self.assertEqual(_file_snapshot(self.temporary_media.name), {})
+
     def test_prepublish_cleanup_retries_one_retained_descriptor(self):
         prepared = self.service.prepare_url(
             self.metadata.url,

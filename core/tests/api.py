@@ -2,6 +2,7 @@ from django.urls import resolve, reverse
 from django.db import connection
 import mock
 from rest_framework import serializers as drf_serializers, status
+from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.test import APITestCase, APITransactionTestCase
 
 from taggit.managers import _TaggableManager
@@ -10,7 +11,8 @@ from taggit.models import Tag
 from .helpers import create_image, create_user, create_pin
 from core.models import Pin, Image, Board
 from core.serializers import PinSerializer
-from core.services.pin_import import PinImportService
+from core.services.media_storage import MediaStorageError
+from core.services.pin_import import PinImportError, PinImportService
 from core.services.safe_url_fetch import FetchedImage, SafeFetchError
 from core.views import PinViewSet
 from django_images.test_helpers import TemporaryMediaMixin
@@ -500,6 +502,16 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
                 {"url": ["internal_error"]},
             ),
+            (
+                ValidationError({"url": [secret]}),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                {"url": ["internal_error"]},
+            ),
+            (
+                APIException({"url": [secret]}),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                {"url": ["internal_error"]},
+            ),
         )
         for factory_error, expected_status, expected_body in cases:
             with self.subTest(factory_error=type(factory_error).__name__):
@@ -540,6 +552,48 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
         self.assertNotIn(secret, response.content.decode("utf-8"))
         factory.assert_not_called()
 
+        with mock.patch.object(
+            PinViewSet,
+            "batch_clock",
+            side_effect=ValidationError({"url": [secret]}),
+        ), mock.patch.object(
+            PinViewSet,
+            "get_pin_import_service",
+            factory,
+        ):
+            response = self.client.post(
+                reverse("pin-list"),
+                {"url": "https://example.com/image.png"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(response.json(), {"url": ["internal_error"]})
+        self.assertNotIn(secret, response.content.decode("utf-8"))
+        factory.assert_not_called()
+
+    def test_url_post_factory_base_exception_reraises_without_service(self):
+        for error_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(error_type=error_type.__name__):
+                factory = mock.Mock()
+                with mock.patch.object(
+                    PinViewSet,
+                    "batch_clock",
+                    side_effect=error_type(),
+                ), mock.patch.object(
+                    PinViewSet,
+                    "get_pin_import_service",
+                    factory,
+                ):
+                    with self.assertRaises(error_type):
+                        self.client.post(
+                            reverse("pin-list"),
+                            {"url": "https://example.com/image.png"},
+                            format="json",
+                        )
+
+                factory.assert_not_called()
+
     def test_url_post_closes_after_response_failure_and_close_error(self):
         service = _SinglePinImport()
         with mock.patch.object(
@@ -577,6 +631,61 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         close.assert_called_once_with()
+
+    def test_url_post_response_api_exception_is_internal_after_commit(self):
+        secret = "/private/response?token=do-not-leak"
+        service = _SinglePinImport()
+        with mock.patch.object(
+            PinViewSet,
+            "get_pin_import_service",
+            return_value=service,
+        ), mock.patch.object(
+            PinSerializer,
+            "to_representation",
+            side_effect=ValidationError({"url": [secret]}),
+        ):
+            response = self.client.post(
+                reverse("pin-list"),
+                {"url": "https://example.com/image.png"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(response.json(), {"url": ["internal_error"]})
+        self.assertNotIn(secret, response.content.decode("utf-8"))
+        self.assertEqual(service.closed, 1)
+        self.assertEqual(Pin.objects.count(), 1)
+
+    def test_url_post_unknown_typed_error_codes_are_internal(self):
+        secret_code = "/private/code?token=do-not-leak"
+        cases = (
+            SafeFetchError(secret_code, "raw", False),
+            MediaStorageError(secret_code, "raw", True),
+            PinImportError(secret_code, "raw", False),
+            SafeFetchError(123, "raw", False),
+            MediaStorageError(123, "raw", True),
+            PinImportError(123, "raw", False),
+        )
+        for error in cases:
+            with self.subTest(error_type=type(error).__name__, code=error.code):
+                service = _SinglePinImport(error)
+                with mock.patch.object(
+                    PinViewSet,
+                    "get_pin_import_service",
+                    return_value=service,
+                ):
+                    response = self.client.post(
+                        reverse("pin-list"),
+                        {"url": "https://example.com/image.png"},
+                        format="json",
+                    )
+
+                self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+                self.assertEqual(response.json(), {
+                    "url": ["internal_error"]
+                })
+                self.assertNotIn(secret_code, response.content.decode("utf-8"))
+                self.assertEqual(service.closed, 1)
 
     def test_url_post_closes_then_reraises_base_exception(self):
         for error_type in (KeyboardInterrupt, SystemExit):

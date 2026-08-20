@@ -278,6 +278,34 @@ class PinnedHTTPTransportTests(SimpleTestCase):
         self.assertIs(caught.exception, primary)
         session.close.assert_called_once_with()
 
+    def test_constructor_keyboard_interrupt_closes_session_and_reraises(self):
+        primary = KeyboardInterrupt()
+        session = TrustEnvFailingSession(primary)
+
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            PinnedHTTPTransport(
+                session_factory=lambda: session,
+                adapter_factory=mock.Mock(),
+            )
+
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(session.close_calls, 1)
+
+    def test_constructor_close_base_exception_does_not_mask_primary(self):
+        primary = KeyboardInterrupt()
+        session = mock.Mock()
+        session.mount.side_effect = [None, primary]
+        session.close.side_effect = SystemExit()
+
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            PinnedHTTPTransport(
+                session_factory=lambda: session,
+                adapter_factory=mock.Mock(return_value=object()),
+            )
+
+        self.assertIs(caught.exception, primary)
+        session.close.assert_called_once_with()
+
     def test_pool_uses_validated_ip_and_original_tls_identity(self):
         adapter = PinnedHTTPAdapter()
         target = make_target(ip_address="203.0.113.10", port=8443)

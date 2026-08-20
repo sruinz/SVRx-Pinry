@@ -11,7 +11,7 @@ from django.views.decorators.cache import cache_page
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets, mixins, routers, status
 from rest_framework.decorators import action
-from rest_framework.exceptions import APIException, ParseError, PermissionDenied
+from rest_framework.exceptions import ParseError, PermissionDenied
 from rest_framework.exceptions import ValidationError
 from rest_framework.filters import SearchFilter, OrderingFilter
 from rest_framework.permissions import IsAuthenticated
@@ -90,20 +90,44 @@ class PinViewSet(viewsets.ModelViewSet):
         service = None
         self._pin_import_deadline = None
         try:
-            self._pin_import_deadline = (
-                self.batch_clock() + settings.PINRY_FETCH_TOTAL_TIMEOUT
-            )
-            service = self.get_pin_import_service()
-            self._pin_import_service = service
-            return super(PinViewSet, self).create(request, *args, **kwargs)
-        except (PinImportError, SafeFetchError, MediaStorageError) as error:
-            api.raise_url_import_error(error)
-        except APIException:
-            raise
-        except Exception:
-            raise api.URLImportInternalError(
-                {"url": ["internal_error"]}
-            ) from None
+            try:
+                self._pin_import_deadline = (
+                    self.batch_clock() + settings.PINRY_FETCH_TOTAL_TIMEOUT
+                )
+                service = self.get_pin_import_service()
+                self._pin_import_service = service
+                serializer = self.get_serializer(data=request.data)
+            except (PinImportError, SafeFetchError, MediaStorageError) as error:
+                api.raise_url_import_error(error)
+            except Exception:
+                raise api.URLImportInternalError(
+                    {"url": ["internal_error"]}
+                ) from None
+            serializer.is_valid(raise_exception=True)
+            try:
+                self.perform_create(serializer)
+            except (
+                ValidationError,
+                api.URLImportUnavailable,
+                api.URLImportConflict,
+                api.URLImportInternalError,
+            ):
+                raise
+            except Exception:
+                raise api.URLImportInternalError(
+                    {"url": ["internal_error"]}
+                ) from None
+            try:
+                headers = self.get_success_headers(serializer.data)
+                return Response(
+                    serializer.data,
+                    status=status.HTTP_201_CREATED,
+                    headers=headers,
+                )
+            except Exception:
+                raise api.URLImportInternalError(
+                    {"url": ["internal_error"]}
+                ) from None
         finally:
             self._pin_import_service = None
             self._pin_import_deadline = None
