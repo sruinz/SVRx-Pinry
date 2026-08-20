@@ -400,6 +400,137 @@ class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
         self.assertFalse(Path(self.temporary_media.name, name).exists())
         self.assertFalse(self._pending_deletions().exists())
 
+    def test_canonical_original_symlinked_parent_preserves_outside_file(self):
+        asset_uuid, name = self._canonical_name()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_file = Path(outside.name, str(asset_uuid), "original.png")
+        outside_file.parent.mkdir()
+        outside_file.write_bytes(b"outside-original")
+        parent = Path(self.temporary_media.name, "originals")
+        parent.symlink_to(outside.name, target_is_directory=True)
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(processed)
+        self.assertEqual(outside_file.read_bytes(), b"outside-original")
+        self.assertTrue(parent.is_symlink())
+        pending.refresh_from_db()
+        self.assertEqual(pending.attempts, 1)
+        self.assertTrue(pending.last_error)
+
+    def test_canonical_derivative_symlinked_parent_preserves_outside_file(self):
+        asset_uuid, name = self._canonical_name(kind="thumbnail")
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_file = Path(outside.name, str(asset_uuid), "thumbnail.png")
+        outside_file.parent.mkdir()
+        outside_file.write_bytes(b"outside-thumbnail")
+        parent = Path(self.temporary_media.name, "derivatives")
+        parent.symlink_to(outside.name, target_is_directory=True)
+        pending = self._pending_deletions().create(
+            kind="thumbnail", name=name
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(processed)
+        self.assertEqual(outside_file.read_bytes(), b"outside-thumbnail")
+        self.assertTrue(parent.is_symlink())
+        pending.refresh_from_db()
+        self.assertEqual(pending.attempts, 1)
+        self.assertTrue(pending.last_error)
+
+    def test_canonical_symlinked_leaf_is_preserved_with_journal(self):
+        asset_uuid, name = self._canonical_name()
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_file = Path(outside.name, "outside.png")
+        outside_file.write_bytes(b"outside-leaf")
+        leaf = Path(self.temporary_media.name, name)
+        leaf.parent.mkdir(parents=True)
+        leaf.symlink_to(outside_file)
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(processed)
+        self.assertEqual(outside_file.read_bytes(), b"outside-leaf")
+        self.assertTrue(leaf.is_symlink())
+        pending.refresh_from_db()
+        self.assertEqual(pending.last_error, "MediaPathError")
+
+    def test_canonical_leaf_name_swap_preserves_original_and_replacement(self):
+        _asset_uuid, name = self._canonical_name()
+        leaf = Path(self.temporary_media.name, name)
+        moved = leaf.with_name("original-old.png")
+        self._write_file(name, b"original")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        real_open = file_ops._open_regular_nofollow
+
+        def swap_after_open(directory_descriptor, leaf_name):
+            descriptor = real_open(directory_descriptor, leaf_name)
+            leaf.rename(moved)
+            leaf.write_bytes(b"replacement")
+            return descriptor
+
+        with mock.patch(
+            "django_images.file_ops._open_regular_nofollow",
+            side_effect=swap_after_open,
+        ):
+            processed = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(processed)
+        self.assertEqual(moved.read_bytes(), b"original")
+        self.assertEqual(leaf.read_bytes(), b"replacement")
+        pending.refresh_from_db()
+        self.assertEqual(pending.last_error, "MediaPathError")
+
+    def test_canonical_parent_swap_preserves_original_and_replacement(self):
+        asset_uuid, name = self._canonical_name()
+        kind_root = Path(self.temporary_media.name, "originals")
+        moved_root = Path(self.temporary_media.name, "originals-old")
+        replacement = kind_root / str(asset_uuid) / "original.png"
+        self._write_file(name, b"original")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        real_open = file_ops._open_child_directory_nofollow
+        calls = {"count": 0}
+
+        def swap_after_asset_open(parent_descriptor, child_name, named_stat):
+            descriptor = real_open(
+                parent_descriptor, child_name, named_stat
+            )
+            calls["count"] += 1
+            if calls["count"] == 2:
+                kind_root.rename(moved_root)
+                replacement.parent.mkdir(parents=True)
+                replacement.write_bytes(b"replacement")
+            return descriptor
+
+        with mock.patch(
+            "django_images.file_ops._open_child_directory_nofollow",
+            side_effect=swap_after_asset_open,
+        ):
+            processed = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(processed)
+        self.assertEqual(
+            Path(moved_root, str(asset_uuid), "original.png").read_bytes(),
+            b"original",
+        )
+        self.assertEqual(replacement.read_bytes(), b"replacement")
+        pending.refresh_from_db()
+        self.assertEqual(pending.last_error, "MediaPathError")
+
     def test_canonical_prune_failure_keeps_journal_until_retry(self):
         asset_uuid, name = self._canonical_name()
         self._write_file(name, b"pending")
@@ -445,9 +576,9 @@ class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
         self.assertEqual(pending.attempts, 1)
         self.assertEqual(pending.last_error, "OSError")
         self.assertFalse(Path(self.temporary_media.name, name).exists())
-        self.assertFalse(
+        self.assertTrue(
             Path(self.temporary_media.name, "originals", str(asset_uuid))
-            .exists()
+            .is_dir()
         )
 
         self.assertTrue(process_pending_media_deletion(pending.pk))
@@ -550,6 +681,19 @@ class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
         self.assertEqual(captured.records[0].media_error, "RuntimeError")
         self.assertNotIn("secret query", "\n".join(captured.output))
 
+    def test_pending_query_and_logger_failures_do_not_escape(self):
+        with mock.patch.object(
+            PendingMediaDeletion.objects,
+            "using",
+            side_effect=RuntimeError("secret query"),
+        ), mock.patch(
+            "django_images.services.media_deletion.logger.warning",
+            side_effect=RuntimeError("secret logger"),
+        ):
+            processed = process_pending_media_deletion(123)
+
+        self.assertFalse(processed)
+
     def test_failure_recording_error_does_not_escape(self):
         pending = self._pending_deletions().create(
             kind="original", name="legacy/failure.png"
@@ -561,6 +705,28 @@ class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
         with mock.patch.object(image_field, "storage", storage), mock.patch(
             "django.db.models.query.QuerySet.update",
             side_effect=RuntimeError("secret update"),
+        ):
+            processed = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(processed)
+        self.assertTrue(
+            self._pending_deletions().filter(pk=pending.pk).exists()
+        )
+
+    def test_processing_update_and_logger_failures_do_not_escape(self):
+        pending = self._pending_deletions().create(
+            kind="original", name="legacy/failure.png"
+        )
+        storage = mock.Mock()
+        storage.exists.side_effect = OSError("secret storage")
+        image_field = Image._meta.get_field("image")
+
+        with mock.patch.object(image_field, "storage", storage), mock.patch(
+            "django.db.models.query.QuerySet.update",
+            side_effect=RuntimeError("secret update"),
+        ), mock.patch(
+            "django_images.services.media_deletion.logger.warning",
+            side_effect=RuntimeError("secret logger"),
         ):
             processed = process_pending_media_deletion(pending.pk)
 
@@ -585,6 +751,26 @@ class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
         self.assertTrue(
             self._pending_deletions().filter(pk=pending.pk).exists()
         )
+
+    def test_pending_delete_and_logger_failures_do_not_escape(self):
+        pending = self._pending_deletions().create(
+            kind="original", name="legacy/deleted.png"
+        )
+
+        with mock.patch.object(
+            PendingMediaDeletion,
+            "delete",
+            side_effect=RuntimeError("secret delete"),
+        ), mock.patch(
+            "django_images.services.media_deletion.logger.warning",
+            side_effect=RuntimeError("secret logger"),
+        ):
+            processed = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(processed)
+        pending.refresh_from_db()
+        self.assertEqual(pending.attempts, 1)
+        self.assertEqual(pending.last_error, "RuntimeError")
 
     def test_rolled_back_image_delete_preserves_files_without_journal(self):
         image, files_before = self._create_four_file_image("rollback")

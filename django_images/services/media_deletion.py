@@ -12,6 +12,7 @@ from django_images.file_ops import (
     media_lifecycle_lock,
     open_media_root,
     remove_empty_media_directory,
+    remove_media_file,
 )
 from django_images.models import Image, PendingMediaDeletion, Thumbnail
 from django_images.paths import (
@@ -110,7 +111,6 @@ def _asset_uuid_is_referenced(asset_uuid, using):
 
 
 def _delete_canonical_media(
-    storage,
     name,
     asset_uuid,
     relative_directory,
@@ -122,8 +122,7 @@ def _delete_canonical_media(
         with media_lifecycle_lock(root_directory, exclusive=True):
             if _media_path_is_referenced(name, using):
                 return
-            if storage.exists(name):
-                storage.delete(name)
+            remove_media_file(root_directory, name)
             if not _asset_uuid_is_referenced(asset_uuid, using):
                 remove_empty_media_directory(
                     root_directory,
@@ -141,7 +140,6 @@ def _process_pending(pending, using):
     if canonical is not None and media_root is not None:
         asset_uuid, relative_directory = canonical
         _delete_canonical_media(
-            storage,
             pending.name,
             asset_uuid,
             relative_directory,
@@ -154,10 +152,13 @@ def _process_pending(pending, using):
 
 
 def _log_failure(error_name):
-    logger.warning(
-        "media_deletion_failed",
-        extra={"media_error": error_name},
-    )
+    try:
+        logger.warning(
+            "media_deletion_failed",
+            extra={"media_error": error_name},
+        )
+    except Exception:
+        pass
 
 
 def _record_failure(pending_id, using, error_name):

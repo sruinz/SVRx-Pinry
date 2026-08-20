@@ -477,6 +477,98 @@ def open_media_root(media_root):
         raise
 
 
+def remove_media_file(root_directory, relative_name):
+    components = _relative_components(relative_name)
+    if len(components) != 3:
+        raise MediaPathError("unsafe_media_file")
+    root_directory.verify_current()
+    parent_name, directory_name, leaf_name = components
+    try:
+        parent_stat = os.stat(
+            parent_name,
+            dir_fd=root_directory.descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        os.fsync(root_directory.descriptor)
+        return True
+    parent_descriptor = _open_child_directory_nofollow(
+        root_directory.descriptor,
+        parent_name,
+        parent_stat,
+    )
+    try:
+        try:
+            directory_stat = os.stat(
+                directory_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            os.fsync(parent_descriptor)
+            return True
+        directory_descriptor = _open_child_directory_nofollow(
+            parent_descriptor,
+            directory_name,
+            directory_stat,
+        )
+        try:
+            try:
+                leaf_stat = os.stat(
+                    leaf_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                os.fsync(directory_descriptor)
+                return True
+            leaf_descriptor = _open_regular_nofollow(
+                directory_descriptor,
+                leaf_name,
+            )
+            try:
+                if _identity(os.fstat(leaf_descriptor)) != _identity(
+                    leaf_stat
+                ):
+                    raise MediaPathError("unsafe_media_file")
+                root_directory.verify_current()
+                current_parent = os.stat(
+                    parent_name,
+                    dir_fd=root_directory.descriptor,
+                    follow_symlinks=False,
+                )
+                current_directory = os.stat(
+                    directory_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                current_leaf = os.stat(
+                    leaf_name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    _identity(current_parent) != _identity(parent_stat)
+                    or _identity(current_directory)
+                    != _identity(directory_stat)
+                    or _identity(current_leaf) != _identity(leaf_stat)
+                ):
+                    raise MediaPathError("unsafe_media_file")
+                _unlink_owned_name(
+                    directory_descriptor,
+                    leaf_name,
+                    leaf_stat,
+                )
+                os.fsync(directory_descriptor)
+                return True
+            finally:
+                os.close(leaf_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
 def remove_empty_media_directory(root_directory, relative_directory):
     components = _relative_components(relative_directory)
     if len(components) != 2:

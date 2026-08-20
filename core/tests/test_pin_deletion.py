@@ -20,6 +20,7 @@ from core.admin import PinAdmin
 from core.models import BatchImportItem, Image, Pin
 from core.services.idempotency import IdempotencyStore, StoredError
 from core.tests.helpers import TEST_IMAGE_PATH, create_image, create_pin, create_user
+from django_images.file_ops import remove_media_file
 from django_images.models import Image as BaseImage, Thumbnail
 from django_images.test_helpers import TemporaryMediaMixin
 
@@ -180,18 +181,18 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         pin = create_pin(self.owner, image, [])
         files_before = self._assert_four_image_files(image)
         original_name = image.image.name
-        storage = image.image.storage
-        real_delete = storage.delete
+        real_delete = remove_media_file
         attempted = []
 
-        def fail_one_delete(name):
+        def fail_one_delete(root_directory, name):
             attempted.append(name)
             if len(attempted) == fail_at:
                 raise OSError("secret storage location")
-            return real_delete(name)
+            return real_delete(root_directory, name)
 
-        with mock.patch.object(
-            storage, "delete", side_effect=fail_one_delete
+        with mock.patch(
+            "django_images.services.media_deletion.remove_media_file",
+            side_effect=fail_one_delete,
         ):
             response = self.client.delete(reverse("pin-detail", args=[pin.pk]))
 
