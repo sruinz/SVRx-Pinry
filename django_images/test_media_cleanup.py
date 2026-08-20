@@ -1,18 +1,27 @@
+from contextlib import contextmanager
 from datetime import timedelta
 from io import BytesIO, StringIO
 import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 from unittest import mock
 import uuid
 
 from django.core.management import CommandError, call_command
+from django.db import connection, OperationalError
 from django.test import TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from PIL import Image as PILImage
 
 from django_images.models import Image, Thumbnail
+from django_images.file_ops import (
+    MediaPathError,
+    media_lifecycle_lock,
+    open_media_root,
+)
 from django_images.services import media_cleanup
 
 
@@ -49,6 +58,7 @@ class TemporaryCleanupRootsMixin(object):
             path.relative_to(root).as_posix(): path.read_bytes()
             for path in root.rglob("*")
             if path.is_file() and not path.is_symlink()
+            and ".pinry-locks" not in path.relative_to(root).parts
         }
 
 
@@ -342,6 +352,7 @@ class LegacyMediaCleanupCommandTest(
                 path.relative_to(moved_root).as_posix(): path.read_bytes()
                 for path in moved_root.rglob("*")
                 if path.is_file() and not path.is_symlink()
+                and ".pinry-locks" not in path.relative_to(moved_root).parts
             },
             opened_files_before,
         )
@@ -484,9 +495,13 @@ class OrphanMediaCleanupCommandTest(
             "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
         )
 
-        self.old_staging = self._write_media(".staging/old.part", b"old")
+        self.old_staging = self._write_media(
+            ".staging/media-migration-10101010-1010-4010-8010-101010101010.part",
+            b"old",
+        )
         self.fresh_staging = self._write_media(
-            ".staging/fresh.part", b"fresh"
+            ".staging/media-migration-20202020-2020-4020-8020-202020202020.part",
+            b"fresh",
         )
         self.orphan_original = self._write_media(
             "originals/{}/original.png".format(self.orphan_uuid),
@@ -560,17 +575,15 @@ class OrphanMediaCleanupCommandTest(
 
         self.assertEqual(self._media_files(), files_before)
         output = stdout.getvalue()
-        self.assertIn(".staging/old.part", output)
-        self.assertIn(str(self.orphan_uuid), output)
-        self.assertNotIn(".staging/fresh.part", output)
-        self.assertNotIn(str(self.mixed_uuid), output)
-        self.assertNotIn(str(self.referenced_image.asset_uuid), output)
+        self.assertIn("candidate-", output)
+        self.assertNotIn("?token=", output)
+        self.assertNotIn(self.temporary_media.name, output)
         self.assertNotIn("image/original/by-md5", output)
 
     def test_orphan_cleanup_execute_removes_only_old_unreferenced_closure(self):
         files_before = self._media_files()
         expected = dict(files_before)
-        del expected[".staging/old.part"]
+        del expected[self.old_staging.relative_to(self.temporary_media.name).as_posix()]
         del expected[
             "originals/{}/original.png".format(self.orphan_uuid)
         ]
@@ -629,19 +642,14 @@ class OrphanMediaCleanupCommandTest(
             "django_images.services.media_cleanup._unlink_file",
             side_effect=swap_parent_then_unlink,
         ):
-            with self.assertRaisesRegex(CommandError, "unsafe_media_file"):
+            with self.assertRaisesRegex(CommandError, "unsafe_orphan_entry"):
                 call_command(
                     "cleanup_orphan_media", execute=True, stdout=StringIO()
                 )
 
-        self.assertTrue(asset_parent.is_symlink())
-        self.assertEqual(
-            (moved_parent / "nested" / "old.part").read_bytes(),
-            b"nested old",
-        )
-        other_files = dict(files_before)
-        del other_files[".staging/asset/nested/old.part"]
-        self.assertEqual(self._media_files(), other_files)
+        self.assertTrue(asset_parent.is_dir())
+        self.assertFalse(moved_parent.exists())
+        self.assertEqual(self._media_files(), files_before)
         self.assertEqual(
             (
                 tuple(Image.objects.values_list("id", "image", "asset_uuid")),
@@ -701,8 +709,8 @@ class OrphanMediaCleanupCommandTest(
                     "cleanup_orphan_media", execute=True, stdout=StringIO()
                 )
 
-        self.assertTrue(asset_parent.is_symlink())
-        self.assertTrue((moved_parent / "nested" / "empty").is_dir())
+        self.assertTrue(asset_parent.is_dir())
+        self.assertFalse(moved_parent.exists())
         self.assertEqual(self._media_files(), files_before)
         self.assertEqual(
             (
@@ -712,7 +720,7 @@ class OrphanMediaCleanupCommandTest(
             database_before,
         )
 
-    def test_orphan_cleanup_scans_the_opened_root_after_path_swap(self):
+    def test_orphan_cleanup_fails_closed_after_media_root_path_swap(self):
         for path in Path(self.temporary_media.name).rglob("*"):
             os.utime(path, None)
         swapped_uuid = uuid.UUID("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
@@ -720,10 +728,12 @@ class OrphanMediaCleanupCommandTest(
             "originals/{}/original.png".format(swapped_uuid),
             make_image_bytes("black"),
         )
+        young_uuid = uuid.UUID("ffffffff-ffff-4fff-8fff-ffffffffffff")
         opened_young = self._write_media(
-            "originals/{}/young.keep".format(swapped_uuid), b"young"
+            "originals/{}/original.png".format(young_uuid), b"young"
         )
         self._set_old(opened_old)
+        self._set_old(opened_old.parent)
 
         outside = tempfile.TemporaryDirectory()
         self.addCleanup(outside.cleanup)
@@ -743,7 +753,7 @@ class OrphanMediaCleanupCommandTest(
         database_before = tuple(
             Image.objects.values_list("id", "image", "asset_uuid")
         ), tuple(Thumbnail.objects.values_list("id", "image"))
-        real_open_root = media_cleanup._open_media_root
+        real_open_root = media_cleanup.open_media_root
 
         def restore_root():
             if media_root.is_symlink():
@@ -761,7 +771,7 @@ class OrphanMediaCleanupCommandTest(
 
         command_error = None
         with mock.patch(
-            "django_images.services.media_cleanup._open_media_root",
+            "django_images.services.media_cleanup.open_media_root",
             side_effect=open_root_then_swap,
         ):
             try:
@@ -777,6 +787,7 @@ class OrphanMediaCleanupCommandTest(
                 path.relative_to(moved_root).as_posix(): path.read_bytes()
                 for path in moved_root.rglob("*")
                 if path.is_file() and not path.is_symlink()
+                and ".pinry-locks" not in path.relative_to(moved_root).parts
             },
             opened_files_before,
         )
@@ -799,7 +810,9 @@ class OrphanMediaCleanupCommandTest(
             ),
             database_before,
         )
-        self.assertIsNone(command_error)
+        self.assertEqual(
+            str(command_error), "orphan_cleanup_lock_failed"
+        )
 
     def test_orphan_cleanup_rejects_age_below_twenty_four_hours(self):
         files_before = self._media_files()
@@ -814,14 +827,19 @@ class OrphanMediaCleanupCommandTest(
         self.assertEqual(self._media_files(), files_before)
 
     def test_orphan_cleanup_preserves_file_exactly_at_cutoff(self):
-        now = time.time()
-        boundary = self._write_media(".staging/boundary.part", b"boundary")
-        cutoff = now - timedelta(hours=24).total_seconds()
-        os.utime(boundary, (cutoff, cutoff))
+        now_ns = time.time_ns()
+        boundary = self._write_media(
+            ".staging/media-migration-30303030-3030-4030-8030-303030303030.part",
+            b"boundary",
+        )
+        cutoff_ns = now_ns - int(
+            timedelta(hours=24).total_seconds() * 1000000000
+        )
+        os.utime(boundary, ns=(cutoff_ns, cutoff_ns))
 
         with mock.patch(
-            "django_images.services.media_cleanup.time.time",
-            return_value=now,
+            "django_images.services.media_cleanup.time.time_ns",
+            return_value=now_ns,
         ):
             call_command(
                 "cleanup_orphan_media", execute=True, stdout=StringIO()
@@ -840,9 +858,10 @@ class OrphanMediaCleanupCommandTest(
         self._set_old(old_file)
         self._set_old(parent)
 
-        call_command("cleanup_orphan_media", execute=True, stdout=StringIO())
+        with self.assertRaisesRegex(CommandError, "unsafe_orphan_entry"):
+            call_command("cleanup_orphan_media", execute=True, stdout=StringIO())
 
-        self.assertFalse(old_file.exists())
+        self.assertTrue(old_file.exists())
         self.assertTrue(parent.is_dir())
         self.assertTrue(young_directory.is_dir())
 
@@ -908,3 +927,663 @@ class OrphanMediaCleanupCommandTest(
         )
         self.assertTrue(self.old_staging.exists())
         self.assertTrue(self.orphan_original.exists())
+
+
+class OrphanMediaCleanupPreparedAssetTests(
+    TemporaryCleanupRootsMixin, TransactionTestCase
+):
+    def _set_old(self, path):
+        timestamp = time.time() - timedelta(hours=25).total_seconds()
+        os.utime(path, (timestamp, timestamp))
+
+    def test_nested_staging_keeps_every_present_slot_when_one_slot_is_young(self):
+        run_uuid = uuid.UUID("11111111-1111-4111-8111-111111111111")
+        asset_uuid = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        asset_directory = Path(
+            self.temporary_media.name,
+            ".staging",
+            str(run_uuid),
+            str(asset_uuid),
+        )
+        asset_directory.mkdir(parents=True)
+        slots = []
+        for kind in ("original", "thumbnail", "standard", "square"):
+            path = asset_directory / "{}.part".format(kind)
+            path.write_bytes(kind.encode("ascii"))
+            slots.append(path)
+        for path in slots[:-1]:
+            self._set_old(path)
+        self._set_old(asset_directory)
+        self._set_old(asset_directory.parent)
+
+        call_command("cleanup_orphan_media", execute=True, stdout=StringIO())
+
+        self.assertTrue(asset_directory.is_dir())
+        self.assertEqual(
+            [path.name for path in sorted(asset_directory.iterdir())],
+            ["original.part", "square.part", "standard.part", "thumbnail.part"],
+        )
+
+    @override_settings(PINRY_ORPHAN_MIN_AGE_SECONDS=26 * 60 * 60)
+    def test_command_default_uses_configured_minimum_age(self):
+        staging = self._write_media(
+            ".staging/media-migration-33333333-3333-4333-8333-333333333333.part",
+            b"old",
+        )
+        timestamp = time.time() - timedelta(hours=25).total_seconds()
+        os.utime(staging, (timestamp, timestamp))
+
+        call_command("cleanup_orphan_media", execute=True, stdout=StringIO())
+
+        self.assertTrue(staging.exists())
+
+    @override_settings(PINRY_ORPHAN_MIN_AGE_SECONDS=48 * 60 * 60)
+    def test_direct_age_override_cannot_undercut_configured_minimum(self):
+        staging = self._write_media(
+            ".staging/media-migration-99999999-9999-4999-8999-999999999999.part",
+            b"old",
+        )
+        timestamp = time.time() - timedelta(hours=25).total_seconds()
+        os.utime(staging, (timestamp, timestamp))
+
+        with self.assertRaisesRegex(CommandError, "orphan_age_too_short"):
+            media_cleanup.OrphanMediaCleaner().run(
+                execute=True,
+                older_than=timedelta(hours=24),
+            )
+
+        self.assertTrue(staging.exists())
+
+    def test_invalid_configured_orphan_ages_fail_closed(self):
+        invalid_values = (
+            True,
+            False,
+            None,
+            "86400",
+            0,
+            -1,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            10 ** 10000,
+        )
+        for index, value in enumerate(invalid_values):
+            with self.subTest(index=index):
+                with override_settings(
+                    PINRY_ORPHAN_MIN_AGE_SECONDS=value
+                ):
+                    with self.assertRaisesRegex(
+                        CommandError, "invalid_orphan_age_setting"
+                    ):
+                        media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+    def test_execute_creates_a_private_lifecycle_lock_but_dry_run_does_not(self):
+        staging = self._write_media(
+            ".staging/media-migration-44444444-4444-4444-8444-444444444444.part",
+            b"old",
+        )
+        self._set_old(staging)
+        lock_path = Path(
+            self.temporary_media.name,
+            ".pinry-locks",
+            "media-lifecycle.lock",
+        )
+
+        call_command("cleanup_orphan_media", stdout=StringIO())
+        self.assertFalse(lock_path.exists())
+
+        call_command("cleanup_orphan_media", execute=True, stdout=StringIO())
+        self.assertTrue(lock_path.is_file())
+        self.assertEqual(lock_path.stat().st_mode & 0o077, 0)
+
+    def test_final_uuid_database_queries_are_bounded_to_four_hundred(self):
+        timestamp = time.time() - timedelta(hours=25).total_seconds()
+        for index in range(1001):
+            asset_uuid = uuid.UUID(int=index + 1)
+            directory = Path(
+                self.temporary_media.name,
+                "originals",
+                str(asset_uuid),
+            )
+            directory.mkdir(parents=True)
+            os.utime(directory, (timestamp, timestamp))
+        parameter_counts = []
+
+        def capture_parameters(execute, sql, params, many, context):
+            if params is not None:
+                parameter_counts.append(len(params))
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(capture_parameters):
+            with CaptureQueriesContext(connection) as queries:
+                call_command("cleanup_orphan_media", stdout=StringIO())
+
+        self.assertLessEqual(len(queries), 20)
+        self.assertTrue(parameter_counts)
+        self.assertLessEqual(max(parameter_counts), 400)
+
+    def test_orphan_scan_does_not_call_recursive_tree_scanner(self):
+        staging = self._write_media(
+            ".staging/media-migration-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.part",
+            b"old",
+        )
+        self._set_old(staging)
+
+        with mock.patch(
+            "django_images.services.media_cleanup._scan_tree",
+            side_effect=AssertionError("recursive scan used"),
+            create=True,
+        ):
+            call_command("cleanup_orphan_media", stdout=StringIO())
+
+    def test_command_hides_raw_filesystem_error_details(self):
+        with mock.patch(
+            "django_images.services.media_cleanup.open_media_root",
+            side_effect=CommandError("unsafe_media_root: /tmp/token=secret"),
+        ):
+            with self.assertRaises(CommandError) as raised:
+                call_command("cleanup_orphan_media", stdout=StringIO())
+
+        self.assertEqual(str(raised.exception), "unsafe_media_root")
+
+    def test_exclusive_lifecycle_lock_times_out_in_a_second_thread(self):
+        root = open_media_root(self.temporary_media.name)
+        result = []
+
+        def contend():
+            contender = open_media_root(self.temporary_media.name)
+            try:
+                with media_lifecycle_lock(
+                    contender,
+                    exclusive=True,
+                    deadline=time.monotonic() + 0.03,
+                ):
+                    result.append("acquired")
+            except MediaPathError as error:
+                result.append(str(error))
+            finally:
+                contender.close()
+
+        try:
+            with media_lifecycle_lock(root, exclusive=True):
+                worker = threading.Thread(target=contend)
+                worker.start()
+                worker.join()
+        finally:
+            root.close()
+
+        self.assertEqual(result, ["media_lifecycle_busy"])
+
+    def test_staging_path_referenced_by_image_is_never_deleted(self):
+        asset_uuid = uuid.UUID("55555555-5555-4555-8555-555555555555")
+        relative_path = (
+            ".staging/media-migration-66666666-6666-4666-8666-666666666666.part"
+        )
+        staging = self._write_media(relative_path, b"referenced")
+        self._set_old(staging)
+        Image.objects.create(
+            image=relative_path,
+            asset_uuid=asset_uuid,
+            original_filename="referenced.png",
+            width=1,
+            height=1,
+        )
+
+        media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertTrue(staging.exists())
+
+    def test_one_slot_staging_closure_is_deleted_once_with_its_directories(self):
+        run_uuid = uuid.UUID("77777777-7777-4777-8777-777777777777")
+        asset_uuid = uuid.UUID("88888888-8888-4888-8888-888888888888")
+        relative_path = ".staging/{}/{}/original.part".format(
+            run_uuid, asset_uuid
+        )
+        staging = self._write_media(relative_path, b"one-slot")
+        self._set_old(staging)
+        self._set_old(staging.parent)
+        self._set_old(staging.parent.parent)
+
+        summary = media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertEqual(summary.deleted, 3)
+        self.assertEqual(len(summary.candidate_paths), 3)
+        self.assertFalse(staging.parent.parent.exists())
+
+
+class OrphanMediaCleanupClosureContractTests(
+    TemporaryCleanupRootsMixin, TransactionTestCase
+):
+    def _set_old(self, path):
+        timestamp = time.time() - timedelta(hours=25).total_seconds()
+        os.utime(path, (timestamp, timestamp))
+
+    def _write_nested_subset(self, run_uuid, asset_uuid, count):
+        asset_directory = Path(
+            self.temporary_media.name,
+            ".staging",
+            str(run_uuid),
+            str(asset_uuid),
+        )
+        asset_directory.mkdir(parents=True)
+        paths = []
+        for kind in ("original", "thumbnail", "standard", "square")[:count]:
+            path = asset_directory / "{}.part".format(kind)
+            path.write_bytes(kind.encode("ascii"))
+            self._set_old(path)
+            paths.append(path)
+        self._set_old(asset_directory)
+        self._set_old(asset_directory.parent)
+        return asset_directory, paths
+
+    def _write_final_subset(self, asset_uuid, count):
+        original_directory = Path(
+            self.temporary_media.name, "originals", str(asset_uuid)
+        )
+        original_directory.mkdir(parents=True)
+        paths = []
+        if count:
+            original = original_directory / "original.png"
+            original.write_bytes(b"original")
+            self._set_old(original)
+            paths.append(original)
+        derivative_directory = None
+        for kind in ("thumbnail", "standard", "square")[:max(0, count - 1)]:
+            if derivative_directory is None:
+                derivative_directory = Path(
+                    self.temporary_media.name,
+                    "derivatives",
+                    str(asset_uuid),
+                )
+                derivative_directory.mkdir(parents=True)
+            derivative = derivative_directory / "{}.png".format(kind)
+            derivative.write_bytes(kind.encode("ascii"))
+            self._set_old(derivative)
+            paths.append(derivative)
+        self._set_old(original_directory)
+        if derivative_directory is not None:
+            self._set_old(derivative_directory)
+        return original_directory, derivative_directory, paths
+
+    def _run_with_lock_mutation(self, mutate):
+        original_lock = media_cleanup.media_lifecycle_lock
+        mutated = {"done": False}
+
+        @contextmanager
+        def mutating_lock(*args, **kwargs):
+            with original_lock(*args, **kwargs):
+                if not mutated["done"]:
+                    mutated["done"] = True
+                    mutate()
+                yield
+
+        with mock.patch(
+            "django_images.services.media_cleanup.media_lifecycle_lock",
+            side_effect=mutating_lock,
+        ):
+            return media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+    def test_nested_staging_zero_through_four_present_slots_converge(self):
+        assets = []
+        for count in range(5):
+            run_uuid = uuid.UUID(int=100 + count)
+            asset_uuid = uuid.UUID(int=200 + count)
+            assets.append(self._write_nested_subset(
+                run_uuid, asset_uuid, count
+            )[0])
+
+        summary = media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertEqual(summary.deleted, 20)
+        self.assertEqual(len(summary.candidate_paths), 20)
+        for asset_directory in assets:
+            self.assertFalse(asset_directory.parent.exists())
+
+    def test_final_zero_through_four_present_slots_converge(self):
+        directories = []
+        for count in range(5):
+            asset_uuid = uuid.UUID(int=300 + count)
+            original, derivatives, _paths = self._write_final_subset(
+                asset_uuid, count
+            )
+            directories.append((original, derivatives))
+
+        summary = media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertEqual(summary.deleted, 18)
+        for original, derivatives in directories:
+            self.assertFalse(original.exists())
+            if derivatives is not None:
+                self.assertFalse(derivatives.exists())
+
+    def test_old_empty_run_left_before_asset_creation_converges(self):
+        run_directory = Path(
+            self.temporary_media.name,
+            ".staging",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        run_directory.mkdir(parents=True)
+        self._set_old(run_directory)
+
+        summary = media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertEqual(summary.deleted, 1)
+        self.assertFalse(run_directory.exists())
+
+    def test_final_unknown_deep_and_duplicate_slots_abort_before_deletion(self):
+        cases = ("unknown", "deep", "duplicate")
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                temporary_media = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary_media.cleanup)
+                root = Path(temporary_media.name)
+                staging = root / ".staging" / (
+                    "media-migration-00000000-0000-4000-8000-{:012d}.part".format(
+                        index + 1
+                    )
+                )
+                staging.parent.mkdir(parents=True)
+                staging.write_bytes(b"retained")
+                self._set_old(staging)
+                asset_uuid = uuid.UUID(int=400 + index)
+                directory = root / "originals" / str(asset_uuid)
+                directory.mkdir(parents=True)
+                if case == "unknown":
+                    invalid_paths = [directory / "token=secret.bin"]
+                elif case == "deep":
+                    invalid_paths = [directory / "nested" / "original.png"]
+                else:
+                    invalid_paths = [
+                        directory / "original.png",
+                        directory / "original.jpg",
+                    ]
+                for invalid in invalid_paths:
+                    invalid.parent.mkdir(parents=True, exist_ok=True)
+                    invalid.write_bytes(b"invalid")
+                    self._set_old(invalid)
+                for parent in sorted(
+                    {path.parent for path in invalid_paths},
+                    key=lambda value: len(value.parts),
+                    reverse=True,
+                ):
+                    self._set_old(parent)
+                self._set_old(directory)
+
+                with override_settings(MEDIA_ROOT=temporary_media.name):
+                    with self.assertRaisesRegex(
+                        CommandError, "unsafe_orphan_entry"
+                    ):
+                        media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+                self.assertTrue(staging.exists())
+                for invalid in invalid_paths:
+                    self.assertTrue(invalid.exists())
+
+    def test_missing_staging_slot_database_reference_protects_present_subset(self):
+        run_uuid = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        asset_uuid = uuid.UUID("33333333-3333-4333-8333-333333333333")
+        asset_directory, paths = self._write_nested_subset(
+            run_uuid, asset_uuid, 1
+        )
+        Image.objects.create(
+            image=".staging/{}/{}/square.part".format(run_uuid, asset_uuid),
+            asset_uuid=asset_uuid,
+            original_filename="referenced.png",
+            width=1,
+            height=1,
+        )
+
+        summary = media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertEqual(summary.deleted, 0)
+        self.assertTrue(asset_directory.exists())
+        self.assertTrue(paths[0].exists())
+
+    def test_path_reference_in_missing_final_root_protects_other_root(self):
+        referenced_image = Image.objects.create(
+            image="originals/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/missing.png",
+            asset_uuid=uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            original_filename="owner.png",
+            width=1,
+            height=1,
+        )
+        asset_uuid = uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        original_directory, _derivatives, paths = self._write_final_subset(
+            asset_uuid, 1
+        )
+        Thumbnail.objects.create(
+            original=referenced_image,
+            image="derivatives/{}/thumbnail.png".format(asset_uuid),
+            size="thumbnail",
+            width=1,
+            height=1,
+        )
+
+        summary = media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertEqual(summary.deleted, 0)
+        self.assertTrue(original_directory.exists())
+        self.assertTrue(paths[0].exists())
+
+    def test_execute_time_new_name_preserves_whole_staging_closure(self):
+        run_uuid = uuid.UUID("44444444-4444-4444-8444-444444444444")
+        asset_uuid = uuid.UUID("55555555-5555-4555-8555-555555555555")
+        asset_directory, paths = self._write_nested_subset(
+            run_uuid, asset_uuid, 1
+        )
+
+        def add_name():
+            (asset_directory / "thumbnail.part").write_bytes(b"new")
+
+        summary = self._run_with_lock_mutation(add_name)
+
+        self.assertEqual(summary.deleted, 0)
+        self.assertTrue(paths[0].exists())
+        self.assertTrue((asset_directory / "thumbnail.part").exists())
+
+    def test_execute_time_missing_name_preserves_remaining_staging_sibling(self):
+        run_uuid = uuid.UUID("66666666-6666-4666-8666-666666666666")
+        asset_uuid = uuid.UUID("77777777-7777-4777-8777-777777777777")
+        asset_directory, paths = self._write_nested_subset(
+            run_uuid, asset_uuid, 2
+        )
+
+        summary = self._run_with_lock_mutation(paths[0].unlink)
+
+        self.assertEqual(summary.deleted, 0)
+        self.assertTrue(asset_directory.exists())
+        self.assertTrue(paths[1].exists())
+
+    def test_execute_time_same_inode_write_preserves_staging_closure(self):
+        run_uuid = uuid.UUID("88888888-8888-4888-8888-888888888888")
+        asset_uuid = uuid.UUID("99999999-9999-4999-8999-999999999999")
+        asset_directory, paths = self._write_nested_subset(
+            run_uuid, asset_uuid, 1
+        )
+
+        def rewrite():
+            with paths[0].open("ab") as stream:
+                stream.write(b"changed")
+
+        summary = self._run_with_lock_mutation(rewrite)
+
+        self.assertEqual(summary.deleted, 0)
+        self.assertTrue(asset_directory.exists())
+        self.assertEqual(paths[0].read_bytes(), b"originalchanged")
+
+    def test_execute_time_database_reference_preserves_final_closure(self):
+        asset_uuid = uuid.UUID("12121212-1212-4212-8212-121212121212")
+        original_directory, _derivatives, paths = self._write_final_subset(
+            asset_uuid, 1
+        )
+
+        def add_reference():
+            Image.objects.create(
+                image="originals/{}/original.png".format(asset_uuid),
+                asset_uuid=asset_uuid,
+                original_filename="claimed.png",
+                width=1,
+                height=1,
+            )
+
+        summary = self._run_with_lock_mutation(add_reference)
+
+        self.assertEqual(summary.deleted, 0)
+        self.assertTrue(original_directory.exists())
+        self.assertTrue(paths[0].exists())
+
+    def test_database_error_is_safe_and_deletes_nothing(self):
+        asset_uuid = uuid.UUID("13131313-1313-4313-8313-131313131313")
+        _original, _derivatives, paths = self._write_final_subset(
+            asset_uuid, 1
+        )
+
+        with mock.patch.object(
+            Image.objects,
+            "filter",
+            side_effect=OperationalError(
+                "database /tmp/private/token=secret is locked"
+            ),
+        ):
+            with self.assertRaises(CommandError) as raised:
+                call_command("cleanup_orphan_media", execute=True)
+
+        self.assertEqual(
+            str(raised.exception), "orphan_database_unavailable"
+        )
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertTrue(paths[0].exists())
+
+    def test_execute_uses_one_exclusive_lock_per_flat_closure(self):
+        for index in (1, 2):
+            staging = self._write_media(
+                ".staging/media-migration-14141414-1414-4414-8414-{:012d}.part".format(
+                    index
+                ),
+                b"old",
+            )
+            self._set_old(staging)
+        original_lock = media_cleanup.media_lifecycle_lock
+        events = []
+
+        @contextmanager
+        def tracked_lock(*args, **kwargs):
+            events.append("enter")
+            with original_lock(*args, **kwargs):
+                yield
+            events.append("exit")
+
+        with mock.patch(
+            "django_images.services.media_cleanup.media_lifecycle_lock",
+            side_effect=tracked_lock,
+        ):
+            media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertEqual(events, ["enter", "exit", "enter", "exit"])
+
+    def test_execute_revalidates_only_the_selected_staging_closure(self):
+        staging = self._write_media(
+            ".staging/media-migration-19191919-1919-4919-8919-191919191919.part",
+            b"old",
+        )
+        self._set_old(staging)
+        original_lock = media_cleanup.media_lifecycle_lock
+        original_scan = media_cleanup._scan_staging_closures
+        in_lock = {"value": False}
+
+        @contextmanager
+        def tracked_lock(*args, **kwargs):
+            with original_lock(*args, **kwargs):
+                in_lock["value"] = True
+                try:
+                    yield
+                finally:
+                    in_lock["value"] = False
+
+        def guarded_scan(*args, **kwargs):
+            if in_lock["value"]:
+                raise AssertionError("global staging rescan under lock")
+            return original_scan(*args, **kwargs)
+
+        with mock.patch(
+            "django_images.services.media_cleanup.media_lifecycle_lock",
+            side_effect=tracked_lock,
+        ), mock.patch(
+            "django_images.services.media_cleanup._scan_staging_closures",
+            side_effect=guarded_scan,
+        ):
+            summary = media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertEqual(summary.deleted, 1)
+        self.assertFalse(staging.exists())
+
+    def test_nanosecond_cutoff_deletes_only_strictly_older_file(self):
+        now_ns = 1700000000123456789
+        cutoff_ns = now_ns - (24 * 60 * 60 * 1000000000)
+        older = self._write_media(
+            ".staging/media-migration-15151515-1515-4515-8515-151515151515.part",
+            b"older",
+        )
+        boundary = self._write_media(
+            ".staging/media-migration-16161616-1616-4616-8616-161616161616.part",
+            b"boundary",
+        )
+        os.utime(older, ns=(cutoff_ns - 1, cutoff_ns - 1))
+        os.utime(boundary, ns=(cutoff_ns, cutoff_ns))
+
+        with mock.patch(
+            "django_images.services.media_cleanup.time.time_ns",
+            return_value=now_ns,
+        ), mock.patch(
+            "django_images.services.media_cleanup.time.time",
+            return_value=now_ns / 1000000000.0,
+        ):
+            media_cleanup.OrphanMediaCleaner().run(execute=True)
+
+        self.assertFalse(older.exists())
+        self.assertTrue(boundary.exists())
+
+    def test_owned_file_unlink_fsyncs_its_parent_directory(self):
+        relative_path = (
+            ".staging/media-migration-17171717-1717-4717-8717-171717171717.part"
+        )
+        path = self._write_media(relative_path, b"durable")
+        candidate = media_cleanup._FileCandidate(
+            relative_path, path.stat()
+        )
+        root = open_media_root(self.temporary_media.name)
+        try:
+            with mock.patch.object(
+                media_cleanup.os,
+                "fsync",
+                wraps=os.fsync,
+            ) as fsync:
+                media_cleanup._unlink_file(root.descriptor, candidate)
+        finally:
+            root.close()
+
+        self.assertEqual(fsync.call_count, 1)
+        self.assertFalse(path.exists())
+
+    def test_owned_directory_removal_fsyncs_its_parent_directory(self):
+        relative_path = ".staging/18181818-1818-4818-8818-181818181818"
+        path = Path(self.temporary_media.name, relative_path)
+        path.mkdir(parents=True)
+        candidate = media_cleanup._DirectoryCandidate(
+            relative_path, path.stat()
+        )
+        root = open_media_root(self.temporary_media.name)
+        try:
+            with mock.patch.object(
+                media_cleanup.os,
+                "fsync",
+                wraps=os.fsync,
+            ) as fsync:
+                media_cleanup._remove_empty_directory(
+                    root.descriptor, candidate
+                )
+        finally:
+            root.close()
+
+        self.assertEqual(fsync.call_count, 1)
+        self.assertFalse(path.exists())
