@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -gt 1 ]; then
+    echo "usage: $0 [output-directory]" >&2
+    exit 2
+fi
+
+script_directory="$(
+    cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1
+    pwd -P
+)"
+repository_root="$(cd "${script_directory}/.." && pwd -P)"
+output_root="${1:-${repository_root}/output/synology}"
+
+mkdir -p "${output_root}"
+output_root="$(cd "${output_root}" && pwd -P)"
+
+cd "${repository_root}"
+source_commit="$(git rev-parse HEAD)"
+short_commit="$(git rev-parse --short=12 HEAD)"
+package_name="pinry-custom-${short_commit}"
+package_directory="${output_root}/${package_name}"
+archive_path="${package_directory}.tar.gz"
+
+if [ -e "${package_directory}" ] || [ -e "${archive_path}" ]; then
+    echo "output_already_exists=${package_name}" >&2
+    exit 1
+fi
+
+temporary_directory="$(
+    mktemp -d "${output_root}/.${package_name}.tmp.XXXXXX"
+)"
+temporary_archive="$(
+    mktemp "${output_root}/.${package_name}.archive.XXXXXX"
+)"
+
+cleanup_temporary_files() {
+    if [ -d "${temporary_directory}" ]; then
+        rm -rf -- "${temporary_directory}"
+    fi
+    if [ -f "${temporary_archive}" ]; then
+        rm -f -- "${temporary_archive}"
+    fi
+}
+trap cleanup_temporary_files EXIT
+
+git archive --format=tar HEAD | tar -xf - -C "${temporary_directory}"
+install -m 0755 \
+    "${repository_root}/deploy/synology/build-image.sh" \
+    "${temporary_directory}/build-image.sh"
+install -m 0644 \
+    "${repository_root}/deploy/synology/README_KO.md" \
+    "${temporary_directory}/README_KO.md"
+printf 'source_commit=%s\ndefault_image=pinry-custom:%s\n' \
+    "${source_commit}" "${short_commit}" \
+    > "${temporary_directory}/BUILD_INFO"
+
+mv "${temporary_directory}" "${package_directory}"
+tar -czf "${temporary_archive}" \
+    -C "${output_root}" "${package_name}"
+mv "${temporary_archive}" "${archive_path}"
+trap - EXIT
+
+printf 'upload_directory=%s\n' "${package_directory}"
+printf 'upload_archive=%s\n' "${archive_path}"
