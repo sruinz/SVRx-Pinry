@@ -48,7 +48,7 @@ def _storage_for_kind(kind):
     return model._meta.get_field("image").storage
 
 
-def _canonical_asset_directory(kind, name):
+def _canonical_media_path(name):
     components = name.split("/")
     if len(components) != 3:
         return None
@@ -60,19 +60,25 @@ def _canonical_asset_directory(kind, name):
     if str(asset_uuid) != asset_uuid_text:
         return None
     if (
-        kind == PendingMediaDeletion.ORIGINAL
-        and root_name == "originals"
+        root_name == "originals"
         and is_valid_original_leaf(asset_uuid_text, leaf)
     ):
-        return asset_uuid, "originals/{}".format(asset_uuid_text)
+        return (
+            PendingMediaDeletion.ORIGINAL,
+            asset_uuid,
+            "originals/{}".format(asset_uuid_text),
+        )
     stem, extension = os.path.splitext(leaf)
     if (
-        kind == PendingMediaDeletion.THUMBNAIL
-        and root_name == "derivatives"
+        root_name == "derivatives"
         and stem in DERIVATIVE_NAMES
         and extension in FORMAT_EXTENSIONS.values()
     ):
-        return asset_uuid, "derivatives/{}".format(asset_uuid_text)
+        return (
+            PendingMediaDeletion.THUMBNAIL,
+            asset_uuid,
+            "derivatives/{}".format(asset_uuid_text),
+        )
     return None
 
 
@@ -116,6 +122,7 @@ def _delete_canonical_media(
     relative_directory,
     media_root,
     using,
+    prune_directory,
 ):
     root_directory = open_media_root(media_root)
     try:
@@ -123,7 +130,10 @@ def _delete_canonical_media(
             if _media_path_is_referenced(name, using):
                 return
             remove_media_file(root_directory, name)
-            if not _asset_uuid_is_referenced(asset_uuid, using):
+            if (
+                prune_directory
+                and not _asset_uuid_is_referenced(asset_uuid, using)
+            ):
                 remove_empty_media_directory(
                     root_directory,
                     relative_directory,
@@ -137,18 +147,21 @@ def _process_pending(pending, using):
     if _media_path_is_referenced(pending.name, using):
         return
     storage = _storage_for_kind(pending.kind)
-    canonical = _canonical_asset_directory(pending.kind, pending.name)
-    media_root = _filesystem_media_root(storage)
-    if canonical is not None and media_root is not None:
-        asset_uuid, relative_directory = canonical
-        _delete_canonical_media(
-            pending.name,
-            asset_uuid,
-            relative_directory,
-            media_root,
-            using,
-        )
-        return
+    canonical = _canonical_media_path(pending.name)
+    if canonical is not None:
+        canonical_kind, asset_uuid, relative_directory = canonical
+        canonical_storage = _storage_for_kind(canonical_kind)
+        media_root = _filesystem_media_root(canonical_storage)
+        if media_root is not None:
+            _delete_canonical_media(
+                pending.name,
+                asset_uuid,
+                relative_directory,
+                media_root,
+                using,
+                prune_directory=pending.kind == canonical_kind,
+            )
+            return
     if storage.exists(pending.name):
         storage.delete(pending.name)
 

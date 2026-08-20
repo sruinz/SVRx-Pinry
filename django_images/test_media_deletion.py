@@ -26,6 +26,7 @@ from django_images.models import Image, PendingMediaDeletion, Thumbnail
 from django_images.services.media_deletion import (
     process_pending_media_deletion,
 )
+from django_images.services import media_deletion as media_deletion_service
 from django_images.test_helpers import TemporaryMediaMixin
 
 
@@ -704,6 +705,83 @@ class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
         )
         self.assertFalse(self._pending_deletions().exists())
 
+    def test_mismatch_rechecks_reference_after_shared_publish(self):
+        asset_uuid, name = self._canonical_name(kind="thumbnail")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        foreign = Path(self.temporary_media.name, "foreign.dat")
+        foreign.write_bytes(b"foreign")
+        initial_checked = threading.Event()
+        publish_done = threading.Event()
+        finished = threading.Event()
+        result = {}
+        errors = []
+        real_is_referenced = media_deletion_service._media_path_is_referenced
+
+        def pause_after_initial_check(media_name, using):
+            referenced = real_is_referenced(media_name, using)
+            if not initial_checked.is_set():
+                initial_checked.set()
+                if not publish_done.wait(2):
+                    raise AssertionError("shared publish did not finish")
+            return referenced
+
+        def process_mismatch():
+            close_old_connections()
+            try:
+                result["processed"] = process_pending_media_deletion(
+                    pending.pk
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+                finished.set()
+
+        with mock.patch(
+            "django_images.services.media_deletion."
+            "_media_path_is_referenced",
+            side_effect=pause_after_initial_check,
+        ):
+            worker = threading.Thread(target=process_mismatch)
+            worker.start()
+            self.assertTrue(initial_checked.wait(1))
+            root = open_media_root(self.temporary_media.name)
+            try:
+                with media_lifecycle_lock(root):
+                    self._write_file(name, b"published-thumbnail")
+                    image = Image.objects.create(
+                        image="legacy/published.png",
+                        asset_uuid=asset_uuid,
+                        original_filename="published.png",
+                        width=32,
+                        height=32,
+                    )
+                    thumbnail = Thumbnail.objects.create(
+                        original=image,
+                        image=name,
+                        size="thumbnail",
+                        width=32,
+                        height=32,
+                    )
+            finally:
+                root.close()
+                publish_done.set()
+            worker.join(2)
+
+        self.assertTrue(finished.is_set())
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(result["processed"])
+        self.assertTrue(Thumbnail.objects.filter(pk=thumbnail.pk).exists())
+        self.assertEqual(
+            Path(self.temporary_media.name, name).read_bytes(),
+            b"published-thumbnail",
+        )
+        self.assertEqual(foreign.read_bytes(), b"foreign")
+        self.assertFalse(self._pending_deletions().exists())
+
     @skipUnless(
         hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
         "FIFO and nonblocking open support required",
@@ -754,6 +832,72 @@ class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
         self.assertFalse(result["processed"])
+        self.assertTrue(leaf.is_fifo())
+        pending.refresh_from_db()
+        self.assertEqual(pending.attempts, 1)
+        self.assertEqual(pending.last_error, "MediaPathError")
+
+    @skipUnless(
+        hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"),
+        "FIFO and nonblocking open support required",
+    )
+    def test_regular_leaf_swapped_to_fifo_before_open_does_not_block(self):
+        _asset_uuid, name = self._canonical_name()
+        leaf = Path(self.temporary_media.name, name)
+        moved = leaf.with_name("original-old.png")
+        self._write_file(name, b"original")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        swapped = threading.Event()
+        finished = threading.Event()
+        result = {}
+        errors = []
+        real_open = file_ops._open_regular_nofollow
+
+        def swap_before_open(directory_descriptor, leaf_name):
+            leaf.rename(moved)
+            os.mkfifo(str(leaf))
+            swapped.set()
+            return real_open(directory_descriptor, leaf_name)
+
+        def process_fifo_swap():
+            close_old_connections()
+            try:
+                result["processed"] = process_pending_media_deletion(
+                    pending.pk
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+                finished.set()
+
+        unblock_descriptor = None
+        with mock.patch(
+            "django_images.file_ops._open_regular_nofollow",
+            side_effect=swap_before_open,
+        ):
+            worker = threading.Thread(target=process_fifo_swap)
+            worker.daemon = True
+            worker.start()
+            self.assertTrue(swapped.wait(1))
+            completed_without_unblock = finished.wait(1)
+            try:
+                if not completed_without_unblock:
+                    unblock_descriptor = os.open(
+                        str(leaf), os.O_RDWR | os.O_NONBLOCK
+                    )
+                worker.join(2)
+            finally:
+                if unblock_descriptor is not None:
+                    os.close(unblock_descriptor)
+
+        self.assertTrue(completed_without_unblock)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertFalse(result["processed"])
+        self.assertEqual(moved.read_bytes(), b"original")
         self.assertTrue(leaf.is_fifo())
         pending.refresh_from_db()
         self.assertEqual(pending.attempts, 1)
