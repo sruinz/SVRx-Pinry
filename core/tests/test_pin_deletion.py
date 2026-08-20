@@ -1,12 +1,16 @@
 from io import StringIO
+import hashlib
 from pathlib import Path
+import queue
 import threading
+import traceback
 import uuid
 from unittest import skipUnless
 
 import mock
 from django.apps import apps
 from django.contrib import admin
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.db import close_old_connections, connection, connections
 from django.db import OperationalError, transaction
@@ -17,9 +21,13 @@ from rest_framework import status
 from rest_framework.test import APITransactionTestCase
 
 from core.admin import PinAdmin
-from core.models import BatchImportItem, Image, Pin
+from core.models import BatchImportItem, Image, MediaAsset, Pin
 from core.services.idempotency import IdempotencyStore, StoredError
+from core.services.media_storage import MediaStorage
+from core.services.pin_import import ImportMetadata, PinImportService
 from core.tests.helpers import TEST_IMAGE_PATH, create_image, create_pin, create_user
+from core.tests.test_pin_import_atomicity import _LinuxStrongPublishMixin
+from django_images import file_ops
 from django_images.file_ops import remove_media_file
 from django_images.models import Image as BaseImage, Thumbnail
 from django_images.test_helpers import TemporaryMediaMixin
@@ -161,7 +169,11 @@ class PinDeletionAPITest(TemporaryMediaMixin, APITransactionTestCase):
         )
 
 
-class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
+class PinMediaLifecycleTest(
+    _LinuxStrongPublishMixin,
+    TemporaryMediaMixin,
+    APITransactionTestCase,
+):
     def setUp(self):
         super(PinMediaLifecycleTest, self).setUp()
         self.owner = create_user("media-owner")
@@ -194,6 +206,14 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         return (
             root / "originals" / asset_uuid,
             root / "derivatives" / asset_uuid,
+        )
+
+    def _register_asset(self, image, submitter=None):
+        content = Path(self.temporary_media.name, image.image.name).read_bytes()
+        return MediaAsset.objects.create(
+            submitter=submitter or self.owner,
+            image=image,
+            content_sha256=hashlib.sha256(content).hexdigest(),
         )
 
     def _assert_delete_continues_after_storage_error(
@@ -302,6 +322,341 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertTrue((root / "originals").is_dir())
         self.assertTrue((root / "derivatives").is_dir())
 
+    def test_registered_last_delete_takes_stripe_before_atomic_recheck(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        events = []
+
+        class RecordingStripe(object):
+            def __enter__(inner_self):
+                events.append(("stripe_enter", connection.in_atomic_block))
+                return inner_self
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error, traceback
+                events.append((
+                    "stripe_exit",
+                    error_type.__name__ if error_type else None,
+                ))
+                return False
+
+        with mock.patch(
+            "core.models.media_dedup_lock",
+            return_value=RecordingStripe(),
+            create=True,
+        ) as dedup_lock:
+            pin.delete()
+
+        self.assertTrue(events, "registered delete did not enter dedup stripe")
+        self.assertEqual(events[0], ("stripe_enter", False))
+        self.assertEqual(events[-1], ("stripe_exit", None))
+        root_directory = dedup_lock.call_args[0][0]
+        self.assertEqual(dedup_lock.call_args[0][1:], (
+            asset.submitter_id,
+            asset.content_sha256,
+        ))
+        self.assertFalse(root_directory.descriptors)
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+
+    def test_registered_shared_delete_preserves_asset_rows_files_and_dirs(
+        self,
+    ):
+        image = create_image()
+        first_pin = create_pin(self.owner, image, [])
+        second_pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        files_before = self._assert_four_image_files(image)
+        directories = self._asset_directories(image)
+
+        first_pin.delete()
+
+        self.assertFalse(Pin.objects.filter(pk=first_pin.pk).exists())
+        self.assertTrue(Pin.objects.filter(pk=second_pin.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(
+            Thumbnail.objects.filter(original_id=image.pk).count(), 3
+        )
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name), files_before
+        )
+        self.assertTrue(all(path.is_dir() for path in directories))
+
+    def test_registered_last_delete_removes_asset_rows_files_and_dirs(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        self._assert_four_image_files(image)
+        directories = self._asset_directories(image)
+
+        pin.delete()
+
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertFalse(
+            Thumbnail.objects.filter(original_id=image.pk).exists()
+        )
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+        self.assertTrue(all(not path.exists() for path in directories))
+
+    def test_registered_delete_rejects_existing_database_transaction(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        files_before = self._assert_four_image_files(image)
+
+        with mock.patch("core.models.media_dedup_lock") as dedup_lock:
+            with transaction.atomic():
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "registered_pin_delete_requires_autocommit",
+                ):
+                    pin.delete()
+
+        dedup_lock.assert_not_called()
+        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name), files_before
+        )
+
+    def test_registered_committed_delete_survives_stripe_unlock_error(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        self._assert_four_image_files(image)
+
+        class UnlockFailureStripe(object):
+            def __enter__(inner_self):
+                return inner_self
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error_type, error, traceback
+                raise RuntimeError("private unlock error")
+
+        with mock.patch(
+            "core.models.media_dedup_lock",
+            return_value=UnlockFailureStripe(),
+        ), self.assertLogs("core.models", level="WARNING"):
+            result = pin.delete()
+
+        self.assertGreater(result[0], 0)
+        self.assertIsNone(pin.pk)
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+
+    def test_registered_committed_delete_survives_root_close_error(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        root_directory = file_ops.open_media_root(
+            self.temporary_media.name
+        )
+        real_close = root_directory.close
+
+        def close_then_fail():
+            real_close()
+            raise RuntimeError("private root close error")
+
+        with mock.patch(
+            "core.models.open_media_root",
+            return_value=root_directory,
+        ), mock.patch.object(
+            root_directory,
+            "close",
+            side_effect=close_then_fail,
+        ), self.assertLogs("core.models", level="WARNING"):
+            result = pin.delete()
+
+        self.assertGreater(result[0], 0)
+        self.assertIsNone(pin.pk)
+        self.assertFalse(root_directory.descriptors)
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+
+    def test_registered_delete_preserves_primary_when_root_close_fails(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        files_before = self._assert_four_image_files(image)
+        root_directory = file_ops.open_media_root(
+            self.temporary_media.name
+        )
+        real_close = root_directory.close
+        primary = KeyboardInterrupt()
+
+        def close_then_fail():
+            real_close()
+            raise RuntimeError("secondary root close error")
+
+        with mock.patch(
+            "core.models.open_media_root",
+            return_value=root_directory,
+        ), mock.patch.object(
+            root_directory,
+            "close",
+            side_effect=close_then_fail,
+        ), mock.patch.object(
+            BaseImage,
+            "delete",
+            side_effect=primary,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                pin.delete()
+
+        self.assertIs(caught.exception, primary)
+        self.assertFalse(root_directory.descriptors)
+        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name), files_before
+        )
+
+    def test_registered_identity_change_fails_closed_without_pin_delete(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        files_before = self._assert_four_image_files(image)
+
+        class RegistryReplacingStripe(object):
+            def __enter__(inner_self):
+                MediaAsset.objects.filter(pk=asset.pk).update(
+                    content_sha256="b" * 64
+                )
+                return inner_self
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error_type, error, traceback
+                return False
+
+        with mock.patch(
+            "core.models.media_dedup_lock",
+            return_value=RegistryReplacingStripe(),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "registered_media_identity_changed",
+            ):
+                pin.delete()
+
+        asset.refresh_from_db()
+        self.assertEqual(asset.content_sha256, "b" * 64)
+        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name), files_before
+        )
+
+    def test_registered_last_delete_racing_same_hash_reupload_is_consistent(
+        self,
+    ):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        self._register_asset(image)
+        original_content = Path(
+            self.temporary_media.name,
+            image.image.name,
+        ).read_bytes()
+        start = threading.Barrier(2)
+        events = queue.Queue()
+
+        def delete_last_pin():
+            close_old_connections()
+            try:
+                start.wait(timeout=5)
+                Pin.objects.get(pk=pin.pk).delete()
+                events.put(("deleted", pin.pk))
+            except BaseException as error:
+                events.put((
+                    "error",
+                    ("delete", error, traceback.format_exc()),
+                ))
+            finally:
+                connections["default"].close()
+
+        def reupload_same_hash():
+            close_old_connections()
+            try:
+                user = type(self.owner).objects.get(pk=self.owner.pk)
+                storage = MediaStorage(
+                    media_root=self.temporary_media.name,
+                    clock=lambda: 10.0,
+                )
+                service = PinImportService(
+                    fetcher=None,
+                    media_storage=storage,
+                    idempotency=IdempotencyStore(),
+                    clock=lambda: 10.0,
+                )
+                prepared = service.prepare_upload(
+                    SimpleUploadedFile(
+                        "reupload.png",
+                        original_content,
+                        content_type="image/png",
+                    ),
+                    deadline=20.0,
+                )
+                start.wait(timeout=5)
+                uploaded_pin = service.commit(
+                    prepared,
+                    user,
+                    ImportMetadata(
+                        url=None,
+                        referer=None,
+                        description="raced reupload",
+                        private=False,
+                        tags=(),
+                        board_ids=(),
+                    ),
+                    claim=None,
+                    deadline=20.0,
+                )
+                events.put(("uploaded", uploaded_pin.pk))
+            except BaseException as error:
+                events.put((
+                    "error",
+                    ("upload", error, traceback.format_exc()),
+                ))
+            finally:
+                connections["default"].close()
+
+        workers = [
+            threading.Thread(target=delete_last_pin),
+            threading.Thread(target=reupload_same_hash),
+        ]
+        for current in workers:
+            current.start()
+        for current in workers:
+            current.join(timeout=10)
+
+        self.assertFalse(any(current.is_alive() for current in workers))
+        collected = [events.get(timeout=1) for _worker in workers]
+        errors = [value for kind, value in collected if kind == "error"]
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            sorted(kind for kind, _value in collected),
+            ["deleted", "uploaded"],
+        )
+        live_pin = Pin.objects.get()
+        live_image = Image.objects.get(pk=live_pin.image_id)
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertEqual(live_pin.description, "raced reupload")
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(Thumbnail.objects.count(), 3)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(len(media_snapshot(self.temporary_media.name)), 4)
+        self._assert_four_image_files(live_image)
+        self.assertFalse(self._pending_deletions().exists())
+
     def test_first_storage_failure_is_journaled_without_stopping_cleanup(self):
         self._assert_delete_continues_after_storage_error(1)
 
@@ -385,6 +740,75 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(
             Thumbnail.objects.filter(original_id=image.pk).count(), 3
         )
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name), files_before
+        )
+
+    def test_registered_queryset_delete_locks_before_pin_row_mutation(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        events = []
+
+        class RecordingStripe(object):
+            def __enter__(inner_self):
+                events.append((
+                    connection.in_atomic_block,
+                    Pin.objects.filter(pk=pin.pk).exists(),
+                ))
+                return inner_self
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error_type, error, traceback
+                return False
+
+        with mock.patch(
+            "core.models.media_dedup_lock",
+            return_value=RecordingStripe(),
+        ):
+            Pin.objects.filter(pk=pin.pk).delete()
+
+        self.assertEqual(events, [(False, True)])
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+
+    def test_registered_multi_queryset_fails_before_partial_delete(self):
+        image = create_image()
+        first_pin = create_pin(self.owner, image, [])
+        second_pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        files_before = self._assert_four_image_files(image)
+        stripe_entries = {"value": 0}
+
+        class SecondStripeFailure(object):
+            def __enter__(inner_self):
+                stripe_entries["value"] += 1
+                if stripe_entries["value"] == 2:
+                    raise RuntimeError("second stripe failed")
+                return inner_self
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error_type, error, traceback
+                return False
+
+        with mock.patch(
+            "core.models.media_dedup_lock",
+            side_effect=lambda *_args, **_kwargs: SecondStripeFailure(),
+        ):
+            with self.assertRaises(RuntimeError):
+                Pin.objects.filter(
+                    pk__in=(first_pin.pk, second_pin.pk)
+                ).order_by("pk").delete()
+
+        self.assertEqual(stripe_entries["value"], 0)
+        self.assertEqual(
+            set(Pin.objects.values_list("pk", flat=True)),
+            {first_pin.pk, second_pin.pk},
+        )
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
         self.assertEqual(
             media_snapshot(self.temporary_media.name), files_before
         )

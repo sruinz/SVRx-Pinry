@@ -1,15 +1,22 @@
+from io import BytesIO
+import os
+from pathlib import Path
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.urls import resolve, reverse
 from django.db import connection
+from django.db.models.query import QuerySet
 import mock
+from PIL import Image as PILImage
 from rest_framework import serializers as drf_serializers, status
 from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.test import APITestCase, APITransactionTestCase
 
-from taggit.managers import _TaggableManager
 from taggit.models import Tag
 
 from .helpers import create_image, create_user, create_pin
-from core.models import Pin, Image, Board
+from core.models import Board, Image, MediaAsset, Pin
 from core.serializers import (
     PinSerializer,
     URLImportConflict,
@@ -25,6 +32,8 @@ from core.services.safe_url_fetch import (
 )
 from core.views import PinViewSet
 from django_images.test_helpers import TemporaryMediaMixin
+from django_images.models import Thumbnail
+from django_images import file_ops
 
 
 def _teardown_models():
@@ -44,16 +53,37 @@ def mock_requests_get_with_non_image_content(url, **kwargs):
     return response
 
 
+def _png_upload(filename="from-client.png", size=(32, 24), color="red"):
+    output = BytesIO()
+    PILImage.new("RGB", size, color).save(output, format="PNG")
+    content = output.getvalue()
+    return SimpleUploadedFile(filename, content, content_type="image/png")
+
+
+def _media_files(media_root):
+    root = Path(media_root)
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.relative_to(root).parts[0] != ".pinry-locks"
+    }
+
+
 class ImageTests(TemporaryMediaMixin, APITestCase):
-    def test_post_create_unsupported(self):
+    def test_authenticated_post_create_is_not_available(self):
+        user = create_user("image-create-closed")
+        self.client.login(username=user.username, password="password")
         url = reverse("image-list")
-        data = {}
         response = self.client.post(
             url,
-            data=data,
-            format='json',
+            data={"image": _png_upload()},
+            format="multipart",
         )
-        self.assertEqual(response.status_code, 401, response.data)
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        self.assertEqual(Image.objects.count(), 0)
+        self.assertEqual(_media_files(self.temporary_media.name), {})
 
 
 class BoardPrivacyTests(TemporaryMediaMixin, APITestCase):
@@ -316,6 +346,250 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
     def tearDown(self):
         _teardown_models()
 
+    def test_multipart_upload_creates_one_complete_owned_asset(self):
+        board = Board.objects.create(
+            submitter=self.user,
+            name="multipart-board",
+        )
+        upload = _png_upload("camera original.png")
+        original = upload.read()
+        upload.seek(0)
+
+        with self._strong_publish_support(), mock.patch.object(
+            PinViewSet,
+            "transport_class",
+            side_effect=AssertionError("local upload built HTTP transport"),
+        ) as transport, mock.patch.object(
+            PinViewSet,
+            "resolver_class",
+            side_effect=AssertionError("local upload built resolver"),
+        ) as resolver:
+            response = self.client.post(
+                reverse("pin-list"),
+                {
+                    "image_file": upload,
+                    "referer": "https://page.example/",
+                    "description": "multipart upload",
+                    "private": "true",
+                    "tags": ["alpha", "beta"],
+                    "board_ids": [str(board.pk)],
+                },
+                format="multipart",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_201_CREATED,
+            getattr(response, "data", None),
+        )
+        pin = Pin.objects.get(pk=response.json()["id"])
+        image = Image.objects.get(pk=pin.image_id)
+        asset = MediaAsset.objects.get(image=image)
+        files = _media_files(self.temporary_media.name)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(Thumbnail.objects.count(), 3)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(asset.submitter_id, self.user.pk)
+        self.assertEqual(image.original_filename, "camera original.png")
+        self.assertEqual(files[image.image.name], original)
+        self.assertEqual(len(files), 4)
+        self.assertEqual(set(pin.tags.names()), {"alpha", "beta"})
+        self.assertTrue(board.pins.filter(pk=pin.pk).exists())
+        self.assertTrue(pin.private)
+        self.assertIsNone(pin.url)
+        staging = Path(self.temporary_media.name, ".staging")
+        self.assertEqual(
+            list(staging.rglob("*.part")) if staging.exists() else [],
+            [],
+        )
+        transport.assert_not_called()
+        resolver.assert_not_called()
+
+    def test_invalid_local_uploads_leave_no_database_or_media_state(self):
+        valid = _png_upload().read()
+        cases = (
+            (
+                SimpleUploadedFile(
+                    "empty.png", b"", content_type="image/png"
+                ),
+                {},
+                "invalid_image_content",
+            ),
+            (
+                SimpleUploadedFile(
+                    "invalid.png", b"not-an-image", content_type="image/png"
+                ),
+                {},
+                "invalid_image_content",
+            ),
+            (
+                SimpleUploadedFile(
+                    "large.png", valid, content_type="image/png"
+                ),
+                {"PINRY_FETCH_MAX_BYTES": len(valid) - 1},
+                "image_too_large",
+            ),
+            (
+                SimpleUploadedFile(
+                    "pixels.png", valid, content_type="image/png"
+                ),
+                {"PINRY_FETCH_MAX_PIXELS": 767},
+                "image_too_many_pixels",
+            ),
+        )
+        for upload, settings_override, expected_code in cases:
+            with self.subTest(expected_code=expected_code), override_settings(
+                **settings_override
+            ):
+                response = self.client.post(
+                    reverse("pin-list"),
+                    {"image_file": upload},
+                    format="multipart",
+                )
+
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(response.json(), {
+                "image_file": [expected_code]
+            })
+            self.assertEqual(Pin.objects.count(), 0)
+            self.assertEqual(Image.objects.count(), 0)
+            self.assertEqual(Thumbnail.objects.count(), 0)
+            self.assertEqual(MediaAsset.objects.count(), 0)
+            self.assertEqual(_media_files(self.temporary_media.name), {})
+
+    def test_foreign_board_rejects_before_local_prepare(self):
+        other = create_user("foreign-board-owner")
+        board = Board.objects.create(submitter=other, name="foreign")
+
+        with mock.patch.object(
+            PinViewSet,
+            "get_local_pin_import_service",
+        ) as factory:
+            response = self.client.post(
+                reverse("pin-list"),
+                {
+                    "image_file": _png_upload(),
+                    "tags": ["must-not-exist"],
+                    "board_ids": [str(board.pk)],
+                },
+                format="multipart",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json(), {
+            "board_ids": ["board_access_denied"]
+        })
+        factory.assert_not_called()
+        self.assertFalse(Tag.objects.filter(name="must-not-exist").exists())
+        self.assertEqual(Pin.objects.count(), 0)
+        self.assertEqual(Image.objects.count(), 0)
+        self.assertEqual(MediaAsset.objects.count(), 0)
+        self.assertEqual(_media_files(self.temporary_media.name), {})
+
+    def test_local_publish_and_database_faults_leave_no_owned_state(self):
+        real_create = QuerySet.create
+
+        def fail_media_asset_create(queryset, **kwargs):
+            if queryset.model is MediaAsset:
+                raise RuntimeError("/private/database/token")
+            return real_create(queryset, **kwargs)
+
+        faults = (
+            (
+                mock.patch(
+                    "core.services.media_storage.MediaStorage.publish",
+                    side_effect=MediaStorageError(
+                        "media_storage_failed",
+                        "private media root",
+                        True,
+                    ),
+                ),
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "media_storage_failed",
+            ),
+            (
+                mock.patch.object(
+                    QuerySet,
+                    "create",
+                    new=fail_media_asset_create,
+                ),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "internal_error",
+            ),
+        )
+        for fault, expected_status, expected_code in faults:
+            with self.subTest(expected_code=expected_code), fault, \
+                    self._strong_publish_support():
+                response = self.client.post(
+                    reverse("pin-list"),
+                    {"image_file": _png_upload()},
+                    format="multipart",
+                )
+
+            self.assertEqual(response.status_code, expected_status)
+            self.assertEqual(response.json(), {
+                "image_file": [expected_code]
+            })
+            self.assertNotIn("private", response.content.decode("utf-8"))
+            self.assertEqual(Pin.objects.count(), 0)
+            self.assertEqual(Image.objects.count(), 0)
+            self.assertEqual(Thumbnail.objects.count(), 0)
+            self.assertEqual(MediaAsset.objects.count(), 0)
+            self.assertEqual(_media_files(self.temporary_media.name), {})
+
+    def _strong_publish_support(self):
+        if file_ops.sys.platform.startswith("linux"):
+            return mock.patch(
+                "django_images.file_ops.sys.platform",
+                file_ops.sys.platform,
+            )
+        return mock.patch.multiple(
+            "django_images.file_ops",
+            sys=mock.Mock(platform="linux"),
+            _publish_linux_descriptor=mock.Mock(
+                side_effect=self._link_staging_descriptor
+            ),
+        )
+
+    def _link_staging_descriptor(
+        self,
+        descriptor,
+        destination_directory_descriptor,
+        destination_name,
+    ):
+        expected = os.fstat(descriptor)
+        staging_root = Path(self.temporary_media.name, ".staging")
+        for candidate in staging_root.rglob("*.part"):
+            current = os.stat(str(candidate), follow_symlinks=False)
+            if (current.st_dev, current.st_ino) != (
+                expected.st_dev,
+                expected.st_ino,
+            ):
+                continue
+            os.link(
+                str(candidate),
+                destination_name,
+                dst_dir_fd=destination_directory_descriptor,
+                follow_symlinks=False,
+            )
+            return
+        raise OSError("test staging descriptor path was not found")
+
+    def test_image_by_id_cannot_attach_another_users_image(self):
+        other = create_user("image-owner")
+        image = create_image()
+        create_pin(other, image=image, tags=[])
+
+        response = self.client.post(
+            reverse("pin-list"),
+            {"image_by_id": image.pk, "description": "forged ownership"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Pin.objects.count(), 1)
+
     def test_serializer_validation_does_not_create_tags(self):
         request = mock.Mock(user=self.user)
         serializer = PinSerializer(
@@ -332,14 +606,13 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
         ).exists())
 
     def test_serializer_requires_exactly_one_image_source(self):
-        image = create_image()
         request = mock.Mock(user=self.user)
         for data in (
             {},
-            {"url": "", "image_by_id": image.pk},
+            {"url": "", "image_file": _png_upload()},
             {
                 "url": "https://example.com/image.png",
-                "image_by_id": image.pk,
+                "image_file": _png_upload(),
             },
         ):
             with self.subTest(data=data):
@@ -352,7 +625,7 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
                 self.assertIn("url-or-image", serializer.errors)
                 self.assertEqual(Pin.objects.count(), 0)
 
-    def test_missing_source_keeps_legacy_scalar_error_body(self):
+    def test_missing_source_fails_before_import_service_creation(self):
         with mock.patch.object(
             PinViewSet,
             "get_pin_import_service",
@@ -362,7 +635,9 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(response.json(), {
-            "url-or-image": "Either url or image_by_id is required."
+            "url-or-image": [
+                "Exactly one of url or image_file is required."
+            ]
         })
 
     def test_serializer_uses_injected_service_for_url_import(self):
@@ -439,7 +714,13 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
                     return_value=service,
                 ):
                     response = self.client.post(
-                        reverse("pin-list"), payload, format="json"
+                        reverse("pin-list"),
+                        payload,
+                        format=(
+                            "multipart"
+                            if "image_file" in payload
+                            else "json"
+                        ),
                     )
 
                 self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -603,7 +884,7 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
 
                 factory.assert_not_called()
 
-    def test_url_post_validation_stage_only_preserves_validation_errors(self):
+    def test_url_post_validation_failure_does_not_create_service(self):
         secret = "/private/validation?token=do-not-leak"
         cases = (
             APIException({"url": [secret]}),
@@ -611,11 +892,12 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
         )
         for error in cases:
             with self.subTest(error_type=type(error).__name__):
-                service = _SinglePinImport()
                 with mock.patch.object(
                     PinViewSet,
                     "get_pin_import_service",
-                    return_value=service,
+                ) as factory, mock.patch.object(
+                    PinViewSet,
+                    "get_local_pin_import_service",
                 ), mock.patch.object(
                     PinSerializer,
                     "is_valid",
@@ -632,7 +914,7 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
                     "url": ["internal_error"]
                 })
                 self.assertNotIn(secret, response.content.decode("utf-8"))
-                self.assertEqual(service.closed, 1)
+                factory.assert_not_called()
 
     def test_url_post_perform_stage_exception_is_internal(self):
         secret = "/private/perform?token=do-not-leak"
@@ -834,37 +1116,42 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
 
                 self.assertEqual(service.closed, 1)
 
-    def test_invalid_url_sources_fail_before_fetch_and_close_created_service(self):
-        image = create_image()
+    def test_invalid_sources_fail_before_import_service_creation(self):
         cases = (
             {"url": ""},
             {"url": None},
             {
                 "url": "https://example.com/image.png",
-                "image_by_id": image.pk,
+                "image_file": _png_upload(),
             },
         )
         for payload in cases:
             with self.subTest(payload=payload):
-                service = _SinglePinImport()
                 with mock.patch.object(
                     PinViewSet,
                     "get_pin_import_service",
-                    return_value=service,
-                ):
+                ) as url_factory, mock.patch.object(
+                    PinViewSet,
+                    "get_local_pin_import_service",
+                ) as local_factory:
                     response = self.client.post(
-                        reverse("pin-list"), payload, format="json"
+                        reverse("pin-list"),
+                        payload,
+                        format=(
+                            "multipart"
+                            if "image_file" in payload
+                            else "json"
+                        ),
                     )
 
                 self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
                 self.assertEqual(response.json(), {
                     "url-or-image": [
-                        "Either url or image_by_id is required."
+                        "Exactly one of url or image_file is required."
                     ]
                 })
-                self.assertEqual(service.prepare_calls, [])
-                self.assertEqual(service.commit_calls, [])
-                self.assertEqual(service.closed, 1)
+                url_factory.assert_not_called()
+                local_factory.assert_not_called()
                 self.assertEqual(Pin.objects.count(), 0)
 
     def test_late_real_prepare_returns_503_without_commit_or_db_write(self):
@@ -898,7 +1185,7 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(idempotency.fence_calls, 0)
         self.assertEqual(Pin.objects.count(), 0)
 
-    def test_image_by_id_tag_write_failure_rolls_back_pin_and_tags(self):
+    def test_image_by_id_is_rejected_before_tag_creation(self):
         image = create_image()
         serializer = PinSerializer(
             data={
@@ -908,22 +1195,8 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
             },
             context={"request": mock.Mock(user=self.user)},
         )
-        self.assertTrue(serializer.is_valid(), serializer.errors)
-        real_set = _TaggableManager.set
-
-        def set_then_fail(manager, *tags, **kwargs):
-            real_set(manager, *tags, **kwargs)
-            raise RuntimeError("after tag write")
-
-        with mock.patch.object(
-            _TaggableManager,
-            "set",
-            side_effect=set_then_fail,
-            autospec=True,
-        ):
-            with self.assertRaises(RuntimeError):
-                serializer.save()
-
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("image_by_id", serializer.errors)
         self.assertEqual(Pin.objects.count(), 0)
         self.assertFalse(Tag.objects.filter(
             name="created-then-rolled-back"
@@ -1016,7 +1289,7 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
         self.assertTrue(service.commit_autocommit)
         self.assertEqual(service.closed, 1)
 
-    def test_only_import_callbacks_are_marked_non_atomic(self):
+    def test_import_and_delete_callbacks_restore_atomic_read_actions(self):
         image = create_image()
         detail_url = reverse("pin-detail", args=[image.pk])
         callback_urls = {
@@ -1031,8 +1304,7 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
 
         self.assertEqual(markers["list"], {"default"})
         self.assertEqual(markers["batch"], {"default"})
-        for name in ("detail",):
-            self.assertEqual(markers[name], set())
+        self.assertEqual(markers["detail"], {"default"})
 
         pin = create_pin(self.user, image, [])
         observed = []
@@ -1057,6 +1329,48 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(observed, [True])
+
+    def test_registered_delete_takes_dedup_stripe_outside_atomic_requests(
+        self,
+    ):
+        image = create_image()
+        pin = create_pin(self.user, image, [])
+        MediaAsset.objects.create(
+            submitter=self.user,
+            image=image,
+            content_sha256="a" * 64,
+        )
+        observed = []
+
+        class RecordingStripe(object):
+            def __enter__(inner_self):
+                observed.append((
+                    connection.in_atomic_block,
+                    connection.get_autocommit(),
+                ))
+                return inner_self
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error_type, error, traceback
+                return False
+
+        previous = connection.settings_dict["ATOMIC_REQUESTS"]
+        connection.settings_dict["ATOMIC_REQUESTS"] = True
+        try:
+            with mock.patch(
+                "core.models.media_dedup_lock",
+                return_value=RecordingStripe(),
+            ):
+                response = self.client.delete(
+                    reverse("pin-detail", args=[pin.pk])
+                )
+        finally:
+            connection.settings_dict["ATOMIC_REQUESTS"] = previous
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(observed, [(False, True)])
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
 
     def test_should_not_create_pin_if_url_content_invalid(self):
         url = 'http://testserver.com/mocked/logo-01.png'
@@ -1125,7 +1439,7 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
         self.assertIsNotNone(pin.image.image)
         self.assertEqual(pin.tags.count(), 0)
 
-    def test_should_post_create_pin_with_existed_image(self):
+    def test_should_reject_pin_create_with_existed_image_id(self):
         image = create_image()
         create_pin(self.user, image=image, tags=[])
         create_url = reverse("pin-list")
@@ -1137,21 +1451,19 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
             'tags': ['random', 'tags'],
         }
         response = self.client.post(create_url, data=post_data, format="json")
-        resp_data = response.json()
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED, resp_data)
-        self.assertEqual(
-            resp_data['description'],
-            'That\'s something else (probably a CC logo)!',
-            resp_data
-        )
-        self.assertEquals(Pin.objects.count(), 2)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(Pin.objects.count(), 1)
 
-    def test_image_by_id_post_does_not_build_url_import_service(self):
+    def test_image_by_id_post_does_not_build_any_import_service(self):
         image = create_image()
         with mock.patch.object(
             PinViewSet,
             "get_pin_import_service",
             side_effect=AssertionError("URL service must not be built"),
+        ), mock.patch.object(
+            PinViewSet,
+            "get_local_pin_import_service",
+            side_effect=AssertionError("local service must not be built"),
         ):
             response = self.client.post(
                 reverse("pin-list"),
@@ -1159,7 +1471,7 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
                 format="json",
             )
 
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_patch_detail_unauthenticated(self):
         image = create_image()

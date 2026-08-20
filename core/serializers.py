@@ -9,6 +9,7 @@ from core.models import Image, Board
 from core.models import Pin
 from django_images.models import Thumbnail
 from django_images.paths import UnsupportedImageFormat
+from core.services.local_upload import LocalUploadError
 from core.services.media_storage import MediaStorageError
 from core.services.pin_import import ImportMetadata, PinImportError
 from core.services.safe_url_fetch import SafeFetchError
@@ -130,15 +131,17 @@ _URL_INTERNAL_ERROR_CODES = frozenset((
 ))
 
 
-def raise_url_import_error(error):
+def raise_url_import_error(error, source_field="url"):
     code = getattr(error, "code", "internal_error")
     if type(code) is not str:
-        raise URLImportInternalError({"url": ["internal_error"]})
-    detail = {"url": [code]}
+        raise URLImportInternalError({source_field: ["internal_error"]})
+    detail = {source_field: [code]}
     if code == "invalid_image_content":
-        raise ValidationError({"url": "invalid image content"})
+        if source_field == "url":
+            raise ValidationError({"url": "invalid image content"})
+        raise ValidationError(detail)
     if code == "unsupported_image_format":
-        raise ValidationError({"url": ["unsupported_image_format"]})
+        raise ValidationError(detail)
     if code in _URL_CLIENT_ERROR_CODES:
         raise ValidationError(detail)
     if code in ("lease_lost", "board_access_changed"):
@@ -146,7 +149,7 @@ def raise_url_import_error(error):
     if code == "image_download_failed":
         retryable = getattr(error, "retryable", None)
         if type(retryable) is not bool:
-            raise URLImportInternalError({"url": ["internal_error"]})
+            raise URLImportInternalError({source_field: ["internal_error"]})
         if retryable:
             raise URLImportUnavailable(detail)
         raise URLImportInternalError(detail)
@@ -154,7 +157,7 @@ def raise_url_import_error(error):
         raise URLImportUnavailable(detail)
     if code in _URL_INTERNAL_ERROR_CODES:
         raise URLImportInternalError(detail)
-    raise URLImportInternalError({"url": ["internal_error"]})
+    raise URLImportInternalError({source_field: ["internal_error"]})
 
 
 class PinSerializer(serializers.HyperlinkedModelSerializer):
@@ -169,8 +172,9 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
             "description",
             "referer",
             "image",
-            "image_by_id",
+            "image_file",
             "tags",
+            "board_ids",
         )
 
     submitter = UserSerializer(read_only=True)
@@ -180,44 +184,70 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
         required=False,
     )
     image = ImageSerializer(required=False, read_only=True)
-    image_by_id = serializers.PrimaryKeyRelatedField(
-        queryset=Image.objects.all(),
+    image_file = serializers.FileField(
         write_only=True,
         required=False,
+        allow_empty_file=True,
+    )
+    board_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        write_only=True,
+        required=False,
+        allow_empty=True,
     )
 
     def validate(self, attrs):
         if self.instance is not None:
             return attrs
+        if "image_by_id" in self.initial_data:
+            raise ValidationError({
+                "image_by_id": ["unsupported_pin_image_reference"]
+            })
         has_url = bool(attrs.get("url"))
-        has_image = "image_by_id" in attrs
+        has_image = "image_file" in attrs
         if (
             "url" in self.initial_data and not has_url
             or has_url == has_image
         ):
             raise ValidationError({
-                "url-or-image": "Either url or image_by_id is required."
+                "url-or-image": (
+                    "Exactly one of url or image_file is required."
+                )
             })
+        board_ids = sorted(set(attrs.get("board_ids", ())))
+        if board_ids:
+            request = self.context.get("request")
+            user = getattr(request, "user", None)
+            owned_count = Board.objects.filter(
+                submitter=user,
+                pk__in=board_ids,
+            ).count()
+            if owned_count != len(board_ids):
+                raise ValidationError({
+                    "board_ids": ["board_access_denied"]
+                })
+        attrs["board_ids"] = board_ids
         return attrs
 
     def create(self, validated_data):
         submitter = self.context['request'].user
         tags = tuple(validated_data.pop('tag_list', ()))
+        board_ids = tuple(validated_data.pop("board_ids", ()))
+        service = self.context.get("pin_import_service")
+        deadline = self.context.get("pin_import_deadline")
+        if service is None or deadline is None:
+            raise URLImportInternalError({"url": ["internal_error"]})
         if 'url' in validated_data:
             url = validated_data.pop('url')
             referer_provided = 'referer' in validated_data
             referer = validated_data.pop('referer', None)
-            service = self.context.get("pin_import_service")
-            deadline = self.context.get("pin_import_deadline")
-            if service is None or deadline is None:
-                raise URLImportInternalError({"url": ["internal_error"]})
             metadata = ImportMetadata(
                 url=url,
                 referer=referer,
                 description=validated_data.get('description'),
                 private=validated_data.get('private', False),
                 tags=tags,
-                board_ids=(),
+                board_ids=board_ids,
             )
             try:
                 prepared = service.prepare_url(
@@ -239,16 +269,35 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
                     {"url": ["internal_error"]}
                 ) from None
 
-        image = validated_data.pop("image_by_id")
-        with transaction.atomic():
-            pin = Pin.objects.create(
-                submitter=submitter,
-                image=image,
-                **validated_data
+        uploaded_file = validated_data.pop("image_file")
+        referer = validated_data.pop("referer", None)
+        metadata = ImportMetadata(
+            url=None,
+            referer=referer,
+            description=validated_data.get("description"),
+            private=validated_data.get("private", False),
+            tags=tags,
+            board_ids=board_ids,
+        )
+        try:
+            prepared = service.prepare_upload(uploaded_file, deadline)
+            return service.commit(
+                prepared,
+                submitter,
+                metadata,
+                None,
+                deadline,
             )
-            if tags:
-                pin.tags.set(*tags)
-        return pin
+        except (
+            LocalUploadError,
+            MediaStorageError,
+            PinImportError,
+        ):
+            raise
+        except Exception:
+            raise URLImportInternalError(
+                {"image_file": ["internal_error"]}
+            ) from None
 
     def update(self, instance, validated_data):
         tags = validated_data.pop('tag_list', None)
@@ -258,7 +307,8 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
             else:
                 instance.tags.set()
             # change for image-id or image is not allowed
-            validated_data.pop('image_by_id', None)
+            validated_data.pop('image_file', None)
+            validated_data.pop('board_ids', None)
             return super(PinSerializer, self).update(instance, validated_data)
 
 

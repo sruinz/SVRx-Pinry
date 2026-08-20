@@ -11,7 +11,10 @@ from django.test import TransactionTestCase, override_settings
 class AssetMetadataMigrationTests(TransactionTestCase):
     migrate_from = ("django_images", "0002_auto_20180826_0814")
     migrate_to = ("django_images", "0005_enforce_image_asset_metadata")
-    migrate_latest = ("django_images", "0006_pending_media_deletion")
+    migrate_latest = [
+        ("core", "0014_media_asset"),
+        ("django_images", "0006_pending_media_deletion"),
+    ]
 
     def setUp(self):
         super(AssetMetadataMigrationTests, self).setUp()
@@ -26,9 +29,10 @@ class AssetMetadataMigrationTests(TransactionTestCase):
         super(AssetMetadataMigrationTests, self).tearDown()
 
     def _migrate(self, target):
+        targets = target if isinstance(target, list) else [target]
         self.executor = MigrationExecutor(connection)
-        self.executor.migrate([target])
-        state = self.executor.loader.project_state([target])
+        self.executor.migrate(targets)
+        state = self.executor.loader.project_state(targets)
         return state.apps
 
     def _write_media_file(self, path, contents):

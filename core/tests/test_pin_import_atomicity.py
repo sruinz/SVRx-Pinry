@@ -16,6 +16,7 @@ from django.db import (
     OperationalError,
     transaction,
 )
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TransactionTestCase
 import mock
 
@@ -34,7 +35,7 @@ from core.services.pin_import import (
     PinImportService,
 )
 from core.services.safe_url_fetch import FetchedImage
-from core.models import BatchImportItem, Board, Pin
+from core.models import BatchImportItem, Board, MediaAsset, Pin
 from django_images import file_ops
 from django_images.models import Image, Thumbnail
 from django_images.paths import canonical_original_path
@@ -47,6 +48,7 @@ class _PreparedAsset(object):
     def __init__(self):
         self.cleanup_calls = 0
         self.is_open = True
+        self.content_sha256 = "a" * 64
 
     def cleanup(self):
         if not self.is_open:
@@ -65,6 +67,17 @@ class _NoopLifecycleContext(object):
 
 
 class _LifecycleStorageMixin(object):
+    def dedup_lock(
+        self,
+        prepared,
+        submitter_id,
+        content_sha256,
+        deadline=None,
+        clock=None,
+    ):
+        del prepared, submitter_id, content_sha256, deadline, clock
+        return _NoopLifecycleContext()
+
     def lifecycle_lock(self, prepared, deadline=None, clock=None):
         del prepared, deadline, clock
         return _NoopLifecycleContext()
@@ -408,6 +421,14 @@ def _png_fetched_image(final_url):
         width=640,
         height=480,
         final_url=final_url,
+    )
+
+
+def _uploaded_png(content, filename="local.png"):
+    return SimpleUploadedFile(
+        filename,
+        content,
+        content_type="image/png",
     )
 
 
@@ -802,25 +823,42 @@ class PinImportCommitTests(TransactionTestCase):
         published = _PublishedAsset(prepared, events)
 
         class RecordingContext(object):
+            def __init__(inner_self, name):
+                inner_self.name = name
+
             def __enter__(inner_self):
-                events.append("lock_enter")
+                events.append("{}_enter".format(inner_self.name))
                 return inner_self
 
             def __exit__(inner_self, error_type, error, traceback):
                 del error, traceback
                 events.append(
-                    "lock_exit:{}".format(
+                    "{}_exit:{}".format(
+                        inner_self.name,
                         error_type.__name__ if error_type else "none"
                     )
                 )
                 return False
 
         class RecordingStorage(_PublishingMediaStorage):
+            def dedup_lock(
+                inner_self,
+                prepared_asset,
+                submitter_id,
+                content_sha256,
+                deadline=None,
+                clock=None,
+            ):
+                del prepared_asset, deadline, clock
+                self.assertEqual(submitter_id, self.user.pk)
+                self.assertEqual(content_sha256, "a" * 64)
+                return RecordingContext("stripe")
+
             def lifecycle_lock(
                 inner_self, prepared_asset, deadline=None, clock=None
             ):
                 del prepared_asset, deadline, clock
-                return RecordingContext()
+                return RecordingContext("lifecycle")
 
         def register_callback(event):
             events.append(event)
@@ -844,13 +882,20 @@ class PinImportCommitTests(TransactionTestCase):
         )
 
         self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
-        self.assertLess(events.index("lock_enter"), events.index("fence"))
+        self.assertIn("stripe_enter", events)
+        self.assertLess(
+            events.index("stripe_enter"), events.index("lifecycle_enter")
+        )
+        self.assertLess(events.index("lifecycle_enter"), events.index("fence"))
         self.assertLess(events.index("fence"), events.index("publish"))
         self.assertLess(events.index("publish"), events.index("on_commit"))
         self.assertLess(
-            events.index("on_commit"), events.index("lock_exit:none")
+            events.index("on_commit"), events.index("lifecycle_exit:none")
         )
-        self.assertLess(events.index("lock_exit:none"), events.index("release"))
+        self.assertLess(
+            events.index("lifecycle_exit:none"), events.index("stripe_exit:none")
+        )
+        self.assertLess(events.index("stripe_exit:none"), events.index("release"))
 
     def test_callback_base_exception_unlocks_then_rethrows_without_compensation(self):
         events = []
@@ -1090,6 +1135,10 @@ class PinImportCommitTests(TransactionTestCase):
 
         pin.refresh_from_db()
         image = Image.objects.get(pk=pin.image_id)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        asset = MediaAsset.objects.get(image=image)
+        self.assertEqual(asset.submitter_id, self.user.pk)
+        self.assertEqual(asset.content_sha256, "a" * 64)
         self.assertEqual(image.asset_uuid, self.asset_uuid)
         self.assertEqual(image.original_filename, "source-name.png")
         self.assertEqual(
@@ -1164,6 +1213,7 @@ class PinImportCommitTests(TransactionTestCase):
                 "verify_current",
                 "after_image_row",
                 "after_thumbnail_rows",
+                "after_media_asset_row",
                 "after_pin_row",
                 "after_tags",
                 "after_boards",
@@ -1306,6 +1356,32 @@ class PinImportCommitTests(TransactionTestCase):
                 deadline=20.0,
             )
 
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(Thumbnail.objects.count(), 3)
+        self.assertEqual(self.published.compensate_calls, 0)
+        self.assertEqual(self.published.release_calls, 1)
+
+    def test_later_on_commit_system_exit_rethrows_without_compensate(self):
+        primary = SystemExit("shutdown")
+
+        def inject_later_callback(event):
+            self.events.append(event)
+            if event == "before_idempotency_success":
+                transaction.on_commit(lambda: self._raise(primary))
+
+        self.service.fault_injector = inject_later_callback
+
+        with self.assertRaises(SystemExit) as caught:
+            self.service.commit(
+                self.prepared,
+                self.user,
+                self.metadata,
+                self.claim,
+                deadline=20.0,
+            )
+
+        self.assertIs(caught.exception, primary)
         self.assertEqual(Pin.objects.count(), 1)
         self.assertEqual(Image.objects.count(), 1)
         self.assertEqual(Thumbnail.objects.count(), 3)
@@ -2308,43 +2384,893 @@ class PinImportRealVerticalTests(
         self.assertEqual(Thumbnail.objects.count(), 0)
         self.assertEqual(_file_snapshot(self.temporary_media.name), {})
 
-    def test_same_url_with_distinct_item_ids_creates_distinct_assets(self):
+    def test_url_then_local_same_bytes_reuses_first_manifest(self):
+        first_prepared = self.service.prepare_url(
+            self.metadata.url,
+            self.metadata.referer,
+            deadline=20.0,
+        )
+        first = self.service.commit(
+            first_prepared,
+            self.user,
+            self.metadata,
+            claim=None,
+            deadline=20.0,
+        )
+        local_metadata = ImportMetadata(
+            url=None,
+            referer="local-device",
+            description="local metadata",
+            private=True,
+            tags=("local",),
+            board_ids=(self.board.pk,),
+        )
+        second_prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "renamed-local.png"),
+            deadline=20.0,
+        )
+        self.assertNotEqual(
+            first_prepared.asset_uuid,
+            second_prepared.asset_uuid,
+        )
+
+        second = self.service.commit(
+            second_prepared,
+            self.user,
+            local_metadata,
+            claim=None,
+            deadline=20.0,
+        )
+
+        image = Image.objects.get(pk=first.image_id)
+        second.refresh_from_db()
+        self.assertEqual(second.image_id, first.image_id)
+        self.assertEqual(image.original_filename, "원본.png")
+        self.assertEqual(second.description, "local metadata")
+        self.assertTrue(second.private)
+        self.assertEqual(set(second.tags.names()), {"local"})
+        self.assertEqual(Pin.objects.count(), 2)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(Thumbnail.objects.count(), 3)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(len(_file_snapshot(self.temporary_media.name)), 4)
+
+    def test_local_then_batch_same_bytes_reuses_local_manifest(self):
+        local_metadata = ImportMetadata(
+            url=None,
+            referer=None,
+            description="local first",
+            private=False,
+            tags=(),
+            board_ids=(),
+        )
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "local-first.png"),
+            deadline=20.0,
+        )
+        first = self.service.commit(
+            prepared,
+            self.user,
+            local_metadata,
+            claim=None,
+            deadline=20.0,
+        )
+
+        result = self._batch_service().process(
+            self.user,
+            self._batch_data(),
+            started_at=10.0,
+        )
+
+        second = Pin.objects.get(pk=result["results"][0]["pin_id"])
+        image = Image.objects.get(pk=first.image_id)
+        self.assertEqual(result["results"][0]["status"], "created")
+        self.assertEqual(second.image_id, first.image_id)
+        self.assertEqual(image.original_filename, "local-first.png")
+        self.assertEqual(second.url, self.metadata.url)
+        self.assertEqual(second.description, self.metadata.description)
+        self.assertEqual(Pin.objects.count(), 2)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(len(_file_snapshot(self.temporary_media.name)), 4)
+
+    def test_different_users_with_same_bytes_create_separate_assets(self):
+        first = self._commit_initial_asset()
+        other = User.objects.create_user(
+            username="second-asset-owner",
+            email="second-asset-owner@example.com",
+        )
+        second_prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "other-owner.png"),
+            deadline=20.0,
+        )
+        second = self.service.commit(
+            second_prepared,
+            other,
+            ImportMetadata(
+                url=None,
+                referer=None,
+                description="other owner",
+                private=False,
+                tags=(),
+                board_ids=(),
+            ),
+            claim=None,
+            deadline=20.0,
+        )
+
+        self.assertNotEqual(first.image_id, second.image_id)
+        self.assertEqual(Pin.objects.count(), 2)
+        self.assertEqual(Image.objects.count(), 2)
+        self.assertEqual(Thumbnail.objects.count(), 6)
+        self.assertEqual(MediaAsset.objects.count(), 2)
+        self.assertEqual(len(_file_snapshot(self.temporary_media.name)), 8)
+
+    def test_same_pixels_with_different_bytes_create_separate_assets(self):
+        first_output = BytesIO()
+        second_output = BytesIO()
+        image = PILImage.new("RGB", (40, 30), "red")
+        image.save(first_output, format="PNG", compress_level=0)
+        image.save(second_output, format="PNG", compress_level=9)
+        image.close()
+        first_content = first_output.getvalue()
+        second_content = second_output.getvalue()
+        self.assertNotEqual(first_content, second_content)
+        metadata = ImportMetadata(
+            url=None,
+            referer=None,
+            description="same pixels",
+            private=False,
+            tags=(),
+            board_ids=(),
+        )
+
+        first = self.service.commit(
+            self.service.prepare_upload(
+                _uploaded_png(first_content, "pixels-a.png"),
+                deadline=20.0,
+            ),
+            self.user,
+            metadata,
+            claim=None,
+            deadline=20.0,
+        )
+        second = self.service.commit(
+            self.service.prepare_upload(
+                _uploaded_png(second_content, "pixels-b.png"),
+                deadline=20.0,
+            ),
+            self.user,
+            metadata,
+            claim=None,
+            deadline=20.0,
+        )
+
+        self.assertNotEqual(first.image_id, second.image_id)
+        self.assertEqual(Image.objects.count(), 2)
+        self.assertEqual(MediaAsset.objects.count(), 2)
+        self.assertEqual(len(_file_snapshot(self.temporary_media.name)), 8)
+
+    def test_reuse_rejects_missing_existing_final_without_new_state(self):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        missing = Path(
+            self.temporary_media.name,
+            image.thumbnail_set.get(size="square").image.name,
+        )
+        missing.unlink()
+
+        self._assert_reuse_conflict_preserves_current_files()
+
+    def test_reuse_rejects_existing_hash_mismatch_without_overwrite(self):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        original = Path(self.temporary_media.name, image.image.name)
+        original.write_bytes(b"foreign replacement bytes")
+
+        self._assert_reuse_conflict_preserves_current_files()
+
+    def test_reuse_rejects_database_dimension_mismatch(self):
+        first = self._commit_initial_asset()
+        Image.objects.filter(pk=first.image_id).update(width=641)
+
+        self._assert_reuse_conflict_preserves_current_files()
+
+    def test_reuse_rejects_noncanonical_database_path_and_preserves_external(
+        self,
+    ):
+        first = self._commit_initial_asset()
+        external = Path(self.temporary_media.name, "external.png")
+        external.write_bytes(b"external-file")
+        Image.objects.filter(pk=first.image_id).update(image="external.png")
+
+        self._assert_reuse_conflict_preserves_current_files()
+        self.assertEqual(external.read_bytes(), b"external-file")
+
+    def test_reuse_name_replacement_after_receipt_rolls_back_without_delete(
+        self,
+    ):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        current = Path(self.temporary_media.name, image.image.name)
+        held = current.with_name("held-{}".format(current.name))
+        original_content = current.read_bytes()
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "replacement-name.png"),
+            deadline=20.0,
+        )
+
+        def replace_name(event):
+            if event == "after_reusable_verified":
+                current.rename(held)
+                current.write_bytes(original_content)
+
+        self.service.fault_injector = replace_name
+
+        with self.assertRaises(MediaStorageError) as caught:
+            self.service.commit(
+                prepared,
+                self.user,
+                self.metadata,
+                claim=None,
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(current.read_bytes(), original_content)
+        self.assertEqual(held.read_bytes(), original_content)
+
+    def test_reuse_file_mutation_after_receipt_rolls_back_without_delete(self):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        current = Path(self.temporary_media.name, image.image.name)
+        replacement = b"foreign file mutation"
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "mutated-name.png"),
+            deadline=20.0,
+        )
+
+        def mutate_file(event):
+            if event == "after_reusable_verified":
+                current.write_bytes(replacement)
+
+        self.service.fault_injector = mutate_file
+
+        with self.assertRaises(MediaStorageError) as caught:
+            self.service.commit(
+                prepared,
+                self.user,
+                self.metadata,
+                claim=None,
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(current.read_bytes(), replacement)
+
+    def test_reuse_root_replacement_after_receipt_rolls_back_without_delete(
+        self,
+    ):
+        self._commit_initial_asset()
+        snapshot = _file_snapshot(self.temporary_media.name)
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "root-replaced.png"),
+            deadline=20.0,
+        )
+        current_root = Path(self.temporary_media.name)
+        held_root = current_root.with_name(
+            "{}-held".format(current_root.name)
+        )
+        sentinel = current_root / "external-sentinel"
+
+        def replace_root(event):
+            if event == "after_reusable_verified":
+                current_root.rename(held_root)
+                current_root.mkdir()
+                sentinel.write_bytes(b"external-root")
+
+        self.service.fault_injector = replace_root
+
+        try:
+            with self.assertRaises(MediaStorageError) as caught:
+                self.service.commit(
+                    prepared,
+                    self.user,
+                    self.metadata,
+                    claim=None,
+                    deadline=20.0,
+                )
+
+            self.assertEqual(caught.exception.code, "media_path_conflict")
+            self.assertFalse(prepared.is_open)
+            self.assertEqual(Pin.objects.count(), 1)
+            self.assertEqual(Image.objects.count(), 1)
+            self.assertEqual(MediaAsset.objects.count(), 1)
+            self.assertEqual(sentinel.read_bytes(), b"external-root")
+            self.assertEqual(_file_snapshot(str(held_root)), snapshot)
+        finally:
+            if sentinel.exists():
+                sentinel.unlink()
+            if current_root.exists():
+                current_root.rmdir()
+            if held_root.exists():
+                held_root.rename(current_root)
+
+    def test_reuse_name_replacement_during_final_hash_is_rejected(self):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        current = Path(self.temporary_media.name, image.image.name)
+        held = current.with_name("hash-held-{}".format(current.name))
+        original_content = current.read_bytes()
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "hash-name-race.png"),
+            deadline=20.0,
+        )
+        real_hash = file_ops.sha256_file_descriptor
+        state = {"active": False, "replaced": False}
+
+        def activate_final_verify(event):
+            if event == "after_reusable_verified":
+                state["active"] = True
+
+        def hash_then_replace_name(descriptor):
+            digest = real_hash(descriptor)
+            if state["active"] and not state["replaced"]:
+                current.rename(held)
+                current.write_bytes(original_content)
+                state["replaced"] = True
+            return digest
+
+        self.service.fault_injector = activate_final_verify
+
+        with mock.patch(
+            "core.services.media_storage.sha256_file_descriptor",
+            side_effect=hash_then_replace_name,
+        ):
+            with self.assertRaises(MediaStorageError) as caught:
+                self.service.commit(
+                    prepared,
+                    self.user,
+                    self.metadata,
+                    claim=None,
+                    deadline=20.0,
+                )
+
+        self.assertTrue(state["replaced"])
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(current.read_bytes(), original_content)
+        self.assertEqual(held.read_bytes(), original_content)
+
+    def test_reuse_file_mutation_during_last_final_hash_is_rejected(self):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        current = Path(
+            self.temporary_media.name,
+            image.thumbnail_set.get(size="square").image.name,
+        )
+        original_content = current.read_bytes()
+        replacement = bytes([original_content[0] ^ 1]) + original_content[1:]
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "hash-file-race.png"),
+            deadline=20.0,
+        )
+        real_hash = file_ops.sha256_file_descriptor
+        state = {"active": False, "hashes": 0}
+
+        def activate_final_verify(event):
+            if event == "after_reusable_verified":
+                state["active"] = True
+
+        def hash_then_mutate_last(descriptor):
+            digest = real_hash(descriptor)
+            if state["active"]:
+                state["hashes"] += 1
+                if state["hashes"] == 4:
+                    current.write_bytes(replacement)
+            return digest
+
+        self.service.fault_injector = activate_final_verify
+
+        with mock.patch(
+            "core.services.media_storage.sha256_file_descriptor",
+            side_effect=hash_then_mutate_last,
+        ):
+            with self.assertRaises(MediaStorageError) as caught:
+                self.service.commit(
+                    prepared,
+                    self.user,
+                    self.metadata,
+                    claim=None,
+                    deadline=20.0,
+                )
+
+        self.assertEqual(state["hashes"], 8)
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(current.read_bytes(), replacement)
+
+    def test_reuse_rollback_preserves_primary_and_existing_final_ownership(
+        self,
+    ):
+        self._commit_initial_asset()
+        before = _file_snapshot(self.temporary_media.name)
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "rollback-reuse.png"),
+            deadline=20.0,
+        )
+        primary = ValueError("primary-reuse-fault")
+        real_close = file_ops._close_descriptor
+        failed = {"value": False}
+
+        def fail_reusable_close_once(descriptor):
+            if not failed["value"]:
+                failed["value"] = True
+                raise file_ops.DescriptorCloseNotAttempted(
+                    "secondary-reuse-close"
+                )
+            return real_close(descriptor)
+
+        def fail_after_receipt(event):
+            if event == "after_reusable_verified":
+                raise primary
+
+        self.service.fault_injector = fail_after_receipt
+
+        with mock.patch(
+            "core.services.media_storage._close_descriptor",
+            side_effect=fail_reusable_close_once,
+        ), self._fail_first_descriptor_close():
+            with self.assertRaises(ValueError) as caught:
+                self.service.commit(
+                    prepared,
+                    self.user,
+                    self.metadata,
+                    claim=None,
+                    deadline=20.0,
+                )
+
+        self.assertIs(caught.exception, primary)
+        self.assertTrue(failed["value"])
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(_file_snapshot(self.temporary_media.name), before)
+
+    def test_reuse_database_fault_hooks_roll_back_only_new_pin_state(self):
+        first = self._commit_initial_asset()
+        before = _file_snapshot(self.temporary_media.name)
+        first_tags = set(first.tags.names())
+        fault_points = (
+            "after_pin_row",
+            "after_tags",
+            "after_boards",
+            "before_idempotency_success",
+        )
+
+        for fault_point in fault_points:
+            with self.subTest(fault_point=fault_point):
+                prepared = self.service.prepare_upload(
+                    _uploaded_png(
+                        self.fetched.content,
+                        "reuse-{}.png".format(fault_point),
+                    ),
+                    deadline=20.0,
+                )
+                primary = ValueError("reuse-{}".format(fault_point))
+
+                def fail_selected(event):
+                    if event == fault_point:
+                        raise primary
+
+                self.service.fault_injector = fail_selected
+
+                with self.assertRaises(ValueError) as caught:
+                    self.service.commit(
+                        prepared,
+                        self.user,
+                        self.metadata,
+                        claim=None,
+                        deadline=20.0,
+                    )
+
+                self.assertIs(caught.exception, primary)
+                self.assertFalse(prepared.is_open)
+                self.assertEqual(Pin.objects.count(), 1)
+                self.assertEqual(Image.objects.count(), 1)
+                self.assertEqual(Thumbnail.objects.count(), 3)
+                self.assertEqual(MediaAsset.objects.count(), 1)
+                self.assertEqual(set(first.tags.names()), first_tags)
+                self.assertEqual(
+                    set(self.board.pins.values_list("pk", flat=True)),
+                    {first.pk},
+                )
+                self.assertEqual(
+                    _file_snapshot(self.temporary_media.name), before
+                )
+
+    def test_reuse_precommit_base_exceptions_preserve_primary_and_finals(self):
+        self._commit_initial_asset()
+        before = _file_snapshot(self.temporary_media.name)
+
+        for primary in (KeyboardInterrupt(), SystemExit("shutdown")):
+            with self.subTest(error_type=type(primary).__name__):
+                prepared = self.service.prepare_upload(
+                    _uploaded_png(
+                        self.fetched.content,
+                        "reuse-{}.png".format(type(primary).__name__),
+                    ),
+                    deadline=20.0,
+                )
+
+                def fail_after_pin(event):
+                    if event == "after_pin_row":
+                        raise primary
+
+                self.service.fault_injector = fail_after_pin
+
+                with self.assertRaises(type(primary)) as caught:
+                    self.service.commit(
+                        prepared,
+                        self.user,
+                        self.metadata,
+                        claim=None,
+                        deadline=20.0,
+                    )
+
+                self.assertIs(caught.exception, primary)
+                self.assertFalse(prepared.is_open)
+                self.assertEqual(Pin.objects.count(), 1)
+                self.assertEqual(Image.objects.count(), 1)
+                self.assertEqual(MediaAsset.objects.count(), 1)
+                self.assertEqual(
+                    _file_snapshot(self.temporary_media.name), before
+                )
+
+    def test_reuse_fence_and_record_success_failures_preserve_asset(self):
+        self._commit_initial_asset()
+        before = _file_snapshot(self.temporary_media.name)
+        claim = ClaimResult(
+            kind="claimed",
+            row_id=1,
+            lease_uuid=uuid.uuid4(),
+            lease_generation=1,
+        )
+
+        cases = (
+            (False, True),
+            (True, False),
+        )
+        for fence_result, success_result in cases:
+            with self.subTest(
+                fence_result=fence_result,
+                success_result=success_result,
+            ):
+                prepared = self.service.prepare_upload(
+                    _uploaded_png(
+                        self.fetched.content,
+                        "reuse-idempotency.png",
+                    ),
+                    deadline=20.0,
+                )
+                events = []
+                store = _ConfigurableIdempotencyStore(
+                    events,
+                    fence_result=fence_result,
+                    success_result=success_result,
+                )
+                self.service.idempotency = store
+                self.service.fault_injector = None
+
+                with self.assertRaises(PinImportError) as caught:
+                    self.service.commit(
+                        prepared,
+                        self.user,
+                        self.metadata,
+                        claim=claim,
+                        deadline=20.0,
+                    )
+
+                self.assertEqual(caught.exception.code, "lease_lost")
+                self.assertFalse(prepared.is_open)
+                self.assertEqual(len(store.fence_calls), 1)
+                self.assertEqual(
+                    len(store.success_calls),
+                    0 if not fence_result else 1,
+                )
+                self.assertEqual(Pin.objects.count(), 1)
+                self.assertEqual(Image.objects.count(), 1)
+                self.assertEqual(MediaAsset.objects.count(), 1)
+                self.assertEqual(
+                    _file_snapshot(self.temporary_media.name), before
+                )
+
+    def test_reuse_actual_commit_failure_rolls_back_pin_and_keeps_finals(self):
+        self._commit_initial_asset()
+        before = _file_snapshot(self.temporary_media.name)
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "reuse-commit-fail.png"),
+            deadline=20.0,
+        )
+        primary = OperationalError("database is locked: private-token")
+
+        with mock.patch.object(connection, "commit", side_effect=primary):
+            with self.assertRaises(OperationalError) as caught:
+                self.service.commit(
+                    prepared,
+                    self.user,
+                    self.metadata,
+                    claim=None,
+                    deadline=20.0,
+                )
+
+        self.assertIs(caught.exception, primary)
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(_file_snapshot(self.temporary_media.name), before)
+
+    def test_reuse_committed_callback_exception_keeps_pin_and_finals(self):
+        first = self._commit_initial_asset()
+        before = _file_snapshot(self.temporary_media.name)
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "callback-reuse.png"),
+            deadline=20.0,
+        )
+
+        def register_failing_callback(event):
+            if event == "before_idempotency_success":
+                transaction.on_commit(
+                    lambda: self._raise(RuntimeError("private-reuse"))
+                )
+
+        self.service.fault_injector = register_failing_callback
+
+        with mock.patch(
+            "core.services.pin_import.logger.warning"
+        ) as warning:
+            second = self.service.commit(
+                prepared,
+                self.user,
+                self.metadata,
+                claim=None,
+                deadline=20.0,
+            )
+
+        self.assertEqual(second.image_id, first.image_id)
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 2)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(_file_snapshot(self.temporary_media.name), before)
+        warning.assert_called_once_with(
+            "pin_import_post_commit_callback_failed error_type=%s",
+            "RuntimeError",
+        )
+
+    def test_reuse_callback_system_exit_rethrows_after_commit_and_cleanup(self):
+        first = self._commit_initial_asset()
+        before = _file_snapshot(self.temporary_media.name)
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "exit-reuse.png"),
+            deadline=20.0,
+        )
+        primary = SystemExit("reuse shutdown")
+
+        def register_failing_callback(event):
+            if event == "before_idempotency_success":
+                transaction.on_commit(lambda: self._raise(primary))
+
+        self.service.fault_injector = register_failing_callback
+
+        with self.assertRaises(SystemExit) as caught:
+            self.service.commit(
+                prepared,
+                self.user,
+                self.metadata,
+                claim=None,
+                deadline=20.0,
+            )
+
+        self.assertIs(caught.exception, primary)
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 2)
+        self.assertEqual(
+            set(Pin.objects.values_list("image_id", flat=True)),
+            {first.image_id},
+        )
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(_file_snapshot(self.temporary_media.name), before)
+
+    def test_reuse_unlock_errors_after_commit_keep_pin_and_finals(self):
+        first = self._commit_initial_asset()
+        before = _file_snapshot(self.temporary_media.name)
+        real_flock = file_ops.fcntl.flock
+
+        for failing_unlock in (1, 2):
+            with self.subTest(failing_unlock=failing_unlock):
+                prepared = self.service.prepare_upload(
+                    _uploaded_png(
+                        self.fetched.content,
+                        "unlock-{}.png".format(failing_unlock),
+                    ),
+                    deadline=20.0,
+                )
+                unlock_calls = {"value": 0}
+
+                def fail_selected_unlock(descriptor, operation):
+                    if operation == file_ops.fcntl.LOCK_UN:
+                        unlock_calls["value"] += 1
+                        if unlock_calls["value"] == failing_unlock:
+                            raise RuntimeError("secondary-unlock")
+                    return real_flock(descriptor, operation)
+
+                with self.assertLogs(
+                    "core.services.pin_import", level="WARNING"
+                ), mock.patch(
+                    "django_images.file_ops.fcntl.flock",
+                    side_effect=fail_selected_unlock,
+                ):
+                    pin = self.service.commit(
+                        prepared,
+                        self.user,
+                        self.metadata,
+                        claim=None,
+                        deadline=20.0,
+                    )
+
+                self.assertEqual(pin.image_id, first.image_id)
+                self.assertFalse(prepared.is_open)
+                self.assertEqual(unlock_calls["value"], 2)
+                self.assertEqual(Image.objects.count(), 1)
+                self.assertEqual(MediaAsset.objects.count(), 1)
+                self.assertEqual(
+                    _file_snapshot(self.temporary_media.name), before
+                )
+
+    def test_reuse_release_and_prepared_cleanup_errors_keep_committed_pin(self):
+        first = self._commit_initial_asset()
+        before = _file_snapshot(self.temporary_media.name)
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "cleanup-reuse.png"),
+            deadline=20.0,
+        )
+        real_close = file_ops._close_descriptor
+        failed = {"value": False}
+
+        def fail_reusable_close_once(descriptor):
+            if not failed["value"]:
+                failed["value"] = True
+                raise file_ops.DescriptorCloseNotAttempted(
+                    "secondary-reuse-close"
+                )
+            return real_close(descriptor)
+
+        with mock.patch(
+            "core.services.media_storage._close_descriptor",
+            side_effect=fail_reusable_close_once,
+        ), self._fail_first_descriptor_close():
+            second = self.service.commit(
+                prepared,
+                self.user,
+                self.metadata,
+                claim=None,
+                deadline=20.0,
+            )
+
+        self.assertTrue(failed["value"])
+        self.assertEqual(second.image_id, first.image_id)
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 2)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(_file_snapshot(self.temporary_media.name), before)
+
+    def test_reuse_close_after_error_is_not_retried_as_owned_descriptor(self):
+        first = self._commit_initial_asset()
+        before = _file_snapshot(self.temporary_media.name)
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "closed-reuse.png"),
+            deadline=20.0,
+        )
+        captured = {}
+        real_verify = self.storage.verify_reusable
+
+        def capture_receipt(*args, **kwargs):
+            captured["receipt"] = real_verify(*args, **kwargs)
+            return captured["receipt"]
+
+        def close_then_raise(descriptor):
+            os.close(descriptor)
+            raise RuntimeError("descriptor closed before error")
+
+        with mock.patch.object(
+            self.storage,
+            "verify_reusable",
+            side_effect=capture_receipt,
+        ), mock.patch(
+            "core.services.media_storage._close_descriptor",
+            side_effect=close_then_raise,
+        ):
+            second = self.service.commit(
+                prepared,
+                self.user,
+                self.metadata,
+                claim=None,
+                deadline=20.0,
+            )
+
+        receipt = captured["receipt"]
+        self.assertEqual(second.image_id, first.image_id)
+        self.assertTrue(receipt._released)
+        self.assertEqual(receipt.files, [])
+        self.assertEqual(receipt.directories, [])
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 2)
+        self.assertEqual(_file_snapshot(self.temporary_media.name), before)
+
+    def test_same_url_with_distinct_item_ids_reuses_one_asset(self):
         second_item_id = uuid.UUID(
             "40000000-0000-0000-0000-000000000002"
         )
         data = self._batch_data((self.item_id, second_item_id))
 
-        result = self._batch_service().process(
-            self.user,
-            data,
-            started_at=10.0,
-        )
+        with mock.patch.object(
+            self.idempotency,
+            "fence",
+            wraps=self.idempotency.fence,
+        ) as fence, mock.patch.object(
+            self.idempotency,
+            "record_success",
+            wraps=self.idempotency.record_success,
+        ) as record_success:
+            result = self._batch_service().process(
+                self.user,
+                data,
+                started_at=10.0,
+            )
 
         rows = BatchImportItem.objects.filter(
             submitter=self.user,
             client_item_id__in=(self.item_id, second_item_id),
         )
-        pins = Pin.objects.filter(pk__in=[
-            item["pin_id"] for item in result["results"]
-        ])
-        asset_uuids = set(
-            Image.objects.values_list("asset_uuid", flat=True)
-        )
         self.assertEqual(
             [item["status"] for item in result["results"]],
             ["created", "created"],
         )
+        pins = Pin.objects.filter(pk__in=[
+            item["pin_id"] for item in result["results"]
+        ])
         self.assertEqual(rows.count(), 2)
         self.assertEqual(
             set(rows.values_list("state", flat=True)),
             {BatchImportItem.SUCCEEDED},
         )
-        self.assertEqual(len(asset_uuids), 2)
         self.assertEqual(pins.count(), 2)
         self.assertEqual(Pin.objects.count(), 2)
-        self.assertEqual(Image.objects.count(), 2)
-        self.assertEqual(Thumbnail.objects.count(), 6)
-        self.assertEqual(len(_file_snapshot(self.temporary_media.name)), 8)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(Thumbnail.objects.count(), 3)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(len(_file_snapshot(self.temporary_media.name)), 4)
+        self.assertEqual(fence.call_count, 2)
+        self.assertEqual(record_success.call_count, 2)
 
     def test_real_commit_survives_later_on_commit_callback_exception(self):
         def register_failing_callback(event):
@@ -2409,6 +3335,44 @@ class PinImportRealVerticalTests(
             "tags": self.metadata.tags,
             "board_ids": self.metadata.board_ids,
         })
+
+    def _commit_initial_asset(self):
+        prepared = self.service.prepare_url(
+            self.metadata.url,
+            self.metadata.referer,
+            deadline=20.0,
+        )
+        return self.service.commit(
+            prepared,
+            self.user,
+            self.metadata,
+            claim=None,
+            deadline=20.0,
+        )
+
+    def _assert_reuse_conflict_preserves_current_files(self):
+        before = _file_snapshot(self.temporary_media.name)
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "fresh-name.png"),
+            deadline=20.0,
+        )
+
+        with self.assertRaises(MediaStorageError) as caught:
+            self.service.commit(
+                prepared,
+                self.user,
+                self.metadata,
+                claim=None,
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(Thumbnail.objects.count(), 3)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(_file_snapshot(self.temporary_media.name), before)
 
     def _batch_data(self, item_ids=None):
         if item_ids is None:
@@ -2695,4 +3659,71 @@ class PinImportConcurrencyTests(
         self.assertEqual(Pin.objects.count(), 1)
         self.assertEqual(Image.objects.count(), 1)
         self.assertEqual(Thumbnail.objects.count(), 3)
+        self.assertEqual(len(_file_snapshot(self.temporary_media.name)), 4)
+
+    def test_same_hash_workers_create_two_pins_and_one_physical_asset(self):
+        prepared_barrier = threading.Barrier(2)
+        events = queue.Queue()
+
+        def worker(worker_id):
+            close_old_connections()
+            try:
+                user = User.objects.get(pk=self.user.pk)
+                storage = MediaStorage(
+                    media_root=self.temporary_media.name,
+                    clock=lambda: 10.0,
+                )
+                fetcher = _Fetcher(self.fetched)
+                service = PinImportService(
+                    fetcher=fetcher,
+                    media_storage=storage,
+                    idempotency=IdempotencyStore(),
+                    clock=lambda: 10.0,
+                )
+                prepared = service.prepare_url(
+                    self.metadata.url,
+                    self.metadata.referer,
+                    deadline=20.0,
+                )
+                prepared_barrier.wait(timeout=5)
+                pin = service.commit(
+                    prepared,
+                    user,
+                    ImportMetadata(
+                        url=self.metadata.url,
+                        referer=self.metadata.referer,
+                        description="worker-{}".format(worker_id),
+                        private=False,
+                        tags=(),
+                        board_ids=(),
+                    ),
+                    claim=None,
+                    deadline=20.0,
+                )
+                events.put(("pin", pin.pk))
+            except BaseException as error:
+                events.put(("error", error))
+            finally:
+                connections["default"].close()
+
+        workers = [
+            threading.Thread(target=worker, args=(worker_id,))
+            for worker_id in range(2)
+        ]
+        for current in workers:
+            current.start()
+        for current in workers:
+            current.join(timeout=10)
+
+        self.assertFalse(any(current.is_alive() for current in workers))
+        collected = [events.get(timeout=1) for _worker in workers]
+        errors = [value for kind, value in collected if kind == "error"]
+        self.assertEqual(errors, [])
+        pin_ids = [value for kind, value in collected if kind == "pin"]
+        self.assertEqual(len(pin_ids), 2)
+        self.assertEqual(Pin.objects.filter(pk__in=pin_ids).count(), 2)
+        self.assertEqual(Pin.objects.count(), 2)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(Thumbnail.objects.count(), 3)
+        self.assertEqual(MediaAsset.objects.count(), 1)
         self.assertEqual(len(_file_snapshot(self.temporary_media.name)), 4)

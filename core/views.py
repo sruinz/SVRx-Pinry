@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+from functools import wraps
 
 from django.conf import settings
 from django.db import transaction
@@ -27,6 +28,7 @@ from core.serializers import filter_private_pin, filter_private_board
 from core.services.batch_import import BatchImportService
 from core.services.bounded_resolver import BoundedResolver
 from core.services.idempotency import IdempotencyStore
+from core.services.local_upload import LocalUploadError
 from core.services.media_storage import MediaStorage
 from core.services.pin_import import PinImportError, PinImportService
 from core.services.pinned_http import PinnedHTTPTransport
@@ -38,16 +40,13 @@ logger = logging.getLogger(__name__)
 _DECIMAL_CONTENT_LENGTH = re.compile(r"\A[0-9]+\Z")
 
 
-class ImageViewSet(mixins.CreateModelMixin, GenericViewSet):
+class ImageViewSet(mixins.ListModelMixin, GenericViewSet):
     queryset = Image.objects.all()
     serializer_class = api.ImageSerializer
 
-    def create(self, request, *args, **kwargs):
-        return super(ImageViewSet, self).create(request, *args, **kwargs)
-
 
 class PinViewSet(viewsets.ModelViewSet):
-    _NON_ATOMIC_IMPORT_ACTIONS = frozenset(("create", "batch"))
+    _NON_ATOMIC_ACTIONS = frozenset(("create", "batch", "destroy"))
     serializer_class = api.PinSerializer
     filter_backends = (DjangoFilterBackend, SearchFilter, OrderingFilter)
     filter_fields = ("submitter__username", 'tags__name', "pins__id")
@@ -72,38 +71,38 @@ class PinViewSet(viewsets.ModelViewSet):
             actions=actions,
             **initkwargs
         )
-        if (
-            actions
-            and cls._NON_ATOMIC_IMPORT_ACTIONS.intersection(actions.values())
+        if not actions or not cls._NON_ATOMIC_ACTIONS.intersection(
+            actions.values()
         ):
-            return transaction.non_atomic_requests(view)
-        return view
+            return view
+
+        @wraps(view)
+        def selectively_atomic(request, *args, **kwargs):
+            action_name = actions.get(request.method.lower())
+            database = transaction.get_connection()
+            if (
+                action_name in cls._NON_ATOMIC_ACTIONS
+                or not database.settings_dict.get("ATOMIC_REQUESTS")
+            ):
+                return view(request, *args, **kwargs)
+            with transaction.atomic(using=database.alias):
+                return view(request, *args, **kwargs)
+
+        return transaction.non_atomic_requests(selectively_atomic)
 
     def create(self, request, *args, **kwargs):
-        if "url" not in request.data:
-            if "image_by_id" not in request.data:
-                raise ValidationError({
-                    "url-or-image": "Either url or image_by_id is required."
-                })
-            return super(PinViewSet, self).create(request, *args, **kwargs)
         service = None
+        source_field = "url"
         self._pin_import_deadline = None
         try:
             try:
-                self._pin_import_deadline = (
-                    self.batch_clock() + settings.PINRY_FETCH_TOTAL_TIMEOUT
-                )
-                service = self.get_pin_import_service()
-                self._pin_import_service = service
                 serializer = self.get_serializer(data=request.data)
-            except (PinImportError, SafeFetchError, MediaStorageError) as error:
-                api.raise_url_import_error(error)
-            except Exception:
-                raise api.URLImportInternalError(
-                    {"url": ["internal_error"]}
-                ) from None
-            try:
                 serializer.is_valid(raise_exception=True)
+                source_field = (
+                    "image_file"
+                    if "image_file" in serializer.validated_data
+                    else "url"
+                )
             except ValidationError:
                 raise
             except Exception:
@@ -111,12 +110,41 @@ class PinViewSet(viewsets.ModelViewSet):
                     {"url": ["internal_error"]}
                 ) from None
             try:
-                self.perform_create(serializer)
-            except (PinImportError, SafeFetchError, MediaStorageError) as error:
-                api.raise_url_import_error(error)
+                self._pin_import_deadline = (
+                    self.batch_clock() + settings.PINRY_FETCH_TOTAL_TIMEOUT
+                )
+                if source_field == "image_file":
+                    service = self.get_local_pin_import_service()
+                else:
+                    service = self.get_pin_import_service()
+                self._pin_import_service = service
+                serializer.context["pin_import_service"] = service
+                serializer.context["pin_import_deadline"] = (
+                    self._pin_import_deadline
+                )
+            except (
+                LocalUploadError,
+                MediaStorageError,
+                PinImportError,
+                SafeFetchError,
+            ) as error:
+                api.raise_url_import_error(error, source_field)
             except Exception:
                 raise api.URLImportInternalError(
-                    {"url": ["internal_error"]}
+                    {source_field: ["internal_error"]}
+                ) from None
+            try:
+                self.perform_create(serializer)
+            except (
+                LocalUploadError,
+                MediaStorageError,
+                PinImportError,
+                SafeFetchError,
+            ) as error:
+                api.raise_url_import_error(error, source_field)
+            except Exception:
+                raise api.URLImportInternalError(
+                    {source_field: ["internal_error"]}
                 ) from None
             try:
                 headers = self.get_success_headers(serializer.data)
@@ -127,7 +155,7 @@ class PinViewSet(viewsets.ModelViewSet):
                 )
             except Exception:
                 raise api.URLImportInternalError(
-                    {"url": ["internal_error"]}
+                    {source_field: ["internal_error"]}
                 ) from None
         finally:
             self._pin_import_service = None
@@ -218,6 +246,17 @@ class PinViewSet(viewsets.ModelViewSet):
         except BaseException:
             self._close_resource(transport, "pin_import_factory")
             raise
+
+    def get_local_pin_import_service(self):
+        clock = self.batch_clock
+        media_storage = self.media_storage_class(clock=clock)
+        idempotency = self.idempotency_class()
+        return self.pin_import_service_class(
+            None,
+            media_storage,
+            idempotency,
+            clock=clock,
+        )
 
     @staticmethod
     def _validate_batch_content_length(request):

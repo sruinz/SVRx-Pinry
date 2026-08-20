@@ -92,7 +92,7 @@ class UnsupportedImageFormatAPITest(
         self.client.login(username=self.user.username, password="password")
         self.ico_bytes = make_ico_bytes()
 
-    def test_image_upload_returns_400_without_row_or_file(self):
+    def test_image_upload_returns_405_without_row_or_file(self):
         response = self.client.post(
             reverse("image-list"),
             {
@@ -103,10 +103,7 @@ class UnsupportedImageFormatAPITest(
             format="multipart",
         )
 
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(
-            response.json(), {"image": ["unsupported_image_format"]}
-        )
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
         self.assertFalse(Image.objects.exists())
         self.assertEqual(media_snapshot(self.temporary_media.name), {})
 

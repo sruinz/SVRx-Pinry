@@ -1,25 +1,43 @@
 import json
 from io import BytesIO
+from pathlib import Path
 import uuid
 
 import mock
-from django.db import OperationalError
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.db import connection, OperationalError
+from django.test import (
+    SimpleTestCase,
+    TestCase,
+    TransactionTestCase,
+    override_settings,
+)
 from django.urls import NoReverseMatch, resolve, reverse
 from django.utils import timezone
 from rest_framework.exceptions import ParseError
 from rest_framework.test import APIRequestFactory, force_authenticate
+from PIL import Image as PILImage
 from taggit.models import Tag
 
 from core.batch_serializers import BatchImportRequestSerializer
-from core.models import Board
+from core.models import BatchImportItem, Board, Image, MediaAsset, Pin
 from core.parsers import LimitedJSONParser
 from core.services.batch_import import BatchImportService
-from core.services.idempotency import ClaimResult, StoredError
-from core.services.pin_import import PinImportError
-from core.services.safe_url_fetch import SafeFetchError
+from core.services.idempotency import (
+    ClaimResult,
+    IdempotencyStore,
+    StoredError,
+)
+from core.services.media_storage import MediaStorage
+from core.services.pin_import import PinImportError, PinImportService
+from core.services.safe_url_fetch import FetchedImage, SafeFetchError
 from core.tests.helpers import create_user
+from core.tests.test_pin_import_atomicity import (
+    _file_snapshot,
+    _LinuxStrongPublishMixin,
+)
 from core.views import PinViewSet
+from django_images.models import Thumbnail
+from django_images.test_helpers import TemporaryMediaMixin
 
 
 class RecordingStream(object):
@@ -1331,3 +1349,167 @@ class BatchServiceFactoryTests(SimpleTestCase):
             FailingFactoryView().get_batch_service()
 
         self.assertEqual(FactoryTransport.latest.close_count, 1)
+
+
+class BatchDedupIntegrationTests(
+    _LinuxStrongPublishMixin,
+    TemporaryMediaMixin,
+    TransactionTestCase,
+):
+    def setUp(self):
+        super(BatchDedupIntegrationTests, self).setUp()
+        self.user = create_user("batch-dedup-owner")
+        output = BytesIO()
+        PILImage.new("RGB", (640, 480), "red").save(
+            output,
+            format="PNG",
+        )
+        self.fetched = FetchedImage(
+            content=output.getvalue(),
+            image_format="PNG",
+            width=640,
+            height=480,
+            final_url="https://cdn.example/batch-dedup.png",
+        )
+        self.fetcher = mock.Mock()
+        self.fetcher.transport = None
+        self.fetcher.fetch.return_value = self.fetched
+        self.storage = MediaStorage(
+            media_root=self.temporary_media.name,
+            clock=ManualClock(0),
+        )
+        self.idempotency = IdempotencyStore()
+        self.pin_import = PinImportService(
+            fetcher=self.fetcher,
+            media_storage=self.storage,
+            idempotency=self.idempotency,
+            clock=ManualClock(0),
+        )
+        self.service = BatchImportService(
+            fetcher=self.fetcher,
+            media_storage=self.storage,
+            idempotency=self.idempotency,
+            pin_import=self.pin_import,
+            clock=ManualClock(0),
+        )
+
+    def _data(self, item_ids):
+        return {
+            "batch_id": uuid.uuid4(),
+            "board_ids": [],
+            "tags": ["batch-dedup"],
+            "private": False,
+            "referer": None,
+            "description": "batch dedup",
+            "items": [
+                {
+                    "client_item_id": item_id,
+                    "url": "https://origin.example/same.png",
+                }
+                for item_id in item_ids
+            ],
+        }
+
+    def test_new_and_reuse_both_fence_and_record_success_in_atomic_commit(
+        self,
+    ):
+        events = []
+        real_fence = self.idempotency.fence
+        real_record_success = self.idempotency.record_success
+
+        def record_fence(claim):
+            events.append(("fence", connection.in_atomic_block))
+            return real_fence(claim)
+
+        def record_success(claim, pin):
+            events.append(("record_success", connection.in_atomic_block))
+            return real_record_success(claim, pin)
+
+        with mock.patch.object(
+            self.idempotency,
+            "fence",
+            side_effect=record_fence,
+        ), mock.patch.object(
+            self.idempotency,
+            "record_success",
+            side_effect=record_success,
+        ), mock.patch.object(
+            self.storage,
+            "publish",
+            wraps=self.storage.publish,
+        ) as publish, mock.patch.object(
+            self.storage,
+            "verify_reusable",
+            wraps=self.storage.verify_reusable,
+        ) as verify_reusable:
+            result = self.service.process(
+                self.user,
+                self._data((uuid.uuid4(), uuid.uuid4())),
+                started_at=0,
+            )
+
+        self.assertEqual(
+            [item["status"] for item in result["results"]],
+            ["created", "created"],
+        )
+        self.assertEqual(events, [
+            ("fence", True),
+            ("record_success", True),
+            ("fence", True),
+            ("record_success", True),
+        ])
+        self.assertEqual(publish.call_count, 1)
+        self.assertEqual(verify_reusable.call_count, 1)
+        self.assertEqual(Pin.objects.count(), 2)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(Thumbnail.objects.count(), 3)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(len(_file_snapshot(self.temporary_media.name)), 4)
+
+    def test_reuse_manifest_conflict_is_stable_and_preserves_first_success(
+        self,
+    ):
+        first_item_id = uuid.uuid4()
+        first = self.service.process(
+            self.user,
+            self._data((first_item_id,)),
+            started_at=0,
+        )
+        image = Image.objects.get()
+        original = Path(self.temporary_media.name, image.image.name)
+        original.write_bytes(b"foreign replacement")
+        before = _file_snapshot(self.temporary_media.name)
+
+        second_item_id = uuid.uuid4()
+        with mock.patch.object(
+            self.storage,
+            "publish",
+            wraps=self.storage.publish,
+        ) as publish:
+            second = self.service.process(
+                self.user,
+                self._data((second_item_id,)),
+                started_at=0,
+            )
+
+        self.assertEqual(first["results"][0]["status"], "created")
+        self.assertEqual(second["results"][0]["status"], "failed")
+        self.assertEqual(second["results"][0]["error"], {
+            "code": "media_path_conflict",
+            "message": "The media destination could not be used safely.",
+            "retryable": False,
+        })
+        self.assertNotIn(self.temporary_media.name, json.dumps(second))
+        self.assertNotIn("origin.example", json.dumps(second))
+        publish.assert_not_called()
+        failed_row = BatchImportItem.objects.get(
+            submitter=self.user,
+            client_item_id=second_item_id,
+        )
+        self.assertEqual(failed_row.state, BatchImportItem.FAILED)
+        self.assertEqual(failed_row.error_code, "media_path_conflict")
+        self.assertFalse(failed_row.retryable)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(_file_snapshot(self.temporary_media.name), before)

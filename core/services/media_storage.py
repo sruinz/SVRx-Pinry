@@ -3,6 +3,7 @@ from io import BytesIO
 import logging
 import os
 from pathlib import PurePosixPath
+import stat
 import time
 import uuid
 
@@ -11,9 +12,12 @@ from django.core.files.images import ImageFile
 from PIL import Image as PILImage
 
 from django_images.file_ops import (
+    DescriptorCloseNotAttempted,
+    MediaDirectory,
     MediaPathError,
     PublishFailure,
     create_owned_staging_file,
+    media_dedup_lock,
     media_lifecycle_lock,
     open_media_root,
     open_or_create_media_directory_from,
@@ -22,6 +26,10 @@ from django_images.file_ops import (
     unlink_published_name_if_current,
     verify_published_identity,
     verify_published_name,
+    _close_descriptor,
+    _identity,
+    _open_child_directory_nofollow,
+    _open_regular_nofollow,
 )
 from django_images.paths import (
     FORMAT_EXTENSIONS,
@@ -105,6 +113,17 @@ class PreparedAsset(object):
     @property
     def is_open(self):
         return not self._cleaned
+
+    @property
+    def content_sha256(self):
+        try:
+            return next(
+                entry.sha256
+                for entry in self.files
+                if entry.kind == "original"
+            )
+        except StopIteration:
+            raise _media_conflict() from None
 
     def cleanup(self):
         if self._cleaned:
@@ -360,6 +379,109 @@ class PublishedAsset(object):
         )
 
 
+@dataclass(frozen=True)
+class ReusableFile:
+    descriptor: int
+    file_stat: object
+    directory: object
+    name: str
+    sha256: str
+
+
+class ReusableAsset(object):
+    def __init__(self, files, directories, clock, deadline):
+        self.files = list(files)
+        self.directories = list(directories)
+        self.clock = clock
+        self.deadline = deadline
+        self._released = False
+
+    def verify_current(self):
+        if self._released:
+            raise _media_conflict()
+        try:
+            for _verification_pass in range(2):
+                for reusable_file in self.files:
+                    self._check_deadline()
+                    reusable_file.directory.verify_current()
+                    descriptor_stat = os.fstat(reusable_file.descriptor)
+                    named_stat = os.stat(
+                        reusable_file.name,
+                        dir_fd=reusable_file.directory.descriptor,
+                        follow_symlinks=False,
+                    )
+                    digest = sha256_file_descriptor(
+                        reusable_file.descriptor
+                    )
+                    reusable_file.directory.verify_current()
+                    current_descriptor_stat = os.fstat(
+                        reusable_file.descriptor
+                    )
+                    current_named_stat = os.stat(
+                        reusable_file.name,
+                        dir_fd=reusable_file.directory.descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        not stat.S_ISREG(named_stat.st_mode)
+                        or not stat.S_ISREG(current_named_stat.st_mode)
+                        or _identity(descriptor_stat)
+                        != _identity(reusable_file.file_stat)
+                        or _identity(current_descriptor_stat)
+                        != _identity(reusable_file.file_stat)
+                        or _identity(named_stat)
+                        != _identity(reusable_file.file_stat)
+                        or _identity(current_named_stat)
+                        != _identity(reusable_file.file_stat)
+                        or descriptor_stat.st_size
+                        != reusable_file.file_stat.st_size
+                        or current_descriptor_stat.st_size
+                        != reusable_file.file_stat.st_size
+                        or digest != reusable_file.sha256
+                    ):
+                        raise _media_conflict()
+                    self._check_deadline()
+        except MediaStorageError:
+            raise
+        except (MediaPathError, OSError):
+            raise _media_conflict() from None
+        return True
+
+    def release(self):
+        if self._released:
+            return
+        first_error = None
+        retained_files = []
+        for reusable_file in reversed(self.files):
+            try:
+                _close_descriptor(reusable_file.descriptor)
+            except DescriptorCloseNotAttempted as error:
+                retained_files.append(reusable_file)
+                if first_error is None:
+                    first_error = error
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        self.files = list(reversed(retained_files))
+        retained_directories = []
+        for directory in reversed(self.directories):
+            try:
+                directory.close()
+            except BaseException as error:
+                if directory.descriptors:
+                    retained_directories.append(directory)
+                if first_error is None:
+                    first_error = error
+        self.directories = list(reversed(retained_directories))
+        self._released = not self.files and not self.directories
+        if first_error is not None:
+            raise first_error
+
+    def _check_deadline(self):
+        if self.deadline is not None and self.clock() >= self.deadline:
+            raise _processing_timeout()
+
+
 class MediaStorage(object):
     def __init__(
         self,
@@ -380,6 +502,150 @@ class MediaStorage(object):
             deadline=deadline,
             clock=self.clock if clock is None else clock,
         )
+
+    def dedup_lock(
+        self,
+        prepared,
+        submitter_id,
+        content_sha256,
+        deadline=None,
+        clock=None,
+    ):
+        if (
+            not isinstance(prepared, PreparedAsset)
+            or not prepared.is_open
+            or prepared.content_sha256 != content_sha256
+        ):
+            raise _media_conflict()
+        return media_dedup_lock(
+            prepared.root_directory,
+            submitter_id,
+            content_sha256,
+            deadline=deadline,
+            clock=self.clock if clock is None else clock,
+        )
+
+    def verify_reusable(
+        self,
+        prepared,
+        image,
+        thumbnails,
+        deadline=None,
+    ):
+        directories = []
+        reusable_files = []
+        try:
+            self._validate_prepared(prepared, deadline)
+            prepared_files = self._verified_prepared_files(
+                prepared,
+                deadline,
+            )
+            asset_uuid = self._asset_uuid(image.asset_uuid)
+            original_filename = image.original_filename
+            if (
+                not isinstance(original_filename, str)
+                or original_filename
+                != sanitize_original_filename(original_filename)
+            ):
+                raise _media_conflict()
+            manifest = self._reusable_manifest(image, thumbnails)
+            originals_directory = self._open_existing_directory(
+                prepared.root_directory,
+                "originals/{}".format(asset_uuid),
+            )
+            directories.append(originals_directory)
+            derivatives_directory = self._open_existing_directory(
+                prepared.root_directory,
+                "derivatives/{}".format(asset_uuid),
+            )
+            directories.append(derivatives_directory)
+
+            for kind in _KINDS:
+                self._check_deadline(deadline)
+                prepared_file = prepared_files[kind]
+                entry = manifest[kind]
+                directory = (
+                    originals_directory
+                    if kind == "original"
+                    else derivatives_directory
+                )
+                path_parts = entry["path"].split("/")
+                expected_parent = (
+                    "originals" if kind == "original" else "derivatives"
+                )
+                if path_parts[:2] != [expected_parent, str(asset_uuid)]:
+                    raise _media_conflict()
+                descriptor = _open_regular_nofollow(
+                    directory.descriptor,
+                    path_parts[2],
+                )
+                file_stat = os.fstat(descriptor)
+                reusable_file = None
+                try:
+                    image_format, width, height = self._inspect(descriptor)
+                    digest = sha256_file_descriptor(descriptor)
+                    if kind == "original":
+                        expected_path = canonical_original_path(
+                            asset_uuid,
+                            original_filename,
+                            FORMAT_EXTENSIONS[image_format],
+                        )
+                    else:
+                        expected_path = "derivatives/{}/{}{}".format(
+                            asset_uuid,
+                            kind,
+                            FORMAT_EXTENSIONS[image_format],
+                        )
+                    if (
+                        entry["path"] != expected_path
+                        or type(entry["width"]) is not int
+                        or type(entry["height"]) is not int
+                        or (entry["width"], entry["height"])
+                        != (width, height)
+                        or prepared_file["size"] != file_stat.st_size
+                        or prepared_file["sha256"] != digest
+                        or prepared_file["format"] != image_format
+                        or prepared_file["dimensions"] != (width, height)
+                        or not self._same_descriptor_bytes(
+                            prepared_file["descriptor"], descriptor
+                        )
+                    ):
+                        raise _media_conflict()
+                    reusable_file = ReusableFile(
+                        descriptor=descriptor,
+                        file_stat=file_stat,
+                        directory=directory,
+                        name=path_parts[2],
+                        sha256=digest,
+                    )
+                    reusable_files.append(reusable_file)
+                finally:
+                    if reusable_file is None:
+                        _close_descriptor(descriptor)
+                self._check_deadline(deadline)
+            reusable = ReusableAsset(
+                reusable_files,
+                directories,
+                self.clock,
+                deadline,
+            )
+            return reusable
+        except BaseException as error:
+            partial = ReusableAsset(
+                reusable_files,
+                directories,
+                self.clock,
+                deadline,
+            )
+            try:
+                partial.release()
+            except BaseException:
+                pass
+            if not isinstance(error, Exception):
+                raise
+            if isinstance(error, MediaStorageError):
+                raise
+            raise _media_conflict() from None
 
     def prepare(
         self,
@@ -579,6 +845,130 @@ class MediaStorage(object):
             if not isinstance(error, Exception):
                 raise
             raise self._map_error(error) from None
+
+    def _verified_prepared_files(self, prepared, deadline):
+        verified = {}
+        for prepared_file in prepared.files:
+            self._check_deadline(deadline)
+            descriptor = prepared_file.owned_staging_handle.descriptor
+            file_stat = os.fstat(descriptor)
+            image_format, width, height = self._inspect(descriptor)
+            digest = sha256_file_descriptor(descriptor)
+            if (
+                file_stat.st_size != prepared_file.size
+                or digest != prepared_file.sha256
+                or image_format != prepared_file.image_format
+                or (width, height)
+                != (prepared_file.width, prepared_file.height)
+            ):
+                raise _media_conflict()
+            verified[prepared_file.kind] = {
+                "descriptor": descriptor,
+                "size": file_stat.st_size,
+                "sha256": digest,
+                "format": image_format,
+                "dimensions": (width, height),
+            }
+            self._check_deadline(deadline)
+        return verified
+
+    @staticmethod
+    def _reusable_manifest(image, thumbnails):
+        try:
+            original_path = image.image.name
+            manifest = {
+                "original": {
+                    "path": original_path,
+                    "width": image.width,
+                    "height": image.height,
+                }
+            }
+            thumbnail_list = list(thumbnails)
+            if len(thumbnail_list) != len(_DERIVATIVE_KINDS):
+                raise ValueError()
+            for thumbnail in thumbnail_list:
+                if (
+                    thumbnail.original_id != image.pk
+                    or thumbnail.size not in _DERIVATIVE_KINDS
+                    or thumbnail.size in manifest
+                ):
+                    raise ValueError()
+                manifest[thumbnail.size] = {
+                    "path": thumbnail.image.name,
+                    "width": thumbnail.width,
+                    "height": thumbnail.height,
+                }
+            if tuple(sorted(manifest)) != tuple(sorted(_KINDS)):
+                raise ValueError()
+            for entry in manifest.values():
+                path = entry["path"]
+                if (
+                    not isinstance(path, str)
+                    or len(path.split("/")) != 3
+                ):
+                    raise ValueError()
+            return manifest
+        except (AttributeError, TypeError, ValueError):
+            raise _media_conflict() from None
+
+    @staticmethod
+    def _open_existing_directory(root_directory, relative_directory):
+        root_directory.verify_current()
+        descriptors = [os.dup(root_directory.descriptor)]
+        names = []
+        directory_stats = []
+        try:
+            for name in relative_directory.split("/"):
+                parent_descriptor = descriptors[-1]
+                named_stat = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if not stat.S_ISDIR(named_stat.st_mode):
+                    raise MediaPathError("unsafe_media_directory")
+                child_descriptor = _open_child_directory_nofollow(
+                    parent_descriptor,
+                    name,
+                    named_stat,
+                )
+                names.append(name)
+                directory_stats.append(os.fstat(child_descriptor))
+                descriptors.append(child_descriptor)
+            return MediaDirectory(
+                descriptors,
+                names=names,
+                directory_stats=directory_stats,
+                created=[False for _name in names],
+                root_path=root_directory.root_path,
+                root_stat=root_directory.root_stat,
+            )
+        except BaseException:
+            partial = MediaDirectory(
+                descriptors,
+                names=names,
+                directory_stats=directory_stats,
+                created=[False for _name in names],
+                root_path=root_directory.root_path,
+                root_stat=root_directory.root_stat,
+            )
+            try:
+                partial.close()
+            except BaseException:
+                pass
+            raise
+
+    @staticmethod
+    def _same_descriptor_bytes(first_descriptor, second_descriptor):
+        offset = 0
+        while True:
+            first = os.pread(first_descriptor, 64 * 1024, offset)
+            second = os.pread(second_descriptor, 64 * 1024, offset)
+            if first != second:
+                return False
+            if not first:
+                return True
+            offset += len(first)
 
     def _stage_bytes(
         self,

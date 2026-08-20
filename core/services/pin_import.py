@@ -4,9 +4,11 @@ import time
 from urllib.parse import unquote, urlsplit
 import uuid
 
+from django.conf import settings
 from django.db import DEFAULT_DB_ALIAS, connections, transaction
 
-from core.models import Board, Pin
+from core.models import Board, MediaAsset, Pin
+from core.services.local_upload import read_local_upload
 from django_images.file_ops import MediaLifecycleLockError, MediaPathError
 from django_images.models import Image, Thumbnail
 from django_images.paths import (
@@ -95,6 +97,27 @@ class PinImportService(object):
             raise
         return prepared
 
+    def prepare_upload(self, uploaded_file, deadline):
+        uploaded = read_local_upload(
+            uploaded_file,
+            settings.PINRY_FETCH_MAX_BYTES,
+            settings.PINRY_FETCH_MAX_PIXELS,
+            deadline,
+            self.clock,
+        )
+        prepared = self.media_storage.prepare(
+            uploaded.inspected,
+            asset_uuid=uuid.uuid4(),
+            original_filename=uploaded.original_filename,
+            deadline=deadline,
+        )
+        try:
+            self._check_deadline(deadline)
+        except BaseException:
+            self._cleanup(prepared)
+            raise
+        return prepared
+
     def commit(self, prepared, user, metadata, claim, deadline):
         database = connections[DEFAULT_DB_ALIAS]
         try:
@@ -108,11 +131,18 @@ class PinImportService(object):
             raise self._internal_error()
 
         published = None
+        reusable = None
         pin = None
         commit_marker = [False]
         try:
             self._check_deadline(deadline)
-            with self._lifecycle_lock(prepared, deadline):
+            content_sha256 = self._content_sha256(prepared)
+            with self._dedup_lock(
+                prepared,
+                user.pk,
+                content_sha256,
+                deadline,
+            ), self._lifecycle_lock(prepared, deadline):
                 with transaction.atomic(using=DEFAULT_DB_ALIAS):
                     transaction.on_commit(
                         lambda: commit_marker.__setitem__(0, True),
@@ -127,33 +157,74 @@ class PinImportService(object):
                     self._check_deadline(deadline)
                     boards = self._owned_boards(user, metadata.board_ids)
                     self._check_deadline(deadline)
-                    published = self.media_storage.publish(
-                        prepared,
-                        deadline=deadline,
-                    )
-                    self._check_deadline(deadline)
-                    files = self._manifest_files(published, prepared)
-                    original = files["original"]
-                    image = Image.objects.using(DEFAULT_DB_ALIAS).create(
-                        image=original.final_relative_path,
-                        asset_uuid=prepared.asset_uuid,
-                        original_filename=prepared.original_filename,
-                        width=original.width,
-                        height=original.height,
-                    )
-                    self._fault("after_image_row")
-                    self._check_deadline(deadline)
-                    Thumbnail.objects.using(DEFAULT_DB_ALIAS).bulk_create([
-                        Thumbnail(
-                            original=image,
-                            image=files[kind].final_relative_path,
-                            size=kind,
-                            width=files[kind].width,
-                            height=files[kind].height,
+                    asset = (
+                        MediaAsset.objects.using(DEFAULT_DB_ALIAS)
+                        .select_for_update()
+                        .select_related("image")
+                        .filter(
+                            submitter=user,
+                            content_sha256=content_sha256,
                         )
-                        for kind in ("thumbnail", "standard", "square")
-                    ])
-                    self._fault("after_thumbnail_rows")
+                        .first()
+                    )
+                    if asset is not None:
+                        image = asset.image
+                        thumbnails = list(
+                            Thumbnail.objects.using(DEFAULT_DB_ALIAS)
+                            .select_for_update()
+                            .filter(original=image)
+                            .order_by("size")
+                        )
+                        reusable = self.media_storage.verify_reusable(
+                            prepared,
+                            image,
+                            thumbnails,
+                            deadline=deadline,
+                        )
+                        self._fault("after_reusable_verified")
+                    else:
+                        published = self.media_storage.publish(
+                            prepared,
+                            deadline=deadline,
+                        )
+                        self._check_deadline(deadline)
+                        files = self._manifest_files(published, prepared)
+                        original = files["original"]
+                        image = Image.objects.using(
+                            DEFAULT_DB_ALIAS
+                        ).create(
+                            image=original.final_relative_path,
+                            asset_uuid=prepared.asset_uuid,
+                            original_filename=prepared.original_filename,
+                            width=original.width,
+                            height=original.height,
+                        )
+                        self._fault("after_image_row")
+                        self._check_deadline(deadline)
+                        Thumbnail.objects.using(
+                            DEFAULT_DB_ALIAS
+                        ).bulk_create([
+                            Thumbnail(
+                                original=image,
+                                image=files[kind].final_relative_path,
+                                size=kind,
+                                width=files[kind].width,
+                                height=files[kind].height,
+                            )
+                            for kind in (
+                                "thumbnail", "standard", "square"
+                            )
+                        ])
+                        self._fault("after_thumbnail_rows")
+                        self._check_deadline(deadline)
+                        MediaAsset.objects.using(
+                            DEFAULT_DB_ALIAS
+                        ).create(
+                            submitter=user,
+                            image=image,
+                            content_sha256=content_sha256,
+                        )
+                        self._fault("after_media_asset_row")
                     self._check_deadline(deadline)
                     pin = Pin.objects.using(DEFAULT_DB_ALIAS).create(
                         submitter=user,
@@ -174,7 +245,7 @@ class PinImportService(object):
                         board.pins.add(pin)
                     self._fault("after_boards")
                     self._check_deadline(deadline)
-                    published.verify_current()
+                    (reusable or published).verify_current()
                     self._check_deadline(deadline)
                     self._fault("before_idempotency_success")
                     self._check_deadline(deadline)
@@ -186,16 +257,12 @@ class PinImportService(object):
                     self._check_deadline(deadline)
         except BaseException as error:
             if commit_marker[0]:
-                self._release(published)
+                self._finish_receipts(published, reusable, prepared)
                 if not isinstance(error, Exception):
                     raise
                 self._log_committed_callback_error(error)
                 return pin
-            if published is None:
-                self._cleanup(prepared)
-            else:
-                self._compensate(published)
-                self._release(published, attempts=1)
+            self._rollback_receipts(published, reusable, prepared)
             if isinstance(error, MediaLifecycleLockError):
                 if error.retryable:
                     raise self._processing_timeout() from None
@@ -205,14 +272,27 @@ class PinImportService(object):
             raise
 
         if not commit_marker[0]:
-            if published is None:
-                self._cleanup(prepared)
-            else:
-                self._compensate(published)
-                self._release(published, attempts=1)
+            self._rollback_receipts(published, reusable, prepared)
             raise self._internal_error()
-        self._release(published)
+        self._finish_receipts(published, reusable, prepared)
         return pin
+
+    @staticmethod
+    def _content_sha256(prepared):
+        try:
+            content_sha256 = prepared.content_sha256
+        except (AttributeError, TypeError):
+            raise PinImportService._internal_error() from None
+        if (
+            type(content_sha256) is not str
+            or len(content_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in content_sha256
+            )
+        ):
+            raise PinImportService._internal_error()
+        return content_sha256
 
     def _owned_boards(self, user, board_ids):
         expected = tuple(board_ids)
@@ -237,6 +317,33 @@ class PinImportService(object):
                 raise TypeError()
             context = lifecycle_lock(
                 prepared,
+                deadline=deadline,
+                clock=self.clock,
+            )
+            if (
+                not callable(getattr(context, "__enter__", None))
+                or not callable(getattr(context, "__exit__", None))
+            ):
+                raise TypeError()
+            return context
+        except (AttributeError, TypeError):
+            raise self._configuration_error() from None
+
+    def _dedup_lock(
+        self,
+        prepared,
+        submitter_id,
+        content_sha256,
+        deadline,
+    ):
+        try:
+            dedup_lock = self.media_storage.dedup_lock
+            if not callable(dedup_lock):
+                raise TypeError()
+            context = dedup_lock(
+                prepared,
+                submitter_id,
+                content_sha256,
                 deadline=deadline,
                 clock=self.clock,
             )
@@ -343,6 +450,25 @@ class PinImportService(object):
                 published.release()
             except BaseException:
                 pass
+
+    @classmethod
+    def _finish_receipts(cls, published, reusable, prepared):
+        if reusable is not None:
+            cls._release(reusable)
+            cls._cleanup(prepared)
+            return
+        cls._release(published)
+
+    @classmethod
+    def _rollback_receipts(cls, published, reusable, prepared):
+        if reusable is not None:
+            cls._release(reusable)
+            cls._cleanup(prepared)
+        elif published is None:
+            cls._cleanup(prepared)
+        else:
+            cls._compensate(published)
+            cls._release(published, attempts=1)
 
     @staticmethod
     def _lease_lost():

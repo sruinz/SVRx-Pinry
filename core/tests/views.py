@@ -22,20 +22,13 @@ class CreateImageTest(TemporaryMediaMixin, TestCase):
     def test_post(self):
         with open('docs/src/imgs/logo-dark.png', mode='rb') as image:
             response = self.client.post(reverse('image-list'), {'image': image})
-        image = Image.objects.latest('pk')
-        self.assertEqual(response.json()['id'], image.pk)
+        self.assertEqual(response.status_code, 405)
+        self.assertFalse(Image.objects.exists())
 
     def test_post_error(self):
         response = self.client.post(reverse('image-list'), {'image': ''})
-        self.assertEqual(
-            response.json(),
-            {
-                'image': [
-                    'The submitted data was not a file. '
-                    'Check the encoding type on the form.'
-                ]
-            }
-        )
+        self.assertEqual(response.status_code, 405)
+        self.assertFalse(Image.objects.exists())
 
 
 class TestDocs(TestCase):
