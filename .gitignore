@@ -55,3 +55,4 @@ docker/data/*
 
 # generated Synology upload bundle
 /output/synology/
+/output/synology-before-original-filename-*/
