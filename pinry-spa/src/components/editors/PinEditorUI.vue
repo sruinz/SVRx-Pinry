@@ -75,8 +75,14 @@ export default {
   },
   data() {
     return {
+      deleteDialogOpen: false,
       deleteInFlight: false,
+      deleteConsumed: false,
+      disposed: false,
     };
+  },
+  beforeDestroy() {
+    this.disposed = true;
   },
   methods: {
     addToBoard() {
@@ -112,24 +118,41 @@ export default {
       );
     },
     deletePin() {
+      if (
+        this.disposed
+        || this.deleteDialogOpen
+        || this.deleteInFlight
+        || this.deleteConsumed
+      ) return;
+      this.deleteDialogOpen = true;
+      let confirmed = false;
       this.$buefy.dialog.confirm({
         message: this.$t('pinDeleteConfirm'),
         onConfirm: () => {
-          if (this.deleteInFlight) return;
+          if (confirmed || this.disposed || this.deleteConsumed) return;
+          confirmed = true;
+          this.deleteDialogOpen = false;
           this.deleteInFlight = true;
           API.Pin.deleteById(this.pin.id).then(
             () => {
+              if (this.disposed) return;
               this.deleteInFlight = false;
+              this.deleteConsumed = true;
               this.$buefy.toast.open(this.$t('pinDeleted'));
               this.$emit('pin-delete-succeed', this.pin.id);
             },
             () => {
+              if (this.disposed) return;
               this.deleteInFlight = false;
               this.$buefy.toast.open(
                 { type: 'is-danger', message: this.$t('pinDeleteError') },
               );
             },
           );
+        },
+        onCancel: () => {
+          if (this.disposed || confirmed) return;
+          this.deleteDialogOpen = false;
         },
       });
     },
