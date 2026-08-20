@@ -110,6 +110,48 @@ describe('PinEditorUI delete behavior', () => {
     expect(axios.delete).not.toHaveBeenCalled();
   });
 
+  it('opens a new confirmation after cancellation without deleting', async () => {
+    const { dialog, wrapper } = mountEditor();
+
+    await wrapper.find('[data-test="delete-pin"]').trigger('click');
+    const firstDialog = dialog.confirm.mock.calls[0][0];
+    firstDialog.onCancel();
+    firstDialog.onCancel();
+
+    expect(axios.delete).not.toHaveBeenCalled();
+    expect(wrapper.vm.deleteDialogOpen).toBe(false);
+    await wrapper.find('[data-test="delete-pin"]').trigger('click');
+
+    expect(dialog.confirm).toHaveBeenCalledTimes(2);
+    expect(wrapper.vm.deleteDialogOpen).toBe(true);
+  });
+
+  it('never accepts a canceled confirmation callback', async () => {
+    const request = deferred();
+    axios.delete.mockImplementation(() => request.promise);
+    const { dialog, wrapper } = mountEditor();
+
+    await wrapper.find('[data-test="delete-pin"]').trigger('click');
+    const firstDialog = dialog.confirm.mock.calls[0][0];
+    firstDialog.onCancel();
+    await wrapper.find('[data-test="delete-pin"]').trigger('click');
+    const currentDialog = dialog.confirm.mock.calls[1][0];
+
+    firstDialog.onConfirm();
+    expect(axios.delete).not.toHaveBeenCalled();
+    currentDialog.onConfirm();
+    currentDialog.onConfirm();
+    firstDialog.onConfirm();
+
+    expect(axios.delete).toHaveBeenCalledTimes(1);
+    await resolveRequest(request);
+    firstDialog.onConfirm();
+    currentDialog.onConfirm();
+    await flushPromises();
+
+    expect(axios.delete).toHaveBeenCalledTimes(1);
+  });
+
   it('uses a confirmation callback only once before and after deletion settles', async () => {
     const request = deferred();
     axios.delete.mockImplementation(() => request.promise);

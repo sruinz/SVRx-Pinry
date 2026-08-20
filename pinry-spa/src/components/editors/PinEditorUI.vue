@@ -125,12 +125,12 @@ export default {
         || this.deleteConsumed
       ) return;
       this.deleteDialogOpen = true;
-      let confirmed = false;
+      let active = true;
       this.$buefy.dialog.confirm({
         message: this.$t('pinDeleteConfirm'),
         onConfirm: () => {
-          if (confirmed || this.disposed || this.deleteConsumed) return;
-          confirmed = true;
+          if (!active || this.disposed || this.deleteConsumed) return;
+          active = false;
           this.deleteDialogOpen = false;
           this.deleteInFlight = true;
           API.Pin.deleteById(this.pin.id).then(
@@ -151,7 +151,8 @@ export default {
           );
         },
         onCancel: () => {
-          if (this.disposed || confirmed) return;
+          if (!active || this.disposed) return;
+          active = false;
           this.deleteDialogOpen = false;
         },
       });
