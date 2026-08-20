@@ -12,6 +12,31 @@ import mock
 from django_images import file_ops
 
 
+class _DeceptiveLockFilename(str):
+    def __eq__(self, other):
+        return False
+
+    def startswith(self, prefix, *args):
+        return True
+
+    def endswith(self, suffix, *args):
+        return True
+
+    def __getitem__(self, item):
+        return "00"
+
+
+class _DeceptiveContentHash(str):
+    def __len__(self):
+        return 64
+
+    def __iter__(self):
+        return iter("0" * 64)
+
+    def __format__(self, format_spec):
+        return "0" * 64
+
+
 def _acquire_dedup_lock_in_process(
     media_root, submitter_id, content_sha256, entered, release, errors
 ):
@@ -691,6 +716,36 @@ class MediaDedupLockTests(SimpleTestCase):
             lifecycle_lock.__enter__,
         )
         self.assertFalse(escaped_path.exists())
+
+    def test_lock_filename_str_subclass_cannot_escape_fixed_set(self):
+        escaped_path = self.root_path / "escaped-subclass.lock"
+        lifecycle_lock = file_ops.MediaLifecycleLock(
+            self.root_directory,
+            exclusive=True,
+            lock_filename=_DeceptiveLockFilename(
+                "../escaped-subclass.lock"
+            ),
+        )
+
+        error = self._assert_lock_error(
+            "media_lifecycle_lock_failed",
+            lifecycle_lock.__enter__,
+        )
+        self.assertFalse(error.retryable)
+        self.assertFalse(escaped_path.exists())
+
+    def test_content_hash_str_subclass_is_rejected_before_lock_creation(self):
+        error = self._assert_lock_error(
+            "media_lifecycle_lock_failed",
+            lambda: file_ops.media_dedup_lock(
+                self.root_directory,
+                1,
+                _DeceptiveContentHash("not-a-content-hash"),
+            ),
+        )
+
+        self.assertFalse(error.retryable)
+        self.assertFalse(self.lock_directory_path.exists())
 
     def test_all_created_names_are_the_fixed_256_stripe_set(self):
         for submitter_id in range(1, 3001):

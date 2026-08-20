@@ -207,7 +207,7 @@ def media_dedup_lock(
     if (
         type(submitter_id) is not int
         or submitter_id <= 0
-        or not isinstance(content_sha256, str)
+        or type(content_sha256) is not str
         or len(content_sha256) != 64
         or any(
             character not in "0123456789abcdef"
@@ -694,10 +694,10 @@ def _lifecycle_lock_error(code, retryable=False):
 def _require_lifecycle_lock_filename(lock_filename):
     dedup_prefix = "media-dedup-"
     dedup_suffix = ".lock"
+    if type(lock_filename) is not str:
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
     if lock_filename == "media-lifecycle.lock":
         return
-    if not isinstance(lock_filename, str):
-        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
     if not (
         lock_filename.startswith(dedup_prefix)
         and lock_filename.endswith(dedup_suffix)
