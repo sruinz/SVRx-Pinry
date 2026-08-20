@@ -159,6 +159,24 @@ class RecordingSession:
         pass
 
 
+class TrustEnvFailingSession(object):
+    def __init__(self, error):
+        self.error = error
+        self.close_calls = 0
+
+    @property
+    def trust_env(self):
+        return True
+
+    @trust_env.setter
+    def trust_env(self, value):
+        del value
+        raise self.error
+
+    def close(self):
+        self.close_calls += 1
+
+
 class PinnedHTTPTransportTests(SimpleTestCase):
     def make_transport(
         self,
@@ -198,6 +216,67 @@ class PinnedHTTPTransportTests(SimpleTestCase):
         self.assertEqual(
             result.location, "https://redirect.test/image.png"
         )
+
+    def test_explicit_none_or_blank_referer_never_uses_origin_url(self):
+        origin = "/image.png?private-token=secret"
+        for referer, expected_header in ((None, None), ("", "")):
+            with self.subTest(referer=referer):
+                raw = RecordingRaw([], RecordingSocket())
+                transport, session = self.make_transport(
+                    RecordingRequestsResponse(raw)
+                )
+                transport.request(
+                    make_target(request_target=origin),
+                    referer,
+                    3,
+                    8,
+                    monotonic() + 12,
+                )
+
+                headers = session.calls[0]["headers"]
+                self.assertEqual(headers.get("Referer"), expected_header)
+                self.assertNotEqual(headers.get("Referer"), origin)
+
+    def test_constructor_failure_closes_local_session_once_and_reraises(self):
+        primary = RuntimeError("primary failure")
+        cases = (
+            ("trust_env", TrustEnvFailingSession(primary), None, None),
+            ("adapter", mock.Mock(), primary, None),
+            ("first_mount", mock.Mock(), None, [primary]),
+            ("second_mount", mock.Mock(), None, [None, primary]),
+        )
+        for name, session, adapter_error, mount_effect in cases:
+            with self.subTest(name=name):
+                if adapter_error is not None:
+                    adapter_factory = mock.Mock(side_effect=adapter_error)
+                else:
+                    adapter_factory = mock.Mock(return_value=object())
+                if mount_effect is not None:
+                    session.mount.side_effect = mount_effect
+                with self.assertRaises(RuntimeError) as caught:
+                    PinnedHTTPTransport(
+                        session_factory=lambda: session,
+                        adapter_factory=adapter_factory,
+                    )
+
+                self.assertIs(caught.exception, primary)
+                if isinstance(session, TrustEnvFailingSession):
+                    self.assertEqual(session.close_calls, 1)
+                else:
+                    session.close.assert_called_once_with()
+
+    def test_constructor_close_error_does_not_mask_primary_failure(self):
+        primary = RuntimeError("adapter failure")
+        session = mock.Mock()
+        session.close.side_effect = RuntimeError("close failure")
+        with self.assertRaises(RuntimeError) as caught:
+            PinnedHTTPTransport(
+                session_factory=lambda: session,
+                adapter_factory=mock.Mock(side_effect=primary),
+            )
+
+        self.assertIs(caught.exception, primary)
+        session.close.assert_called_once_with()
 
     def test_pool_uses_validated_ip_and_original_tls_identity(self):
         adapter = PinnedHTTPAdapter()

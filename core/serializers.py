@@ -118,7 +118,7 @@ _URL_CLIENT_ERROR_CODES = frozenset((
 ))
 
 
-def _raise_url_import_error(error):
+def raise_url_import_error(error):
     code = getattr(error, "code", "internal_error")
     detail = {"url": [code]}
     if code == "invalid_image_content":
@@ -182,6 +182,7 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
         tags = tuple(validated_data.pop('tag_list', ()))
         if 'url' in validated_data:
             url = validated_data.pop('url')
+            referer_provided = 'referer' in validated_data
             referer = validated_data.pop('referer', None)
             service = self.context.get("pin_import_service")
             deadline = self.context.get("pin_import_deadline")
@@ -198,7 +199,7 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
             try:
                 prepared = service.prepare_url(
                     url,
-                    referer or url,
+                    referer if referer_provided else url,
                     deadline,
                 )
                 return service.commit(
@@ -209,7 +210,7 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
                     deadline,
                 )
             except (PinImportError, SafeFetchError, MediaStorageError) as error:
-                _raise_url_import_error(error)
+                raise_url_import_error(error)
             except Exception:
                 raise URLImportInternalError(
                     {"url": ["internal_error"]}

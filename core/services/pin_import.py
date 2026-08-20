@@ -77,12 +77,18 @@ class PinImportService(object):
         original_filename = sanitize_original_filename(
             unquote(basename)
         )
-        return self.media_storage.prepare(
+        prepared = self.media_storage.prepare(
             fetched,
             asset_uuid=uuid.uuid4(),
             original_filename=original_filename,
             deadline=deadline,
         )
+        try:
+            self._check_deadline(deadline)
+        except BaseException:
+            self._cleanup(prepared)
+            raise
+        return prepared
 
     def commit(self, prepared, user, metadata, claim, deadline):
         database = connections[DEFAULT_DB_ALIAS]

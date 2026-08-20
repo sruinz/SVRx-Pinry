@@ -11,7 +11,8 @@ from django.views.decorators.cache import cache_page
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets, mixins, routers, status
 from rest_framework.decorators import action
-from rest_framework.exceptions import ParseError, PermissionDenied
+from rest_framework.exceptions import APIException, ParseError, PermissionDenied
+from rest_framework.exceptions import ValidationError
 from rest_framework.filters import SearchFilter, OrderingFilter
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -28,9 +29,10 @@ from core.services.batch_import import BatchImportService
 from core.services.bounded_resolver import BoundedResolver
 from core.services.idempotency import IdempotencyStore
 from core.services.media_storage import MediaStorage
-from core.services.pin_import import PinImportService
+from core.services.pin_import import PinImportError, PinImportService
 from core.services.pinned_http import PinnedHTTPTransport
-from core.services.safe_url_fetch import SafeUrlFetcher
+from core.services.safe_url_fetch import SafeFetchError, SafeUrlFetcher
+from core.services.media_storage import MediaStorageError
 
 
 logger = logging.getLogger(__name__)
@@ -80,18 +82,33 @@ class PinViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         if "url" not in request.data:
+            if "image_by_id" not in request.data:
+                raise ValidationError({
+                    "url-or-image": "Either url or image_by_id is required."
+                })
             return super(PinViewSet, self).create(request, *args, **kwargs)
-        service = self.get_pin_import_service()
-        self._pin_import_service = service
-        self._pin_import_deadline = (
-            self.batch_clock() + settings.PINRY_FETCH_TOTAL_TIMEOUT
-        )
+        service = None
+        self._pin_import_deadline = None
         try:
+            self._pin_import_deadline = (
+                self.batch_clock() + settings.PINRY_FETCH_TOTAL_TIMEOUT
+            )
+            service = self.get_pin_import_service()
+            self._pin_import_service = service
             return super(PinViewSet, self).create(request, *args, **kwargs)
+        except (PinImportError, SafeFetchError, MediaStorageError) as error:
+            api.raise_url_import_error(error)
+        except APIException:
+            raise
+        except Exception:
+            raise api.URLImportInternalError(
+                {"url": ["internal_error"]}
+            ) from None
         finally:
             self._pin_import_service = None
             self._pin_import_deadline = None
-            self._close_pin_import_service(service)
+            if service is not None:
+                self._close_pin_import_service(service)
 
     def get_serializer_context(self):
         context = super(PinViewSet, self).get_serializer_context()

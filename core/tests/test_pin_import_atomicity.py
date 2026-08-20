@@ -499,6 +499,60 @@ class PinImportPrepareTests(TransactionTestCase):
         self.assertEqual(media_storage.calls[0][2], "photo.png")
         self.assertIs(media_storage.calls[0][3], deadline)
 
+    def test_late_prepare_is_cleaned_before_commit_can_begin(self):
+        fetched = FetchedImage(
+            content=b"image-bytes",
+            image_format="PNG",
+            width=10,
+            height=20,
+            final_url="https://cdn.example/photo.png",
+        )
+        prepared = _PreparedAsset()
+        service = PinImportService(
+            fetcher=_Fetcher(fetched),
+            media_storage=_PreparingMediaStorage(prepared),
+            idempotency=object(),
+            clock=lambda: 20.0,
+        )
+
+        with self.assertRaises(PinImportError) as caught:
+            service.prepare_url(
+                "https://origin.example/image",
+                "https://origin.example/page",
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "image_processing_timeout")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(prepared.cleanup_calls, 1)
+
+    def test_post_prepare_clock_base_exception_cleans_and_reraises(self):
+        fetched = FetchedImage(
+            content=b"image-bytes",
+            image_format="PNG",
+            width=10,
+            height=20,
+            final_url="https://cdn.example/photo.png",
+        )
+        prepared = _PreparedAsset()
+        original = KeyboardInterrupt()
+        service = PinImportService(
+            fetcher=_Fetcher(fetched),
+            media_storage=_PreparingMediaStorage(prepared),
+            idempotency=object(),
+            clock=mock.Mock(side_effect=original),
+        )
+
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            service.prepare_url(
+                "https://origin.example/image",
+                "https://origin.example/page",
+                deadline=20.0,
+            )
+
+        self.assertIs(caught.exception, original)
+        self.assertEqual(prepared.cleanup_calls, 1)
+
 
 class PinImportCommitTests(TransactionTestCase):
     def setUp(self):

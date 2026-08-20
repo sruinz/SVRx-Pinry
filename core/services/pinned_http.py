@@ -317,11 +317,20 @@ class PinnedHTTPTransport:
         if adapter_factory is None:
             adapter_factory = PinnedHTTPAdapter
         self.clock = clock
-        self.session = session_factory()
-        self.session.trust_env = False
-        self.adapter = adapter_factory()
-        self.session.mount("http://", self.adapter)
-        self.session.mount("https://", self.adapter)
+        session = session_factory()
+        try:
+            session.trust_env = False
+            adapter = adapter_factory()
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+        except BaseException:
+            try:
+                session.close()
+            except BaseException:
+                pass
+            raise
+        self.session = session
+        self.adapter = adapter
 
     def request(
         self,

@@ -1,15 +1,17 @@
 from django.urls import resolve, reverse
 from django.db import connection
 import mock
-from rest_framework import status
+from rest_framework import serializers as drf_serializers, status
 from rest_framework.test import APITestCase, APITransactionTestCase
 
+from taggit.managers import _TaggableManager
 from taggit.models import Tag
 
 from .helpers import create_image, create_user, create_pin
 from core.models import Pin, Image, Board
 from core.serializers import PinSerializer
-from core.services.safe_url_fetch import SafeFetchError
+from core.services.pin_import import PinImportService
+from core.services.safe_url_fetch import FetchedImage, SafeFetchError
 from core.views import PinViewSet
 from django_images.test_helpers import TemporaryMediaMixin
 
@@ -207,6 +209,63 @@ class _SinglePinImport(object):
         self.closed += 1
 
 
+class _SequenceClock(object):
+    def __init__(self, values):
+        self.values = list(values)
+
+    def __call__(self):
+        return self.values.pop(0)
+
+
+class _LatePrepareAsset(object):
+    def __init__(self):
+        self.cleanup_calls = 0
+        self.is_open = True
+
+    def cleanup(self):
+        self.cleanup_calls += 1
+        self.is_open = False
+
+
+class _LatePrepareFetcher(object):
+    transport = None
+
+    def fetch(self, url, referer=None, deadline=None):
+        del url, referer, deadline
+        return FetchedImage(
+            content=b"image-bytes",
+            image_format="PNG",
+            width=1,
+            height=1,
+            final_url="https://cdn.example/image.png",
+        )
+
+
+class _LatePrepareStorage(object):
+    def __init__(self, prepared):
+        self.prepared = prepared
+        self.publish_calls = 0
+
+    def prepare(self, fetched, asset_uuid, original_filename, deadline=None):
+        del fetched, asset_uuid, original_filename, deadline
+        return self.prepared
+
+    def publish(self, prepared, deadline=None):
+        del prepared, deadline
+        self.publish_calls += 1
+        raise AssertionError("commit must not be entered after late prepare")
+
+
+class _LatePrepareIdempotency(object):
+    def __init__(self):
+        self.fence_calls = 0
+
+    def fence(self, claim):
+        del claim
+        self.fence_calls += 1
+        raise AssertionError("fence must not run after late prepare")
+
+
 class _AtomicCheckingBatchService(object):
     def __init__(self):
         self.in_atomic_block = None
@@ -282,6 +341,19 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
                 self.assertIn("url-or-image", serializer.errors)
                 self.assertEqual(Pin.objects.count(), 0)
 
+    def test_missing_source_keeps_legacy_scalar_error_body(self):
+        with mock.patch.object(
+            PinViewSet,
+            "get_pin_import_service",
+            side_effect=AssertionError("URL service must not be built"),
+        ):
+            response = self.client.post(reverse("pin-list"), {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json(), {
+            "url-or-image": "Either url or image_by_id is required."
+        })
+
     def test_serializer_uses_injected_service_for_url_import(self):
         service = _SinglePinImport()
         request = mock.Mock(user=self.user)
@@ -334,13 +406,53 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(len(service.commit_calls), 1)
         self.assertEqual(service.closed, 1)
 
-    def test_url_post_maps_safe_and_internal_errors_without_raw_details(self):
+    def test_url_post_preserves_referer_fetch_and_response_meaning(self):
         cases = (
+            ({}, "https://example.com/image.png", None),
+            ({"referer": None}, None, None),
+            ({"referer": ""}, "", ""),
             (
-                SafeFetchError("blocked_address", "127.0.0.1", False),
-                status.HTTP_400_BAD_REQUEST,
-                {"url": ["blocked_address"]},
+                {"referer": "https://page.example/"},
+                "https://page.example/",
+                "https://page.example/",
             ),
+        )
+        for extra, expected_fetch, expected_referer in cases:
+            with self.subTest(extra=extra):
+                service = _SinglePinImport()
+                payload = {"url": "https://example.com/image.png"}
+                payload.update(extra)
+                with mock.patch.object(
+                    PinViewSet,
+                    "get_pin_import_service",
+                    return_value=service,
+                ):
+                    response = self.client.post(
+                        reverse("pin-list"), payload, format="json"
+                    )
+
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+                self.assertEqual(service.prepare_calls[0][1], expected_fetch)
+                self.assertEqual(
+                    service.commit_calls[0][2].referer, expected_referer
+                )
+                self.assertEqual(response.json()["referer"], expected_referer)
+                self.assertEqual(
+                    Pin.objects.get(pk=response.json()["id"]).referer,
+                    expected_referer,
+                )
+
+    def test_url_post_maps_safe_and_internal_errors_without_raw_details(self):
+        client_codes = (
+            "invalid_url_policy", "blocked_address", "dns_rebinding_detected",
+            "too_many_redirects", "unsupported_content_encoding",
+            "image_too_large", "image_too_many_pixels",
+        )
+        cases = [
+            (SafeFetchError(code, "127.0.0.1", False),
+             status.HTTP_400_BAD_REQUEST, {"url": [code]})
+            for code in client_codes
+        ] + [
             (
                 SafeFetchError("image_fetch_timeout", "timeout", True),
                 status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -351,7 +463,12 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
                 status.HTTP_500_INTERNAL_SERVER_ERROR,
                 {"url": ["internal_error"]},
             ),
-        )
+            (
+                SafeFetchError("unsupported_http_stack", "secret", False),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                {"url": ["unsupported_http_stack"]},
+            ),
+        ]
         for error, expected_status, expected_body in cases:
             with self.subTest(error=type(error).__name__):
                 service = _SinglePinImport(error)
@@ -369,6 +486,237 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
                 self.assertEqual(response.status_code, expected_status)
                 self.assertEqual(response.json(), expected_body)
                 self.assertEqual(service.closed, 1)
+
+    def test_url_post_factory_and_clock_failures_use_safe_api_boundary(self):
+        secret = "/private/secret?token=do-not-leak"
+        cases = (
+            (
+                SafeFetchError("unsupported_http_stack", secret, False),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                {"url": ["unsupported_http_stack"]},
+            ),
+            (
+                RuntimeError(secret),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                {"url": ["internal_error"]},
+            ),
+        )
+        for factory_error, expected_status, expected_body in cases:
+            with self.subTest(factory_error=type(factory_error).__name__):
+                with mock.patch.object(
+                    PinViewSet,
+                    "get_pin_import_service",
+                    side_effect=factory_error,
+                ) as factory:
+                    response = self.client.post(
+                        reverse("pin-list"),
+                        {"url": "https://example.com/image.png"},
+                        format="json",
+                    )
+
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(response.json(), expected_body)
+                self.assertNotIn(secret, response.content.decode("utf-8"))
+                factory.assert_called_once_with()
+
+        factory = mock.Mock()
+        with mock.patch.object(
+            PinViewSet,
+            "batch_clock",
+            side_effect=RuntimeError(secret),
+        ), mock.patch.object(
+            PinViewSet,
+            "get_pin_import_service",
+            factory,
+        ):
+            response = self.client.post(
+                reverse("pin-list"),
+                {"url": "https://example.com/image.png"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(response.json(), {"url": ["internal_error"]})
+        self.assertNotIn(secret, response.content.decode("utf-8"))
+        factory.assert_not_called()
+
+    def test_url_post_closes_after_response_failure_and_close_error(self):
+        service = _SinglePinImport()
+        with mock.patch.object(
+            PinViewSet,
+            "get_pin_import_service",
+            return_value=service,
+        ), mock.patch.object(
+            PinSerializer,
+            "to_representation",
+            side_effect=RuntimeError("response serialization failure"),
+        ):
+            response = self.client.post(
+                reverse("pin-list"),
+                {"url": "https://example.com/image.png"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(response.json(), {"url": ["internal_error"]})
+        self.assertEqual(service.closed, 1)
+
+        service = _SinglePinImport()
+        close = mock.Mock(side_effect=RuntimeError("close failure"))
+        service.close = close
+        with mock.patch.object(
+            PinViewSet,
+            "get_pin_import_service",
+            return_value=service,
+        ):
+            response = self.client.post(
+                reverse("pin-list"),
+                {"url": "https://example.com/image.png"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        close.assert_called_once_with()
+
+    def test_url_post_closes_then_reraises_base_exception(self):
+        for error_type in (KeyboardInterrupt, SystemExit):
+            with self.subTest(error_type=error_type.__name__):
+                service = _SinglePinImport(error_type())
+                with mock.patch.object(
+                    PinViewSet,
+                    "get_pin_import_service",
+                    return_value=service,
+                ):
+                    with self.assertRaises(error_type):
+                        self.client.post(
+                            reverse("pin-list"),
+                            {"url": "https://example.com/image.png"},
+                            format="json",
+                        )
+
+                self.assertEqual(service.closed, 1)
+
+    def test_invalid_url_sources_fail_before_fetch_and_close_created_service(self):
+        image = create_image()
+        cases = (
+            {"url": ""},
+            {"url": None},
+            {
+                "url": "https://example.com/image.png",
+                "image_by_id": image.pk,
+            },
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                service = _SinglePinImport()
+                with mock.patch.object(
+                    PinViewSet,
+                    "get_pin_import_service",
+                    return_value=service,
+                ):
+                    response = self.client.post(
+                        reverse("pin-list"), payload, format="json"
+                    )
+
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(response.json(), {
+                    "url-or-image": [
+                        "Either url or image_by_id is required."
+                    ]
+                })
+                self.assertEqual(service.prepare_calls, [])
+                self.assertEqual(service.commit_calls, [])
+                self.assertEqual(service.closed, 1)
+                self.assertEqual(Pin.objects.count(), 0)
+
+    def test_late_real_prepare_returns_503_without_commit_or_db_write(self):
+        prepared = _LatePrepareAsset()
+        storage = _LatePrepareStorage(prepared)
+        idempotency = _LatePrepareIdempotency()
+        clock = _SequenceClock((10.0, 23.0))
+        service = PinImportService(
+            fetcher=_LatePrepareFetcher(),
+            media_storage=storage,
+            idempotency=idempotency,
+            clock=clock,
+        )
+        with mock.patch.object(PinViewSet, "batch_clock", clock), mock.patch.object(
+            PinViewSet,
+            "get_pin_import_service",
+            return_value=service,
+        ):
+            response = self.client.post(
+                reverse("pin-list"),
+                {"url": "https://example.com/image.png"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(response.json(), {
+            "url": ["image_processing_timeout"]
+        })
+        self.assertEqual(prepared.cleanup_calls, 1)
+        self.assertEqual(storage.publish_calls, 0)
+        self.assertEqual(idempotency.fence_calls, 0)
+        self.assertEqual(Pin.objects.count(), 0)
+
+    def test_image_by_id_tag_write_failure_rolls_back_pin_and_tags(self):
+        image = create_image()
+        serializer = PinSerializer(
+            data={
+                "image_by_id": image.pk,
+                "description": "must roll back",
+                "tags": ["created-then-rolled-back"],
+            },
+            context={"request": mock.Mock(user=self.user)},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        real_set = _TaggableManager.set
+
+        def set_then_fail(manager, *tags, **kwargs):
+            real_set(manager, *tags, **kwargs)
+            raise RuntimeError("after tag write")
+
+        with mock.patch.object(
+            _TaggableManager,
+            "set",
+            side_effect=set_then_fail,
+            autospec=True,
+        ):
+            with self.assertRaises(RuntimeError):
+                serializer.save()
+
+        self.assertEqual(Pin.objects.count(), 0)
+        self.assertFalse(Tag.objects.filter(
+            name="created-then-rolled-back"
+        ).exists())
+
+    def test_patch_tag_write_failure_rolls_back_tags_and_body(self):
+        image = create_image()
+        pin = create_pin(self.user, image, ["old-tag"])
+        original_description = pin.description
+        serializer = PinSerializer(
+            pin,
+            data={
+                "tags": ["new-tag"],
+                "description": "must roll back",
+            },
+            partial=True,
+            context={"request": mock.Mock(user=self.user)},
+        )
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        with mock.patch.object(
+            drf_serializers.ModelSerializer,
+            "update",
+            side_effect=RuntimeError("after tag replacement"),
+        ):
+            with self.assertRaises(RuntimeError):
+                serializer.save()
+
+        pin.refresh_from_db()
+        self.assertEqual(pin.description, original_description)
+        self.assertEqual(list(pin.tags.values_list("name", flat=True)), ["old-tag"])
+        self.assertFalse(Tag.objects.filter(name="new-tag").exists())
 
     def test_url_post_runs_import_outside_atomic_requests_transaction(self):
         service = _SinglePinImport()
