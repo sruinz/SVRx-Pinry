@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -36,6 +37,21 @@ def _read_argv(path):
     ]
 
 
+def _final_stage_copy_sources(dockerfile):
+    final_stage = dockerfile.split("# Final image", 1)[1]
+    sources = []
+    for line in final_stage.splitlines():
+        if not line.strip().startswith("COPY "):
+            continue
+        arguments = shlex.split(line.strip())
+        if (
+            arguments[1].startswith("--from=")
+        ):
+            continue
+        sources.extend(arguments[1:-1])
+    return sources
+
+
 class SynologyPackageTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -44,10 +60,11 @@ class SynologyPackageTests(unittest.TestCase):
         self.output_root = self.temporary_root / "output"
         self.full_sha = _git_output("rev-parse", "HEAD")
         self.short_sha = _git_output("rev-parse", "--short=12", "HEAD")
-        self.package_name = "pinry-custom-{}".format(self.short_sha)
+        self.package_name = "pinry-custom"
         self.package_directory = self.output_root / self.package_name
-        self.archive_path = self.output_root / "{}.tar.gz".format(
-            self.package_name
+        self.context_directory = self.package_directory / "context"
+        self.archive_path = self.output_root / "{}-{}.tar.gz".format(
+            self.package_name, self.short_sha
         )
 
     def _run_packager(self):
@@ -62,6 +79,10 @@ class SynologyPackageTests(unittest.TestCase):
         completed = self._run_packager()
         self.assertEqual(
             completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        self.assertTrue(
+            self.package_directory.is_dir(),
+            "canonical Synology upload folder was not created",
         )
 
     def _docker_environment(self):
@@ -80,23 +101,34 @@ class SynologyPackageTests(unittest.TestCase):
         environment["PINRY_DOCKER_CWD"] = str(working_directory)
         return environment, capture, working_directory
 
-    def test_packager_creates_upload_folder_and_archive_from_head(self):
+    def test_packager_creates_minimal_build_context_from_head(self):
         self._create_package()
 
-        required = (
+        self.assertEqual(
+            {path.name for path in self.package_directory.iterdir()},
+            {"BUILD_INFO", "build-image.sh", "context"},
+        )
+        required_context = (
             "Dockerfile.autobuild",
+            ".dockerignore",
             "requirements.txt",
             "manage.py",
-            "pinry",
+            "core/models.py",
+            "django_images/models.py",
+            "pinry/settings/docker.py",
+            "pinry/settings/local_settings.example.py",
+            "pinry_plugins/apps.py",
+            "users/models.py",
+            "pinry-spa/package.json",
+            "pinry-spa/pnpm-lock.yaml",
+            "pinry-spa/src/main.js",
+            "docker/nginx/nginx.conf",
             "docker/scripts/start.sh",
-            "build-image.sh",
-            "README_KO.md",
-            "BUILD_INFO",
         )
-        for relative_path in required:
+        for relative_path in required_context:
             with self.subTest(relative_path=relative_path):
                 self.assertTrue(
-                    (self.package_directory / relative_path).exists()
+                    (self.context_directory / relative_path).exists()
                 )
         self.assertTrue(
             (self.package_directory / "build-image.sh").stat().st_mode
@@ -109,16 +141,49 @@ class SynologyPackageTests(unittest.TestCase):
                 self.full_sha, self.short_sha
             ),
         )
+        self.assertEqual(
+            {path.name for path in self.context_directory.iterdir()},
+            {
+                ".dockerignore",
+                "Dockerfile.autobuild",
+                "requirements.txt",
+                "manage.py",
+                "core",
+                "django_images",
+                "pinry",
+                "pinry_plugins",
+                "users",
+                "pinry-spa",
+                "docker",
+            },
+        )
+        self.assertEqual(
+            {
+                path.name
+                for path in (self.context_directory / "docker").iterdir()
+            },
+            {"nginx", "scripts"},
+        )
+        for path in self.context_directory.rglob("*"):
+            relative = path.relative_to(self.context_directory)
+            with self.subTest(forbidden=str(relative)):
+                self.assertNotIn("tests", relative.parts)
+                self.assertFalse(path.name == "tests.py")
+                self.assertFalse(path.name.startswith("test_"))
+                self.assertNotIn(path.suffix.lower(), (".md", ".rst"))
+                self.assertNotEqual(path.name, ".DS_Store")
+        self.assertEqual(
+            (self.context_directory / ".dockerignore").read_text(),
+            "Dockerfile.autobuild\n.dockerignore\n",
+        )
         for relative_path in (
-            ".git",
-            ".DS_Store",
-            ".venv",
-            "media",
-            "db.sqlite3",
+            "pinry-spa/.editorconfig",
+            "pinry-spa/.gitignore",
+            "pinry/settings/development.py",
         ):
-            with self.subTest(excluded=relative_path):
+            with self.subTest(build_only_metadata=relative_path):
                 self.assertFalse(
-                    (self.package_directory / relative_path).exists()
+                    (self.context_directory / relative_path).exists()
                 )
 
         self.assertTrue(self.archive_path.is_file())
@@ -127,13 +192,36 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertIn(
             "{}/build-image.sh".format(self.package_name), names
         )
+        self.assertIn(
+            "{}/context/core/models.py".format(self.package_name), names
+        )
         self.assertTrue(
             all(
                 ".." not in Path(name).parts
                 and ".git" not in Path(name).parts
                 and ".DS_Store" not in Path(name).parts
+                and Path(name).suffix.lower() not in (".md", ".rst")
                 for name in names
             )
+        )
+
+    def test_final_image_copies_only_runtime_application_paths(self):
+        sources = _final_stage_copy_sources(
+            (REPOSITORY_ROOT / "Dockerfile.autobuild").read_text()
+        )
+
+        self.assertEqual(
+            sources,
+            [
+                "requirements.txt",
+                "manage.py",
+                "core",
+                "django_images",
+                "pinry",
+                "pinry_plugins",
+                "users",
+                "docker/scripts",
+            ],
         )
 
     def test_packager_refuses_to_replace_existing_output(self):
@@ -180,7 +268,7 @@ class SynologyPackageTests(unittest.TestCase):
         )
         self.assertEqual(
             Path(working_directory.read_text()).resolve(),
-            self.package_directory.resolve(),
+            self.context_directory.resolve(),
         )
 
     def test_build_accepts_one_custom_image_tag(self):
@@ -211,7 +299,7 @@ class SynologyPackageTests(unittest.TestCase):
 
     def test_build_rejects_missing_input_before_invoking_docker(self):
         self._create_package()
-        (self.package_directory / "Dockerfile.autobuild").unlink()
+        (self.context_directory / "Dockerfile.autobuild").unlink()
         environment, capture, _working_directory = (
             self._docker_environment()
         )

@@ -19,9 +19,9 @@ output_root="$(cd "${output_root}" && pwd -P)"
 cd "${repository_root}"
 source_commit="$(git rev-parse HEAD)"
 short_commit="$(git rev-parse --short=12 HEAD)"
-package_name="pinry-custom-${short_commit}"
+package_name="pinry-custom"
 package_directory="${output_root}/${package_name}"
-archive_path="${package_directory}.tar.gz"
+archive_path="${output_root}/${package_name}-${short_commit}.tar.gz"
 
 if [ -e "${package_directory}" ] || [ -e "${archive_path}" ]; then
     echo "output_already_exists=${package_name}" >&2
@@ -45,13 +45,37 @@ cleanup_temporary_files() {
 }
 trap cleanup_temporary_files EXIT
 
-git archive --format=tar HEAD | tar -xf - -C "${temporary_directory}"
+mkdir "${temporary_directory}/context"
+git archive --format=tar HEAD -- \
+    Dockerfile.autobuild \
+    requirements.txt \
+    manage.py \
+    core \
+    django_images \
+    pinry \
+    pinry_plugins \
+    users \
+    pinry-spa \
+    docker/nginx \
+    docker/scripts \
+    ':(exclude)core/tests' \
+    ':(exclude)django_images/test_*.py' \
+    ':(exclude)django_images/tests.py' \
+    ':(exclude)pinry/settings/test_sqlite_file.py' \
+    ':(exclude)pinry/settings/development.py' \
+    ':(exclude)pinry_plugins/tests.py' \
+    ':(exclude)users/tests.py' \
+    ':(exclude)pinry-spa/.editorconfig' \
+    ':(exclude)pinry-spa/.gitignore' \
+    ':(exclude)pinry-spa/README.md' \
+    ':(exclude)pinry-spa/tests' \
+    ':(exclude)pinry-spa/jest.config.js' \
+    | tar -xf - -C "${temporary_directory}/context"
+printf 'Dockerfile.autobuild\n.dockerignore\n' \
+    > "${temporary_directory}/context/.dockerignore"
 install -m 0755 \
     "${repository_root}/deploy/synology/build-image.sh" \
     "${temporary_directory}/build-image.sh"
-install -m 0644 \
-    "${repository_root}/deploy/synology/README_KO.md" \
-    "${temporary_directory}/README_KO.md"
 printf 'source_commit=%s\ndefault_image=pinry-custom:%s\n' \
     "${source_commit}" "${short_commit}" \
     > "${temporary_directory}/BUILD_INFO"
