@@ -234,7 +234,10 @@ class SynologyPackageTests(unittest.TestCase):
                 self.assertNotEqual(path.name, ".DS_Store")
         self.assertEqual(
             (self.context_directory / ".dockerignore").read_text(),
-            "Dockerfile.autobuild\n.dockerignore\n",
+            "Dockerfile.autobuild\n"
+            ".dockerignore\n"
+            ".DS_Store\n"
+            "**/.DS_Store\n",
         )
         for relative_path in (
             "pinry-spa/.editorconfig",

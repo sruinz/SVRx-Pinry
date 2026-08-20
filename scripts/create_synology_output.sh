@@ -70,8 +70,9 @@ git archive --format=tar HEAD -- \
     ':(exclude)pinry-spa/README.md' \
     ':(exclude)pinry-spa/tests' \
     ':(exclude)pinry-spa/jest.config.js' \
+    ':(exclude,glob)**/.DS_Store' \
     | tar -xf - -C "${temporary_directory}/context"
-printf 'Dockerfile.autobuild\n.dockerignore\n' \
+printf 'Dockerfile.autobuild\n.dockerignore\n.DS_Store\n**/.DS_Store\n' \
     > "${temporary_directory}/context/.dockerignore"
 install -m 0755 \
     "${repository_root}/deploy/synology/build-image.sh" \
@@ -87,7 +88,7 @@ printf 'source_commit=%s\ndefault_image=pinry-custom:latest\n' \
     > "${temporary_directory}/BUILD_INFO"
 
 mv "${temporary_directory}" "${package_directory}"
-tar -czf "${temporary_archive}" \
+tar --exclude='.DS_Store' --exclude='*/.DS_Store' -czf "${temporary_archive}" \
     -C "${output_root}" "${package_name}"
 mv "${temporary_archive}" "${archive_path}"
 trap - EXIT
