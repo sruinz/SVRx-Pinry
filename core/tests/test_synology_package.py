@@ -35,18 +35,82 @@ def _write_tar_race_wrapper(path, real_tar):
     path.write_text(
         "#!/bin/sh\n"
         "set -eu\n"
+        "create=0\n"
+        "package_root=\n"
+        "package_name=\n"
+        "previous=\n"
+        "for argument in \"$@\"; do\n"
+        "    if [ \"$previous\" = \"-czf\" ]; then\n"
+        "        previous=\n"
+        "        continue\n"
+        "    fi\n"
+        "    if [ \"$previous\" = \"-C\" ]; then\n"
+        "        package_root=$argument\n"
+        "        previous=\n"
+        "        continue\n"
+        "    fi\n"
+        "    if [ \"$previous\" = \"--exclude\" ]; then\n"
+        "        previous=\n"
+        "        continue\n"
+        "    fi\n"
+        "    case \"$argument\" in\n"
+        "        -czf)\n"
+        "            create=1\n"
+        "            previous=$argument\n"
+        "            ;;\n"
+        "        -C)\n"
+        "            previous=$argument\n"
+        "            ;;\n"
+        "        --exclude)\n"
+        "            previous=$argument\n"
+        "            ;;\n"
+        "        --exclude=*)\n"
+        "            ;;\n"
+        "        *)\n"
+        "            package_name=$argument\n"
+        "            ;;\n"
+        "    esac\n"
+        "done\n"
+        "if [ \"$create\" = 1 ]; then\n"
+        "    package_root=$package_root/$package_name\n"
+        "    test -d \"$package_root/context\"\n"
+        "    mkdir -p \"$package_root/context/pinry-spa/src/race\"\n"
+        "    : > \"$package_root/.DS_Store\"\n"
+        "    : > \"$package_root/.DS_Store.backup\"\n"
+        "    : > \"$package_root/context/pinry-spa/src/race/.DS_Store\"\n"
+        "    : > \"$package_root/context/pinry-spa/src/race/.DS_Store.backup\"\n"
+        "fi\n"
+        "exec \"$PINRY_REAL_TAR\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_final_tar_failure_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
         "for argument in \"$@\"; do\n"
         "    if [ \"$argument\" = \"-czf\" ]; then\n"
-        "        test -d \"$PINRY_PACKAGE_ROOT/context\"\n"
-        "        mkdir -p \"$PINRY_PACKAGE_ROOT/context/pinry-spa/src/race\"\n"
-        "        : > \"$PINRY_PACKAGE_ROOT/.DS_Store\"\n"
-        "        : > \"$PINRY_PACKAGE_ROOT/.DS_Store.backup\"\n"
-        "        : > \"$PINRY_PACKAGE_ROOT/context/pinry-spa/src/race/.DS_Store\"\n"
-        "        : > \"$PINRY_PACKAGE_ROOT/context/pinry-spa/src/race/.DS_Store.backup\"\n"
-        "        break\n"
+        "        exit 42\n"
         "    fi\n"
         "done\n"
         "exec \"$PINRY_REAL_TAR\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_archive_publish_failure_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "for argument in \"$@\"; do\n"
+        "    case \"$argument\" in\n"
+        "        */.pinry-custom.archive.*)\n"
+        "            exit 43\n"
+        "            ;;\n"
+        "    esac\n"
+        "done\n"
+        "exec \"$PINRY_REAL_MV\" \"$@\"\n"
     )
     path.chmod(0o700)
 
@@ -104,10 +168,11 @@ class SynologyPackageTests(unittest.TestCase):
             self.package_name, self.short_sha
         )
 
-    def _run_packager(self):
+    def _run_packager(self, environment=None):
         return subprocess.run(
             ["bash", str(PACKAGE_SCRIPT), str(self.output_root)],
             cwd=str(REPOSITORY_ROOT),
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -137,6 +202,30 @@ class SynologyPackageTests(unittest.TestCase):
         environment["PINRY_DOCKER_CAPTURE"] = str(capture)
         environment["PINRY_DOCKER_CWD"] = str(working_directory)
         return environment, capture, working_directory
+
+    def _tar_environment(self, wrapper):
+        environment = os.environ.copy()
+        real_tar = shutil.which("tar")
+        self.assertIsNotNone(real_tar)
+        environment["PATH"] = "{}{}{}".format(
+            wrapper.parent,
+            os.pathsep,
+            environment.get("PATH", ""),
+        )
+        environment["PINRY_REAL_TAR"] = real_tar
+        return environment
+
+    def _move_environment(self, wrapper):
+        environment = os.environ.copy()
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        environment["PATH"] = "{}{}{}".format(
+            wrapper.parent,
+            os.pathsep,
+            environment.get("PATH", ""),
+        )
+        environment["PINRY_REAL_MV"] = real_mv
+        return environment
 
     def _clone_with_tracked_finder_metadata(self):
         repository = self.temporary_root / "fixture-repository"
@@ -388,7 +477,6 @@ class SynologyPackageTests(unittest.TestCase):
             os.pathsep,
             environment.get("PATH", ""),
         )
-        environment["PINRY_PACKAGE_ROOT"] = str(package_directory)
         environment["PINRY_REAL_TAR"] = real_tar
 
         completed = self._run_packager_in(
@@ -424,6 +512,82 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertIn(
             "pinry-custom/context/pinry-spa/src/package-sentinel.txt", names
         )
+
+    def test_packager_cleans_failed_publish_and_allows_immediate_retry(self):
+        self.output_root.mkdir()
+        sentinel = self.output_root / "unrelated-sentinel"
+        sentinel.write_text("preserve")
+        binary_directory = self.temporary_root / "failing-tar"
+        binary_directory.mkdir()
+        wrapper = binary_directory / "tar"
+        _write_final_tar_failure_wrapper(wrapper)
+
+        failed = self._run_packager(self._tar_environment(wrapper))
+
+        self.assertEqual(failed.returncode, 42)
+        self.assertFalse(self.package_directory.exists())
+        self.assertFalse(self.archive_path.exists())
+        self.assertEqual(sentinel.read_text(), "preserve")
+        self.assertEqual(
+            {
+                path.name
+                for path in self.output_root.iterdir()
+                if path.name.startswith(".pinry-custom.tmp.")
+                or path.name.startswith(".pinry-custom.archive.")
+            },
+            set(),
+        )
+
+        self._create_package()
+
+        self.assertEqual(
+            (self.package_directory / "BUILD_INFO").read_text(),
+            "source_commit={}\n"
+            "default_image=pinry-custom:latest\n".format(self.full_sha),
+        )
+        self.assertTrue((self.context_directory / "core/models.py").is_file())
+        self.assertTrue(self.archive_path.is_file())
+        self.assertEqual(sentinel.read_text(), "preserve")
+        self.assertEqual(
+            {
+                path.name
+                for path in self.output_root.iterdir()
+                if path.name.startswith(".pinry-custom.tmp.")
+                or path.name.startswith(".pinry-custom.archive.")
+            },
+            set(),
+        )
+
+    def test_packager_rolls_back_directory_when_archive_publish_fails(self):
+        self.output_root.mkdir()
+        sentinel = self.output_root / "unrelated-sentinel"
+        sentinel.write_text("preserve")
+        binary_directory = self.temporary_root / "failing-mv"
+        binary_directory.mkdir()
+        wrapper = binary_directory / "mv"
+        _write_archive_publish_failure_wrapper(wrapper)
+
+        failed = self._run_packager(self._move_environment(wrapper))
+
+        self.assertEqual(failed.returncode, 43)
+        self.assertFalse(self.package_directory.exists())
+        self.assertFalse(self.archive_path.exists())
+        self.assertEqual(sentinel.read_text(), "preserve")
+        self.assertEqual(
+            {
+                path.name
+                for path in self.output_root.iterdir()
+                if path.name.startswith(".pinry-custom.tmp.")
+                or path.name.startswith(".pinry-custom.archive.")
+            },
+            set(),
+        )
+
+        self._create_package()
+
+        self.assertTrue(self.package_directory.is_dir())
+        self.assertTrue(self.archive_path.is_file())
+        self.assertEqual(sentinel.read_text(), "preserve")
 
     def test_final_image_copies_only_runtime_application_paths(self):
         sources = _final_stage_copy_sources(

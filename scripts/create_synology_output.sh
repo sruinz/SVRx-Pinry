@@ -28,16 +28,17 @@ if [ -e "${package_directory}" ] || [ -e "${archive_path}" ]; then
     exit 1
 fi
 
-temporary_directory="$(
+temporary_root="$(
     mktemp -d "${output_root}/.${package_name}.tmp.XXXXXX"
 )"
+temporary_directory="${temporary_root}/${package_name}"
 temporary_archive="$(
     mktemp "${output_root}/.${package_name}.archive.XXXXXX"
 )"
 
 cleanup_temporary_files() {
-    if [ -d "${temporary_directory}" ]; then
-        rm -rf -- "${temporary_directory}"
+    if [ -d "${temporary_root}" ]; then
+        rm -rf -- "${temporary_root}"
     fi
     if [ -f "${temporary_archive}" ]; then
         rm -f -- "${temporary_archive}"
@@ -45,6 +46,7 @@ cleanup_temporary_files() {
 }
 trap cleanup_temporary_files EXIT
 
+mkdir "${temporary_directory}"
 mkdir "${temporary_directory}/context"
 git archive --format=tar HEAD -- \
     Dockerfile.autobuild \
@@ -87,11 +89,16 @@ printf 'source_commit=%s\ndefault_image=pinry-custom:latest\n' \
     "${source_commit}" \
     > "${temporary_directory}/BUILD_INFO"
 
-mv "${temporary_directory}" "${package_directory}"
 tar --exclude='.DS_Store' --exclude='*/.DS_Store' -czf "${temporary_archive}" \
-    -C "${output_root}" "${package_name}"
-mv "${temporary_archive}" "${archive_path}"
-trap - EXIT
+    -C "${temporary_root}" "${package_name}"
+mv "${temporary_directory}" "${package_directory}"
+if mv "${temporary_archive}" "${archive_path}"; then
+    :
+else
+    archive_status=$?
+    mv "${package_directory}" "${temporary_directory}" || :
+    exit "${archive_status}"
+fi
 
 printf 'upload_directory=%s\n' "${package_directory}"
 printf 'upload_archive=%s\n' "${archive_path}"
