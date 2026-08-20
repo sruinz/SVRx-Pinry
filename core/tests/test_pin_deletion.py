@@ -17,7 +17,7 @@ from rest_framework import status
 from rest_framework.test import APITransactionTestCase
 
 from core.admin import PinAdmin
-from core.models import BatchImportItem, Board, Image, Pin
+from core.models import BatchImportItem, Image, Pin
 from core.services.idempotency import IdempotencyStore, StoredError
 from core.tests.helpers import TEST_IMAGE_PATH, create_image, create_pin, create_user
 from django_images.models import Image as BaseImage, Thumbnail
@@ -33,193 +33,49 @@ def media_snapshot(media_root):
     }
 
 
-class PinTrashAPITest(TemporaryMediaMixin, APITransactionTestCase):
+class PinDeletionAPITest(TemporaryMediaMixin, APITransactionTestCase):
     def setUp(self):
-        super(PinTrashAPITest, self).setUp()
+        super(PinDeletionAPITest, self).setUp()
         self.owner = create_user("trash-owner")
         self.other_user = create_user("trash-other")
         self.image = create_image()
         self.pin = create_pin(self.owner, self.image, [])
         self.client.login(username=self.owner.username, password="password")
 
-    @staticmethod
-    def _detail_action_url(pin, action):
-        return "{}{}/".format(reverse("pin-detail", args=[pin.pk]), action)
-
-    @staticmethod
-    def _trash_url():
-        return "{}trash/".format(reverse("pin-list"))
-
-    def _active_pin_ids(self, query=""):
-        response = self.client.get("{}{}".format(reverse("pin-list"), query))
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        return [item["id"] for item in response.json()["results"]]
-
-    def test_delete_moves_pin_to_trash_without_deleting_media(self):
-        files_before = media_snapshot(self.temporary_media.name)
-        self.assertEqual(len(files_before), 4)
-
+    def test_delete_removes_owned_pin_immediately(self):
         response = self.client.delete(reverse("pin-detail", args=[self.pin.pk]))
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertTrue(Pin.objects.filter(pk=self.pin.pk).exists())
-        self.pin.refresh_from_db()
-        self.assertIsNotNone(self.pin.trashed_at)
-        self.assertNotIn(self.pin.pk, self._active_pin_ids())
-        detail = self.client.get(reverse("pin-detail", args=[self.pin.pk]))
-        self.assertEqual(detail.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertTrue(Image.objects.filter(pk=self.image.pk).exists())
-        self.assertEqual(
-            media_snapshot(self.temporary_media.name), files_before
-        )
+        self.assertFalse(Pin.objects.filter(pk=self.pin.pk).exists())
 
-    def test_repeated_delete_preserves_original_trash_timestamp(self):
-        detail_url = reverse("pin-detail", args=[self.pin.pk])
-        self.assertEqual(
-            self.client.delete(detail_url).status_code,
-            status.HTTP_204_NO_CONTENT,
-        )
-        self.assertTrue(Pin.objects.filter(pk=self.pin.pk).exists())
-        self.pin.refresh_from_db()
-        first_trashed_at = self.pin.trashed_at
-
-        response = self.client.delete(detail_url)
-
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.pin.refresh_from_db()
-        self.assertEqual(self.pin.trashed_at, first_trashed_at)
-
-    def test_restore_is_idempotent_and_returns_pin_to_active_list(self):
-        detail_url = reverse("pin-detail", args=[self.pin.pk])
-        self.assertEqual(
-            self.client.delete(detail_url).status_code,
-            status.HTTP_204_NO_CONTENT,
-        )
-        restore_url = self._detail_action_url(self.pin, "restore")
-
-        first = self.client.post(restore_url)
-        second = self.client.post(restore_url)
-
-        self.assertEqual(first.status_code, status.HTTP_200_OK)
-        self.assertEqual(second.status_code, status.HTTP_200_OK)
-        self.assertEqual(first.json()["id"], self.pin.pk)
-        self.assertEqual(second.json()["id"], self.pin.pk)
-        self.pin.refresh_from_db()
-        self.assertIsNone(self.pin.trashed_at)
-        self.assertIn(self.pin.pk, self._active_pin_ids())
-
-    def test_trash_list_is_paginated_and_contains_only_owner_pins(self):
-        second_image = create_image()
-        second_pin = create_pin(self.owner, second_image, [])
-        other_image = create_image()
-        other_pin = create_pin(self.other_user, other_image, [])
-
-        for pin in (self.pin, second_pin):
-            response = self.client.delete(reverse("pin-detail", args=[pin.pk]))
-            self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.client.login(
-            username=self.other_user.username, password="password"
-        )
-        response = self.client.delete(reverse("pin-detail", args=[other_pin.pk]))
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.client.login(username=self.owner.username, password="password")
-
-        first_page = self.client.get(
-            "{}?limit=1&offset=0&ordering=-id".format(self._trash_url())
-        )
-        second_page = self.client.get(
-            "{}?limit=1&offset=1&ordering=-id".format(self._trash_url())
-        )
-
-        self.assertEqual(first_page.status_code, status.HTTP_200_OK)
-        self.assertEqual(second_page.status_code, status.HTTP_200_OK)
-        self.assertEqual(first_page.json()["count"], 2)
-        self.assertEqual(second_page.json()["count"], 2)
-        self.assertEqual(
-            [item["id"] for item in first_page.json()["results"]],
-            [second_pin.pk],
-        )
-        self.assertEqual(
-            [item["id"] for item in second_page.json()["results"]],
-            [self.pin.pk],
-        )
-        self.assertNotIn(
-            other_pin.pk,
-            {
-                item["id"]
-                for item in first_page.json()["results"]
-                + second_page.json()["results"]
-            },
-        )
-
-    def test_active_list_search_and_board_summary_exclude_trashed_pin(self):
-        self.pin.description = "trash-only-search-value"
-        self.pin.save(update_fields=["description"])
-        active_image = create_image()
-        active_pin = create_pin(self.owner, active_image, [])
-        active_pin.description = "active-value"
-        active_pin.save(update_fields=["description"])
-        board = Board.objects.create(name="trash-board", submitter=self.owner)
-        board.pins.add(self.pin, active_pin)
-        response = self.client.delete(
-            reverse("pin-detail", args=[self.pin.pk])
-        )
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertTrue(Pin.objects.filter(pk=self.pin.pk).exists())
-
-        active_ids = self._active_pin_ids()
-        search_ids = self._active_pin_ids("?search=trash-only-search-value")
-        board_response = self.client.get(
-            reverse("board-detail", args=[board.pk])
-        )
-
-        self.assertEqual(active_ids, [active_pin.pk])
-        self.assertNotIn(self.pin.pk, search_ids)
-        self.assertEqual(board_response.status_code, status.HTTP_200_OK)
-        self.assertEqual(board_response.json()["total_pins"], 1)
-        self.assertEqual(board_response.json()["cover"]["id"], active_pin.pk)
-
-    def test_anonymous_custom_trash_actions_return_401(self):
-        self.client.logout()
-
+    def test_removed_trash_routes_return_404(self):
+        detail = reverse("pin-detail", args=[self.pin.pk])
         responses = (
-            self.client.get(self._trash_url()),
-            self.client.post(self._detail_action_url(self.pin, "restore")),
-            self.client.delete(self._detail_action_url(self.pin, "permanent")),
+            self.client.get("{}trash/".format(reverse("pin-list"))),
+            self.client.post("{}restore/".format(detail)),
+            self.client.delete("{}permanent/".format(detail)),
         )
-
         self.assertEqual(
             [response.status_code for response in responses],
-            [
-                status.HTTP_401_UNAUTHORIZED,
-                status.HTTP_401_UNAUTHORIZED,
-                status.HTTP_401_UNAUTHORIZED,
-            ],
+            [status.HTTP_404_NOT_FOUND] * 3,
         )
+        self.assertTrue(Pin.objects.filter(pk=self.pin.pk).exists())
 
-    def test_other_user_and_missing_pin_actions_return_404(self):
+    def test_non_owner_cannot_delete_pin(self):
         self.client.login(username=self.other_user.username, password="password")
-        missing_id = self.pin.pk + 100000
+        response = self.client.delete(reverse("pin-detail", args=[self.pin.pk]))
 
-        responses = (
-            self.client.delete(reverse("pin-detail", args=[self.pin.pk])),
-            self.client.post(self._detail_action_url(self.pin, "restore")),
-            self.client.delete(self._detail_action_url(self.pin, "permanent")),
-            self.client.post(
-                "{}{}/restore/".format(reverse("pin-list"), missing_id)
-            ),
-            self.client.delete(
-                "{}{}/permanent/".format(reverse("pin-list"), missing_id)
-            ),
-        )
-
-        self.assertEqual(
-            [response.status_code for response in responses],
-            [status.HTTP_404_NOT_FOUND] * 5,
-        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         self.assertTrue(Pin.objects.filter(pk=self.pin.pk).exists())
 
-    def test_permanent_delete_preserves_succeeded_item_as_tombstone(self):
+    def test_missing_pin_delete_returns_404(self):
+        response = self.client.delete(
+            reverse("pin-detail", args=[self.pin.pk + 100000])
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_direct_delete_preserves_succeeded_item_as_tombstone(self):
         batch_id = uuid.uuid4()
         client_item_id = uuid.uuid4()
         fingerprint = "a" * 64
@@ -233,9 +89,7 @@ class PinTrashAPITest(TemporaryMediaMixin, APITransactionTestCase):
             lease_generation=7,
         )
 
-        response = self.client.delete(
-            self._detail_action_url(self.pin, "permanent")
-        )
+        response = self.client.delete(reverse("pin-detail", args=[self.pin.pk]))
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         item.refresh_from_db()
@@ -260,28 +114,27 @@ class PinTrashAPITest(TemporaryMediaMixin, APITransactionTestCase):
             mismatch.error, StoredError("idempotency_mismatch", False)
         )
 
-    def test_soft_delete_keeps_succeeded_item_replayable(self):
-        batch_id = uuid.uuid4()
-        client_item_id = uuid.uuid4()
-        fingerprint = "c" * 64
-        BatchImportItem.objects.create(
-            submitter=self.owner,
-            batch_id=batch_id,
-            client_item_id=client_item_id,
-            request_fingerprint=fingerprint,
-            state=BatchImportItem.SUCCEEDED,
-            pin=self.pin,
-            lease_generation=1,
-        )
-
-        response = self.client.delete(reverse("pin-detail", args=[self.pin.pk]))
-
+    def test_post_commit_cleanup_error_does_not_flip_success_or_leak_detail(
+        self
+    ):
+        secret = "/private/media?token=secret"
+        with mock.patch.object(
+            BaseImage, "delete", side_effect=RuntimeError(secret)
+        ):
+            with self.assertLogs("core.models", level="WARNING") as captured:
+                response = self.client.delete(
+                    reverse("pin-detail", args=[self.pin.pk])
+                )
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        result = IdempotencyStore().claim(
-            self.owner, batch_id, client_item_id, fingerprint, timezone.now()
+        self.assertFalse(Pin.objects.filter(pk=self.pin.pk).exists())
+        output = "\n".join(captured.output)
+        self.assertEqual(len(captured.records), 1)
+        self.assertEqual(
+            captured.records[0].getMessage(), "pin_image_cleanup_failed"
         )
-        self.assertEqual(result.kind, "replayed")
-        self.assertEqual(result.replay_pin_id, self.pin.pk)
+        self.assertEqual(captured.records[0].media_error, "RuntimeError")
+        self.assertNotIn(secret, output)
+        self.assertNotIn(secret, captured.records[0].getMessage())
 
 
 class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
@@ -290,10 +143,6 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.owner = create_user("media-owner")
         self.other_user = create_user("media-other")
         self.client.login(username=self.owner.username, password="password")
-
-    @staticmethod
-    def _permanent_url(pin):
-        return "{}permanent/".format(reverse("pin-detail", args=[pin.pk]))
 
     def _assert_four_image_files(self, image):
         image.refresh_from_db()
@@ -309,18 +158,13 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         )
         return snapshot
 
-    def _move_to_trash(self, pin):
-        response = self.client.delete(reverse("pin-detail", args=[pin.pk]))
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
-
     @staticmethod
     def _pending_deletions():
         return apps.get_model(
             "django_images", "PendingMediaDeletion"
         ).objects
 
-    def _assert_permanent_delete_continues_after_storage_error(
+    def _assert_delete_continues_after_storage_error(
         self, fail_at
     ):
         image = create_image()
@@ -337,11 +181,10 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
                 raise OSError("secret storage location")
             return real_delete(name)
 
-        self._move_to_trash(pin)
         with mock.patch.object(
             storage, "delete", side_effect=fail_one_delete
         ):
-            response = self.client.delete(self._permanent_url(pin))
+            response = self.client.delete(reverse("pin-detail", args=[pin.pk]))
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
@@ -366,7 +209,7 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(pending.last_error, "OSError")
         return pending
 
-    def test_permanent_delete_preserves_shared_image_rows_and_file_bytes(self):
+    def test_delete_preserves_shared_image_rows_and_file_bytes(self):
         image = create_image()
         owner_pin = create_pin(self.owner, image, [])
         other_pin = create_pin(self.other_user, image, [])
@@ -380,14 +223,9 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
             lease_generation=1,
         )
         files_before = self._assert_four_image_files(image)
-        self.client.login(
-            username=self.other_user.username, password="password"
+        response = self.client.delete(
+            reverse("pin-detail", args=[owner_pin.pk])
         )
-        self._move_to_trash(other_pin)
-        self.client.login(username=self.owner.username, password="password")
-        self._move_to_trash(owner_pin)
-
-        response = self.client.delete(self._permanent_url(owner_pin))
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Pin.objects.filter(pk=owner_pin.pk).exists())
@@ -403,13 +241,11 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         )
         self.assertFalse(self._pending_deletions().exists())
 
-    def test_permanent_delete_of_last_reference_removes_rows_and_files(self):
+    def test_delete_of_last_reference_removes_rows_and_files(self):
         image = create_image()
         pin = create_pin(self.owner, image, [])
         self._assert_four_image_files(image)
-        self._move_to_trash(pin)
-
-        response = self.client.delete(self._permanent_url(pin))
+        response = self.client.delete(reverse("pin-detail", args=[pin.pk]))
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
@@ -420,11 +256,11 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(media_snapshot(self.temporary_media.name), {})
 
     def test_first_storage_failure_is_journaled_without_stopping_cleanup(self):
-        self._assert_permanent_delete_continues_after_storage_error(1)
+        self._assert_delete_continues_after_storage_error(1)
 
     def test_middle_storage_failure_is_retried_by_management_command(self):
         pending = (
-            self._assert_permanent_delete_continues_after_storage_error(2)
+            self._assert_delete_continues_after_storage_error(2)
         )
         expected_pending = list(
             self._pending_deletions().values_list(
@@ -464,7 +300,7 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertIn("pending=1 processed=1 remaining=0", execute.getvalue())
 
     def test_last_storage_failure_is_journaled_without_stopping_cleanup(self):
-        self._assert_permanent_delete_continues_after_storage_error(4)
+        self._assert_delete_continues_after_storage_error(4)
 
     def test_malformed_legacy_name_cannot_delete_unrelated_file(self):
         target = Path(self.temporary_media.name, "target.dat")
@@ -476,9 +312,7 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
             height=32,
         )
         pin = create_pin(self.owner, image, [])
-        self._move_to_trash(pin)
-
-        response = self.client.delete(self._permanent_url(pin))
+        response = self.client.delete(reverse("pin-detail", args=[pin.pk]))
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())

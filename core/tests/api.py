@@ -1023,9 +1023,6 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
             "list": reverse("pin-list"),
             "batch": "{}batch/".format(reverse("pin-list")),
             "detail": detail_url,
-            "trash": "{}trash/".format(reverse("pin-list")),
-            "restore": "{}restore/".format(detail_url),
-            "permanent": "{}permanent/".format(detail_url),
         }
         markers = {
             name: getattr(resolve(url).func, "_non_atomic_requests", set())
@@ -1034,7 +1031,7 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
 
         self.assertEqual(markers["list"], {"default"})
         self.assertEqual(markers["batch"], {"default"})
-        for name in ("detail", "trash", "restore", "permanent"):
+        for name in ("detail",):
             self.assertEqual(markers[name], set())
 
         pin = create_pin(self.user, image, [])
@@ -1199,6 +1196,4 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
         uri = reverse("pin-detail", kwargs={"pk": pin.pk})
         response = self.client.delete(uri)
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertEqual(Pin.objects.count(), 1)
-        pin.refresh_from_db()
-        self.assertIsNotNone(pin.trashed_at)
+        self.assertEqual(Pin.objects.count(), 0)

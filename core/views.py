@@ -5,7 +5,6 @@ import time
 from django.conf import settings
 from django.db import transaction
 from django.shortcuts import get_object_or_404
-from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
 from django_filters.rest_framework import DjangoFilterBackend
@@ -145,9 +144,7 @@ class PinViewSet(viewsets.ModelViewSet):
         return context
 
     def get_queryset(self):
-        query = Pin.objects.filter(trashed_at__isnull=True)
-        request = self.request
-        return filter_private_pin(request, query)
+        return filter_private_pin(self.request, Pin.objects.all())
 
     @staticmethod
     def _get_owned_pin(request, pin_id):
@@ -157,48 +154,6 @@ class PinViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         pin = self._get_owned_pin(request, kwargs["pk"])
-        Pin.objects.filter(
-            pk=pin.pk, trashed_at__isnull=True
-        ).update(trashed_at=timezone.now())
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-    @action(
-        detail=False,
-        methods=["get"],
-        permission_classes=[IsAuthenticated],
-    )
-    def trash(self, request):
-        queryset = Pin.objects.filter(
-            submitter=request.user,
-            trashed_at__isnull=False,
-        ).select_related("image", "submitter")
-        queryset = self.filter_queryset(queryset)
-        page = self.paginate_queryset(queryset)
-        if page is not None:
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
-
-    @action(
-        detail=True,
-        methods=["post"],
-        permission_classes=[IsAuthenticated],
-    )
-    def restore(self, request, pk=None):
-        pin = self._get_owned_pin(request, pk)
-        Pin.objects.filter(pk=pin.pk).update(trashed_at=None)
-        pin.refresh_from_db()
-        serializer = self.get_serializer(pin)
-        return Response(serializer.data)
-
-    @action(
-        detail=True,
-        methods=["delete"],
-        permission_classes=[IsAuthenticated],
-    )
-    def permanent(self, request, pk=None):
-        pin = self._get_owned_pin(request, pk)
         pin.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 

@@ -21,9 +21,7 @@ def filter_private_pin(request, query):
         query = query.exclude(~Q(submitter=request.user), private=True)
     else:
         query = query.exclude(private=True)
-    return query.filter(trashed_at__isnull=True).select_related(
-        'image', 'submitter'
-    )
+    return query.select_related('image', 'submitter')
 
 
 def filter_private_board(request, query):

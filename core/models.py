@@ -1,3 +1,5 @@
+import logging
+
 from django.db import models, transaction
 from django.dispatch import receiver
 
@@ -5,6 +7,9 @@ from django_images.models import Image as BaseImage, Thumbnail
 from taggit.managers import TaggableManager
 
 from users.models import User
+
+
+logger = logging.getLogger(__name__)
 
 
 class Image(BaseImage):
@@ -56,7 +61,6 @@ class Pin(models.Model):
     description = models.TextField(blank=True, null=True)
     image = models.ForeignKey(Image, related_name='pin', on_delete=models.CASCADE)
     published = models.DateTimeField(auto_now_add=True)
-    trashed_at = models.DateTimeField(blank=True, null=True)
     tags = TaggableManager()
 
     def tag_list(self):
@@ -105,17 +109,26 @@ def delete_unreferenced_pin_image(sender, instance, **kwargs):
     using = kwargs.get("using")
 
     def delete_after_pin_commit():
-        with transaction.atomic(using=using):
-            image = (
-                BaseImage.objects.select_for_update()
-                .using(using)
-                .filter(pk=image_id)
-                .first()
+        try:
+            with transaction.atomic(using=using):
+                image = (
+                    BaseImage.objects.select_for_update()
+                    .using(using)
+                    .filter(pk=image_id)
+                    .first()
+                )
+                if image is None:
+                    return
+                if Pin.objects.filter(image_id=image_id).using(using).exists():
+                    return
+                image.delete(using=using)
+        except Exception as error:
+            logger.warning(
+                "pin_image_cleanup_failed",
+                extra={
+                    "image_id": image_id,
+                    "media_error": error.__class__.__name__,
+                },
             )
-            if image is None:
-                return
-            if Pin.objects.filter(image_id=image_id).using(using).exists():
-                return
-            image.delete(using=using)
 
     transaction.on_commit(delete_after_pin_commit, using=using)
