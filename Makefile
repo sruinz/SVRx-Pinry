@@ -20,7 +20,7 @@ bootstrap:
 	make install
 	make collect-static-no-input
 serve-gunicorn:
-	poetry run gunicorn pinry.wsgi -b 0.0.0.0:8000 -w 4 --capture-output --timeout 30 --user www-data --group www-data
+	poetry run gunicorn pinry.wsgi -b 0.0.0.0:8000 -w 4 --capture-output --timeout 60 --user www-data --group www-data
 serve:
 	poetry run python manage.py runserver 0.0.0.0:8000
 export-requirements-dev:

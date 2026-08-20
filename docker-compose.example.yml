@@ -8,7 +8,7 @@ services:
     command: >
       bash -c "poetry run python manage.py migrate
       && poetry run python3 manage.py collectstatic --noinput
-      && poetry run gunicorn pinry.wsgi:application -b 0.0.0.0:8000 --timeout 30"
+      && poetry run gunicorn pinry.wsgi:application -b 0.0.0.0:8000 --timeout 60"
     ports:
       - "127.0.0.1:2048:8000"
     environment:
