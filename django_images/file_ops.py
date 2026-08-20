@@ -5,11 +5,24 @@ import os
 from pathlib import PurePosixPath
 import stat
 import sys
+import time
 import uuid
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised by platform gate tests
+    fcntl = None
 
 
 class MediaPathError(Exception):
     pass
+
+
+class MediaLifecycleLockError(MediaPathError):
+    def __init__(self, code, retryable=False):
+        super(MediaLifecycleLockError, self).__init__(code)
+        self.code = code
+        self.retryable = retryable
 
 
 class PublishResult(object):
@@ -33,6 +46,137 @@ class PublishFailure(Exception):
 
 class DescriptorCloseNotAttempted(Exception):
     pass
+
+
+class MediaLifecycleLock(object):
+    def __init__(
+        self,
+        root_directory,
+        exclusive,
+        deadline=None,
+        clock=None,
+        sleeper=None,
+    ):
+        self.root_directory = root_directory
+        self.exclusive = exclusive
+        self.deadline = deadline
+        self.clock = time.monotonic if clock is None else clock
+        self.sleeper = time.sleep if sleeper is None else sleeper
+        self._directory_descriptor = None
+        self._lock_descriptor = None
+        self._held = False
+
+    def __enter__(self):
+        try:
+            self._check_deadline()
+            self._directory_descriptor, self._lock_descriptor = (
+                _open_media_lifecycle_lock(self.root_directory)
+            )
+            operation = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+            while True:
+                self._check_deadline()
+                try:
+                    fcntl.flock(
+                        self._lock_descriptor,
+                        operation | fcntl.LOCK_NB,
+                    )
+                except OSError as error:
+                    if error.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise _lifecycle_lock_error(
+                            "media_lifecycle_lock_failed"
+                        ) from error
+                    if self.deadline is None:
+                        raise _lifecycle_lock_error(
+                            "media_lifecycle_busy",
+                            retryable=True,
+                        )
+                    now = self.clock()
+                    remaining = self.deadline - now
+                    if remaining <= 0:
+                        raise _lifecycle_lock_error(
+                            "media_lifecycle_busy",
+                            retryable=True,
+                        )
+                    self.sleeper(min(0.01, remaining))
+                    continue
+                self._held = True
+                self._check_deadline()
+                _verify_held_media_lifecycle_lock(
+                    self.root_directory,
+                    self._directory_descriptor,
+                    self._lock_descriptor,
+                )
+                self._check_deadline()
+                return self
+        except BaseException:
+            self._close_preserving_active_error()
+            raise
+
+    def __exit__(self, error_type, error, traceback):
+        del error, traceback
+        try:
+            self.close()
+        except BaseException:
+            if error_type is None:
+                raise
+        return False
+
+    def _check_deadline(self):
+        if self.deadline is not None and self.clock() >= self.deadline:
+            raise _lifecycle_lock_error(
+                "media_lifecycle_busy",
+                retryable=True,
+            )
+
+    def _close_preserving_active_error(self):
+        try:
+            self.close()
+        except BaseException:
+            pass
+
+    def close(self):
+        first_error = None
+        if self._lock_descriptor is not None:
+            descriptor = self._lock_descriptor
+            self._lock_descriptor = None
+            held = self._held
+            self._held = False
+            if held:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except BaseException as error:
+                    first_error = error
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if self._directory_descriptor is not None:
+            descriptor = self._directory_descriptor
+            self._directory_descriptor = None
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+
+def media_lifecycle_lock(
+    root_directory,
+    exclusive=False,
+    deadline=None,
+    clock=None,
+    sleeper=None,
+):
+    return MediaLifecycleLock(
+        root_directory,
+        exclusive=exclusive,
+        deadline=deadline,
+        clock=clock,
+        sleeper=sleeper,
+    )
 
 
 def _close_descriptor(descriptor):
@@ -331,6 +475,181 @@ def open_media_root(media_root):
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _lifecycle_lock_error(code, retryable=False):
+    return MediaLifecycleLockError(code, retryable=retryable)
+
+
+def _require_lifecycle_lock_support():
+    required_flags = (
+        getattr(os, "O_DIRECTORY", None),
+        getattr(os, "O_NOFOLLOW", None),
+        getattr(os, "O_CLOEXEC", None),
+    )
+    if (
+        fcntl is None
+        or not callable(getattr(fcntl, "flock", None))
+        or any(type(flag) is not int for flag in required_flags)
+        or not callable(getattr(os, "geteuid", None))
+        or os.open not in getattr(os, "supports_dir_fd", set())
+        or os.mkdir not in getattr(os, "supports_dir_fd", set())
+        or os.stat not in getattr(os, "supports_dir_fd", set())
+        or os.stat not in getattr(os, "supports_follow_symlinks", set())
+    ):
+        raise _lifecycle_lock_error("media_lifecycle_lock_unsupported")
+
+
+def _open_media_lifecycle_lock(root_directory):  # noqa: C901
+    _require_lifecycle_lock_support()
+    if not isinstance(root_directory, MediaDirectory):
+        raise _lifecycle_lock_error("media_lifecycle_lock_unsupported")
+    try:
+        root_directory.verify_current()
+        root_descriptor = root_directory.descriptor
+        root_stat = os.fstat(root_descriptor)
+    except BaseException as error:
+        if not isinstance(error, Exception):
+            raise
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed") from error
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+
+    directory_descriptor = None
+    lock_descriptor = None
+    try:
+        try:
+            lock_directory_stat = os.stat(
+                ".pinry-locks",
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            try:
+                os.mkdir(".pinry-locks", 0o700, dir_fd=root_descriptor)
+            except FileExistsError:
+                pass
+            lock_directory_stat = os.stat(
+                ".pinry-locks",
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+        _verify_lifecycle_lock_directory(lock_directory_stat)
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC
+        )
+        directory_descriptor = os.open(
+            ".pinry-locks", flags, dir_fd=root_descriptor
+        )
+        opened_directory_stat = os.fstat(directory_descriptor)
+        if _identity(lock_directory_stat) != _identity(opened_directory_stat):
+            raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+        _verify_lifecycle_lock_directory(opened_directory_stat)
+
+        lock_descriptor = _open_lifecycle_lock_file(directory_descriptor)
+        opened_lock_stat = os.fstat(lock_descriptor)
+        named_lock_stat = os.stat(
+            "media-lifecycle.lock",
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if _identity(opened_lock_stat) != _identity(named_lock_stat):
+            raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+        _verify_lifecycle_lock_file(opened_lock_stat)
+        return directory_descriptor, lock_descriptor
+    except BaseException as error:
+        if lock_descriptor is not None:
+            try:
+                os.close(lock_descriptor)
+            except BaseException:
+                pass
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except BaseException:
+                pass
+        if isinstance(error, MediaLifecycleLockError):
+            raise
+        if not isinstance(error, Exception):
+            raise
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed") from error
+
+
+def _open_lifecycle_lock_file(directory_descriptor):
+    existing_flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+    create_flags = existing_flags | os.O_CREAT | os.O_EXCL
+    for _attempt in range(3):
+        try:
+            return os.open(
+                "media-lifecycle.lock",
+                existing_flags,
+                dir_fd=directory_descriptor,
+            )
+        except FileNotFoundError:
+            try:
+                return os.open(
+                    "media-lifecycle.lock",
+                    create_flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+            except FileExistsError:
+                continue
+    raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+
+
+def _verify_lifecycle_lock_directory(file_stat):
+    if (
+        not stat.S_ISDIR(file_stat.st_mode)
+        or file_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(file_stat.st_mode) != 0o700
+    ):
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+
+
+def _verify_lifecycle_lock_file(file_stat):
+    if (
+        not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(file_stat.st_mode) != 0o600
+        or file_stat.st_nlink != 1
+    ):
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+
+
+def _verify_held_media_lifecycle_lock(
+    root_directory, directory_descriptor, lock_descriptor
+):
+    try:
+        root_directory.verify_current()
+        directory_stat = os.fstat(directory_descriptor)
+        lock_stat = os.fstat(lock_descriptor)
+        named_directory = os.stat(
+            ".pinry-locks",
+            dir_fd=root_directory.descriptor,
+            follow_symlinks=False,
+        )
+        named_lock = os.stat(
+            "media-lifecycle.lock",
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _identity(directory_stat) != _identity(named_directory)
+            or _identity(lock_stat) != _identity(named_lock)
+        ):
+            raise _lifecycle_lock_error("media_lifecycle_lock_failed")
+        _verify_lifecycle_lock_directory(directory_stat)
+        _verify_lifecycle_lock_file(lock_stat)
+    except BaseException as error:
+        if isinstance(error, MediaLifecycleLockError):
+            raise
+        if not isinstance(error, Exception):
+            raise
+        raise _lifecycle_lock_error("media_lifecycle_lock_failed") from error
 
 
 def open_or_create_media_directory_from(root_directory, relative_directory):

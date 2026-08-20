@@ -14,6 +14,7 @@ from django_images.file_ops import (
     MediaPathError,
     PublishFailure,
     create_owned_staging_file,
+    media_lifecycle_lock,
     open_media_root,
     open_or_create_media_directory_from,
     publish_owned_noreplace,
@@ -365,6 +366,16 @@ class MediaStorage(object):
         self.media_root = media_root or settings.MEDIA_ROOT
         self.clock = clock
         self.fault_injector = fault_injector
+
+    def lifecycle_lock(self, prepared, deadline=None, clock=None):
+        if not isinstance(prepared, PreparedAsset) or not prepared.is_open:
+            raise _media_conflict()
+        return media_lifecycle_lock(
+            prepared.root_directory,
+            exclusive=False,
+            deadline=deadline,
+            clock=self.clock if clock is None else clock,
+        )
 
     def prepare(
         self,

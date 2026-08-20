@@ -3,6 +3,7 @@ from io import BytesIO
 import os
 from pathlib import Path
 import queue
+import tempfile
 import threading
 from types import SimpleNamespace
 import uuid
@@ -52,7 +53,22 @@ class _PreparedAsset(object):
         self.is_open = False
 
 
-class _MediaStorage(object):
+class _NoopLifecycleContext(object):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, error_type, error, traceback):
+        del error_type, error, traceback
+        return False
+
+
+class _LifecycleStorageMixin(object):
+    def lifecycle_lock(self, prepared, deadline=None, clock=None):
+        del prepared, deadline, clock
+        return _NoopLifecycleContext()
+
+
+class _MediaStorage(_LifecycleStorageMixin):
     def __init__(self):
         self.publish_calls = 0
 
@@ -234,7 +250,7 @@ class _ReceiptAwarePublishedAsset(_PublishedAsset):
         self.released = True
 
 
-class _PublishingMediaStorage(object):
+class _PublishingMediaStorage(_LifecycleStorageMixin):
     def __init__(self, published, events):
         self.published = published
         self.events = events
@@ -247,7 +263,24 @@ class _PublishingMediaStorage(object):
         return self.published
 
 
-class _RaisingMediaStorage(object):
+class _ActualLifecyclePublishingStorage(_PublishingMediaStorage):
+    def __init__(self, published, events, root_directory):
+        super(_ActualLifecyclePublishingStorage, self).__init__(
+            published,
+            events,
+        )
+        self.root_directory = root_directory
+
+    def lifecycle_lock(self, prepared, deadline=None, clock=None):
+        del prepared
+        return file_ops.media_lifecycle_lock(
+            self.root_directory,
+            deadline=deadline,
+            clock=clock,
+        )
+
+
+class _RaisingMediaStorage(_LifecycleStorageMixin):
     def __init__(self, error):
         self.error = error
         self.publish_calls = []
@@ -361,6 +394,7 @@ def _file_snapshot(media_root):
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in root.rglob("*")
         if path.is_file()
+        and ".pinry-locks" not in path.relative_to(root).parts
     }
 
 
@@ -599,6 +633,421 @@ class PinImportCommitTests(TransactionTestCase):
             tags=("design", "reference"),
             board_ids=(self.board.pk,),
         )
+
+    def test_missing_lifecycle_lock_fails_closed_before_publish(self):
+        published = self.published
+
+        class MissingLifecycleStorage(object):
+            def __init__(inner_self):
+                inner_self.publish_calls = []
+
+            def publish(inner_self, prepared, deadline=None):
+                inner_self.publish_calls.append((prepared, deadline))
+                return published
+
+        storage = MissingLifecycleStorage()
+        service = PinImportService(
+            fetcher=object(),
+            media_storage=storage,
+            idempotency=self.idempotency,
+            clock=lambda: 10.0,
+        )
+
+        with self.assertRaises(PinImportError) as caught:
+            service.commit(
+                self.prepared,
+                self.user,
+                self.metadata,
+                self.claim,
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "media_configuration_error")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(storage.publish_calls, [])
+        self.assertEqual(self.prepared.cleanup_calls, 1)
+        self.assertEqual(Pin.objects.count(), 0)
+
+    def test_lifecycle_method_type_error_is_not_retried(self):
+        class TypeErrorLifecycleStorage(_PublishingMediaStorage):
+            def __init__(inner_self, published, events):
+                super(TypeErrorLifecycleStorage, inner_self).__init__(
+                    published,
+                    events,
+                )
+                inner_self.lock_calls = 0
+
+            def lifecycle_lock(
+                inner_self, prepared, deadline=None, clock=None
+            ):
+                del prepared, deadline, clock
+                inner_self.lock_calls += 1
+                raise TypeError("private-body-error")
+
+        storage = TypeErrorLifecycleStorage(self.published, self.events)
+        service = PinImportService(
+            fetcher=object(),
+            media_storage=storage,
+            idempotency=self.idempotency,
+            clock=lambda: 10.0,
+        )
+
+        with self.assertRaises(PinImportError) as caught:
+            service.commit(
+                self.prepared,
+                self.user,
+                self.metadata,
+                self.claim,
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "media_configuration_error")
+        self.assertEqual(storage.lock_calls, 1)
+        self.assertEqual(storage.publish_calls, [])
+        self.assertEqual(self.prepared.cleanup_calls, 1)
+
+    def test_unsafe_lifecycle_lock_maps_to_closed_configuration_error(self):
+        class UnsafeContext(object):
+            def __enter__(inner_self):
+                raise file_ops.MediaLifecycleLockError(
+                    "media_lifecycle_lock_failed"
+                )
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error_type, error, traceback
+                return False
+
+        storage = _PublishingMediaStorage(self.published, self.events)
+        storage.lifecycle_lock = mock.Mock(return_value=UnsafeContext())
+        self.service.media_storage = storage
+
+        with self.assertRaises(PinImportError) as caught:
+            self.service.commit(
+                self.prepared,
+                self.user,
+                self.metadata,
+                self.claim,
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "media_configuration_error")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(storage.publish_calls, [])
+        self.assertEqual(self.prepared.cleanup_calls, 1)
+
+    def test_busy_lifecycle_lock_maps_to_retryable_processing_timeout(self):
+        class BusyContext(object):
+            def __enter__(inner_self):
+                raise file_ops.MediaLifecycleLockError(
+                    "media_lifecycle_busy",
+                    retryable=True,
+                )
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error_type, error, traceback
+                return False
+
+        storage = _PublishingMediaStorage(self.published, self.events)
+        storage.lifecycle_lock = mock.Mock(return_value=BusyContext())
+        self.service.media_storage = storage
+
+        with self.assertRaises(PinImportError) as caught:
+            self.service.commit(
+                self.prepared,
+                self.user,
+                self.metadata,
+                self.claim,
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "image_processing_timeout")
+        self.assertTrue(caught.exception.retryable)
+        self.assertEqual(storage.publish_calls, [])
+        self.assertEqual(self.prepared.cleanup_calls, 1)
+
+    def test_lock_wraps_atomic_commit_and_later_callbacks(self):
+        events = []
+        prepared = _ManifestPreparedAsset(
+            uuid.uuid4(),
+            "source-name.png",
+        )
+        published = _PublishedAsset(prepared, events)
+
+        class RecordingContext(object):
+            def __enter__(inner_self):
+                events.append("lock_enter")
+                return inner_self
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error, traceback
+                events.append(
+                    "lock_exit:{}".format(
+                        error_type.__name__ if error_type else "none"
+                    )
+                )
+                return False
+
+        class RecordingStorage(_PublishingMediaStorage):
+            def lifecycle_lock(
+                inner_self, prepared_asset, deadline=None, clock=None
+            ):
+                del prepared_asset, deadline, clock
+                return RecordingContext()
+
+        def register_callback(event):
+            events.append(event)
+            if event == "before_idempotency_success":
+                transaction.on_commit(lambda: events.append("on_commit"))
+
+        service = PinImportService(
+            fetcher=object(),
+            media_storage=RecordingStorage(published, events),
+            idempotency=_SuccessfulIdempotencyStore(events),
+            clock=lambda: 10.0,
+            fault_injector=register_callback,
+        )
+
+        pin = service.commit(
+            prepared,
+            self.user,
+            self.metadata,
+            self.claim,
+            deadline=20.0,
+        )
+
+        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertLess(events.index("lock_enter"), events.index("fence"))
+        self.assertLess(events.index("fence"), events.index("publish"))
+        self.assertLess(events.index("publish"), events.index("on_commit"))
+        self.assertLess(
+            events.index("on_commit"), events.index("lock_exit:none")
+        )
+        self.assertLess(events.index("lock_exit:none"), events.index("release"))
+
+    def test_callback_base_exception_unlocks_then_rethrows_without_compensation(self):
+        events = []
+        primary = KeyboardInterrupt()
+        prepared = _ManifestPreparedAsset(uuid.uuid4(), "source-name.png")
+        published = _PublishedAsset(prepared, events)
+
+        class RecordingContext(object):
+            def __enter__(inner_self):
+                events.append("lock_enter")
+                return inner_self
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error, traceback
+                events.append("lock_exit:{}".format(error_type.__name__))
+                return False
+
+        class RecordingStorage(_PublishingMediaStorage):
+            def lifecycle_lock(
+                inner_self, prepared_asset, deadline=None, clock=None
+            ):
+                del prepared_asset, deadline, clock
+                return RecordingContext()
+
+        def register_callback(event):
+            events.append(event)
+            if event == "before_idempotency_success":
+                def raise_primary():
+                    events.append("on_commit_base_exception")
+                    raise primary
+
+                transaction.on_commit(raise_primary)
+
+        service = PinImportService(
+            fetcher=object(),
+            media_storage=RecordingStorage(published, events),
+            idempotency=_SuccessfulIdempotencyStore(events),
+            clock=lambda: 10.0,
+            fault_injector=register_callback,
+        )
+
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            service.commit(
+                prepared,
+                self.user,
+                self.metadata,
+                self.claim,
+                deadline=20.0,
+            )
+
+        self.assertIs(caught.exception, primary)
+        self.assertLess(
+            events.index("on_commit_base_exception"),
+            events.index("lock_exit:KeyboardInterrupt"),
+        )
+        self.assertLess(
+            events.index("lock_exit:KeyboardInterrupt"),
+            events.index("release"),
+        )
+        self.assertEqual(published.compensate_calls, 0)
+        self.assertEqual(published.release_calls, 1)
+        self.assertEqual(Pin.objects.count(), 1)
+
+    def test_rollback_primary_error_survives_actual_lock_close_error(self):
+        primary = ValueError("primary-transaction-error")
+        real_flock = file_ops.fcntl.flock
+
+        def fail_unlock(descriptor, operation):
+            if operation == file_ops.fcntl.LOCK_UN:
+                raise RuntimeError("secondary-lock-close-error")
+            return real_flock(descriptor, operation)
+
+        with tempfile.TemporaryDirectory() as media_root:
+            root_directory = file_ops.open_media_root(media_root)
+            try:
+                prepared = _ManifestPreparedAsset(
+                    uuid.uuid4(),
+                    "source-name.png",
+                )
+                events = []
+                published = _PublishedAsset(prepared, events)
+                storage = _ActualLifecyclePublishingStorage(
+                    published,
+                    events,
+                    root_directory,
+                )
+
+                def fail_after_image(event):
+                    events.append(event)
+                    if event == "after_image_row":
+                        raise primary
+
+                service = PinImportService(
+                    fetcher=object(),
+                    media_storage=storage,
+                    idempotency=_SuccessfulIdempotencyStore(events),
+                    clock=lambda: 10.0,
+                    fault_injector=fail_after_image,
+                )
+                with mock.patch(
+                    "django_images.file_ops.fcntl.flock",
+                    side_effect=fail_unlock,
+                ):
+                    with self.assertRaises(ValueError) as caught:
+                        service.commit(
+                            prepared,
+                            self.user,
+                            self.metadata,
+                            self.claim,
+                            deadline=20.0,
+                        )
+
+                self.assertIs(caught.exception, primary)
+                self.assertEqual(published.compensate_calls, 1)
+                self.assertEqual(Pin.objects.count(), 0)
+                with file_ops.media_lifecycle_lock(
+                    root_directory,
+                    exclusive=True,
+                    deadline=file_ops.time.monotonic() + 1,
+                ):
+                    pass
+            finally:
+                root_directory.close()
+
+    def test_committed_success_survives_actual_lock_close_error(self):
+        real_flock = file_ops.fcntl.flock
+
+        def fail_unlock(descriptor, operation):
+            if operation == file_ops.fcntl.LOCK_UN:
+                raise RuntimeError("secondary-lock-close-error")
+            return real_flock(descriptor, operation)
+
+        with tempfile.TemporaryDirectory() as media_root:
+            root_directory = file_ops.open_media_root(media_root)
+            try:
+                prepared = _ManifestPreparedAsset(
+                    uuid.uuid4(),
+                    "source-name.png",
+                )
+                events = []
+                published = _PublishedAsset(prepared, events)
+                service = PinImportService(
+                    fetcher=object(),
+                    media_storage=_ActualLifecyclePublishingStorage(
+                        published,
+                        events,
+                        root_directory,
+                    ),
+                    idempotency=_SuccessfulIdempotencyStore(events),
+                    clock=lambda: 10.0,
+                )
+                with self.assertLogs(
+                    "core.services.pin_import", level="WARNING"
+                ), mock.patch(
+                    "django_images.file_ops.fcntl.flock",
+                    side_effect=fail_unlock,
+                ):
+                    pin = service.commit(
+                        prepared,
+                        self.user,
+                        self.metadata,
+                        self.claim,
+                        deadline=20.0,
+                    )
+
+                self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+                self.assertEqual(published.compensate_calls, 0)
+                self.assertEqual(published.release_calls, 1)
+            finally:
+                root_directory.close()
+
+    def test_callback_base_exception_survives_actual_lock_close_error(self):
+        primary = KeyboardInterrupt()
+        real_flock = file_ops.fcntl.flock
+
+        def fail_unlock(descriptor, operation):
+            if operation == file_ops.fcntl.LOCK_UN:
+                raise RuntimeError("secondary-lock-close-error")
+            return real_flock(descriptor, operation)
+
+        with tempfile.TemporaryDirectory() as media_root:
+            root_directory = file_ops.open_media_root(media_root)
+            try:
+                prepared = _ManifestPreparedAsset(
+                    uuid.uuid4(),
+                    "source-name.png",
+                )
+                events = []
+                published = _PublishedAsset(prepared, events)
+
+                def register_callback(event):
+                    events.append(event)
+                    if event == "before_idempotency_success":
+                        transaction.on_commit(lambda: self._raise(primary))
+
+                service = PinImportService(
+                    fetcher=object(),
+                    media_storage=_ActualLifecyclePublishingStorage(
+                        published,
+                        events,
+                        root_directory,
+                    ),
+                    idempotency=_SuccessfulIdempotencyStore(events),
+                    clock=lambda: 10.0,
+                    fault_injector=register_callback,
+                )
+                with mock.patch(
+                    "django_images.file_ops.fcntl.flock",
+                    side_effect=fail_unlock,
+                ):
+                    with self.assertRaises(KeyboardInterrupt) as caught:
+                        service.commit(
+                            prepared,
+                            self.user,
+                            self.metadata,
+                            self.claim,
+                            deadline=20.0,
+                        )
+
+                self.assertIs(caught.exception, primary)
+                self.assertEqual(Pin.objects.count(), 1)
+                self.assertEqual(published.compensate_calls, 0)
+                self.assertEqual(published.release_calls, 1)
+            finally:
+                root_directory.close()
 
     def test_commit_maps_manifest_to_rows_and_releases_after_commit(self):
         deadline = 20.0

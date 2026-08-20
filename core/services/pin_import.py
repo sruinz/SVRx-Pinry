@@ -7,6 +7,7 @@ import uuid
 from django.db import DEFAULT_DB_ALIAS, connections, transaction
 
 from core.models import Board, Pin
+from django_images.file_ops import MediaLifecycleLockError, MediaPathError
 from django_images.models import Image, Thumbnail
 from django_images.paths import FORMAT_EXTENSIONS, sanitize_original_filename
 
@@ -107,77 +108,78 @@ class PinImportService(object):
         commit_marker = [False]
         try:
             self._check_deadline(deadline)
-            with transaction.atomic(using=DEFAULT_DB_ALIAS):
-                transaction.on_commit(
-                    lambda: commit_marker.__setitem__(0, True),
-                    using=DEFAULT_DB_ALIAS,
-                )
-                self._check_deadline(deadline)
-                if (
-                    claim is not None
-                    and not self.idempotency.fence(claim)
-                ):
-                    raise self._lease_lost()
-                self._check_deadline(deadline)
-                boards = self._owned_boards(user, metadata.board_ids)
-                self._check_deadline(deadline)
-                published = self.media_storage.publish(
-                    prepared,
-                    deadline=deadline,
-                )
-                self._check_deadline(deadline)
-                files = self._manifest_files(published, prepared)
-                original = files["original"]
-                image = Image.objects.using(DEFAULT_DB_ALIAS).create(
-                    image=original.final_relative_path,
-                    asset_uuid=prepared.asset_uuid,
-                    original_filename=prepared.original_filename,
-                    width=original.width,
-                    height=original.height,
-                )
-                self._fault("after_image_row")
-                self._check_deadline(deadline)
-                Thumbnail.objects.using(DEFAULT_DB_ALIAS).bulk_create([
-                    Thumbnail(
-                        original=image,
-                        image=files[kind].final_relative_path,
-                        size=kind,
-                        width=files[kind].width,
-                        height=files[kind].height,
+            with self._lifecycle_lock(prepared, deadline):
+                with transaction.atomic(using=DEFAULT_DB_ALIAS):
+                    transaction.on_commit(
+                        lambda: commit_marker.__setitem__(0, True),
+                        using=DEFAULT_DB_ALIAS,
                     )
-                    for kind in ("thumbnail", "standard", "square")
-                ])
-                self._fault("after_thumbnail_rows")
-                self._check_deadline(deadline)
-                pin = Pin.objects.using(DEFAULT_DB_ALIAS).create(
-                    submitter=user,
-                    image=image,
-                    url=metadata.url,
-                    referer=metadata.referer,
-                    description=metadata.description,
-                    private=metadata.private,
-                )
-                self._fault("after_pin_row")
-                self._check_deadline(deadline)
-                if metadata.tags:
-                    pin.tags.add(*metadata.tags)
-                self._fault("after_tags")
-                self._check_deadline(deadline)
-                for board in boards:
                     self._check_deadline(deadline)
-                    board.pins.add(pin)
-                self._fault("after_boards")
-                self._check_deadline(deadline)
-                published.verify_current()
-                self._check_deadline(deadline)
-                self._fault("before_idempotency_success")
-                self._check_deadline(deadline)
-                if (
-                    claim is not None
-                    and not self.idempotency.record_success(claim, pin)
-                ):
-                    raise self._lease_lost()
-                self._check_deadline(deadline)
+                    if (
+                        claim is not None
+                        and not self.idempotency.fence(claim)
+                    ):
+                        raise self._lease_lost()
+                    self._check_deadline(deadline)
+                    boards = self._owned_boards(user, metadata.board_ids)
+                    self._check_deadline(deadline)
+                    published = self.media_storage.publish(
+                        prepared,
+                        deadline=deadline,
+                    )
+                    self._check_deadline(deadline)
+                    files = self._manifest_files(published, prepared)
+                    original = files["original"]
+                    image = Image.objects.using(DEFAULT_DB_ALIAS).create(
+                        image=original.final_relative_path,
+                        asset_uuid=prepared.asset_uuid,
+                        original_filename=prepared.original_filename,
+                        width=original.width,
+                        height=original.height,
+                    )
+                    self._fault("after_image_row")
+                    self._check_deadline(deadline)
+                    Thumbnail.objects.using(DEFAULT_DB_ALIAS).bulk_create([
+                        Thumbnail(
+                            original=image,
+                            image=files[kind].final_relative_path,
+                            size=kind,
+                            width=files[kind].width,
+                            height=files[kind].height,
+                        )
+                        for kind in ("thumbnail", "standard", "square")
+                    ])
+                    self._fault("after_thumbnail_rows")
+                    self._check_deadline(deadline)
+                    pin = Pin.objects.using(DEFAULT_DB_ALIAS).create(
+                        submitter=user,
+                        image=image,
+                        url=metadata.url,
+                        referer=metadata.referer,
+                        description=metadata.description,
+                        private=metadata.private,
+                    )
+                    self._fault("after_pin_row")
+                    self._check_deadline(deadline)
+                    if metadata.tags:
+                        pin.tags.add(*metadata.tags)
+                    self._fault("after_tags")
+                    self._check_deadline(deadline)
+                    for board in boards:
+                        self._check_deadline(deadline)
+                        board.pins.add(pin)
+                    self._fault("after_boards")
+                    self._check_deadline(deadline)
+                    published.verify_current()
+                    self._check_deadline(deadline)
+                    self._fault("before_idempotency_success")
+                    self._check_deadline(deadline)
+                    if (
+                        claim is not None
+                        and not self.idempotency.record_success(claim, pin)
+                    ):
+                        raise self._lease_lost()
+                    self._check_deadline(deadline)
         except BaseException as error:
             if commit_marker[0]:
                 self._release(published)
@@ -190,6 +192,12 @@ class PinImportService(object):
             else:
                 self._compensate(published)
                 self._release(published, attempts=1)
+            if isinstance(error, MediaLifecycleLockError):
+                if error.retryable:
+                    raise self._processing_timeout() from None
+                raise self._configuration_error() from None
+            if isinstance(error, MediaPathError):
+                raise self._configuration_error() from None
             raise
 
         if not commit_marker[0]:
@@ -217,6 +225,25 @@ class PinImportService(object):
                 False,
             )
         return boards
+
+    def _lifecycle_lock(self, prepared, deadline):
+        try:
+            lifecycle_lock = self.media_storage.lifecycle_lock
+            if not callable(lifecycle_lock):
+                raise TypeError()
+            context = lifecycle_lock(
+                prepared,
+                deadline=deadline,
+                clock=self.clock,
+            )
+            if (
+                not callable(getattr(context, "__enter__", None))
+                or not callable(getattr(context, "__exit__", None))
+            ):
+                raise TypeError()
+            return context
+        except (AttributeError, TypeError):
+            raise self._configuration_error() from None
 
     @staticmethod
     def _manifest_files(published, prepared):
@@ -312,6 +339,22 @@ class PinImportService(object):
         return PinImportError(
             "internal_error",
             "The image import could not be completed safely.",
+            False,
+        )
+
+    @staticmethod
+    def _processing_timeout():
+        return PinImportError(
+            "image_processing_timeout",
+            "The image could not be processed before the deadline.",
+            True,
+        )
+
+    @staticmethod
+    def _configuration_error():
+        return PinImportError(
+            "media_configuration_error",
+            "The image storage configuration is invalid.",
             False,
         )
 
