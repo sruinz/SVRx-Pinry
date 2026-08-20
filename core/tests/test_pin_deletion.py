@@ -30,6 +30,7 @@ def media_snapshot(media_root):
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in root.rglob("*")
         if path.is_file()
+        and path.relative_to(root).parts[0] != ".pinry-locks"
     }
 
 
@@ -164,6 +165,14 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
             "django_images", "PendingMediaDeletion"
         ).objects
 
+    def _asset_directories(self, image):
+        asset_uuid = str(image.asset_uuid)
+        root = Path(self.temporary_media.name)
+        return (
+            root / "originals" / asset_uuid,
+            root / "derivatives" / asset_uuid,
+        )
+
     def _assert_delete_continues_after_storage_error(
         self, fail_at
     ):
@@ -209,7 +218,9 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(pending.last_error, "OSError")
         return pending
 
-    def test_delete_preserves_shared_image_rows_and_file_bytes(self):
+    def test_direct_delete_preserves_shared_image_rows_files_and_uuid_directories(
+        self,
+    ):
         image = create_image()
         owner_pin = create_pin(self.owner, image, [])
         other_pin = create_pin(self.other_user, image, [])
@@ -223,6 +234,8 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
             lease_generation=1,
         )
         files_before = self._assert_four_image_files(image)
+        asset_directories = self._asset_directories(image)
+        self.assertTrue(all(path.is_dir() for path in asset_directories))
         response = self.client.delete(
             reverse("pin-detail", args=[owner_pin.pk])
         )
@@ -239,12 +252,17 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(
             media_snapshot(self.temporary_media.name), files_before
         )
+        self.assertTrue(all(path.is_dir() for path in asset_directories))
         self.assertFalse(self._pending_deletions().exists())
 
-    def test_delete_of_last_reference_removes_rows_and_files(self):
+    def test_direct_delete_of_last_reference_removes_rows_files_and_uuid_directories(
+        self,
+    ):
         image = create_image()
         pin = create_pin(self.owner, image, [])
         self._assert_four_image_files(image)
+        asset_directories = self._asset_directories(image)
+        self.assertTrue(all(path.is_dir() for path in asset_directories))
         response = self.client.delete(reverse("pin-detail", args=[pin.pk]))
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
@@ -254,6 +272,12 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
             Thumbnail.objects.filter(original_id=image.pk).exists()
         )
         self.assertEqual(media_snapshot(self.temporary_media.name), {})
+        self.assertTrue(
+            all(not path.exists() for path in asset_directories)
+        )
+        root = Path(self.temporary_media.name)
+        self.assertTrue((root / "originals").is_dir())
+        self.assertTrue((root / "derivatives").is_dir())
 
     def test_first_storage_failure_is_journaled_without_stopping_cleanup(self):
         self._assert_delete_continues_after_storage_error(1)
@@ -357,12 +381,16 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         )
         self.assertEqual(media_snapshot(self.temporary_media.name), {})
 
-    def test_rolled_back_pin_delete_keeps_database_rows_and_media(self):
+    def test_rolled_back_pin_delete_keeps_rows_media_and_uuid_directories(
+        self,
+    ):
         image = create_image()
         pin = create_pin(self.owner, image, [])
         image_id = image.pk
         pin_id = pin.pk
         files_before = self._assert_four_image_files(image)
+        asset_directories = self._asset_directories(image)
+        self.assertTrue(all(path.is_dir() for path in asset_directories))
 
         with self.assertRaisesRegex(RuntimeError, "rollback pin delete"):
             with transaction.atomic():
@@ -376,6 +404,7 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(
             media_snapshot(self.temporary_media.name), files_before
         )
+        self.assertTrue(all(path.is_dir() for path in asset_directories))
 
     def test_reference_created_before_commit_prevents_media_deletion(self):
         image = create_image()

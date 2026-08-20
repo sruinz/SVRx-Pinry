@@ -1,15 +1,24 @@
 from io import StringIO
+import errno
 from pathlib import Path
 import tempfile
+import uuid
 
 import mock
 from django.apps import apps
 from django.core.management import CommandError, call_command
 from django.db import connections, transaction
 from django.db.migrations.executor import MigrationExecutor
-from django.test import TransactionTestCase
+from django.test import SimpleTestCase, TransactionTestCase
 
-from django_images.models import Image, Thumbnail
+from django_images import file_ops
+from django_images.file_ops import (
+    MediaPathError,
+    media_lifecycle_lock,
+    open_media_root,
+    remove_empty_media_directory,
+)
+from django_images.models import Image, PendingMediaDeletion, Thumbnail
 from django_images.services.media_deletion import (
     process_pending_media_deletion,
 )
@@ -22,7 +31,178 @@ def media_snapshot(media_root):
         path.relative_to(root).as_posix(): path.read_bytes()
         for path in root.rglob("*")
         if path.is_file()
+        and path.relative_to(root).parts[0] != ".pinry-locks"
     }
+
+
+class EmptyMediaDirectoryRemovalTest(SimpleTestCase):
+    asset_uuid = "12345678-1234-5678-1234-567812345678"
+
+    def setUp(self):
+        self.temporary_media = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_media.cleanup)
+
+    @property
+    def relative_directory(self):
+        return "originals/{}".format(self.asset_uuid)
+
+    @property
+    def leaf(self):
+        return Path(
+            self.temporary_media.name,
+            "originals",
+            self.asset_uuid,
+        )
+
+    def _remove(self, relative_directory=None):
+        root = open_media_root(self.temporary_media.name)
+        try:
+            return remove_empty_media_directory(
+                root,
+                relative_directory or self.relative_directory,
+            )
+        finally:
+            root.close()
+
+    def _assert_kind_roots_preserved(self):
+        root = Path(self.temporary_media.name)
+        self.assertTrue(root.is_dir())
+        for name in ("originals", "derivatives"):
+            path = root / name
+            if path.exists():
+                self.assertTrue(path.is_dir())
+
+    def test_remove_empty_media_directory_removes_leaf_and_fsyncs_parent(self):
+        self.leaf.mkdir(parents=True)
+
+        removed = self._remove()
+
+        self.assertTrue(removed)
+        self.assertFalse(self.leaf.exists())
+        self.assertTrue(
+            Path(self.temporary_media.name, "originals").is_dir()
+        )
+        self._assert_kind_roots_preserved()
+
+    def test_remove_empty_media_directory_treats_missing_leaf_as_success(self):
+        Path(self.temporary_media.name, "originals").mkdir()
+
+        self.assertTrue(self._remove())
+
+        self._assert_kind_roots_preserved()
+
+    def test_remove_empty_media_directory_preserves_nonempty_leaf(self):
+        foreign = self.leaf / "foreign.dat"
+        foreign.parent.mkdir(parents=True)
+        foreign.write_bytes(b"foreign-bytes")
+
+        self.assertFalse(self._remove())
+
+        self.assertEqual(foreign.read_bytes(), b"foreign-bytes")
+        self._assert_kind_roots_preserved()
+
+    def test_remove_empty_media_directory_rejects_one_component_root_target(self):
+        for name in ("originals", "derivatives"):
+            Path(self.temporary_media.name, name).mkdir()
+
+        for name in ("originals", "derivatives"):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    MediaPathError, "unsafe_media_directory"
+                ):
+                    self._remove(name)
+
+        self._assert_kind_roots_preserved()
+
+    def test_remove_empty_media_directory_rejects_symlinked_parent(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        foreign = Path(outside.name, self.asset_uuid, "foreign.dat")
+        foreign.parent.mkdir()
+        foreign.write_bytes(b"outside-parent")
+        Path(self.temporary_media.name, "originals").symlink_to(
+            outside.name, target_is_directory=True
+        )
+
+        with self.assertRaises((MediaPathError, OSError)):
+            self._remove()
+
+        self.assertEqual(foreign.read_bytes(), b"outside-parent")
+
+    def test_remove_empty_media_directory_rejects_symlinked_leaf(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        foreign = Path(outside.name, "foreign.dat")
+        foreign.write_bytes(b"outside-leaf")
+        parent = Path(self.temporary_media.name, "originals")
+        parent.mkdir()
+        self.leaf.symlink_to(outside.name, target_is_directory=True)
+
+        with self.assertRaises((MediaPathError, OSError)):
+            self._remove()
+
+        self.assertEqual(foreign.read_bytes(), b"outside-leaf")
+        self.assertTrue(self.leaf.is_symlink())
+
+    def test_remove_empty_media_directory_parent_swap_preserves_replacement(self):
+        self.leaf.mkdir(parents=True)
+        moved_parent = Path(self.temporary_media.name, "originals-old")
+        replacement = Path(
+            self.temporary_media.name,
+            "originals",
+            self.asset_uuid,
+        )
+        foreign = replacement / "foreign.dat"
+        real_open = file_ops._open_child_directory_nofollow
+        calls = {"count": 0}
+
+        def swap_after_leaf_open(parent_descriptor, name, named_stat):
+            descriptor = real_open(parent_descriptor, name, named_stat)
+            calls["count"] += 1
+            if calls["count"] == 2:
+                self.leaf.parent.rename(moved_parent)
+                replacement.mkdir(parents=True)
+                foreign.write_bytes(b"replacement")
+            return descriptor
+
+        with mock.patch(
+            "django_images.file_ops._open_child_directory_nofollow",
+            side_effect=swap_after_leaf_open,
+        ):
+            with self.assertRaisesRegex(
+                MediaPathError, "unsafe_media_directory"
+            ):
+                self._remove()
+
+        self.assertEqual(foreign.read_bytes(), b"replacement")
+        self.assertTrue(Path(moved_parent, self.asset_uuid).is_dir())
+
+    def test_remove_empty_media_directory_propagates_rmdir_io_failure(self):
+        self.leaf.mkdir(parents=True)
+
+        with mock.patch(
+            "django_images.file_ops.os.rmdir",
+            side_effect=OSError(errno.EIO, "secret path"),
+        ):
+            with self.assertRaises(OSError) as caught:
+                self._remove()
+
+        self.assertEqual(caught.exception.errno, errno.EIO)
+        self.assertTrue(self.leaf.is_dir())
+
+    def test_remove_empty_media_directory_propagates_parent_fsync_failure(self):
+        self.leaf.mkdir(parents=True)
+
+        with mock.patch(
+            "django_images.file_ops.os.fsync",
+            side_effect=OSError(errno.EIO, "secret path"),
+        ):
+            with self.assertRaises(OSError) as caught:
+                self._remove()
+
+        self.assertEqual(caught.exception.errno, errno.EIO)
+        self.assertFalse(self.leaf.exists())
+        self._assert_kind_roots_preserved()
 
 
 class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
@@ -58,6 +238,353 @@ class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
         for index, name in enumerate(names):
             self._write_file(name, "file-{}".format(index).encode("ascii"))
         return image, media_snapshot(self.temporary_media.name)
+
+    def _canonical_name(self, asset_uuid=None, kind="original"):
+        asset_uuid = asset_uuid or uuid.uuid4()
+        root = "originals" if kind == "original" else "derivatives"
+        leaf = "original.png" if kind == "original" else "thumbnail.png"
+        return asset_uuid, "{}/{}/{}".format(root, asset_uuid, leaf)
+
+    def test_canonical_pending_deletion_removes_empty_uuid_parent(self):
+        asset_uuid, name = self._canonical_name()
+        self._write_file(name, b"pending")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertTrue(processed)
+        self.assertFalse(Path(self.temporary_media.name, name).exists())
+        self.assertFalse(
+            Path(self.temporary_media.name, "originals", str(asset_uuid))
+            .exists()
+        )
+        self.assertTrue(
+            Path(self.temporary_media.name, "originals").is_dir()
+        )
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_canonical_missing_file_retry_removes_empty_uuid_parent(self):
+        asset_uuid, name = self._canonical_name()
+        directory = Path(
+            self.temporary_media.name, "originals", str(asset_uuid)
+        )
+        directory.mkdir(parents=True)
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertTrue(processed)
+        self.assertFalse(directory.exists())
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_canonical_original_reused_by_live_image_is_preserved(self):
+        asset_uuid, name = self._canonical_name()
+        self._write_file(name, b"reused-original")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        Image.objects.create(
+            image=name,
+            asset_uuid=asset_uuid,
+            original_filename="live.png",
+            width=32,
+            height=32,
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertTrue(processed)
+        self.assertEqual(
+            Path(self.temporary_media.name, name).read_bytes(),
+            b"reused-original",
+        )
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_canonical_derivative_reused_by_live_thumbnail_is_preserved(self):
+        asset_uuid, name = self._canonical_name(kind="thumbnail")
+        self._write_file(name, b"reused-thumbnail")
+        image = Image.objects.create(
+            image="legacy/live.png",
+            asset_uuid=asset_uuid,
+            original_filename="live.png",
+            width=32,
+            height=32,
+        )
+        Thumbnail.objects.create(
+            original=image,
+            image=name,
+            size="thumbnail",
+            width=32,
+            height=32,
+        )
+        pending = self._pending_deletions().create(
+            kind="thumbnail", name=name
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertTrue(processed)
+        self.assertEqual(
+            Path(self.temporary_media.name, name).read_bytes(),
+            b"reused-thumbnail",
+        )
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_canonical_delete_preserves_directory_owned_by_same_uuid(self):
+        asset_uuid, name = self._canonical_name()
+        self._write_file(name, b"stale")
+        Image.objects.create(
+            image="legacy/current.png",
+            asset_uuid=asset_uuid,
+            original_filename="current.png",
+            width=32,
+            height=32,
+        )
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        directory = Path(
+            self.temporary_media.name, "originals", str(asset_uuid)
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertTrue(processed)
+        self.assertFalse(Path(self.temporary_media.name, name).exists())
+        self.assertTrue(directory.is_dir())
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_canonical_delete_defers_while_shared_lifecycle_lock_is_held(self):
+        _asset_uuid, name = self._canonical_name()
+        self._write_file(name, b"locked")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        root = open_media_root(self.temporary_media.name)
+        try:
+            with media_lifecycle_lock(root):
+                processed = process_pending_media_deletion(pending.pk)
+        finally:
+            root.close()
+
+        self.assertFalse(processed)
+        self.assertEqual(
+            Path(self.temporary_media.name, name).read_bytes(), b"locked"
+        )
+        pending.refresh_from_db()
+        self.assertEqual(pending.attempts, 1)
+        self.assertEqual(pending.last_error, "MediaLifecycleLockError")
+
+    def test_canonical_delete_preserves_foreign_entry_and_resolves_journal(self):
+        asset_uuid, name = self._canonical_name()
+        self._write_file(name, b"pending")
+        foreign = Path(
+            self.temporary_media.name,
+            "originals",
+            str(asset_uuid),
+            "foreign.dat",
+        )
+        foreign.write_bytes(b"foreign")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+
+        processed = process_pending_media_deletion(pending.pk)
+
+        self.assertTrue(processed)
+        self.assertEqual(foreign.read_bytes(), b"foreign")
+        self.assertFalse(Path(self.temporary_media.name, name).exists())
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_canonical_prune_failure_keeps_journal_until_retry(self):
+        asset_uuid, name = self._canonical_name()
+        self._write_file(name, b"pending")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+
+        with mock.patch(
+            "django_images.services.media_deletion."
+            "remove_empty_media_directory",
+            side_effect=OSError(errno.EIO, "secret directory"),
+            create=True,
+        ):
+            first = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(first)
+        pending.refresh_from_db()
+        self.assertEqual(pending.attempts, 1)
+        self.assertEqual(pending.last_error, "OSError")
+        self.assertTrue(
+            Path(self.temporary_media.name, "originals", str(asset_uuid))
+            .is_dir()
+        )
+
+        self.assertTrue(process_pending_media_deletion(pending.pk))
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_canonical_parent_fsync_failure_keeps_journal_until_retry(self):
+        asset_uuid, name = self._canonical_name()
+        self._write_file(name, b"pending")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+
+        with mock.patch(
+            "django_images.file_ops.os.fsync",
+            side_effect=OSError(errno.EIO, "secret directory"),
+        ):
+            first = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(first)
+        pending.refresh_from_db()
+        self.assertEqual(pending.attempts, 1)
+        self.assertEqual(pending.last_error, "OSError")
+        self.assertFalse(Path(self.temporary_media.name, name).exists())
+        self.assertFalse(
+            Path(self.temporary_media.name, "originals", str(asset_uuid))
+            .exists()
+        )
+
+        self.assertTrue(process_pending_media_deletion(pending.pk))
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_noncanonical_pending_deletion_never_prunes_parent(self):
+        name = "legacy/asset/original.png"
+        self._write_file(name, b"legacy")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        parent = Path(self.temporary_media.name, "legacy", "asset")
+
+        self.assertTrue(process_pending_media_deletion(pending.pk))
+
+        self.assertTrue(parent.is_dir())
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_kind_root_mismatch_never_prunes_parent(self):
+        asset_uuid, name = self._canonical_name(kind="thumbnail")
+        self._write_file(name, b"mismatch")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        parent = Path(
+            self.temporary_media.name, "derivatives", str(asset_uuid)
+        )
+
+        self.assertTrue(process_pending_media_deletion(pending.pk))
+
+        self.assertTrue(parent.is_dir())
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_non_filesystem_storage_skips_local_directory_cleanup(self):
+        asset_uuid, name = self._canonical_name()
+        local_directory = Path(
+            self.temporary_media.name, "originals", str(asset_uuid)
+        )
+        local_directory.mkdir(parents=True)
+        storage = mock.Mock()
+        storage.exists.return_value = True
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        image_field = Image._meta.get_field("image")
+
+        with mock.patch.object(image_field, "storage", storage):
+            processed = process_pending_media_deletion(pending.pk)
+
+        self.assertTrue(processed)
+        self.assertTrue(local_directory.is_dir())
+        storage.delete.assert_called_once_with(name)
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_one_storage_failure_does_not_stop_independent_journals(self):
+        first_name = "legacy/first.png"
+        second_name = "legacy/second.png"
+        first = self._pending_deletions().create(
+            kind="original", name=first_name
+        )
+        self._pending_deletions().create(
+            kind="original", name=second_name
+        )
+        storage = mock.Mock()
+        storage.exists.return_value = True
+
+        def delete(name):
+            if name == first_name:
+                raise OSError("secret first path")
+
+        storage.delete.side_effect = delete
+        image_field = Image._meta.get_field("image")
+
+        with mock.patch.object(image_field, "storage", storage):
+            call_command(
+                "retry_media_deletions", execute=True, stdout=StringIO()
+            )
+
+        first.refresh_from_db()
+        self.assertEqual(first.attempts, 1)
+        self.assertEqual(first.last_error, "OSError")
+        self.assertEqual(
+            list(self._pending_deletions().values_list("name", flat=True)),
+            [first_name],
+        )
+
+    def test_pending_query_failure_does_not_escape(self):
+        with mock.patch.object(
+            PendingMediaDeletion.objects,
+            "using",
+            side_effect=RuntimeError("secret query"),
+        ):
+            with self.assertLogs(
+                "django_images.services.media_deletion", level="WARNING"
+            ) as captured:
+                processed = process_pending_media_deletion(123)
+
+        self.assertFalse(processed)
+        self.assertEqual(captured.records[0].getMessage(), "media_deletion_failed")
+        self.assertEqual(captured.records[0].media_error, "RuntimeError")
+        self.assertNotIn("secret query", "\n".join(captured.output))
+
+    def test_failure_recording_error_does_not_escape(self):
+        pending = self._pending_deletions().create(
+            kind="original", name="legacy/failure.png"
+        )
+        storage = mock.Mock()
+        storage.exists.side_effect = OSError("secret storage")
+        image_field = Image._meta.get_field("image")
+
+        with mock.patch.object(image_field, "storage", storage), mock.patch(
+            "django.db.models.query.QuerySet.update",
+            side_effect=RuntimeError("secret update"),
+        ):
+            processed = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(processed)
+        self.assertTrue(
+            self._pending_deletions().filter(pk=pending.pk).exists()
+        )
+
+    def test_pending_delete_error_does_not_escape(self):
+        pending = self._pending_deletions().create(
+            kind="original", name="legacy/deleted.png"
+        )
+
+        with mock.patch.object(
+            PendingMediaDeletion,
+            "delete",
+            side_effect=RuntimeError("secret delete"),
+        ):
+            processed = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(processed)
+        self.assertTrue(
+            self._pending_deletions().filter(pk=pending.pk).exists()
+        )
 
     def test_rolled_back_image_delete_preserves_files_without_journal(self):
         image, files_before = self._create_four_file_image("rollback")

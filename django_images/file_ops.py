@@ -477,6 +477,73 @@ def open_media_root(media_root):
         raise
 
 
+def remove_empty_media_directory(root_directory, relative_directory):
+    components = _relative_components(relative_directory)
+    if len(components) != 2:
+        raise MediaPathError("unsafe_media_directory")
+    root_directory.verify_current()
+    parent_name, leaf_name = components
+    try:
+        parent_stat = os.stat(
+            parent_name,
+            dir_fd=root_directory.descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return True
+    parent_descriptor = _open_child_directory_nofollow(
+        root_directory.descriptor,
+        parent_name,
+        parent_stat,
+    )
+    try:
+        try:
+            leaf_stat = os.stat(
+                leaf_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            os.fsync(parent_descriptor)
+            return True
+        leaf_descriptor = _open_child_directory_nofollow(
+            parent_descriptor,
+            leaf_name,
+            leaf_stat,
+        )
+        try:
+            root_directory.verify_current()
+            current_parent = os.stat(
+                parent_name,
+                dir_fd=root_directory.descriptor,
+                follow_symlinks=False,
+            )
+            current_leaf = os.stat(
+                leaf_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                _identity(current_parent) != _identity(parent_stat)
+                or _identity(current_leaf) != _identity(leaf_stat)
+            ):
+                raise MediaPathError("unsafe_media_directory")
+            try:
+                os.rmdir(leaf_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                if error.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                    return False
+                raise
+            os.fsync(parent_descriptor)
+            return True
+        finally:
+            os.close(leaf_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
 def _lifecycle_lock_error(code, retryable=False):
     return MediaLifecycleLockError(code, retryable=retryable)
 
