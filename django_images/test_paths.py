@@ -1,6 +1,7 @@
 from io import BytesIO
 import os
 from pathlib import Path
+import uuid
 import unicodedata
 
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -10,7 +11,12 @@ from PIL import Image as PILImage
 from core.models import Image as CoreImage
 from core.serializers import ImageSerializer
 from django_images.models import Image, Thumbnail
-from django_images.paths import canonical_extension, sanitize_original_filename
+from django_images.paths import (
+    canonical_extension,
+    canonical_original_path,
+    is_valid_original_leaf,
+    sanitize_original_filename,
+)
 from django_images.test_helpers import TemporaryMediaMixin
 
 
@@ -71,6 +77,87 @@ class OriginalFilenameTest(SimpleTestCase):
         )
 
         self.assertEqual(sanitize_original_filename(filename), "사진.png")
+
+
+class CanonicalOriginalPathTest(SimpleTestCase):
+    asset_uuid = uuid.UUID(
+        "8dbc3cf8-0348-43ff-8e72-dc1c4774012a"
+    )
+
+    def test_uses_original_stem_and_actual_extension(self):
+        self.assertEqual(
+            canonical_original_path(
+                self.asset_uuid, "folder/여행 사진.jpg", ".png"
+            ),
+            "originals/{}/여행 사진.png".format(self.asset_uuid),
+        )
+
+    def test_invalid_names_use_exact_uuid_fallback(self):
+        invalid = (
+            "", ".", "..", ".png", "CON.txt", "con.backup.jpg",
+            "LPT9.backup.png",
+        )
+        for original_name in invalid:
+            with self.subTest(original_name=original_name):
+                self.assertEqual(
+                    canonical_original_path(
+                        self.asset_uuid, original_name, ".png"
+                    ),
+                    "originals/{}/image-8dbc3cf80348.png".format(
+                        self.asset_uuid
+                    ),
+                )
+
+    def test_portable_characters_and_unicode_are_normalized(self):
+        original_name = unicodedata.normalize(
+            "NFD", "사진<촬영>:2026?.jpg"
+        )
+        path = canonical_original_path(
+            self.asset_uuid, original_name, ".png"
+        )
+
+        self.assertEqual(
+            path,
+            "originals/{}/사진_촬영__2026_.png".format(
+                self.asset_uuid
+            ),
+        )
+        self.assertEqual(path, unicodedata.normalize("NFC", path))
+
+    def test_long_multibyte_name_fits_both_limits(self):
+        path = canonical_original_path(
+            self.asset_uuid,
+            ("한글. " * 100) + "source.jpg",
+            ".webp",
+        )
+        leaf = path.rsplit("/", 1)[-1]
+
+        self.assertLessEqual(len(path), 255)
+        self.assertLessEqual(len(leaf.encode("utf-8")), 255)
+        self.assertTrue(leaf.endswith(".webp"))
+        self.assertEqual(leaf[:-5], leaf[:-5].strip(" ."))
+        self.assertTrue(is_valid_original_leaf(self.asset_uuid, leaf))
+
+    def test_leaf_validator_rejects_noncanonical_names(self):
+        invalid = (
+            "photo.PNG", "CON.png", "name?.png", " name.png",
+        )
+        for leaf in invalid:
+            with self.subTest(leaf=leaf):
+                self.assertFalse(
+                    is_valid_original_leaf(self.asset_uuid, leaf)
+                )
+
+        self.assertTrue(
+            is_valid_original_leaf(self.asset_uuid, "original.png")
+        )
+        self.assertTrue(
+            is_valid_original_leaf(self.asset_uuid, "사진.png")
+        )
+        self.assertTrue(is_valid_original_leaf(
+            self.asset_uuid,
+            unicodedata.normalize("NFD", "사진.png"),
+        ))
 
 
 class AssetStoragePathTest(TemporaryMediaMixin, TransactionTestCase):
