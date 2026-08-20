@@ -1,5 +1,6 @@
 from io import BytesIO
 import struct
+from unittest.mock import patch
 import zlib
 
 from django.conf import settings
@@ -8,9 +9,11 @@ from PIL import Image as PILImage
 
 from core.services.safe_url_fetch import (
     FetchLimits,
+    FetchedImage,
     SafeFetchError,
     SafeUrlFetcher,
 )
+from core.services.image_inspection import InspectedImage
 from django_images.paths import FORMAT_EXTENSIONS
 
 
@@ -818,3 +821,37 @@ class SafeUrlFetcherPolicyTests(SimpleTestCase):
             "https://images.example/final.jpg?token=kept",
         )
         self.assertTrue(response.closed)
+
+    def test_fetched_image_remains_the_public_inspection_result(self):
+        self.assertIs(FetchedImage, InspectedImage)
+
+        fetcher, resolver, transport = self.make_fetcher(
+            responses=[FakeResponse(content=make_image_bytes("JPEG", (4, 5)))]
+        )
+
+        fetched = fetcher.fetch("https://images.example/final.jpg")
+
+        self.assertIsInstance(fetched, FetchedImage)
+        self.assertEqual(fetched.image_format, "JPEG")
+        self.assertEqual((fetched.width, fetched.height), (4, 5))
+
+    @patch("core.services.safe_url_fetch.inspect_image_bytes")
+    def test_url_fetch_adapts_the_common_image_inspection_result(
+        self, inspect_image_bytes
+    ):
+        inspect_image_bytes.return_value = InspectedImage(
+            b"checked-content",
+            "PNG",
+            7,
+            8,
+            "https://images.example/final.jpg",
+        )
+        fetcher, resolver, transport = self.make_fetcher(
+            responses=[FakeResponse(content=b"not an image")]
+        )
+
+        fetched = fetcher.fetch("https://images.example/final.jpg")
+
+        self.assertIsInstance(fetched, FetchedImage)
+        self.assertEqual(fetched.content, b"checked-content")
+        self.assertEqual((fetched.width, fetched.height), (7, 8))

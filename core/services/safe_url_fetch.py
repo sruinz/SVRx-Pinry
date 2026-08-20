@@ -1,26 +1,24 @@
 from collections import namedtuple
-from io import BytesIO
 import ipaddress
 from time import monotonic
 import unicodedata
 from urllib.parse import urljoin, urlsplit
-import warnings
 
 from django.conf import settings
-from PIL import Image as PILImage
 import requests
 
-from django_images.paths import FORMAT_EXTENSIONS
+from core.services.image_inspection import (
+    ImageInspectionError,
+    InspectedImage,
+    inspect_image_bytes,
+)
 
 
 ResolvedTarget = namedtuple(
     "ResolvedTarget",
     ("scheme", "hostname", "port", "ip_address", "request_target"),
 )
-FetchedImage = namedtuple(
-    "FetchedImage",
-    ("content", "image_format", "width", "height", "final_url"),
-)
+FetchedImage = InspectedImage
 
 
 class FetchLimits:
@@ -425,52 +423,15 @@ class SafeUrlFetcher:
 
     def _verify_image(self, content, final_url, deadline):
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter(
-                    "error", PILImage.DecompressionBombWarning
-                )
-                self._check_deadline(deadline)
-                with PILImage.open(BytesIO(content)) as image:
-                    self._verify_pixel_count(image)
-                    image.verify()
-                self._check_deadline(deadline)
-                with PILImage.open(BytesIO(content)) as image:
-                    self._verify_pixel_count(image)
-                    image.load()
-                    image_format = image.format
-                    width, height = image.size
-                self._check_deadline(deadline)
-        except SafeFetchError:
-            raise
-        except (
-            PILImage.DecompressionBombError,
-            PILImage.DecompressionBombWarning,
-        ):
-            raise _too_many_pixels() from None
-        except Exception:
-            raise SafeFetchError(
-                "invalid_image_content",
-                "The response was not a valid image.",
-                False,
-            ) from None
-        if image_format not in FORMAT_EXTENSIONS:
-            raise SafeFetchError(
-                "unsupported_image_format",
-                "The response image format is not supported.",
-                False,
+            return inspect_image_bytes(
+                content,
+                final_url,
+                self.limits.max_pixels,
+                deadline,
+                self.clock,
             )
-        return FetchedImage(
-            content=content,
-            image_format=image_format,
-            width=width,
-            height=height,
-            final_url=final_url,
-        )
-
-    def _verify_pixel_count(self, image):
-        width, height = image.size
-        if width * height > self.limits.max_pixels:
-            raise _too_many_pixels()
+        except ImageInspectionError as error:
+            raise _fetch_inspection_error(error.code) from None
 
     def _check_deadline(self, deadline):
         if self.clock() >= deadline:
@@ -526,5 +487,25 @@ def _too_many_pixels():
     return SafeFetchError(
         "image_too_many_pixels",
         "The image exceeded the pixel limit.",
+        False,
+    )
+
+
+def _fetch_inspection_error(code):
+    if code == "image_processing_timeout":
+        return _fetch_timeout()
+    if code == "image_too_large":
+        return _image_too_large()
+    if code == "image_too_many_pixels":
+        return _too_many_pixels()
+    if code == "unsupported_image_format":
+        return SafeFetchError(
+            "unsupported_image_format",
+            "The response image format is not supported.",
+            False,
+        )
+    return SafeFetchError(
+        "invalid_image_content",
+        "The response was not a valid image.",
         False,
     )
