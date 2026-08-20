@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -26,6 +27,26 @@ def _write_fake_docker(path):
         "    printf '%s\\0' \"$argument\" >> \"$PINRY_DOCKER_CAPTURE\"\n"
         "done\n"
         "printf '%s' \"$PWD\" > \"$PINRY_DOCKER_CWD\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_tar_race_wrapper(path, real_tar):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "for argument in \"$@\"; do\n"
+        "    if [ \"$argument\" = \"-czf\" ]; then\n"
+        "        test -d \"$PINRY_PACKAGE_ROOT/context\"\n"
+        "        mkdir -p \"$PINRY_PACKAGE_ROOT/context/pinry-spa/src/race\"\n"
+        "        : > \"$PINRY_PACKAGE_ROOT/.DS_Store\"\n"
+        "        : > \"$PINRY_PACKAGE_ROOT/.DS_Store.backup\"\n"
+        "        : > \"$PINRY_PACKAGE_ROOT/context/pinry-spa/src/race/.DS_Store\"\n"
+        "        : > \"$PINRY_PACKAGE_ROOT/context/pinry-spa/src/race/.DS_Store.backup\"\n"
+        "        break\n"
+        "    fi\n"
+        "done\n"
+        "exec \"$PINRY_REAL_TAR\" \"$@\"\n"
     )
     path.chmod(0o700)
 
@@ -116,6 +137,83 @@ class SynologyPackageTests(unittest.TestCase):
         environment["PINRY_DOCKER_CAPTURE"] = str(capture)
         environment["PINRY_DOCKER_CWD"] = str(working_directory)
         return environment, capture, working_directory
+
+    def _clone_with_tracked_finder_metadata(self):
+        repository = self.temporary_root / "fixture-repository"
+        completed = subprocess.run(
+            ["git", "clone", "--quiet", "--no-local", str(REPOSITORY_ROOT),
+             str(repository)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        root_finder_file = repository / ".DS_Store"
+        root_finder_file.write_text("tracked root Finder metadata")
+        finder_file = repository / "pinry-spa/src/.DS_Store"
+        finder_file.write_text("tracked Finder metadata")
+        backup_file = repository / "pinry-spa/src/.DS_Store.backup"
+        backup_file.write_text("keep this backup")
+        sentinel = repository / "pinry-spa/src/package-sentinel.txt"
+        sentinel.write_text("keep this sentinel")
+        script = repository / "scripts/create_synology_output.sh"
+        shutil.copy2(PACKAGE_SCRIPT, script)
+        completed = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Package Test",
+                "-c",
+                "user.email=package-test@example.invalid",
+                "add",
+                "--force",
+                str(root_finder_file.relative_to(repository)),
+                str(finder_file.relative_to(repository)),
+                str(backup_file.relative_to(repository)),
+                str(sentinel.relative_to(repository)),
+                str(script.relative_to(repository)),
+            ],
+            cwd=str(repository),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        completed = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Package Test",
+                "-c",
+                "user.email=package-test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "test fixture",
+            ],
+            cwd=str(repository),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        return repository
+
+    def _run_packager_in(self, repository, output_root, environment):
+        return subprocess.run(
+            [
+                "bash",
+                str(repository / "scripts/create_synology_output.sh"),
+                str(output_root),
+            ],
+            cwd=str(repository),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
     def test_packager_creates_minimal_build_context_from_head(self):
         self._create_package()
@@ -273,6 +371,58 @@ class SynologyPackageTests(unittest.TestCase):
                 and Path(name).suffix.lower() not in (".md", ".rst")
                 for name in names
             )
+        )
+
+    def test_packager_excludes_finder_metadata_from_context_and_archive(self):
+        repository = self._clone_with_tracked_finder_metadata()
+        output_root = self.temporary_root / "fixture-output"
+        package_directory = output_root / self.package_name
+        binary_directory = self.temporary_root / "tar-wrapper"
+        binary_directory.mkdir()
+        real_tar = shutil.which("tar")
+        self.assertIsNotNone(real_tar)
+        _write_tar_race_wrapper(binary_directory / "tar", real_tar)
+        environment = os.environ.copy()
+        environment["PATH"] = "{}{}{}".format(
+            binary_directory,
+            os.pathsep,
+            environment.get("PATH", ""),
+        )
+        environment["PINRY_PACKAGE_ROOT"] = str(package_directory)
+        environment["PINRY_REAL_TAR"] = real_tar
+
+        completed = self._run_packager_in(
+            repository, output_root, environment
+        )
+
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        context = package_directory / "context"
+        self.assertFalse((context / "pinry-spa/src/.DS_Store").exists())
+        self.assertTrue((context / "pinry-spa/src/.DS_Store.backup").is_file())
+        self.assertTrue((context / "pinry-spa/src/package-sentinel.txt").is_file())
+        archive_path = output_root / "pinry-custom-{}.tar.gz".format(
+            subprocess.check_output(
+                ["git", "rev-parse", "--short=12", "HEAD"],
+                cwd=str(repository),
+            ).decode("utf-8").strip()
+        )
+        with tarfile.open(str(archive_path), "r:gz") as archive:
+            names = archive.getnames()
+        self.assertFalse(
+            any(Path(name).name == ".DS_Store" for name in names)
+        )
+        self.assertIn("pinry-custom/.DS_Store.backup", names)
+        self.assertIn(
+            "pinry-custom/context/pinry-spa/src/.DS_Store.backup", names
+        )
+        self.assertIn(
+            "pinry-custom/context/pinry-spa/src/race/.DS_Store.backup",
+            names,
+        )
+        self.assertIn(
+            "pinry-custom/context/pinry-spa/src/package-sentinel.txt", names
         )
 
     def test_final_image_copies_only_runtime_application_paths(self):
