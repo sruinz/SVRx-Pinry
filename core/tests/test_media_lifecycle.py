@@ -14,7 +14,9 @@ from rest_framework import status
 from rest_framework.test import APITransactionTestCase
 
 from core.models import Image, Pin
+from core.services.safe_url_fetch import SafeFetchError
 from core.tests.helpers import create_user
+from core.views import PinViewSet
 from django_images.test_helpers import TemporaryMediaMixin
 
 
@@ -33,6 +35,17 @@ def media_snapshot(media_root):
         for path in root.rglob("*")
         if path.is_file()
     }
+
+
+class UnsupportedUrlImportService(object):
+    def prepare_url(self, url, referer, deadline):
+        del url, referer, deadline
+        raise SafeFetchError(
+            "unsupported_image_format", "unsupported", False
+        )
+
+    def close(self):
+        pass
 
 
 class TemporaryMediaMixinTest(SimpleTestCase):
@@ -97,19 +110,21 @@ class UnsupportedImageFormatAPITest(
         self.assertFalse(Image.objects.exists())
         self.assertEqual(media_snapshot(self.temporary_media.name), {})
 
-    @mock.patch("requests.get")
-    def test_url_pin_returns_400_without_pin_image_or_file(self, requests_get):
-        requests_get.return_value = mock.Mock(content=self.ico_bytes)
-
-        response = self.client.post(
-            reverse("pin-list"),
-            {
-                "url": "https://example.com/icon.ico",
-                "referer": "https://example.com/",
-                "description": "unsupported icon",
-            },
-            format="json",
-        )
+    def test_url_pin_returns_400_without_pin_image_or_file(self):
+        with mock.patch.object(
+            PinViewSet,
+            "get_pin_import_service",
+            return_value=UnsupportedUrlImportService(),
+        ):
+            response = self.client.post(
+                reverse("pin-list"),
+                {
+                    "url": "https://example.com/icon.ico",
+                    "referer": "https://example.com/",
+                    "description": "unsupported icon",
+                },
+                format="json",
+            )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(

@@ -1,6 +1,7 @@
 from io import StringIO
 from pathlib import Path
 import threading
+import uuid
 from unittest import skipUnless
 
 import mock
@@ -11,11 +12,13 @@ from django.db import close_old_connections, connection, connections
 from django.db import OperationalError, transaction
 from django.db.models.query import QuerySet
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITransactionTestCase
 
 from core.admin import PinAdmin
-from core.models import Board, Image, Pin
+from core.models import BatchImportItem, Board, Image, Pin
+from core.services.idempotency import IdempotencyStore, StoredError
 from core.tests.helpers import TEST_IMAGE_PATH, create_image, create_pin, create_user
 from django_images.models import Image as BaseImage, Thumbnail
 from django_images.test_helpers import TemporaryMediaMixin
@@ -216,6 +219,70 @@ class PinTrashAPITest(TemporaryMediaMixin, APITransactionTestCase):
         )
         self.assertTrue(Pin.objects.filter(pk=self.pin.pk).exists())
 
+    def test_permanent_delete_preserves_succeeded_item_as_tombstone(self):
+        batch_id = uuid.uuid4()
+        client_item_id = uuid.uuid4()
+        fingerprint = "a" * 64
+        item = BatchImportItem.objects.create(
+            submitter=self.owner,
+            batch_id=batch_id,
+            client_item_id=client_item_id,
+            request_fingerprint=fingerprint,
+            state=BatchImportItem.SUCCEEDED,
+            pin=self.pin,
+            lease_generation=7,
+        )
+
+        response = self.client.delete(
+            self._detail_action_url(self.pin, "permanent")
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        item.refresh_from_db()
+        self.assertEqual(item.state, BatchImportItem.SUCCEEDED)
+        self.assertEqual(item.request_fingerprint, fingerprint)
+        self.assertEqual(item.lease_generation, 7)
+        self.assertIsNone(item.pin_id)
+
+        store = IdempotencyStore()
+        same = store.claim(
+            self.owner, batch_id, client_item_id, fingerprint, timezone.now()
+        )
+        mismatch = store.claim(
+            self.owner, batch_id, client_item_id, "b" * 64, timezone.now()
+        )
+        self.assertEqual(same.kind, "failed")
+        self.assertEqual(
+            same.error, StoredError("pin_permanently_deleted", False)
+        )
+        self.assertEqual(mismatch.kind, "conflict")
+        self.assertEqual(
+            mismatch.error, StoredError("idempotency_mismatch", False)
+        )
+
+    def test_soft_delete_keeps_succeeded_item_replayable(self):
+        batch_id = uuid.uuid4()
+        client_item_id = uuid.uuid4()
+        fingerprint = "c" * 64
+        BatchImportItem.objects.create(
+            submitter=self.owner,
+            batch_id=batch_id,
+            client_item_id=client_item_id,
+            request_fingerprint=fingerprint,
+            state=BatchImportItem.SUCCEEDED,
+            pin=self.pin,
+            lease_generation=1,
+        )
+
+        response = self.client.delete(reverse("pin-detail", args=[self.pin.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        result = IdempotencyStore().claim(
+            self.owner, batch_id, client_item_id, fingerprint, timezone.now()
+        )
+        self.assertEqual(result.kind, "replayed")
+        self.assertEqual(result.replay_pin_id, self.pin.pk)
+
 
 class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
     def setUp(self):
@@ -303,6 +370,15 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
         image = create_image()
         owner_pin = create_pin(self.owner, image, [])
         other_pin = create_pin(self.other_user, image, [])
+        item = BatchImportItem.objects.create(
+            submitter=self.owner,
+            batch_id=uuid.uuid4(),
+            client_item_id=uuid.uuid4(),
+            request_fingerprint="d" * 64,
+            state=BatchImportItem.SUCCEEDED,
+            pin=owner_pin,
+            lease_generation=1,
+        )
         files_before = self._assert_four_image_files(image)
         self.client.login(
             username=self.other_user.username, password="password"
@@ -315,6 +391,8 @@ class PinMediaLifecycleTest(TemporaryMediaMixin, APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Pin.objects.filter(pk=owner_pin.pk).exists())
+        item.refresh_from_db()
+        self.assertIsNone(item.pin_id)
         self.assertTrue(Pin.objects.filter(pk=other_pin.pk).exists())
         self.assertTrue(Image.objects.filter(pk=image.pk).exists())
         self.assertEqual(

@@ -3,6 +3,7 @@ import re
 import time
 
 from django.conf import settings
+from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.decorators import method_decorator
@@ -45,6 +46,7 @@ class ImageViewSet(mixins.CreateModelMixin, GenericViewSet):
 
 
 class PinViewSet(viewsets.ModelViewSet):
+    _NON_ATOMIC_IMPORT_ACTIONS = frozenset(("create", "batch"))
     serializer_class = api.PinSerializer
     filter_backends = (DjangoFilterBackend, SearchFilter, OrderingFilter)
     filter_fields = ("submitter__username", 'tags__name', "pins__id")
@@ -62,6 +64,42 @@ class PinViewSet(viewsets.ModelViewSet):
     idempotency_class = IdempotencyStore
     pin_import_service_class = PinImportService
     batch_clock = staticmethod(time.monotonic)
+
+    @classmethod
+    def as_view(cls, actions=None, **initkwargs):
+        view = super(PinViewSet, cls).as_view(
+            actions=actions,
+            **initkwargs
+        )
+        if (
+            actions
+            and cls._NON_ATOMIC_IMPORT_ACTIONS.intersection(actions.values())
+        ):
+            return transaction.non_atomic_requests(view)
+        return view
+
+    def create(self, request, *args, **kwargs):
+        if "url" not in request.data:
+            return super(PinViewSet, self).create(request, *args, **kwargs)
+        service = self.get_pin_import_service()
+        self._pin_import_service = service
+        self._pin_import_deadline = (
+            self.batch_clock() + settings.PINRY_FETCH_TOTAL_TIMEOUT
+        )
+        try:
+            return super(PinViewSet, self).create(request, *args, **kwargs)
+        finally:
+            self._pin_import_service = None
+            self._pin_import_deadline = None
+            self._close_pin_import_service(service)
+
+    def get_serializer_context(self):
+        context = super(PinViewSet, self).get_serializer_context()
+        service = getattr(self, "_pin_import_service", None)
+        if service is not None:
+            context["pin_import_service"] = service
+            context["pin_import_deadline"] = self._pin_import_deadline
+        return context
 
     def get_queryset(self):
         query = Pin.objects.filter(trashed_at__isnull=True)
@@ -152,32 +190,35 @@ class PinViewSet(viewsets.ModelViewSet):
             self._close_batch_service(service)
 
     def get_batch_service(self):
+        pin_import = self.get_pin_import_service()
+        try:
+            return self.batch_service_class(
+                pin_import.fetcher,
+                pin_import.media_storage,
+                pin_import.idempotency,
+                pin_import,
+                clock=self.batch_clock,
+            )
+        except BaseException:
+            self._close_pin_import_service(pin_import)
+            raise
+
+    def get_pin_import_service(self):
         clock = self.batch_clock
         transport = self.transport_class(clock=clock)
         try:
             resolver = self.resolver_class(clock=clock)
-            fetcher = self.fetcher_class(
-                resolver,
-                transport,
-                clock=clock,
-            )
+            fetcher = self.fetcher_class(resolver, transport, clock=clock)
             media_storage = self.media_storage_class(clock=clock)
             idempotency = self.idempotency_class()
-            pin_import = self.pin_import_service_class(
+            return self.pin_import_service_class(
                 fetcher,
                 media_storage,
                 idempotency,
-                clock=clock,
-            )
-            return self.batch_service_class(
-                fetcher,
-                media_storage,
-                idempotency,
-                pin_import,
                 clock=clock,
             )
         except BaseException:
-            self._close_resource(transport, "batch_factory")
+            self._close_resource(transport, "pin_import_factory")
             raise
 
     @staticmethod
@@ -221,6 +262,16 @@ class PinViewSet(viewsets.ModelViewSet):
     @classmethod
     def _close_batch_service(cls, service):
         cls._close_resource(service, "batch_service")
+
+    @classmethod
+    def _close_pin_import_service(cls, service):
+        if callable(getattr(service, "close", None)):
+            cls._close_resource(service, "pin_import_service")
+            return
+        cls._close_resource(
+            getattr(getattr(service, "fetcher", None), "transport", None),
+            "pin_import_transport",
+        )
 
     @staticmethod
     def _close_resource(resource, event):

@@ -1,13 +1,17 @@
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Q
 from rest_framework import serializers
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import APIException, ValidationError
 from taggit.models import Tag
 
 from core.models import Image, Board
 from core.models import Pin
 from django_images.models import Thumbnail
 from django_images.paths import UnsupportedImageFormat
+from core.services.media_storage import MediaStorageError
+from core.services.pin_import import ImportMetadata, PinImportError
+from core.services.safe_url_fetch import SafeFetchError
 from users.serializers import UserSerializer
 from users.models import User
 
@@ -86,11 +90,48 @@ class TagSerializer(serializers.SlugRelatedField):
         )
 
     def to_internal_value(self, data):
-        obj, _ = self.get_queryset().get_or_create(
-            defaults={self.slug_field: data, "slug": data},
-            **{self.slug_field: data}
-        )
-        return obj
+        if not isinstance(data, str):
+            raise ValidationError("Invalid tag name.")
+        return data
+
+
+class URLImportUnavailable(APIException):
+    status_code = 503
+
+
+class URLImportConflict(APIException):
+    status_code = 409
+
+
+class URLImportInternalError(APIException):
+    status_code = 500
+
+
+_URL_CLIENT_ERROR_CODES = frozenset((
+    "invalid_url_policy",
+    "blocked_address",
+    "dns_rebinding_detected",
+    "too_many_redirects",
+    "unsupported_content_encoding",
+    "image_too_large",
+    "image_too_many_pixels",
+))
+
+
+def _raise_url_import_error(error):
+    code = getattr(error, "code", "internal_error")
+    detail = {"url": [code]}
+    if code == "invalid_image_content":
+        raise ValidationError({"url": "invalid image content"})
+    if code == "unsupported_image_format":
+        raise ValidationError({"url": ["unsupported_image_format"]})
+    if code in _URL_CLIENT_ERROR_CODES:
+        raise ValidationError(detail)
+    if code in ("lease_lost", "board_access_changed"):
+        raise URLImportConflict(detail)
+    if getattr(error, "retryable", False):
+        raise URLImportUnavailable(detail)
+    raise URLImportInternalError(detail)
 
 
 class PinSerializer(serializers.HyperlinkedModelSerializer):
@@ -122,46 +163,79 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
         required=False,
     )
 
-    def create(self, validated_data):
-        if 'url' not in validated_data and\
-                'image_by_id' not in validated_data:
-            raise ValidationError(
-                detail={
-                    "url-or-image": "Either url or image_by_id is required."
-                },
-            )
+    def validate(self, attrs):
+        if self.instance is not None:
+            return attrs
+        has_url = bool(attrs.get("url"))
+        has_image = "image_by_id" in attrs
+        if (
+            "url" in self.initial_data and not has_url
+            or has_url == has_image
+        ):
+            raise ValidationError({
+                "url-or-image": "Either url or image_by_id is required."
+            })
+        return attrs
 
+    def create(self, validated_data):
         submitter = self.context['request'].user
-        if 'url' in validated_data and validated_data['url']:
-            url = validated_data['url']
+        tags = tuple(validated_data.pop('tag_list', ()))
+        if 'url' in validated_data:
+            url = validated_data.pop('url')
+            referer = validated_data.pop('referer', None)
+            service = self.context.get("pin_import_service")
+            deadline = self.context.get("pin_import_deadline")
+            if service is None or deadline is None:
+                raise URLImportInternalError({"url": ["internal_error"]})
+            metadata = ImportMetadata(
+                url=url,
+                referer=referer,
+                description=validated_data.get('description'),
+                private=validated_data.get('private', False),
+                tags=tags,
+                board_ids=(),
+            )
             try:
-                image = Image.objects.create_for_url(
+                prepared = service.prepare_url(
                     url,
-                    validated_data.get('referer', url),
+                    referer or url,
+                    deadline,
                 )
-            except UnsupportedImageFormat:
-                raise ValidationError(
-                    {"url": ["unsupported_image_format"]}
+                return service.commit(
+                    prepared,
+                    submitter,
+                    metadata,
+                    None,
+                    deadline,
                 )
-            if not image:
-                raise ValidationError({"url": "invalid image content"})
-        else:
-            image = validated_data.pop("image_by_id")
-        tags = validated_data.pop('tag_list', [])
-        pin = Pin.objects.create(submitter=submitter, image=image, **validated_data)
-        if tags:
-            pin.tags.set(*tags)
+            except (PinImportError, SafeFetchError, MediaStorageError) as error:
+                _raise_url_import_error(error)
+            except Exception:
+                raise URLImportInternalError(
+                    {"url": ["internal_error"]}
+                ) from None
+
+        image = validated_data.pop("image_by_id")
+        with transaction.atomic():
+            pin = Pin.objects.create(
+                submitter=submitter,
+                image=image,
+                **validated_data
+            )
+            if tags:
+                pin.tags.set(*tags)
         return pin
 
     def update(self, instance, validated_data):
         tags = validated_data.pop('tag_list', None)
-        if tags:
-            instance.tags.set(*tags)
-        else:
-            instance.tags.set()
-        # change for image-id or image is not allowed
-        validated_data.pop('image_by_id', None)
-        return super(PinSerializer, self).update(instance, validated_data)
+        with transaction.atomic():
+            if tags:
+                instance.tags.set(*tags)
+            else:
+                instance.tags.set()
+            # change for image-id or image is not allowed
+            validated_data.pop('image_by_id', None)
+            return super(PinSerializer, self).update(instance, validated_data)
 
 
 class PinIdListField(serializers.ListField):

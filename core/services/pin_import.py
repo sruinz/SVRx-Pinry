@@ -53,6 +53,19 @@ class PinImportService(object):
         self.idempotency = idempotency
         self.clock = clock
         self.fault_injector = fault_injector
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(getattr(self.fetcher, "transport", None), "close", None)
+        if close is None:
+            return
+        try:
+            close()
+        except BaseException as error:
+            self._log_committed_callback_error(error)
 
     def prepare_url(self, url, referer, deadline):
         fetched = self.fetcher.fetch(
