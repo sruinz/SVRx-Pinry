@@ -153,13 +153,7 @@ def canonical_original_path(asset_uuid, original_filename, extension):
     return "{}{}".format(prefix, leaf)
 
 
-def asset_upload_to(instance, filename: str) -> str:
-    extension = canonical_extension(instance.image)
-    if instance._meta.model_name == "image":
-        instance.original_filename = sanitize_original_filename(filename)
-        return "originals/{}/original{}".format(
-            instance.asset_uuid, extension
-        )
+def _derivative_upload_path(instance, extension):
     if instance.size not in DERIVATIVE_NAMES:
         raise ValueError(
             "Unsupported derivative size: {}".format(instance.size)
@@ -169,3 +163,25 @@ def asset_upload_to(instance, filename: str) -> str:
         instance.size,
         extension,
     )
+
+
+def legacy_asset_upload_to(instance, filename):
+    extension = canonical_extension(instance.image)
+    if instance._meta.model_name == "image":
+        instance.original_filename = sanitize_original_filename(filename)
+        return "originals/{}/original{}".format(
+            instance.asset_uuid, extension
+        )
+    return _derivative_upload_path(instance, extension)
+
+
+def asset_upload_to(instance, filename: str) -> str:
+    extension = canonical_extension(instance.image)
+    if instance._meta.model_name == "image":
+        instance.original_filename = sanitize_original_filename(filename)
+        return canonical_original_path(
+            instance.asset_uuid,
+            instance.original_filename,
+            extension,
+        )
+    return _derivative_upload_path(instance, extension)

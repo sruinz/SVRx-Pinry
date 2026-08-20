@@ -22,7 +22,11 @@ from django_images.file_ops import (
     resolve_media_path,
 )
 from django_images.models import Image, Thumbnail
-from django_images.services.media_migration import ManifestLog, MediaMigrator
+from django_images.services.media_migration import (
+    ManifestLog,
+    MediaMigrator,
+    MigrationPlan,
+)
 
 
 def make_image_bytes(color):
@@ -152,6 +156,18 @@ class MediaMigrationCommandTest(TransactionTestCase):
             return []
         return sorted(
             path for path in staging.rglob("*") if path.is_file()
+        )
+
+    def test_migration_plan_keeps_legacy_fixed_original_slot(self):
+        plan = MigrationPlan.for_image(self.image)
+
+        self.assertEqual(
+            plan.new_original,
+            "originals/{}/original.png".format(self.image.asset_uuid),
+        )
+        self.assertEqual(
+            {entry.new_path for entry in plan.files},
+            set(self._canonical_paths().values()),
         )
 
     def _assert_crash_window_resumes(self, crash_point):

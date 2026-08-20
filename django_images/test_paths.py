@@ -185,7 +185,7 @@ class AssetStoragePathTest(TemporaryMediaMixin, TransactionTestCase):
         )
         image.refresh_from_db()
 
-        original_path = "originals/{}/original.png".format(
+        original_path = "originals/{}/photo.png".format(
             image.asset_uuid
         )
         derivative_paths = {
@@ -227,6 +227,24 @@ class AssetStoragePathTest(TemporaryMediaMixin, TransactionTestCase):
                     derivative.load()
                     self.assertEqual(derivative.format, "PNG")
                     self.assertEqual(derivative.size, expected_sizes[size])
+
+    def test_same_original_name_uses_distinct_uuid_directories(self):
+        first = Image.objects.create(
+            image=SimpleUploadedFile("photo.jpg", self.png_bytes)
+        )
+        second = Image.objects.create(
+            image=SimpleUploadedFile("photo.jpg", self.png_bytes)
+        )
+
+        self.assertNotEqual(first.asset_uuid, second.asset_uuid)
+        self.assertEqual(
+            first.image.name,
+            "originals/{}/photo.png".format(first.asset_uuid),
+        )
+        self.assertEqual(
+            second.image.name,
+            "originals/{}/photo.png".format(second.asset_uuid),
+        )
 
     def test_original_filename_is_sanitized_before_it_is_stored(self):
         filename = "../../{}\x00.png".format(

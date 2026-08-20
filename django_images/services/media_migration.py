@@ -24,7 +24,7 @@ from django_images.models import Image, Thumbnail
 from django_images.paths import (
     DERIVATIVE_NAMES,
     UnsupportedImageFormat,
-    asset_upload_to,
+    legacy_asset_upload_to,
 )
 
 
@@ -102,7 +102,7 @@ class MigrationPlan(object):
         for kind, record, thumbnail in records:
             old_path = record.image.name
             try:
-                new_path = asset_upload_to(
+                new_path = legacy_asset_upload_to(
                     record, os.path.basename(old_path)
                 )
                 resolve_media_path(new_path, settings.MEDIA_ROOT)
