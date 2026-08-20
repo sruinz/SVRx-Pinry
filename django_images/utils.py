@@ -27,10 +27,18 @@ def scale_and_crop_iter(image, options):
     """
     with open_django_file(image) as img:
         im = Image.open(img)
-        im.load()
-        for opts in options:
-            # Use already-loaded file when cropping.
-            yield scale_and_crop_single(im, **opts)
+        try:
+            im.load()
+            for opts in options:
+                # Use already-loaded file when cropping.
+                derivative = scale_and_crop_single(im, **opts)
+                if derivative is im:
+                    derivative = im.copy()
+                    derivative.format = im.format
+                    derivative.info = dict(im.info)
+                yield derivative
+        finally:
+            im.close()
 
 
 # this neat function is based on easy-thumbnails
@@ -94,18 +102,18 @@ def scale_and_crop_single(image, size, crop=False, upscale=False, quality=None):
     # Close image and replace format/metadata, as PIL blows this away.
     # We mutate the quality, but needs to passed into save() to actually
     # do anything.
-    info = image.info
+    info = dict(image.info)
     if quality is not None:
         info['quality'] = quality
     im.format, im.info = image.format, info
     return im
 
 
-def write_image_in_memory(img):
-    # save to memory
-    buf = BytesIO()
+def write_image_to_file(img, file_obj):
+    file_obj.seek(0)
+    file_obj.truncate()
     try:
-        img.save(buf, img.format, **img.info)
+        img.save(file_obj, img.format, **img.info)
     except IOError:
         if img.info.get('progression'):
             orig_MAXBLOCK = PIL.ImageFile.MAXBLOCK
@@ -114,9 +122,17 @@ def write_image_in_memory(img):
                 raise
             PIL.ImageFile.MAXBLOCK = temp_MAXBLOCK
             try:
-                img.save(buf, img.format, **img.info)
+                file_obj.seek(0)
+                file_obj.truncate()
+                img.save(file_obj, img.format, **img.info)
             finally:
                 PIL.ImageFile.MAXBLOCK = orig_MAXBLOCK
         else:
             raise
+
+
+def write_image_in_memory(img):
+    # save to memory
+    buf = BytesIO()
+    write_image_to_file(img, buf)
     return buf

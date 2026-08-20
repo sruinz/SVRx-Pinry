@@ -4,8 +4,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
-from unittest import mock
+from unittest import mock, skipUnless
 
 from django.core.files.storage import default_storage
 from django.core.management import CommandError, call_command
@@ -604,6 +605,7 @@ class MediaMigrationCommandTest(TransactionTestCase):
                 content,
             )
 
+    @skipUnless(sys.platform == "darwin", "requires macOS fclonefileat")
     def test_publish_alias_swap_cannot_publish_foreign_inode_or_switch_database(
         self,
     ):
@@ -1190,6 +1192,117 @@ class MediaFileOperationTest(TestCase):
         ):
             migration_lock_path(self.root.name)
 
+    def test_linux_publish_falls_back_to_proc_descriptor_link(self):
+        with mock.patch(
+            "django_images.file_ops.sys.platform",
+            "linux",
+        ), mock.patch(
+            "django_images.file_ops._link_descriptor_empty_path",
+            return_value=False,
+        ) as empty_path, mock.patch(
+            "django_images.file_ops._link_descriptor_proc",
+            return_value=True,
+        ) as proc_path:
+            file_ops._publish_linux_descriptor(10, 11, "image.png")
+
+        empty_path.assert_called_once_with(10, 11, "image.png")
+        proc_path.assert_called_once_with(10, 11, "image.png")
+
+    def test_linux_publish_stops_after_empty_path_link(self):
+        with mock.patch(
+            "django_images.file_ops.sys.platform",
+            "linux",
+        ), mock.patch(
+            "django_images.file_ops._link_descriptor_empty_path",
+            return_value=True,
+        ) as empty_path, mock.patch(
+            "django_images.file_ops._link_descriptor_proc",
+            return_value=True,
+        ) as proc_path:
+            file_ops._publish_linux_descriptor(10, 11, "image.png")
+
+        empty_path.assert_called_once_with(10, 11, "image.png")
+        proc_path.assert_not_called()
+
+    def test_linux_publish_fails_closed_without_descriptor_link(self):
+        with mock.patch(
+            "django_images.file_ops.sys.platform",
+            "linux",
+        ), mock.patch(
+            "django_images.file_ops._link_descriptor_empty_path",
+            return_value=False,
+        ), mock.patch(
+            "django_images.file_ops._link_descriptor_proc",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(
+                MediaPathError,
+                "atomic_publish_unsupported",
+            ):
+                file_ops._publish_linux_descriptor(10, 11, "image.png")
+
+    def test_path_publish_attempts_every_owned_close_after_one_error(self):
+        staging = Path(self.root.name, ".staging")
+        destination_parent = Path(self.root.name, "originals", "asset")
+        staging.mkdir()
+        destination_parent.mkdir(parents=True)
+        part = staging / "candidate.part"
+        part.write_bytes(make_image_bytes("red"))
+        destination = destination_parent / "original.png"
+        real_close = file_ops.os.close
+        attempted = []
+        failed_descriptor = []
+
+        def fail_first_close(descriptor):
+            attempted.append(descriptor)
+            if not failed_descriptor:
+                failed_descriptor.append(descriptor)
+                raise OSError("injected close failure")
+            return real_close(descriptor)
+
+        try:
+            with mock.patch(
+                "django_images.file_ops._publish_verified_descriptor",
+                return_value=file_ops.PublishResult(created=True),
+            ), mock.patch(
+                "django_images.file_ops.os.close",
+                side_effect=fail_first_close,
+            ):
+                with self.assertRaisesRegex(OSError, "close failure"):
+                    publish_noreplace(
+                        str(part),
+                        str(destination),
+                        hashlib.sha256(part.read_bytes()).hexdigest(),
+                    )
+
+            self.assertEqual(len(attempted), 3)
+        finally:
+            if failed_descriptor:
+                real_close(failed_descriptor[0])
+
+    def test_unique_staging_preserves_error_and_attempts_directory_close(self):
+        directory = mock.Mock()
+        directory.descriptor = 10
+
+        with mock.patch(
+            "django_images.file_ops.open_or_create_media_directory",
+            return_value=directory,
+        ), mock.patch(
+            "django_images.file_ops.os.open",
+            return_value=11,
+        ), mock.patch(
+            "django_images.file_ops.os.fstat",
+            side_effect=OSError("injected fstat failure"),
+        ), mock.patch(
+            "django_images.file_ops.os.close",
+            side_effect=OSError("injected close failure"),
+        ):
+            with self.assertRaisesRegex(OSError, "fstat failure"):
+                file_ops.create_unique_staging_file(self.root.name)
+
+        directory.close.assert_called_once_with()
+
+    @skipUnless(sys.platform == "darwin", "requires macOS fclonefileat")
     def test_publish_darwin_fd_clone_reuses_only_identical_destination(self):
         staging = Path(self.root.name, ".staging")
         destination_parent = Path(self.root.name, "originals", "asset")
@@ -1250,12 +1363,11 @@ class MediaFileOperationTest(TestCase):
         expected = make_image_bytes("red")
         part.write_bytes(expected)
 
-        with mock.patch("django_images.file_ops.sys.platform", "darwin"):
-            result = publish_noreplace(
-                str(part),
-                str(destination),
-                hashlib.sha256(expected).hexdigest(),
-            )
+        result = publish_noreplace(
+            str(part),
+            str(destination),
+            hashlib.sha256(expected).hexdigest(),
+        )
 
         self.assertTrue(result.created)
         self.assertEqual(destination.read_bytes(), expected)
@@ -1304,13 +1416,12 @@ class MediaFileOperationTest(TestCase):
         Path(destination).write_bytes(destination_bytes)
         Path(part).write_bytes(part_bytes)
 
-        with mock.patch("django_images.file_ops.sys.platform", "darwin"):
-            with self.assertRaisesRegex(MediaPathError, "media_path_conflict"):
-                publish_noreplace(
-                    part,
-                    destination,
-                    hashlib.sha256(part_bytes).hexdigest(),
-                )
+        with self.assertRaisesRegex(MediaPathError, "media_path_conflict"):
+            publish_noreplace(
+                part,
+                destination,
+                hashlib.sha256(part_bytes).hexdigest(),
+            )
 
         self.assertEqual(Path(destination).read_bytes(), destination_bytes)
         self.assertEqual(Path(part).read_bytes(), part_bytes)

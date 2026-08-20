@@ -8,7 +8,11 @@ from django.conf import settings
 from django_images.models import Image, Thumbnail
 from django_images.templatetags.images import at_size
 from django_images.test_helpers import TemporaryMediaMixin
-from django_images.utils import scale_and_crop_single
+from django_images.utils import (
+    scale_and_crop_iter,
+    scale_and_crop_single,
+    write_image_to_file,
+)
 from PIL import Image as PILImage
 
 
@@ -183,3 +187,48 @@ class UtilsScaleAndDropTest(TestCase):
     def test_change_quality(self):
         image = scale_and_crop_single(self.image, (10, 10), quality=50)
         self.assertEqual(image.info.get('quality'), 50)
+
+    def test_iter_returns_independent_images_when_source_is_not_resized(self):
+        image_obj = BytesIO()
+        PILImage.new("RGB", (10, 10), "red").save(image_obj, "PNG")
+        source = ImageFile(BytesIO(image_obj.getvalue()), "small.png")
+
+        derivatives = list(scale_and_crop_iter(
+            source,
+            [
+                {"size": (100, 0), "upscale": False},
+                {"size": (200, 0), "upscale": False},
+            ],
+        ))
+
+        self.assertIsNot(derivatives[0], derivatives[1])
+        derivatives[0].close()
+        output = BytesIO()
+        derivatives[1].save(output, derivatives[1].format)
+        self.assertTrue(output.getvalue())
+        derivatives[1].close()
+
+    def test_progressive_retry_truncates_partial_output(self):
+        class RetryImage(object):
+            format = "JPEG"
+            info = {"progression": True}
+
+            def __init__(self):
+                self.calls = 0
+
+            def save(self, file_obj, image_format, **kwargs):
+                del image_format, kwargs
+                self.calls += 1
+                if self.calls == 1:
+                    file_obj.write(b"partial")
+                    raise IOError("retry")
+                file_obj.write(b"complete")
+
+        output = BytesIO(b"preexisting")
+        image = RetryImage()
+
+        with mock.patch("PIL.ImageFile.MAXBLOCK", 65536):
+            write_image_to_file(image, output)
+
+        self.assertEqual(image.calls, 2)
+        self.assertEqual(output.getvalue(), b"complete")

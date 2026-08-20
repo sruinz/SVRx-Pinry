@@ -11,6 +11,7 @@ from django.db import transaction
 from PIL import Image as PILImage
 
 from django_images.file_ops import (
+    _close_all,
     create_unique_staging_file,
     MediaPathError,
     open_or_create_media_directory,
@@ -635,9 +636,11 @@ class MediaMigrator(object):
                     staging.cleanup()
                 raise
             finally:
+                close_functions = []
                 if staging is not None:
-                    staging.close()
-                destination_directory.close()
+                    close_functions.append(staging.close)
+                close_functions.append(destination_directory.close)
+                _close_all(*close_functions)
             self._verify_file(file_plan, file_plan.new_path)
 
     def _verify_part_descriptor(self, file_plan, part_descriptor):
