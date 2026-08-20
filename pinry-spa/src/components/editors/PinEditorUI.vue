@@ -73,6 +73,11 @@ export default {
       );
     },
   },
+  data() {
+    return {
+      deleteInFlight: false,
+    };
+  },
   methods: {
     addToBoard() {
       modals.openAdd2Board(this, this.pin, this.currentUsername);
@@ -108,16 +113,20 @@ export default {
     },
     deletePin() {
       this.$buefy.dialog.confirm({
-        message: this.$t('pinMoveToTrashConfirm'),
+        message: this.$t('pinDeleteConfirm'),
         onConfirm: () => {
+          if (this.deleteInFlight) return;
+          this.deleteInFlight = true;
           API.Pin.deleteById(this.pin.id).then(
             () => {
-              this.$buefy.toast.open(this.$t('pinMovedToTrash'));
+              this.deleteInFlight = false;
+              this.$buefy.toast.open(this.$t('pinDeleted'));
               this.$emit('pin-delete-succeed', this.pin.id);
             },
             () => {
+              this.deleteInFlight = false;
               this.$buefy.toast.open(
-                { type: 'is-danger', message: this.$t('pinMoveToTrashError') },
+                { type: 'is-danger', message: this.$t('pinDeleteError') },
               );
             },
           );

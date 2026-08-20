@@ -80,19 +80,7 @@
     "tagsLabel": "Tags",
     "descriptionLabel": "Description",
     "selectBoardLabel": "Selectionner un tableau",
-    "trashLink": "Corbeille",
-    "trashTitle": "Corbeille",
-    "trashLoading": "Chargement de la corbeille…",
-    "trashEmpty": "La corbeille est vide.",
-    "trashLoadError": "Impossible de charger la corbeille.",
-    "trashRestoreButton": "Restaurer",
-    "trashPermanentDeleteButton": "Supprimer définitivement",
-    "trashRestoreSuccess": "Fiche restaurée",
-    "trashRestoreError": "Impossible de restaurer la fiche",
-    "trashPermanentDeleteConfirm": "Supprimer définitivement cette fiche ? L'original peut disparaître de Pinry et de la bibliothèque externe Immich après sa prochaine analyse.",
-    "trashPermanentDeleteSuccess": "Fiche supprimée définitivement",
-    "trashPermanentDeleteError": "Impossible de supprimer définitivement la fiche",
-    "pinMoveToTrashConfirm": "Placer cette fiche dans la corbeille ?",
-    "pinMovedToTrash": "Fiche placée dans la corbeille",
-    "pinMoveToTrashError": "Impossible de placer la fiche dans la corbeille"
+    "pinDeleteConfirm": "Supprimer cette fiche ?",
+    "pinDeleted": "Fiche supprimée",
+    "pinDeleteError": "Impossible de supprimer la fiche"
 }

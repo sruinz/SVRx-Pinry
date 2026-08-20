@@ -80,19 +80,7 @@
     "tagsLabel": "Tags",
     "descriptionLabel": "Descripton",
     "selectBoardLabel": "Select Board",
-    "trashLink": "Trash",
-    "trashTitle": "Trash",
-    "trashLoading": "Loading trash…",
-    "trashEmpty": "Trash is empty.",
-    "trashLoadError": "Failed to load trash.",
-    "trashRestoreButton": "Restore",
-    "trashPermanentDeleteButton": "Delete permanently",
-    "trashRestoreSuccess": "Pin restored",
-    "trashRestoreError": "Failed to restore Pin",
-    "trashPermanentDeleteConfirm": "Permanently delete this Pin? The original may disappear from Pinry and the Immich external library after its next scan.",
-    "trashPermanentDeleteSuccess": "Pin permanently deleted",
-    "trashPermanentDeleteError": "Failed to permanently delete Pin",
-    "pinMoveToTrashConfirm": "Move this Pin to trash?",
-    "pinMovedToTrash": "Pin moved to trash",
-    "pinMoveToTrashError": "Failed to move Pin to trash"
+    "pinDeleteConfirm": "Delete this Pin?",
+    "pinDeleted": "Pin deleted",
+    "pinDeleteError": "Failed to delete Pin"
 }
