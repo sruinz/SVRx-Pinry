@@ -10,10 +10,19 @@ from taggit.models import Tag
 
 from .helpers import create_image, create_user, create_pin
 from core.models import Pin, Image, Board
-from core.serializers import PinSerializer
+from core.serializers import (
+    PinSerializer,
+    URLImportConflict,
+    URLImportInternalError,
+    URLImportUnavailable,
+)
 from core.services.media_storage import MediaStorageError
 from core.services.pin_import import PinImportError, PinImportService
-from core.services.safe_url_fetch import FetchedImage, SafeFetchError
+from core.services.safe_url_fetch import (
+    FetchedImage,
+    SafeFetchError,
+    SafeUrlFetcher,
+)
 from core.views import PinViewSet
 from django_images.test_helpers import TemporaryMediaMixin
 
@@ -594,6 +603,70 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
 
                 factory.assert_not_called()
 
+    def test_url_post_validation_stage_only_preserves_validation_errors(self):
+        secret = "/private/validation?token=do-not-leak"
+        cases = (
+            APIException({"url": [secret]}),
+            RuntimeError(secret),
+        )
+        for error in cases:
+            with self.subTest(error_type=type(error).__name__):
+                service = _SinglePinImport()
+                with mock.patch.object(
+                    PinViewSet,
+                    "get_pin_import_service",
+                    return_value=service,
+                ), mock.patch.object(
+                    PinSerializer,
+                    "is_valid",
+                    side_effect=error,
+                ):
+                    response = self.client.post(
+                        reverse("pin-list"),
+                        {"url": "https://example.com/image.png"},
+                        format="json",
+                    )
+
+                self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+                self.assertEqual(response.json(), {
+                    "url": ["internal_error"]
+                })
+                self.assertNotIn(secret, response.content.decode("utf-8"))
+                self.assertEqual(service.closed, 1)
+
+    def test_url_post_perform_stage_exception_is_internal(self):
+        secret = "/private/perform?token=do-not-leak"
+        cases = (
+            ValidationError({"url": [secret]}),
+            URLImportUnavailable({"url": [secret]}),
+            URLImportConflict({"url": [secret]}),
+            URLImportInternalError({"url": [secret]}),
+        )
+        for error in cases:
+            with self.subTest(error_type=type(error).__name__):
+                service = _SinglePinImport()
+                with mock.patch.object(
+                    PinViewSet,
+                    "get_pin_import_service",
+                    return_value=service,
+                ), mock.patch.object(
+                    PinViewSet,
+                    "perform_create",
+                    side_effect=error,
+                ):
+                    response = self.client.post(
+                        reverse("pin-list"),
+                        {"url": "https://example.com/image.png"},
+                        format="json",
+                    )
+
+                self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+                self.assertEqual(response.json(), {
+                    "url": ["internal_error"]
+                })
+                self.assertNotIn(secret, response.content.decode("utf-8"))
+                self.assertEqual(service.closed, 1)
+
     def test_url_post_closes_after_response_failure_and_close_error(self):
         service = _SinglePinImport()
         with mock.patch.object(
@@ -685,6 +758,62 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
                     "url": ["internal_error"]
                 })
                 self.assertNotIn(secret_code, response.content.decode("utf-8"))
+                self.assertEqual(service.closed, 1)
+
+    def test_image_download_failed_keeps_safe_fetch_retryability(self):
+        cases = (
+            (404, status.HTTP_500_INTERNAL_SERVER_ERROR),
+            (503, status.HTTP_503_SERVICE_UNAVAILABLE),
+        )
+        for source_status, expected_status in cases:
+            with self.subTest(source_status=source_status):
+                with self.assertRaises(SafeFetchError) as caught:
+                    SafeUrlFetcher._verify_status(source_status)
+                error = caught.exception
+                service = _SinglePinImport(error)
+                with mock.patch.object(
+                    PinViewSet,
+                    "get_pin_import_service",
+                    return_value=service,
+                ):
+                    response = self.client.post(
+                        reverse("pin-list"),
+                        {"url": "https://example.com/image.png"},
+                        format="json",
+                    )
+
+                self.assertEqual(error.code, "image_download_failed")
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(response.json(), {
+                    "url": ["image_download_failed"]
+                })
+                self.assertEqual(service.closed, 1)
+
+    def test_image_download_failed_requires_boolean_retryability(self):
+        errors = (
+            SafeFetchError("image_download_failed", "raw", None),
+            SafeFetchError("image_download_failed", "raw", "yes"),
+        )
+        missing = SafeFetchError("image_download_failed", "raw", False)
+        del missing.retryable
+        for error in errors + (missing,):
+            with self.subTest(retryable=getattr(error, "retryable", None)):
+                service = _SinglePinImport(error)
+                with mock.patch.object(
+                    PinViewSet,
+                    "get_pin_import_service",
+                    return_value=service,
+                ):
+                    response = self.client.post(
+                        reverse("pin-list"),
+                        {"url": "https://example.com/image.png"},
+                        format="json",
+                    )
+
+                self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+                self.assertEqual(response.json(), {
+                    "url": ["internal_error"]
+                })
                 self.assertEqual(service.closed, 1)
 
     def test_url_post_closes_then_reraises_base_exception(self):

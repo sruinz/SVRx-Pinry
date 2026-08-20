@@ -103,16 +103,18 @@ class PinViewSet(viewsets.ModelViewSet):
                 raise api.URLImportInternalError(
                     {"url": ["internal_error"]}
                 ) from None
-            serializer.is_valid(raise_exception=True)
+            try:
+                serializer.is_valid(raise_exception=True)
+            except ValidationError:
+                raise
+            except Exception:
+                raise api.URLImportInternalError(
+                    {"url": ["internal_error"]}
+                ) from None
             try:
                 self.perform_create(serializer)
-            except (
-                ValidationError,
-                api.URLImportUnavailable,
-                api.URLImportConflict,
-                api.URLImportInternalError,
-            ):
-                raise
+            except (PinImportError, SafeFetchError, MediaStorageError) as error:
+                api.raise_url_import_error(error)
             except Exception:
                 raise api.URLImportInternalError(
                     {"url": ["internal_error"]}

@@ -118,7 +118,6 @@ _URL_CLIENT_ERROR_CODES = frozenset((
 ))
 _URL_RETRYABLE_ERROR_CODES = frozenset((
     "image_fetch_timeout",
-    "image_download_failed",
     "image_processing_timeout",
     "media_storage_failed",
 ))
@@ -146,6 +145,13 @@ def raise_url_import_error(error):
         raise ValidationError(detail)
     if code in ("lease_lost", "board_access_changed"):
         raise URLImportConflict(detail)
+    if code == "image_download_failed":
+        retryable = getattr(error, "retryable", None)
+        if type(retryable) is not bool:
+            raise URLImportInternalError({"url": ["internal_error"]})
+        if retryable:
+            raise URLImportUnavailable(detail)
+        raise URLImportInternalError(detail)
     if code in _URL_RETRYABLE_ERROR_CODES:
         raise URLImportUnavailable(detail)
     if code in _URL_INTERNAL_ERROR_CODES:
@@ -228,8 +234,8 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
                     None,
                     deadline,
                 )
-            except (PinImportError, SafeFetchError, MediaStorageError) as error:
-                raise_url_import_error(error)
+            except (PinImportError, SafeFetchError, MediaStorageError):
+                raise
             except Exception:
                 raise URLImportInternalError(
                     {"url": ["internal_error"]}
