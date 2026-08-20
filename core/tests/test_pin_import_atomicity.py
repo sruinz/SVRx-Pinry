@@ -6,6 +6,7 @@ import queue
 import tempfile
 import threading
 from types import SimpleNamespace
+import unicodedata
 import uuid
 
 from django.db import (
@@ -36,6 +37,7 @@ from core.services.safe_url_fetch import FetchedImage
 from core.models import BatchImportItem, Board, Pin
 from django_images import file_ops
 from django_images.models import Image, Thumbnail
+from django_images.paths import canonical_original_path
 from django_images.test_helpers import TemporaryMediaMixin
 from taggit.models import Tag
 from users.models import User
@@ -131,8 +133,10 @@ class _PublishedAsset(object):
         self.files = (
             SimpleNamespace(
                 kind="original",
-                final_relative_path="originals/{}/original.png".format(
-                    prepared.asset_uuid
+                final_relative_path=canonical_original_path(
+                    prepared.asset_uuid,
+                    prepared.original_filename,
+                    ".png",
                 ),
                 width=640,
                 height=480,
@@ -390,12 +394,17 @@ def _png_fetched_image(final_url):
 
 def _file_snapshot(media_root):
     root = Path(media_root)
-    return {
-        path.relative_to(root).as_posix(): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
-        and ".pinry-locks" not in path.relative_to(root).parts
-    }
+    snapshot = {}
+    for path in root.rglob("*"):
+        if (
+            path.is_file()
+            and ".pinry-locks" not in path.relative_to(root).parts
+        ):
+            relative_path = unicodedata.normalize(
+                "NFC", path.relative_to(root).as_posix()
+            )
+            snapshot[relative_path] = path.read_bytes()
+    return snapshot
 
 
 class PinImportOutermostTransactionTests(TransactionTestCase):
@@ -1066,7 +1075,7 @@ class PinImportCommitTests(TransactionTestCase):
         self.assertEqual(image.original_filename, "source-name.png")
         self.assertEqual(
             image.image.name,
-            "originals/{}/original.png".format(self.asset_uuid),
+            "originals/{}/source-name.png".format(self.asset_uuid),
         )
         self.assertEqual((image.width, image.height), (640, 480))
         thumbnails = list(
@@ -1669,6 +1678,26 @@ class PinImportCommitTests(TransactionTestCase):
         self.assertEqual(Image.objects.count(), 0)
         self.assertEqual(self.published.compensate_calls, 1)
 
+    def test_commit_rejects_original_leaf_not_derived_from_metadata(self):
+        original = self.published.files[0]
+        object.__setattr__(
+            original,
+            "final_relative_path",
+            "originals/{}/forged.png".format(self.asset_uuid),
+        )
+
+        with self.assertRaises(PinImportError) as caught:
+            self.service.commit(
+                self.prepared,
+                self.user,
+                self.metadata,
+                claim=None,
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "internal_error")
+        self.assertEqual(Image.objects.count(), 0)
+
     def test_publish_error_cleans_staging_and_creates_no_rows(self):
         storage_error = MediaStorageError(
             "media_storage_failed",
@@ -1863,11 +1892,15 @@ class PinImportRealVerticalTests(
             {"thumbnail", "standard", "square"},
         )
         expected_paths = {
-            "originals/{}/original.png".format(asset_uuid),
+            "originals/{}/원본.png".format(asset_uuid),
             "derivatives/{}/thumbnail.png".format(asset_uuid),
             "derivatives/{}/standard.png".format(asset_uuid),
             "derivatives/{}/square.png".format(asset_uuid),
         }
+        self.assertEqual(
+            image.image.name,
+            "originals/{}/원본.png".format(asset_uuid),
+        )
         self.assertEqual(set(snapshot), expected_paths)
         self.assertEqual(snapshot[image.image.name], self.fetched.content)
         self.assertTrue(self.board.pins.filter(pk=pin.pk).exists())

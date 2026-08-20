@@ -136,7 +136,7 @@ class MediaStorageTests(
 
         published = self.make_storage().publish(prepared)
         expected_paths = {
-            "originals/{}/original.png".format(ASSET_UUID),
+            "originals/{}/page-image.png".format(ASSET_UUID),
             "derivatives/{}/thumbnail.png".format(ASSET_UUID),
             "derivatives/{}/standard.png".format(ASSET_UUID),
             "derivatives/{}/square.png".format(ASSET_UUID),
@@ -144,7 +144,7 @@ class MediaStorageTests(
         snapshot = file_snapshot(self.temporary_media.name)
         self.assertEqual(set(snapshot), expected_paths)
         self.assertEqual(
-            snapshot["originals/{}/original.png".format(ASSET_UUID)],
+            snapshot["originals/{}/page-image.png".format(ASSET_UUID)],
             fetched.content,
         )
         self.assertTrue(published.verify_current())
@@ -275,7 +275,13 @@ class MediaStorageTests(
                     entry for entry in published.files
                     if entry.kind == "original"
                 )
-                self.assertTrue(original.final_relative_path.endswith(extension))
+                self.assertEqual(
+                    original.final_relative_path,
+                    "originals/{}/misleading{}".format(
+                        asset_uuid,
+                        extension,
+                    ),
+                )
                 self.assertEqual(
                     Path(
                         self.temporary_media.name,
@@ -442,7 +448,7 @@ class MediaStorageTests(
             self.temporary_media.name,
             "originals",
             str(ASSET_UUID),
-            "original.png",
+            "photo.png",
         )
 
         def replace_after_last_publish(event):
@@ -467,7 +473,7 @@ class MediaStorageTests(
         self.assertEqual(caught.exception.code, "media_publish_changed")
         self.assertEqual(original_path.read_bytes(), b"foreign")
         self.assertEqual(file_snapshot(self.temporary_media.name), {
-            "originals/{}/original.png".format(ASSET_UUID): b"foreign",
+            "originals/{}/photo.png".format(ASSET_UUID): b"foreign",
         })
 
     def test_publish_rejects_replaced_destination_top_component(self):
@@ -499,7 +505,7 @@ class MediaStorageTests(
         self.assertTrue(Path(
             retained,
             str(ASSET_UUID),
-            "original.png",
+            "photo.png",
         ).is_file())
 
     def test_reused_receipt_replacement_is_never_compensated(self):
@@ -508,7 +514,7 @@ class MediaStorageTests(
             self.temporary_media.name,
             "originals",
             str(ASSET_UUID),
-            "original.png",
+            "photo.png",
         )
         original_path.parent.mkdir(parents=True)
         original_path.write_bytes(fetched.content)
@@ -534,7 +540,7 @@ class MediaStorageTests(
 
         self.assertEqual(caught.exception.code, "media_publish_changed")
         self.assertEqual(file_snapshot(self.temporary_media.name), {
-            "originals/{}/original.png".format(ASSET_UUID): b"foreign",
+            "originals/{}/photo.png".format(ASSET_UUID): b"foreign",
         })
 
     def test_release_closes_all_owned_descriptors_without_deleting_final(self):
@@ -663,7 +669,7 @@ class MediaStorageTests(
             self.temporary_media.name,
             "originals",
             str(ASSET_UUID),
-            "original.png",
+            "photo.png",
         ).exists())
 
     def test_replaced_staging_run_component_is_rejected(self):
@@ -700,7 +706,7 @@ class MediaStorageTests(
             self.temporary_media.name,
             "originals",
             str(ASSET_UUID),
-            "original.png",
+            "photo.png",
         ).exists())
 
     def test_internal_destination_fsync_failure_is_compensated(self):
@@ -1504,6 +1510,25 @@ class MediaStorageTests(
         self.assertEqual(caught.exception.code, "media_path_conflict")
         self.assertEqual(file_snapshot(self.temporary_media.name), {})
 
+    def test_prepared_original_leaf_tamper_is_rejected_before_publish(self):
+        prepared = self.make_storage().prepare(
+            make_fetched_image(),
+            asset_uuid=ASSET_UUID,
+            original_filename="page-image.jpg",
+        )
+        original = prepared.files[0]
+        object.__setattr__(
+            original,
+            "final_relative_path",
+            "originals/{}/forged.png".format(ASSET_UUID),
+        )
+
+        with self.assertRaises(MediaStorageError) as caught:
+            self.make_storage().publish(prepared)
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertEqual(file_snapshot(self.temporary_media.name), {})
+
     def test_cleanup_failure_does_not_stop_remaining_file_cleanup(self):
         prepared = self.make_storage().prepare(
             make_fetched_image(),
@@ -1582,7 +1607,7 @@ class MediaStorageTests(
             "square.png",
             "standard.png",
             "thumbnail.png",
-            "original.png",
+            "photo.png",
         ])
         self.assertEqual(originals_fsync.call_count, 1)
         self.assertEqual(derivatives_fsync.call_count, 2)

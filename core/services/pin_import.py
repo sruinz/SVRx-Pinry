@@ -9,7 +9,11 @@ from django.db import DEFAULT_DB_ALIAS, connections, transaction
 from core.models import Board, Pin
 from django_images.file_ops import MediaLifecycleLockError, MediaPathError
 from django_images.models import Image, Thumbnail
-from django_images.paths import FORMAT_EXTENSIONS, sanitize_original_filename
+from django_images.paths import (
+    FORMAT_EXTENSIONS,
+    canonical_original_path,
+    sanitize_original_filename,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -259,9 +263,12 @@ class PinImportService(object):
                 raise ValueError()
             for entry in files.values():
                 extension = FORMAT_EXTENSIONS.get(entry.image_format)
+                if extension is None:
+                    raise ValueError()
                 if entry.kind == "original":
-                    expected_path = "originals/{}/original{}".format(
+                    expected_path = canonical_original_path(
                         prepared.asset_uuid,
+                        prepared.original_filename,
                         extension,
                     )
                 else:
@@ -272,7 +279,6 @@ class PinImportService(object):
                     )
                 if (
                     not isinstance(entry.final_relative_path, str)
-                    or extension is None
                     or entry.final_relative_path != expected_path
                     or type(entry.width) is not int
                     or entry.width <= 0

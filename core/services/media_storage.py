@@ -23,7 +23,11 @@ from django_images.file_ops import (
     verify_published_identity,
     verify_published_name,
 )
-from django_images.paths import FORMAT_EXTENSIONS, sanitize_original_filename
+from django_images.paths import (
+    FORMAT_EXTENSIONS,
+    canonical_original_path,
+    sanitize_original_filename,
+)
 from django_images.utils import scale_and_crop_iter, write_image_to_file
 
 
@@ -412,11 +416,16 @@ class MediaStorage(object):
             )
             active_kind = "original"
             extension = FORMAT_EXTENSIONS[image_format]
+            original_path = canonical_original_path(
+                asset_uuid,
+                original_filename,
+                extension,
+            )
             original = self._stage_bytes(
                 staging_directory,
                 "original",
                 fetched.content,
-                "originals/{}/original{}".format(asset_uuid, extension),
+                original_path,
                 image_format,
                 deadline,
             )
@@ -823,10 +832,14 @@ class MediaStorage(object):
             if extension is None:
                 raise _media_conflict()
             if expected_kind == "original":
-                expected_path = "originals/{}/original{}".format(
-                    asset_uuid,
-                    extension,
-                )
+                try:
+                    expected_path = canonical_original_path(
+                        asset_uuid,
+                        prepared.original_filename,
+                        extension,
+                    )
+                except ValueError:
+                    raise _media_conflict() from None
             else:
                 expected_path = "derivatives/{}/{}{}".format(
                     asset_uuid,
