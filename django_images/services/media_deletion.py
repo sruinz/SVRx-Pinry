@@ -150,8 +150,7 @@ def _process_pending(pending, using):
     canonical = _canonical_media_path(pending.name)
     if canonical is not None:
         canonical_kind, asset_uuid, relative_directory = canonical
-        canonical_storage = _storage_for_kind(canonical_kind)
-        media_root = _filesystem_media_root(canonical_storage)
+        media_root = _filesystem_media_root(storage)
         if media_root is not None:
             _delete_canonical_media(
                 pending.name,

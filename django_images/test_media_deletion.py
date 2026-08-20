@@ -650,6 +650,64 @@ class MediaDeletionJournalTest(TemporaryMediaMixin, TransactionTestCase):
         self.assertTrue(parent.is_dir())
         self.assertFalse(self._pending_deletions().exists())
 
+    def test_remote_pending_kind_mismatch_uses_remote_storage_only(self):
+        asset_uuid, name = self._canonical_name(kind="thumbnail")
+        local_file = Path(self.temporary_media.name, name)
+        self._write_file(name, b"local-foreign")
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        remote_storage = mock.Mock()
+        remote_storage.exists.return_value = True
+        image_field = Image._meta.get_field("image")
+
+        with mock.patch.object(image_field, "storage", remote_storage):
+            processed = process_pending_media_deletion(pending.pk)
+
+        self.assertTrue(processed)
+        self.assertEqual(local_file.read_bytes(), b"local-foreign")
+        self.assertTrue(
+            Path(
+                self.temporary_media.name,
+                "derivatives",
+                str(asset_uuid),
+            ).is_dir()
+        )
+        remote_storage.exists.assert_called_once_with(name)
+        remote_storage.delete.assert_called_once_with(name)
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_local_pending_kind_mismatch_rejects_symlinked_parent(self):
+        asset_uuid, name = self._canonical_name(kind="thumbnail")
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_file = Path(
+            outside.name, str(asset_uuid), "thumbnail.png"
+        )
+        outside_file.parent.mkdir()
+        outside_file.write_bytes(b"outside-thumbnail")
+        parent = Path(self.temporary_media.name, "derivatives")
+        parent.symlink_to(outside.name, target_is_directory=True)
+        pending = self._pending_deletions().create(
+            kind="original", name=name
+        )
+        remote_storage = mock.Mock()
+        thumbnail_field = Thumbnail._meta.get_field("image")
+
+        with mock.patch.object(
+            thumbnail_field, "storage", remote_storage
+        ):
+            processed = process_pending_media_deletion(pending.pk)
+
+        self.assertFalse(processed)
+        self.assertEqual(outside_file.read_bytes(), b"outside-thumbnail")
+        self.assertTrue(parent.is_symlink())
+        remote_storage.exists.assert_not_called()
+        remote_storage.delete.assert_not_called()
+        pending.refresh_from_db()
+        self.assertEqual(pending.attempts, 1)
+        self.assertTrue(pending.last_error)
+
     def test_original_kind_mismatch_preserves_live_thumbnail_exact_path(self):
         asset_uuid, name = self._canonical_name(kind="thumbnail")
         self._write_file(name, b"live-thumbnail")
