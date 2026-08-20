@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tarfile
@@ -50,6 +51,21 @@ def _final_stage_copy_sources(dockerfile):
             continue
         sources.extend(arguments[1:-1])
     return sources
+
+
+def _environment_values(source):
+    values = {}
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in stripped:
+            raise AssertionError("invalid environment assignment")
+        name, value = stripped.split("=", 1)
+        if not name or name in values:
+            raise AssertionError("invalid environment variable name")
+        values[name] = value
+    return values
 
 
 class SynologyPackageTests(unittest.TestCase):
@@ -106,7 +122,13 @@ class SynologyPackageTests(unittest.TestCase):
 
         self.assertEqual(
             {path.name for path in self.package_directory.iterdir()},
-            {"BUILD_INFO", "build-image.sh", "context"},
+            {
+                ".env.example",
+                "BUILD_INFO",
+                "build-image.sh",
+                "context",
+                "docker-compose.yml",
+            },
         )
         required_context = (
             "Dockerfile.autobuild",
@@ -141,6 +163,46 @@ class SynologyPackageTests(unittest.TestCase):
                 self.full_sha, self.short_sha
             ),
         )
+        self.assertFalse((self.package_directory / ".env").exists())
+        self.assertEqual(
+            _environment_values(
+                (self.package_directory / ".env.example").read_text()
+            ),
+            {
+                "PINRY_IMAGE": "pinry-custom:{}".format(self.short_sha),
+                "PINRY_CONTAINER_NAME": "pinry-custom",
+                "PINRY_HTTP_PORT": "2048",
+                "PINRY_DATA_PATH": "/volume1/docker/pinry-custom/data",
+            },
+        )
+        compose = (
+            self.package_directory / "docker-compose.yml"
+        ).read_text()
+        self.assertEqual(
+            [line.strip() for line in compose.splitlines() if line.strip()],
+            [
+                'version: "3.8"',
+                "services:",
+                "pinry:",
+                "image: ${PINRY_IMAGE}",
+                "container_name: ${PINRY_CONTAINER_NAME}",
+                "ports:",
+                '- "${PINRY_HTTP_PORT}:80"',
+                "volumes:",
+                '- "${PINRY_DATA_PATH}:/data"',
+                "restart: unless-stopped",
+            ],
+        )
+        for unsafe_compose_value in (
+            "build:",
+            "privileged:",
+            "network_mode:",
+            ".:/pinry",
+            "development",
+            "poetry",
+        ):
+            with self.subTest(unsafe_compose_value=unsafe_compose_value):
+                self.assertNotIn(unsafe_compose_value, compose)
         self.assertEqual(
             {path.name for path in self.context_directory.iterdir()},
             {
@@ -193,6 +255,13 @@ class SynologyPackageTests(unittest.TestCase):
             "{}/build-image.sh".format(self.package_name), names
         )
         self.assertIn(
+            "{}/.env.example".format(self.package_name), names
+        )
+        self.assertIn(
+            "{}/docker-compose.yml".format(self.package_name), names
+        )
+        self.assertNotIn("{}/.env".format(self.package_name), names)
+        self.assertIn(
             "{}/context/core/models.py".format(self.package_name), names
         )
         self.assertTrue(
@@ -223,6 +292,19 @@ class SynologyPackageTests(unittest.TestCase):
                 "docker/scripts",
             ],
         )
+
+    def test_synology_dockerfile_uses_supported_bookworm_inputs(self):
+        source = (REPOSITORY_ROOT / "Dockerfile.autobuild").read_text()
+
+        self.assertEqual(
+            re.findall(r"^FROM python:([^\s]+)", source, re.MULTILINE),
+            ["3.9-slim-bookworm", "3.9-slim-bookworm"],
+        )
+        self.assertNotIn("buster", source)
+        self.assertIn("libtiff-dev", source)
+        self.assertNotIn("libtiff5-dev", source)
+        self.assertNotIn("--install-option", source)
+        self.assertNotIn("rcssmin==1.0.6", source)
 
     def test_packager_refuses_to_replace_existing_output(self):
         self._create_package()

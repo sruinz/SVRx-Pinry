@@ -76,6 +76,12 @@ printf 'Dockerfile.autobuild\n.dockerignore\n' \
 install -m 0755 \
     "${repository_root}/deploy/synology/build-image.sh" \
     "${temporary_directory}/build-image.sh"
+install -m 0644 \
+    "${repository_root}/deploy/synology/docker-compose.synology.yml" \
+    "${temporary_directory}/docker-compose.yml"
+sed "s/__PINRY_IMAGE_TAG__/${short_commit}/" \
+    "${repository_root}/deploy/synology/.env.example" \
+    > "${temporary_directory}/.env.example"
 printf 'source_commit=%s\ndefault_image=pinry-custom:%s\n' \
     "${source_commit}" "${short_commit}" \
     > "${temporary_directory}/BUILD_INFO"
