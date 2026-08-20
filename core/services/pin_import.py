@@ -253,12 +253,16 @@ class PinImportService(object):
     def _manifest_files(published, prepared):
         try:
             files = {entry.kind: entry for entry in published.files}
+            destination_directories = tuple(
+                published.destination_directories
+            )
             if (
                 published.asset_uuid != prepared.asset_uuid
                 or published.original_filename
                 != prepared.original_filename
                 or tuple(entry.kind for entry in published.files)
                 != ("original", "thumbnail", "standard", "square")
+                or len(destination_directories) != 2
             ):
                 raise ValueError()
             for entry in files.values():
@@ -277,9 +281,17 @@ class PinImportService(object):
                         entry.kind,
                         extension,
                     )
+                expected_parts = expected_path.split("/")
+                destination_directory = entry.destination_directory
                 if (
                     not isinstance(entry.final_relative_path, str)
                     or entry.final_relative_path != expected_path
+                    or entry.destination_name != expected_parts[-1]
+                    or destination_directory.names != expected_parts[:-1]
+                    or not any(
+                        destination_directory is directory
+                        for directory in destination_directories
+                    )
                     or type(entry.width) is not int
                     or entry.width <= 0
                     or type(entry.height) is not int

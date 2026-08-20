@@ -220,8 +220,8 @@ class MediaStorageTests(
         retained = asset_directory.with_name("retained-after-validation")
         real_validate = storage._validate_prepared
 
-        def validate_then_replace_namespace(asset):
-            real_validate(asset)
+        def validate_then_replace_namespace(asset, deadline=None):
+            real_validate(asset, deadline)
             os.rename(str(asset_directory), str(retained))
             for staged_file in retained.iterdir():
                 Path(outside.name, staged_file.name).write_bytes(
@@ -1527,6 +1527,78 @@ class MediaStorageTests(
             self.make_storage().publish(prepared)
 
         self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertEqual(file_snapshot(self.temporary_media.name), {})
+
+    def test_prepared_format_and_path_pair_tamper_is_rejected_before_publish(
+        self,
+    ):
+        prepared = self.make_storage().prepare(
+            make_fetched_image(),
+            asset_uuid=ASSET_UUID,
+            original_filename="page-image.png",
+        )
+        original = prepared.files[0]
+        object.__setattr__(original, "image_format", "JPEG")
+        object.__setattr__(
+            original,
+            "final_relative_path",
+            "originals/{}/page-image.jpg".format(ASSET_UUID),
+        )
+
+        with self.assertRaises(MediaStorageError) as caught:
+            self.make_storage().publish(prepared)
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertEqual(file_snapshot(self.temporary_media.name), {})
+
+    def test_publish_validation_inspection_observes_deadline(self):
+        clock = ManualClock()
+        storage = self.make_storage(clock=clock)
+        prepared = storage.prepare(
+            make_fetched_image(),
+            asset_uuid=ASSET_UUID,
+            original_filename="photo.png",
+            deadline=1,
+        )
+        real_inspect = storage._inspect
+        calls = {"count": 0}
+
+        def inspect_then_expire(descriptor):
+            result = real_inspect(descriptor)
+            calls["count"] += 1
+            clock.advance(2)
+            return result
+
+        with mock.patch.object(
+            storage,
+            "_inspect",
+            side_effect=inspect_then_expire,
+        ):
+            with self.assertRaises(MediaStorageError) as caught:
+                storage.publish(prepared, deadline=1)
+
+        self.assertEqual(caught.exception.code, "image_processing_timeout")
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(file_snapshot(self.temporary_media.name), {})
+
+    def test_publish_validation_inspection_error_fails_closed(self):
+        storage = self.make_storage()
+        prepared = storage.prepare(
+            make_fetched_image(),
+            asset_uuid=ASSET_UUID,
+            original_filename="photo.png",
+        )
+
+        with mock.patch.object(
+            storage,
+            "_inspect",
+            side_effect=OSError("/private/secret/token"),
+        ):
+            with self.assertRaises(MediaStorageError) as caught:
+                storage.publish(prepared)
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertNotIn("secret", str(caught.exception))
         self.assertEqual(file_snapshot(self.temporary_media.name), {})
 
     def test_cleanup_failure_does_not_stop_remaining_file_cleanup(self):

@@ -130,17 +130,30 @@ class _PublishedAsset(object):
         self.prepared = prepared
         self.asset_uuid = prepared.asset_uuid
         self.original_filename = prepared.original_filename
+        original_path = canonical_original_path(
+            prepared.asset_uuid,
+            prepared.original_filename,
+            ".png",
+        )
+        originals_directory = SimpleNamespace(
+            names=["originals", str(prepared.asset_uuid)]
+        )
+        derivatives_directory = SimpleNamespace(
+            names=["derivatives", str(prepared.asset_uuid)]
+        )
+        self.destination_directories = (
+            originals_directory,
+            derivatives_directory,
+        )
         self.files = (
             SimpleNamespace(
                 kind="original",
-                final_relative_path=canonical_original_path(
-                    prepared.asset_uuid,
-                    prepared.original_filename,
-                    ".png",
-                ),
+                final_relative_path=original_path,
                 width=640,
                 height=480,
                 image_format="PNG",
+                destination_directory=originals_directory,
+                destination_name=original_path.rsplit("/", 1)[-1],
             ),
             SimpleNamespace(
                 kind="thumbnail",
@@ -152,6 +165,8 @@ class _PublishedAsset(object):
                 width=240,
                 height=180,
                 image_format="PNG",
+                destination_directory=derivatives_directory,
+                destination_name="thumbnail.png",
             ),
             SimpleNamespace(
                 kind="standard",
@@ -163,6 +178,8 @@ class _PublishedAsset(object):
                 width=600,
                 height=450,
                 image_format="PNG",
+                destination_directory=derivatives_directory,
+                destination_name="standard.png",
             ),
             SimpleNamespace(
                 kind="square",
@@ -174,6 +191,8 @@ class _PublishedAsset(object):
                 width=125,
                 height=125,
                 image_format="PNG",
+                destination_directory=derivatives_directory,
+                destination_name="square.png",
             ),
         )
         self.events = events
@@ -1697,6 +1716,83 @@ class PinImportCommitTests(TransactionTestCase):
 
         self.assertEqual(caught.exception.code, "internal_error")
         self.assertEqual(Image.objects.count(), 0)
+
+    def test_commit_rejects_format_and_path_pair_not_bound_to_receipt(self):
+        published = _ReceiptAwarePublishedAsset(
+            self.prepared,
+            self.events,
+        )
+        self.service.media_storage = _PublishingMediaStorage(
+            published,
+            self.events,
+        )
+        original = published.files[0]
+        original.image_format = "JPEG"
+        original.final_relative_path = "originals/{}/source-name.jpg".format(
+            self.asset_uuid
+        )
+
+        with self.assertRaises(PinImportError) as caught:
+            self.service.commit(
+                self.prepared,
+                self.user,
+                self.metadata,
+                claim=None,
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "internal_error")
+        self.assertEqual(Image.objects.count(), 0)
+        self.assertEqual(Thumbnail.objects.count(), 0)
+        self.assertEqual(Pin.objects.count(), 0)
+        self.assertEqual(Tag.objects.count(), 0)
+        self.assertFalse(self.board.pins.exists())
+        self.assertEqual(published.compensate_calls, 1)
+        self.assertEqual(published.destinations, {
+            "reused": b"reused",
+            "replacement": b"foreign",
+        })
+
+    def test_commit_rejects_asset_uuid_and_paths_not_bound_to_receipts(self):
+        published = _ReceiptAwarePublishedAsset(
+            self.prepared,
+            self.events,
+        )
+        self.service.media_storage = _PublishingMediaStorage(
+            published,
+            self.events,
+        )
+        forged_uuid = uuid.UUID("87654321-4321-8765-4321-876543218765")
+        self.prepared.asset_uuid = forged_uuid
+        published.asset_uuid = forged_uuid
+        for entry in published.files:
+            parent = "originals" if entry.kind == "original" else "derivatives"
+            entry.final_relative_path = "{}/{}/{}".format(
+                parent,
+                forged_uuid,
+                entry.destination_name,
+            )
+
+        with self.assertRaises(PinImportError) as caught:
+            self.service.commit(
+                self.prepared,
+                self.user,
+                self.metadata,
+                claim=None,
+                deadline=20.0,
+            )
+
+        self.assertEqual(caught.exception.code, "internal_error")
+        self.assertEqual(Image.objects.count(), 0)
+        self.assertEqual(Thumbnail.objects.count(), 0)
+        self.assertEqual(Pin.objects.count(), 0)
+        self.assertEqual(Tag.objects.count(), 0)
+        self.assertFalse(self.board.pins.exists())
+        self.assertEqual(published.compensate_calls, 1)
+        self.assertEqual(published.destinations, {
+            "reused": b"reused",
+            "replacement": b"foreign",
+        })
 
     def test_publish_error_cleans_staging_and_creates_no_rows(self):
         storage_error = MediaStorageError(

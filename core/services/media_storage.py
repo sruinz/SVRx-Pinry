@@ -505,7 +505,7 @@ class MediaStorage(object):
         derivatives_directory = None
         published_files = []
         try:
-            self._validate_prepared(prepared)
+            self._validate_prepared(prepared, deadline)
             self._check_deadline(deadline)
             originals_directory = open_or_create_media_directory_from(
                 prepared.root_directory,
@@ -805,7 +805,7 @@ class MediaStorage(object):
             destination_name=destination_name,
         )
 
-    def _validate_prepared(self, prepared):
+    def _validate_prepared(self, prepared, deadline=None):
         asset_uuid = self._asset_uuid(prepared.asset_uuid)
         try:
             run_uuid = self._asset_uuid(prepared.run_uuid)
@@ -828,7 +828,25 @@ class MediaStorage(object):
         for expected_kind, prepared_file in zip(_KINDS, prepared.files):
             if prepared_file.kind != expected_kind:
                 raise _media_conflict()
-            extension = FORMAT_EXTENSIONS.get(prepared_file.image_format)
+            handle = prepared_file.owned_staging_handle
+            if (
+                handle.directory is not prepared.staging_directory
+                or handle.name != "{}.part".format(expected_kind)
+                or handle._closed
+                or prepared_file.size <= 0
+                or prepared_file.width <= 0
+                or prepared_file.height <= 0
+            ):
+                raise _media_conflict()
+            self._check_deadline(deadline)
+            try:
+                actual_format, actual_width, actual_height = self._inspect(
+                    handle.descriptor
+                )
+            except Exception:
+                raise _media_conflict() from None
+            self._check_deadline(deadline)
+            extension = FORMAT_EXTENSIONS.get(actual_format)
             if extension is None:
                 raise _media_conflict()
             if expected_kind == "original":
@@ -846,15 +864,11 @@ class MediaStorage(object):
                     expected_kind,
                     extension,
                 )
-            handle = prepared_file.owned_staging_handle
             if (
-                prepared_file.final_relative_path != expected_path
-                or handle.directory is not prepared.staging_directory
-                or handle.name != "{}.part".format(expected_kind)
-                or handle._closed
-                or prepared_file.size <= 0
-                or prepared_file.width <= 0
-                or prepared_file.height <= 0
+                prepared_file.image_format != actual_format
+                or prepared_file.width != actual_width
+                or prepared_file.height != actual_height
+                or prepared_file.final_relative_path != expected_path
             ):
                 raise _media_conflict()
 
