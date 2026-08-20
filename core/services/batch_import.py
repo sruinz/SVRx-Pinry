@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 import time
 import uuid
@@ -111,6 +112,15 @@ class _ClaimFailure(object):
         self.result = result
 
 
+def _valid_positive_seconds(value):
+    if type(value) not in (int, float) or value <= 0:
+        return False
+    try:
+        return math.isfinite(value)
+    except (TypeError, OverflowError):
+        return False
+
+
 class BatchImportService(object):
     def __init__(
         self,
@@ -138,13 +148,24 @@ class BatchImportService(object):
         self._closed = False
 
     def process(self, user, validated_data, started_at):
-        batch_deadline = (
-            started_at + settings.PINRY_BATCH_DEADLINE_SECONDS
+        batch_seconds = settings.PINRY_BATCH_DEADLINE_SECONDS
+        reserve_seconds = settings.PINRY_BATCH_RESULT_RESERVE_SECONDS
+        valid_timing = (
+            _valid_positive_seconds(batch_seconds)
+            and _valid_positive_seconds(reserve_seconds)
         )
+        batch_deadline = (
+            started_at + batch_seconds if valid_timing else None
+        )
+        admission_closed = not valid_timing
         results = []
         for item in validated_data["items"]:
-            item_started_at = self.clock()
-            if batch_deadline - item_started_at < _ITEM_DEADLINE_SECONDS:
+            if not admission_closed:
+                item_started_at = self.clock()
+                remaining = batch_deadline - item_started_at
+                if remaining < _ITEM_DEADLINE_SECONDS + reserve_seconds:
+                    admission_closed = True
+            if admission_closed:
                 results.append(self._error_result(
                     item["client_item_id"],
                     "failed",

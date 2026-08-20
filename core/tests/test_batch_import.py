@@ -461,8 +461,8 @@ class BatchImportServiceTests(SimpleTestCase):
         )
         self.assertEqual(pin_import.prepare_calls, [])
 
-    def test_item_is_not_claimed_without_a_full_twelve_second_budget(self):
-        clock = ManualClock(34)
+    def test_item_is_not_claimed_without_item_and_result_budget(self):
+        clock = ManualClock(31)
         service, store, pin_import, _transport = self._service(
             [], clock=clock
         )
@@ -482,7 +482,7 @@ class BatchImportServiceTests(SimpleTestCase):
         )
 
     def test_next_item_is_not_claimed_after_first_consumes_batch_budget(self):
-        clock = SequenceClock([0, 0, 34])
+        clock = SequenceClock([0, 0, 31])
         service, store, pin_import, _transport = self._service(
             [self._claim()], clock=clock
         )
