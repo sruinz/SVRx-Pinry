@@ -16,8 +16,9 @@
     "pinsLink": "Pins",
     "profileLink": "Profile",
     "browserExtensionsLink": "Browser Extensions",
-    "chromeLink": "Chrome",
-    "firefoxLink": "Firefox",
+    "chromeLink": "Chrome — existing single-image",
+    "firefoxLink": "Firefox — existing single-image",
+    "customExtensionPendingLink": "Pinry Custom select-all extension — coming soon",
     "signUpLink": "Sign up",
     "logInLink": "Log in",
     "logOutLink": "Log out",
@@ -82,5 +83,8 @@
     "selectBoardLabel": "Select Board",
     "pinDeleteConfirm": "Delete this Pin?",
     "pinDeleted": "Pin deleted",
-    "pinDeleteError": "Failed to delete Pin"
+    "pinDeleteError": "Failed to delete Pin",
+    "pinCreateError": "Failed to create Pin",
+    "buildInfoTitle": "Build information",
+    "buildVersionLabel": "Running version"
 }

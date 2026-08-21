@@ -373,6 +373,23 @@ describe('local pin creation', () => {
     expect(buttons.at(1).attributes('disabled')).toBeUndefined();
   });
 
+  it('uses the localized generic message when no safe server detail exists', async () => {
+    const request = deferred();
+    axios.post.mockImplementation(() => request.promise);
+    const { wrapper } = mountCreateModal();
+    await flushPromises();
+    const file = new File(['image'], 'photo.png', { type: 'image/png' });
+    wrapper.findComponent(FileUpload).vm.$emit('imageSelected', file);
+    wrapper.vm.createPin();
+
+    request.reject(new Error('/private/network/detail'));
+    await request.promise.catch(() => {});
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="create-error"]').text())
+      .toBe('Failed to create Pin');
+  });
+
   it('has no success UI side effects after destruction', async () => {
     const request = deferred();
     axios.post.mockImplementation(() => request.promise);

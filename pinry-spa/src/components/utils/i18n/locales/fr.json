@@ -16,8 +16,9 @@
     "pinsLink": "Fiches",
     "profileLink": "Profil",
     "browserExtensionsLink": "Extensions de navigateur",
-    "chromeLink": "Chrome",
-    "firefoxLink": "Firefox",
+    "chromeLink": "Chrome — extension existante pour une image",
+    "firefoxLink": "Firefox — extension existante pour une image",
+    "customExtensionPendingLink": "Extension de sélection globale Pinry Custom — bientôt disponible",
     "signUpLink": "S'enregistrer",
     "logInLink": "Se connecter",
     "logOutLink": "Se déconnecter",
@@ -82,5 +83,8 @@
     "selectBoardLabel": "Selectionner un tableau",
     "pinDeleteConfirm": "Supprimer cette fiche ?",
     "pinDeleted": "Fiche supprimée",
-    "pinDeleteError": "Impossible de supprimer la fiche"
+    "pinDeleteError": "Impossible de supprimer la fiche",
+    "pinCreateError": "Impossible de créer la fiche",
+    "buildInfoTitle": "Informations de compilation",
+    "buildVersionLabel": "Version en cours d'exécution"
 }

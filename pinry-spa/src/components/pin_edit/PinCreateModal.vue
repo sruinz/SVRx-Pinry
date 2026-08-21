@@ -133,7 +133,7 @@ function textOrBlank(value) {
 }
 
 
-function createErrorMessage(error) {
+function createErrorMessage(error, fallbackMessage) {
   const responseData = error && error.response && error.response.data;
   if (typeof responseData === 'string') {
     return responseData;
@@ -146,7 +146,7 @@ function createErrorMessage(error) {
       return message;
     }
   }
-  return (error && error.message) || 'Cannot create pin';
+  return fallbackMessage;
 }
 
 
@@ -358,7 +358,7 @@ export default {
         }
         console.log('Cannot create pin:', error);
         self.createInFlight = false;
-        self.createError = createErrorMessage(error);
+        self.createError = createErrorMessage(error, self.$t('pinCreateError'));
         self.closeLoading();
       });
     },

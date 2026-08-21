@@ -68,12 +68,28 @@
                 {{ $t("browserExtensionsLink") }}
               </a>
               <div class="navbar-dropdown">
-                <a class="navbar-item" href="https://chrome.google.com/webstore/detail/jmhdcnmfkglikfjafdmdikoonedgijpa/">
+                <a
+                  class="navbar-item"
+                  data-test="chrome-extension-link"
+                  href="https://chrome.google.com/webstore/detail/jmhdcnmfkglikfjafdmdikoonedgijpa/"
+                  target="_blank"
+                  rel="noopener noreferrer">
                   {{ $t("chromeLink") }}
                 </a>
-                <a class="navbar-item" href="https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/">
+                <a
+                  class="navbar-item"
+                  data-test="firefox-extension-link"
+                  href="https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/"
+                  target="_blank"
+                  rel="noopener noreferrer">
                   {{ $t("firefoxLink") }}
                 </a>
+                <span
+                  class="navbar-item is-disabled"
+                  data-test="custom-extension-pending"
+                  aria-disabled="true">
+                  {{ $t("customExtensionPendingLink") }}
+                </span>
               </div>
             </div>
           </div>
@@ -98,9 +114,10 @@
               </a>
               <div class="navbar-dropdown">
                 <a
-                  v-for="locale in $i18n.availableLocales"
+                  v-for="locale in locales"
                   :key="`locale-${locale}`"
                   @click="setLocale(locale)"
+                  data-test="locale-option"
                   class="navbar-item">
                   {{ langs[locale] }}
                 </a>
@@ -136,7 +153,10 @@
 </template>
 
 <script>
-import localeUtils from '@/components/utils/i18n';
+import localeUtils, {
+  SUPPORTED_LOCALES,
+  persistLocale,
+} from '@/components/utils/i18n';
 import api from './api';
 import modals from './modals';
 
@@ -150,6 +170,7 @@ export default {
         meta: {},
       },
       langs: localeUtils.langCode2Name,
+      locales: SUPPORTED_LOCALES,
     };
   },
   computed: {
@@ -161,8 +182,7 @@ export default {
   },
   methods: {
     setLocale(locale) {
-      this.$i18n.locale = locale;
-      localStorage.setItem('localeCode', locale);
+      this.$i18n.locale = persistLocale(localStorage, locale);
     },
     toggleMenu() {
       this.active = !this.active;

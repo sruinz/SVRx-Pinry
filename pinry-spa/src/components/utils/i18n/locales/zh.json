@@ -16,8 +16,9 @@
   "pinsLink": "Pin",
   "profileLink": "个人资料",
   "browserExtensionsLink": "浏览器插件",
-  "chromeLink": "Chrome",
-  "firefoxLink": "Firefox",
+  "chromeLink": "Chrome — 现有单图版",
+  "firefoxLink": "Firefox — 现有单图版",
+  "customExtensionPendingLink": "Pinry Custom 全选扩展 — 准备中",
   "signUpLink": "注册",
   "logInLink": "登录",
   "logOutLink": "登出",
@@ -82,5 +83,8 @@
   "selectBoardLabel": "选择画板",
   "pinDeleteConfirm": "删除此 Pin？",
   "pinDeleted": "Pin 已删除",
-  "pinDeleteError": "无法删除 Pin"
+  "pinDeleteError": "无法删除 Pin",
+  "pinCreateError": "无法创建 Pin",
+  "buildInfoTitle": "构建信息",
+  "buildVersionLabel": "运行版本"
 }

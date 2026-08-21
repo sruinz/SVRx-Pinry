@@ -266,6 +266,12 @@ const Tag = {
   },
 };
 
+const Version = {
+  fetch() {
+    return axios.get(`${API_PREFIX}version/`);
+  },
+};
+
 export default {
   Tag,
   Pin,
@@ -274,4 +280,5 @@ export default {
   fetchPins,
   fetchBoardForUser,
   User,
+  Version,
 };
