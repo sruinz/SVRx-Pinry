@@ -998,6 +998,228 @@ class PinMediaLifecycleTest(
         self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
         self.assertEqual(media_snapshot(self.temporary_media.name), {})
 
+    def test_stale_missing_single_probe_does_not_delete_new_matches(self):
+        candidate_image = create_image()
+        candidate = create_pin(self.owner, candidate_image, [])
+        candidate.description = "stale-probe-target"
+        candidate.save(update_fields=("description",))
+        first_image = create_image()
+        first = create_pin(self.owner, first_image, [])
+        first_asset = self._register_asset(first_image)
+        second_image = create_image()
+        second = create_pin(self.other_user, second_image, [])
+        second_asset = self._register_asset(
+            second_image,
+            submitter=self.other_user,
+        )
+        files_before = media_snapshot(self.temporary_media.name)
+        real_using = Pin._base_manager.using
+        swapped = {"value": False}
+
+        def swap_matches_before_candidate_fetch(database_alias):
+            if not swapped["value"]:
+                swapped["value"] = True
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        'DELETE FROM "core_pin" WHERE "id" = %s',
+                        (candidate.pk,),
+                    )
+                    cursor.execute(
+                        'UPDATE "core_pin" SET "description" = %s '
+                        'WHERE "id" IN (%s, %s)',
+                        (
+                            "stale-probe-target",
+                            first.pk,
+                            second.pk,
+                        ),
+                    )
+            return real_using(database_alias)
+
+        queryset = Pin.objects.filter(description="stale-probe-target")
+        with mock.patch.object(
+            Pin._base_manager,
+            "using",
+            side_effect=swap_matches_before_candidate_fetch,
+        ):
+            result = queryset.delete()
+
+        self.assertEqual(result, (0, {}))
+        self.assertTrue(swapped["value"])
+        self.assertFalse(Pin.objects.filter(pk=candidate.pk).exists())
+        self.assertEqual(
+            set(Pin.objects.values_list("pk", flat=True)),
+            {first.pk, second.pk},
+        )
+        self.assertTrue(Image.objects.filter(pk=first_image.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=second_image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=first_asset.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=second_asset.pk).exists())
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name),
+            files_before,
+        )
+
+    def test_stale_legacy_single_probe_deletes_only_probed_pk(self):
+        candidate_image = create_image()
+        candidate = create_pin(self.owner, candidate_image, [])
+        candidate.description = "stale-legacy-target"
+        candidate.save(update_fields=("description",))
+        first_image = create_image()
+        first = create_pin(self.owner, first_image, [])
+        first_asset = self._register_asset(first_image)
+        second_image = create_image()
+        second = create_pin(self.other_user, second_image, [])
+        second_asset = self._register_asset(
+            second_image,
+            submitter=self.other_user,
+        )
+        first_paths = {
+            first_image.image.name,
+            *first_image.thumbnail_set.values_list("image", flat=True),
+        }
+        second_paths = {
+            second_image.image.name,
+            *second_image.thumbnail_set.values_list("image", flat=True),
+        }
+        real_using = Pin._base_manager.using
+        swapped = {"value": False}
+
+        def add_matches_before_candidate_fetch(database_alias):
+            if not swapped["value"]:
+                swapped["value"] = True
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        'UPDATE "core_pin" SET "description" = %s '
+                        'WHERE "id" IN (%s, %s)',
+                        (
+                            "stale-legacy-target",
+                            first.pk,
+                            second.pk,
+                        ),
+                    )
+            return real_using(database_alias)
+
+        queryset = Pin.objects.filter(description="stale-legacy-target")
+        with mock.patch.object(
+            Pin._base_manager,
+            "using",
+            side_effect=add_matches_before_candidate_fetch,
+        ):
+            queryset.delete()
+
+        self.assertTrue(swapped["value"])
+        self.assertFalse(Pin.objects.filter(pk=candidate.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=candidate_image.pk).exists())
+        self.assertEqual(
+            set(Pin.objects.values_list("pk", flat=True)),
+            {first.pk, second.pk},
+        )
+        self.assertTrue(Image.objects.filter(pk=first_image.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=second_image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=first_asset.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=second_asset.pk).exists())
+        self.assertEqual(
+            set(media_snapshot(self.temporary_media.name)),
+            first_paths | second_paths,
+        )
+
+    def test_legacy_multi_queryset_deletes_all_matching_pins(self):
+        pins = []
+        images = []
+        for index in range(3):
+            image = create_image()
+            pin = create_pin(self.owner, image, [])
+            pin.description = "three-legacy-candidates"
+            pin.save(update_fields=("description",))
+            images.append(image)
+            pins.append(pin)
+
+        result = Pin.objects.filter(
+            description="three-legacy-candidates"
+        ).delete()
+
+        self.assertEqual(result, (3, {"core.Pin": 3}))
+        self.assertFalse(Pin.objects.filter(
+            pk__in=[pin.pk for pin in pins]
+        ).exists())
+        self.assertFalse(Image.objects.filter(
+            pk__in=[image.pk for image in images]
+        ).exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+
+    def test_mixed_multi_queryset_fails_before_any_candidate_delete(self):
+        pins = []
+        images = []
+        for index in range(3):
+            image = create_image()
+            pin = create_pin(self.owner, image, [])
+            pin.description = "mixed-multi-candidates"
+            pin.save(update_fields=("description",))
+            images.append(image)
+            pins.append(pin)
+        asset = self._register_asset(images[-1])
+        files_before = media_snapshot(self.temporary_media.name)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "registered_pin_bulk_delete_unsupported",
+        ):
+            Pin.objects.filter(
+                description="mixed-multi-candidates"
+            ).delete()
+
+        self.assertEqual(
+            set(Pin.objects.values_list("pk", flat=True)),
+            {pin.pk for pin in pins},
+        )
+        self.assertEqual(
+            set(Image.objects.values_list("pk", flat=True)),
+            {image.pk for image in images},
+        )
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name),
+            files_before,
+        )
+
+    def test_registered_image_cascade_delete_is_not_queryset_guarded(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        self._assert_four_image_files(image)
+        caught = None
+
+        try:
+            image.delete()
+        except RuntimeError as error:
+            caught = error
+
+        self.assertIsNone(caught)
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+
+    def test_registered_user_cascade_delete_is_not_queryset_guarded(self):
+        owner_id = self.owner.pk
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        self._assert_four_image_files(image)
+        caught = None
+
+        try:
+            self.owner.delete()
+        except RuntimeError as error:
+            caught = error
+
+        self.assertIsNone(caught)
+        self.assertFalse(type(self.owner).objects.filter(pk=owner_id).exists())
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+
     def test_registered_multi_queryset_fails_before_partial_delete(self):
         image = create_image()
         first_pin = create_pin(self.owner, image, [])

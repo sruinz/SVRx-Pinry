@@ -524,6 +524,51 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
                     for pin in list(Pin.objects.all()):
                         pin.delete()
 
+    def test_local_upload_rejects_same_root_storage_subclass(self):
+        class EvilFileSystemStorage(FileSystemStorage):
+            def url(inner_self, name):
+                return "evil://{}".format(name)
+
+            def open(inner_self, name, mode="rb"):
+                del name, mode
+                return BytesIO(b"evil")
+
+            def delete(inner_self, name):
+                del name
+
+            def save(inner_self, name, content, max_length=None):
+                del content, max_length
+                return name
+
+        evil_storage = EvilFileSystemStorage(
+            location=self.temporary_media.name,
+        )
+        image_field = Image._meta.get_field("image")
+
+        with mock.patch.object(
+            image_field,
+            "storage",
+            evil_storage,
+        ), self._strong_publish_support():
+            response = self.client.post(
+                reverse("pin-list"),
+                {"image_file": _png_upload()},
+                format="multipart",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+        self.assertEqual(response.json(), {
+            "image_file": ["media_configuration_error"]
+        })
+        self.assertEqual(Pin.objects.count(), 0)
+        self.assertEqual(Image.objects.count(), 0)
+        self.assertEqual(Thumbnail.objects.count(), 0)
+        self.assertEqual(MediaAsset.objects.count(), 0)
+        self.assertEqual(_media_files(self.temporary_media.name), {})
+
     def test_foreign_board_rejects_before_local_prepare(self):
         other = create_user("foreign-board-owner")
         board = Board.objects.create(submitter=other, name="foreign")

@@ -923,7 +923,7 @@ class MediaStorage(object):
             for model in (Image, Thumbnail):
                 storage = model._meta.get_field("image").storage
                 if (
-                    not isinstance(storage, FileSystemStorage)
+                    storage.__class__ is not FileSystemStorage
                     or os.path.realpath(storage.location)
                     != configured_root
                 ):

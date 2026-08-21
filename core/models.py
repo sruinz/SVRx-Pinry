@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import time
 
 from django.conf import settings
@@ -89,6 +90,21 @@ class Board(models.Model):
     published = models.DateTimeField(auto_now_add=True)
 
 
+_pin_queryset_delete_state = threading.local()
+
+
+def _delete_pin_queryset_with_registry_guard(queryset):
+    previous_depth = getattr(_pin_queryset_delete_state, "depth", 0)
+    _pin_queryset_delete_state.depth = previous_depth + 1
+    try:
+        return models.QuerySet.delete(queryset)
+    finally:
+        if previous_depth:
+            _pin_queryset_delete_state.depth = previous_depth
+        else:
+            del _pin_queryset_delete_state.depth
+
+
 class PinQuerySet(models.QuerySet):
     def delete(self):
         assert self.query.can_filter(), (
@@ -111,26 +127,28 @@ class PinQuerySet(models.QuerySet):
             .distinct()[:2]
         )
         if not pin_ids:
-            return super(PinQuerySet, self).delete()
+            self._result_cache = None
+            return 0, {}
         if len(pin_ids) != 1:
-            image_ids = (
-                probe
-                .values("image_id")
+            result = _delete_pin_queryset_with_registry_guard(
+                self.using(database_alias)
             )
-            if not MediaAsset.objects.using(database_alias).filter(
-                image_id__in=image_ids
-            ).exists():
-                return super(PinQuerySet, self).delete()
-            raise RuntimeError("registered_pin_bulk_delete_unsupported")
-        pin = (
+            self._result_cache = None
+            return result
+        candidates = (
             self.model._base_manager.using(database_alias)
             .filter(pk=pin_ids[0])
-            .first()
         )
-        if pin is None or not MediaAsset.objects.using(
+        pin = candidates.first()
+        if pin is None:
+            self._result_cache = None
+            return 0, {}
+        if not MediaAsset.objects.using(
             database_alias
         ).filter(image_id=pin.image_id).exists():
-            return super(PinQuerySet, self).delete()
+            result = _delete_pin_queryset_with_registry_guard(candidates)
+            self._result_cache = None
+            return result
         result = pin.delete(using=database_alias)
         self._result_cache = None
         return result
@@ -197,6 +215,19 @@ class BatchImportItem(models.Model):
 
     class Meta:
         unique_together = (("submitter", "client_item_id"),)
+
+
+@receiver(models.signals.pre_delete, sender=Pin)
+def prevent_unmanaged_registered_pin_delete(sender, instance, using, **kwargs):
+    if (
+        not getattr(_pin_queryset_delete_state, "depth", 0)
+        or getattr(instance, "_media_delete_managed", False)
+    ):
+        return
+    if MediaAsset.objects.using(using).filter(
+        image_id=instance.image_id
+    ).exists():
+        raise RuntimeError("registered_pin_bulk_delete_unsupported")
 
 
 @receiver(models.signals.post_delete, sender=Pin)
