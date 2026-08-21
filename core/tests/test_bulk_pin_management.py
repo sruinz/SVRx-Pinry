@@ -1,12 +1,17 @@
-from django.db import connection
+from django.conf import settings
+from django.db import connection, OperationalError
 from django.test import SimpleTestCase
 from django.test.utils import CaptureQueriesContext
+import mock
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APITestCase, APITransactionTestCase
 
 from core.bulk_serializers import BulkPinRequestSerializer
 from core.models import Board, Pin
+from core.services.bulk_pin_management import BulkOperationError
 from core.tests.helpers import create_image, create_user
+from core.views import PinViewSet
+from django_images.test_helpers import TemporaryMediaMixin
 
 
 class BulkPinRequestSerializerTests(SimpleTestCase):
@@ -163,6 +168,639 @@ class BulkPinRequestSerializerTests(SimpleTestCase):
             self.assertFalse(serializer.is_valid())
             self.assertEqual(serializer.errors["code"][0],
                              "bulk_invalid_request")
+
+
+class BulkExceptionNormalizationTests(SimpleTestCase):
+    def test_normalizes_only_closed_safe_codes(self):
+        from core.services.bulk_pin_management import (
+            normalize_bulk_exception,
+        )
+
+        cases = (
+            (
+                OperationalError("database is locked at /private/path"),
+                ("database_busy", True),
+            ),
+            (
+                RuntimeError("secret token and /private/path"),
+                ("internal_error", False),
+            ),
+        )
+        for error, expected in cases:
+            with self.subTest(error_type=type(error).__name__):
+                self.assertEqual(normalize_bulk_exception(error), expected)
+
+
+class BulkPinWriteAPITests(TemporaryMediaMixin, APITransactionTestCase):
+    def setUp(self):
+        super(BulkPinWriteAPITests, self).setUp()
+        self.owner = create_user("bulk-write-owner")
+        self.other_user = create_user("bulk-write-other")
+        self.source = Board.objects.create(
+            submitter=self.owner,
+            name="bulk-write-source",
+        )
+        self.target = Board.objects.create(
+            submitter=self.owner,
+            name="bulk-write-target",
+        )
+        self.other_board = Board.objects.create(
+            submitter=self.owner,
+            name="bulk-write-other-board",
+        )
+        self.image = create_image()
+        self.first = self._create_pin(self.owner)
+        self.second = self._create_pin(self.owner)
+        self.outside = self._create_pin(self.owner)
+        self.foreign = self._create_pin(self.other_user)
+        self.source.pins.add(self.first)
+        self.client.login(
+            username=self.owner.username,
+            password="password",
+        )
+
+    def _create_pin(self, user, private=False):
+        return Pin.objects.create(
+            submitter=user,
+            image=self.image,
+            private=private,
+            description="original description",
+            referer="https://example.com/original",
+        )
+
+    @staticmethod
+    def _url():
+        return "/api/v2/pins/bulk/"
+
+    def test_bulk_requires_authentication(self):
+        self.client.logout()
+
+        response = self.client.post(
+            self._url(),
+            {"operation": "delete", "pin_ids": [self.first.pk]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertTrue(Pin.objects.filter(pk=self.first.pk).exists())
+
+    def test_invalid_request_is_code_only_and_changes_nothing(self):
+        response = self.client.post(
+            self._url(),
+            {
+                "operation": "update",
+                "pin_ids": [self.first.pk],
+                "changes": {"description": "forbidden"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data, {"code": "bulk_invalid_request"})
+        self.first.refresh_from_db()
+        self.assertEqual(self.first.description, "original description")
+
+    def test_delete_keeps_success_before_later_failure(self):
+        with mock.patch.object(
+            Pin,
+            "delete",
+            autospec=True,
+            side_effect=[
+                (1, {"core.Pin": 1}),
+                RuntimeError("busy /private/path"),
+            ],
+        ):
+            response = self.client.post(
+                self._url(),
+                {
+                    "operation": "delete",
+                    "pin_ids": [self.first.pk, self.second.pk],
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {
+            "operation": "delete",
+            "succeeded": 1,
+            "preserved": 0,
+            "failed": 1,
+            "results": [
+                {"id": self.first.pk, "status": "deleted"},
+                {
+                    "id": self.second.pk,
+                    "status": "failed",
+                    "code": "internal_error",
+                    "retryable": False,
+                },
+            ],
+        })
+        self.assertNotIn("private", str(response.data))
+        self.assertNotIn("busy", str(response.data))
+
+    def test_delete_maps_database_busy_without_raw_message(self):
+        with mock.patch.object(
+            Pin,
+            "delete",
+            autospec=True,
+            side_effect=OperationalError(
+                "database is locked at /private/database.sqlite3"
+            ),
+        ):
+            response = self.client.post(
+                self._url(),
+                {"operation": "delete", "pin_ids": [self.first.pk]},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {
+            "operation": "delete",
+            "succeeded": 0,
+            "preserved": 0,
+            "failed": 1,
+            "results": [{
+                "id": self.first.pk,
+                "status": "failed",
+                "code": "database_busy",
+                "retryable": True,
+            }],
+        })
+        self.assertNotIn("sqlite3", str(response.data))
+
+    def test_delete_marks_unstarted_items_after_deadline(self):
+        clock = mock.Mock(side_effect=[10.0, 10.0, 23.0])
+        with mock.patch.object(
+            PinViewSet,
+            "bulk_clock",
+            clock,
+        ), mock.patch.object(
+            Pin,
+            "delete",
+            autospec=True,
+            return_value=(1, {"core.Pin": 1}),
+        ) as delete:
+            response = self.client.post(
+                self._url(),
+                {
+                    "operation": "delete",
+                    "pin_ids": [self.first.pk, self.second.pk],
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {
+            "operation": "delete",
+            "succeeded": 1,
+            "preserved": 0,
+            "failed": 1,
+            "results": [
+                {"id": self.first.pk, "status": "deleted"},
+                {
+                    "id": self.second.pk,
+                    "status": "failed",
+                    "code": "bulk_deadline_exceeded",
+                    "retryable": True,
+                },
+            ],
+        })
+        self.assertEqual(delete.call_count, 1)
+        self.assertGreater(
+            23.0,
+            10.0 + settings.PINRY_FETCH_TOTAL_TIMEOUT,
+        )
+
+    def test_add_preserves_other_boards_and_is_idempotent(self):
+        self.other_board.pins.add(self.first, self.second)
+        self.target.pins.add(self.second)
+        payload = {
+            "operation": "add_to_board",
+            "pin_ids": [self.first.pk, self.second.pk],
+            "board_id": self.target.pk,
+        }
+
+        first_response = self.client.post(
+            self._url(), payload, format="json"
+        )
+        second_response = self.client.post(
+            self._url(), payload, format="json"
+        )
+
+        self.assertEqual(first_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(first_response.data, {
+            "operation": "add_to_board",
+            "succeeded": 2,
+            "preserved": 0,
+            "failed": 0,
+            "results": [
+                {"id": self.first.pk, "status": "updated"},
+                {"id": self.second.pk, "status": "unchanged"},
+            ],
+        })
+        self.assertEqual(second_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [item["status"] for item in second_response.data["results"]],
+            ["unchanged", "unchanged"],
+        )
+        self.assertTrue(self.other_board.pins.filter(
+            pk=self.first.pk
+        ).exists())
+        self.assertTrue(self.other_board.pins.filter(
+            pk=self.second.pk
+        ).exists())
+
+    def test_move_supports_all_success_membership_states(self):
+        source_only = self.first
+        both = self.second
+        target_only = self.outside
+        self.source.pins.add(both)
+        self.target.pins.add(both, target_only)
+
+        response = self.client.post(
+            self._url(),
+            {
+                "operation": "move_between_boards",
+                "pin_ids": [source_only.pk, both.pk, target_only.pk],
+                "source_board_id": self.source.pk,
+                "target_board_id": self.target.pk,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {
+            "operation": "move_between_boards",
+            "succeeded": 3,
+            "preserved": 0,
+            "failed": 0,
+            "results": [
+                {"id": source_only.pk, "status": "moved"},
+                {"id": both.pk, "status": "moved"},
+                {"id": target_only.pk, "status": "unchanged"},
+            ],
+        })
+        self.assertFalse(self.source.pins.filter(
+            pk__in=[source_only.pk, both.pk, target_only.pk]
+        ).exists())
+        self.assertEqual(
+            set(self.target.pins.filter(
+                pk__in=[source_only.pk, both.pk, target_only.pk]
+            ).values_list("pk", flat=True)),
+            {source_only.pk, both.pk, target_only.pk},
+        )
+
+    def test_move_conflict_is_code_only_and_rolls_back_whole_chunk(self):
+        response = self.client.post(
+            self._url(),
+            {
+                "operation": "move_between_boards",
+                "pin_ids": [self.first.pk, self.outside.pk],
+                "source_board_id": self.source.pk,
+                "target_board_id": self.target.pk,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data, {"code": "pin_membership_changed"})
+        self.assertTrue(self.source.pins.filter(pk=self.first.pk).exists())
+        self.assertFalse(self.target.pins.filter(pk=self.first.pk).exists())
+
+    def test_move_hides_private_foreign_and_missing_pin(self):
+        private_foreign = self._create_pin(self.other_user, private=True)
+        self.source.pins.add(private_foreign)
+
+        for pin_id in (private_foreign.pk, private_foreign.pk + 100000):
+            with self.subTest(pin_id=pin_id):
+                response = self.client.post(
+                    self._url(),
+                    {
+                        "operation": "move_between_boards",
+                        "pin_ids": [pin_id],
+                        "source_board_id": self.source.pk,
+                        "target_board_id": self.target.pk,
+                    },
+                    format="json",
+                )
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_404_NOT_FOUND,
+                )
+                self.assertEqual(response.data, {"code": "pin_not_found"})
+
+        self.assertTrue(self.source.pins.filter(
+            pk=private_foreign.pk
+        ).exists())
+        self.assertFalse(self.target.pins.filter(
+            pk=private_foreign.pk
+        ).exists())
+
+    def test_update_supports_all_tag_modes(self):
+        cases = (
+            ("add", ["new"], ["old"], {"old", "new"}),
+            ("remove", ["old"], ["old", "keep"], {"keep"}),
+            ("replace", ["new"], ["old"], {"new"}),
+            ("replace", [], ["old"], set()),
+        )
+        for mode, values, before, expected in cases:
+            with self.subTest(mode=mode, values=values):
+                self.first.tags.set(*before)
+                response = self.client.post(
+                    self._url(),
+                    {
+                        "operation": "update",
+                        "pin_ids": [self.first.pk],
+                        "changes": {
+                            "tags": {"mode": mode, "values": values},
+                        },
+                    },
+                    format="json",
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(response.data, {
+                    "operation": "update",
+                    "succeeded": 1,
+                    "preserved": 0,
+                    "failed": 0,
+                    "results": [{
+                        "id": self.first.pk,
+                        "status": "updated",
+                    }],
+                })
+                self.assertEqual(set(self.first.tags.names()), expected)
+
+    def test_update_private_only_preserves_description_and_referer(self):
+        response = self.client.post(
+            self._url(),
+            {
+                "operation": "update",
+                "pin_ids": [self.first.pk, self.second.pk],
+                "changes": {"private": True},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {
+            "operation": "update",
+            "succeeded": 2,
+            "preserved": 0,
+            "failed": 0,
+            "results": [
+                {"id": self.first.pk, "status": "updated"},
+                {"id": self.second.pk, "status": "updated"},
+            ],
+        })
+        for pin in (self.first, self.second):
+            pin.refresh_from_db()
+            self.assertTrue(pin.private)
+            self.assertEqual(pin.description, "original description")
+            self.assertEqual(
+                pin.referer,
+                "https://example.com/original",
+            )
+
+    def test_update_failure_rolls_back_whole_chunk(self):
+        real_save = Pin.save
+        save_count = [0]
+
+        def fail_after_second_save(pin, *args, **kwargs):
+            real_save(pin, *args, **kwargs)
+            save_count[0] += 1
+            if save_count[0] == 2:
+                raise RuntimeError("secret update failure /private/path")
+
+        with mock.patch.object(
+            Pin,
+            "save",
+            autospec=True,
+            side_effect=fail_after_second_save,
+        ):
+            response = self.client.post(
+                self._url(),
+                {
+                    "operation": "update",
+                    "pin_ids": [self.first.pk, self.second.pk],
+                    "changes": {"private": True},
+                },
+                format="json",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+        self.assertEqual(response.data, {"code": "internal_error"})
+        self.first.refresh_from_db()
+        self.second.refresh_from_db()
+        self.assertFalse(self.first.private)
+        self.assertFalse(self.second.private)
+
+    def test_missing_or_non_owned_pin_rejects_atomic_operations(self):
+        cases = ("delete", "add_to_board", "update")
+        for operation in cases:
+            for kind in ("missing", "non_owned"):
+                with self.subTest(operation=operation, kind=kind):
+                    candidate = self._create_pin(self.owner)
+                    invalid_id = (
+                        self.foreign.pk
+                        if kind == "non_owned"
+                        else self.foreign.pk + 100000
+                    )
+                    payload = {
+                        "operation": operation,
+                        "pin_ids": [candidate.pk, invalid_id],
+                    }
+                    if operation == "add_to_board":
+                        payload["board_id"] = self.target.pk
+                    elif operation == "update":
+                        payload["changes"] = {"private": True}
+
+                    response = self.client.post(
+                        self._url(), payload, format="json"
+                    )
+
+                    self.assertEqual(
+                        response.status_code,
+                        status.HTTP_404_NOT_FOUND,
+                    )
+                    self.assertEqual(
+                        response.data,
+                        {"code": "pin_not_found"},
+                    )
+                    self.assertTrue(Pin.objects.filter(
+                        pk=candidate.pk
+                    ).exists())
+                    candidate.refresh_from_db()
+                    self.assertFalse(candidate.private)
+                    self.assertFalse(self.target.pins.filter(
+                        pk=candidate.pk
+                    ).exists())
+
+    def test_missing_or_non_owned_boards_return_same_code(self):
+        foreign_board = Board.objects.create(
+            submitter=self.other_user,
+            name="bulk-write-foreign-board",
+        )
+        missing_id = foreign_board.pk + 100000
+        cases = (
+            {
+                "operation": "add_to_board",
+                "pin_ids": [self.first.pk],
+                "board_id": foreign_board.pk,
+            },
+            {
+                "operation": "move_between_boards",
+                "pin_ids": [self.first.pk],
+                "source_board_id": missing_id,
+                "target_board_id": self.target.pk,
+            },
+            {
+                "operation": "move_between_boards",
+                "pin_ids": [self.first.pk],
+                "source_board_id": self.source.pk,
+                "target_board_id": foreign_board.pk,
+            },
+            {
+                "operation": "delete_if_exclusive_to_board",
+                "pin_ids": [self.first.pk],
+                "source_board_id": missing_id,
+            },
+        )
+        for payload in cases:
+            with self.subTest(operation=payload["operation"]):
+                response = self.client.post(
+                    self._url(), payload, format="json"
+                )
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_404_NOT_FOUND,
+                )
+                self.assertEqual(response.data, {"code": "board_not_found"})
+
+        self.assertTrue(self.source.pins.filter(pk=self.first.pk).exists())
+        self.assertFalse(self.target.pins.filter(pk=self.first.pk).exists())
+
+    def test_conditional_delete_aggregates_deleted_and_preserved_codes(self):
+        shared = self.second
+        foreign = self.foreign
+        missing_membership = self.outside
+        self.source.pins.add(shared, foreign)
+        self.other_board.pins.add(shared)
+
+        response = self.client.post(
+            self._url(),
+            {
+                "operation": "delete_if_exclusive_to_board",
+                "pin_ids": [
+                    self.first.pk,
+                    shared.pk,
+                    foreign.pk,
+                    missing_membership.pk,
+                ],
+                "source_board_id": self.source.pk,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {
+            "operation": "delete_if_exclusive_to_board",
+            "succeeded": 1,
+            "preserved": 3,
+            "failed": 0,
+            "results": [
+                {"id": self.first.pk, "status": "deleted"},
+                {
+                    "id": shared.pk,
+                    "status": "preserved",
+                    "code": "shared_pin",
+                },
+                {
+                    "id": foreign.pk,
+                    "status": "preserved",
+                    "code": "non_owned_pin",
+                },
+                {
+                    "id": missing_membership.pk,
+                    "status": "preserved",
+                    "code": "source_membership_changed",
+                },
+            ],
+        })
+        self.assertFalse(Pin.objects.filter(pk=self.first.pk).exists())
+        self.assertTrue(Pin.objects.filter(pk=shared.pk).exists())
+        self.assertTrue(Pin.objects.filter(pk=foreign.pk).exists())
+        self.assertTrue(Pin.objects.filter(
+            pk=missing_membership.pk
+        ).exists())
+
+    def test_atomic_service_errors_are_code_only(self):
+        cases = (
+            (
+                BulkOperationError("pin_not_found", 500),
+                status.HTTP_404_NOT_FOUND,
+                "pin_not_found",
+            ),
+            (
+                OperationalError("database locked /private/path"),
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "database_busy",
+            ),
+            (
+                RuntimeError("secret token /private/path"),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "internal_error",
+            ),
+            (
+                BulkOperationError("secret /private/path", 418),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "internal_error",
+            ),
+        )
+        payload = {
+            "operation": "update",
+            "pin_ids": [self.first.pk],
+            "changes": {"private": True},
+        }
+        for error, expected_status, expected_code in cases:
+            with self.subTest(error_type=type(error).__name__):
+                with mock.patch.object(
+                    PinViewSet,
+                    "bulk_service_class",
+                ) as service_class:
+                    service_class.return_value.execute.side_effect = error
+                    response = self.client.post(
+                        self._url(), payload, format="json"
+                    )
+
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(response.data, {"code": expected_code})
+                self.assertNotIn("private/path", str(response.data))
+
+    def test_service_factory_error_is_code_only(self):
+        with mock.patch.object(
+            PinViewSet,
+            "bulk_service_class",
+            side_effect=RuntimeError("secret factory /private/path"),
+        ):
+            response = self.client.post(
+                self._url(),
+                {
+                    "operation": "update",
+                    "pin_ids": [self.first.pk],
+                    "changes": {"private": True},
+                },
+                format="json",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+        self.assertEqual(response.data, {"code": "internal_error"})
 
 
 class BulkPinReadAPITests(APITestCase):

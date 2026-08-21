@@ -26,6 +26,7 @@ from core.serializers import (
     URLImportUnavailable,
 )
 from core.services.media_storage import MediaStorageError
+from core.services.bulk_pin_management import BulkPinManagementService
 from core.services.pin_membership import PinMembershipService
 from core.services.pin_import import PinImportError, PinImportService
 from core.services.safe_url_fetch import (
@@ -469,6 +470,29 @@ class _AtomicCheckingBatchService(object):
 
     def close(self):
         self.closed += 1
+
+
+class _AtomicCheckingMembershipService(object):
+    def __init__(self):
+        self.in_atomic_block = None
+        self.autocommit = None
+
+    def add_owned_pins(self, user, board_id, pin_ids):
+        del user, board_id, pin_ids
+        self.in_atomic_block = connection.in_atomic_block
+        self.autocommit = connection.get_autocommit()
+        return ["added"]
+
+
+class _AtomicCheckingBulkService(BulkPinManagementService):
+    def execute(self, user, request_data, started_at):
+        self.in_atomic_block = connection.in_atomic_block
+        self.autocommit = connection.get_autocommit()
+        return super(_AtomicCheckingBulkService, self).execute(
+            user,
+            request_data,
+            started_at,
+        )
 
 
 class PinTests(TemporaryMediaMixin, APITransactionTestCase):
@@ -1553,6 +1577,46 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
         self.assertFalse(service.commit_in_atomic_block)
         self.assertTrue(service.commit_autocommit)
         self.assertEqual(service.closed, 1)
+
+    def test_bulk_post_runs_outside_atomic_requests_transaction(self):
+        membership = _AtomicCheckingMembershipService()
+        service = _AtomicCheckingBulkService(
+            membership_service=membership,
+            clock=lambda: 0.0,
+        )
+        board = Board.objects.create(
+            submitter=self.user,
+            name="bulk-atomic-board",
+        )
+        pin = Pin.objects.create(
+            submitter=self.user,
+            image=create_image(),
+        )
+        previous = connection.settings_dict["ATOMIC_REQUESTS"]
+        connection.settings_dict["ATOMIC_REQUESTS"] = True
+        try:
+            with mock.patch.object(
+                PinViewSet,
+                "bulk_service_class",
+                return_value=service,
+            ):
+                response = self.client.post(
+                    "{}bulk/".format(reverse("pin-list")),
+                    {
+                        "operation": "add_to_board",
+                        "pin_ids": [pin.pk],
+                        "board_id": board.pk,
+                    },
+                    format="json",
+                )
+        finally:
+            connection.settings_dict["ATOMIC_REQUESTS"] = previous
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(service.in_atomic_block)
+        self.assertTrue(service.autocommit)
+        self.assertTrue(membership.in_atomic_block)
+        self.assertFalse(membership.autocommit)
 
     def test_import_and_delete_callbacks_restore_atomic_read_actions(self):
         image = create_image()

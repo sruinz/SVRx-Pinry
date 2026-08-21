@@ -21,6 +21,7 @@ from taggit.models import Tag
 
 from core import serializers as api
 from core.batch_serializers import BatchImportRequestSerializer
+from core.bulk_serializers import BulkPinRequestSerializer
 from core.models import Image, Pin, Board
 from core.parsers import LimitedJSONParser
 from core.permissions import IsOwnerOrReadOnly, OwnerOnlyIfPrivate
@@ -29,6 +30,7 @@ from core.services.batch_import import BatchImportService
 from core.services.bulk_pin_management import (
     BulkOperationError,
     BulkPinManagementService,
+    normalize_bulk_exception,
     parse_selection_query,
 )
 from core.services.bounded_resolver import BoundedResolver
@@ -58,7 +60,16 @@ class ImageViewSet(mixins.CreateModelMixin, GenericViewSet):
 
 
 class PinViewSet(viewsets.ModelViewSet):
-    _NON_ATOMIC_ACTIONS = frozenset(("create", "batch", "destroy"))
+    _NON_ATOMIC_ACTIONS = frozenset(
+        ("create", "batch", "bulk", "destroy")
+    )
+    _BULK_ERROR_STATUS = {
+        "board_not_found": status.HTTP_404_NOT_FOUND,
+        "pin_not_found": status.HTTP_404_NOT_FOUND,
+        "pin_membership_changed": status.HTTP_409_CONFLICT,
+        "database_busy": status.HTTP_503_SERVICE_UNAVAILABLE,
+        "internal_error": status.HTTP_500_INTERNAL_SERVER_ERROR,
+    }
     serializer_class = api.PinSerializer
     filter_backends = (DjangoFilterBackend, SearchFilter, OrderingFilter)
     filter_fields = ("submitter__username", 'tags__name', "pins__id")
@@ -76,6 +87,8 @@ class PinViewSet(viewsets.ModelViewSet):
     idempotency_class = IdempotencyStore
     pin_import_service_class = PinImportService
     batch_clock = staticmethod(time.monotonic)
+    bulk_service_class = BulkPinManagementService
+    bulk_clock = staticmethod(time.monotonic)
     bulk_pin_management_service_class = BulkPinManagementService
 
     @classmethod
@@ -214,6 +227,50 @@ class PinViewSet(viewsets.ModelViewSet):
         except BulkOperationError as error:
             return Response({"code": error.code}, status=error.status_code)
         return Response(result)
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="bulk",
+        url_name="bulk",
+        parser_classes=[LimitedJSONParser],
+        permission_classes=[IsAuthenticated],
+    )
+    def bulk(self, request):
+        serializer = BulkPinRequestSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"code": "bulk_invalid_request"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            service = self.bulk_service_class(clock=self.bulk_clock)
+            result = service.execute(
+                request.user,
+                serializer.validated_data,
+                self.bulk_clock(),
+            )
+        except BulkOperationError as error:
+            error_status = self._BULK_ERROR_STATUS.get(error.code)
+            if error_status is None:
+                return Response(
+                    {"code": "internal_error"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+            return Response(
+                {"code": error.code},
+                status=error_status,
+            )
+        except Exception as error:
+            code, retryable = normalize_bulk_exception(error)
+            del retryable
+            error_status = (
+                status.HTTP_503_SERVICE_UNAVAILABLE
+                if code == "database_busy"
+                else status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+            return Response({"code": code}, status=error_status)
+        return Response(result, status=status.HTTP_200_OK)
 
     @action(
         detail=False,
