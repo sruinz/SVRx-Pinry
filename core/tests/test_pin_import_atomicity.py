@@ -48,6 +48,102 @@ from taggit.models import Tag
 from users.models import User
 
 
+class _SQLiteConcurrencyHarness(object):
+    def __init__(self, test_case):
+        self.test_case = test_case
+        self.barriers = []
+        self.release_events = []
+        self.workers = []
+
+        with connection.cursor() as cursor:
+            cursor.execute("PRAGMA journal_mode")
+            self.original_journal_mode = cursor.fetchone()[0].lower()
+        self.test_case.addCleanup(self._restore_journal_mode)
+        with connection.cursor() as cursor:
+            cursor.execute("PRAGMA journal_mode = WAL")
+            self.test_case.assertEqual(
+                cursor.fetchone()[0].lower(),
+                "wal",
+            )
+
+    def barrier(self, parties):
+        barrier = threading.Barrier(parties)
+        self.barriers.append(barrier)
+        return barrier
+
+    def release_event(self):
+        release_event = threading.Event()
+        self.release_events.append(release_event)
+        return release_event
+
+    def start(self, workers):
+        self.workers = list(workers)
+        self.test_case.addCleanup(self._stop_workers)
+        for worker in self.workers:
+            worker.start()
+
+    def join_and_collect(self, outcomes, expected):
+        for worker in self.workers:
+            worker.join(timeout=10)
+        collected = []
+        while True:
+            try:
+                collected.append(outcomes.get_nowait())
+            except queue.Empty:
+                break
+        alive = [worker.name for worker in self.workers if worker.is_alive()]
+        self.test_case.assertEqual(
+            alive,
+            [],
+            "concurrency workers still alive: {}; outcomes: {}".format(
+                alive,
+                collected,
+            ),
+        )
+        self.test_case.assertEqual(
+            len(collected),
+            expected,
+            "expected {} worker outcomes, got {}: {}".format(
+                expected,
+                len(collected),
+                collected,
+            ),
+        )
+        return collected
+
+    def _stop_workers(self):
+        for barrier in self.barriers:
+            barrier.abort()
+        for release_event in self.release_events:
+            release_event.set()
+        for worker in self.workers:
+            if worker.ident is not None:
+                worker.join(timeout=10)
+        alive = [worker.name for worker in self.workers if worker.is_alive()]
+        self.test_case.assertEqual(
+            alive,
+            [],
+            "cleanup could not stop concurrency workers: {}".format(alive),
+        )
+
+    def _restore_journal_mode(self):
+        database = connections["default"]
+        database.close()
+        try:
+            with database.cursor() as cursor:
+                cursor.execute(
+                    "PRAGMA journal_mode = {}".format(
+                        self.original_journal_mode
+                    )
+                )
+                self.test_case.assertEqual(
+                    cursor.fetchone()[0].lower(),
+                    self.original_journal_mode,
+                )
+        finally:
+            database.close()
+
+
 class _PreparedAsset(object):
     def __init__(self):
         self.cleanup_calls = 0
@@ -4238,6 +4334,48 @@ class PinImportConcurrencyTests(
         self.assertEqual(len(_file_snapshot(self.temporary_media.name)), 4)
 
 
+class SQLiteConcurrencyHarnessTests(TransactionTestCase):
+    def test_cleanup_stops_workers_before_restoring_journal_mode(self):
+        if connection.vendor != "sqlite":
+            self.skipTest("This concurrency contract requires SQLite.")
+        if connection.creation.is_in_memory_db(
+            connection.settings_dict["NAME"]
+        ):
+            self.skipTest("This concurrency contract requires file SQLite.")
+        harness = _SQLiteConcurrencyHarness(self)
+        original_journal_mode = harness.original_journal_mode
+        worker_started = harness.barrier(2)
+        worker_release = harness.release_event()
+        worker_blocked = threading.Event()
+
+        def worker():
+            close_old_connections()
+            try:
+                worker_started.wait(timeout=5)
+                worker_blocked.set()
+                worker_release.wait(5)
+            finally:
+                close_old_connections()
+
+        current = threading.Thread(
+            target=worker,
+            name="cleanup-observation-worker",
+        )
+        harness.start([current])
+        worker_started.wait(timeout=5)
+        self.assertTrue(worker_blocked.wait(5))
+
+        self.doCleanups()
+
+        self.assertFalse(current.is_alive())
+        with connection.cursor() as cursor:
+            cursor.execute("PRAGMA journal_mode")
+            self.assertEqual(
+                cursor.fetchone()[0].lower(),
+                original_journal_mode,
+            )
+
+
 class BoardPatchConditionalDeleteConcurrencyTests(
     TemporaryMediaMixin,
     TransactionTestCase,
@@ -4274,34 +4412,13 @@ class BoardPatchConditionalDeleteConcurrencyTests(
     def test_patch_racing_conditional_delete_preserves_committed_membership(
         self,
     ):
-        with connection.cursor() as cursor:
-            cursor.execute("PRAGMA journal_mode")
-            original_journal_mode = cursor.fetchone()[0].lower()
-            cursor.execute("PRAGMA journal_mode = WAL")
-            self.assertEqual(cursor.fetchone()[0].lower(), "wal")
-
-        def restore_journal_mode():
-            connections["default"].close()
-            with connections["default"].cursor() as cursor:
-                cursor.execute(
-                    "PRAGMA journal_mode = {}".format(
-                        original_journal_mode
-                    )
-                )
-                self.assertEqual(
-                    cursor.fetchone()[0].lower(),
-                    original_journal_mode,
-                )
-            connections["default"].close()
-
-        self.addCleanup(restore_journal_mode)
-
+        harness = _SQLiteConcurrencyHarness(self)
         owner = self.owner
         pin_id = self.pin.pk
         source_id = self.source.pk
         target_id = self.target.pk
-        pin_snapshot_ready = threading.Barrier(2)
-        patch_finished = threading.Event()
+        pin_snapshot_ready = harness.barrier(2)
+        patch_finished = harness.release_event()
         outcomes = queue.Queue()
         original_lock = PinMembershipService.lock_source_board_and_pin
 
@@ -4344,7 +4461,7 @@ class BoardPatchConditionalDeleteConcurrencyTests(
             except BaseException as error:
                 outcomes.put(("error", "delete", error))
             finally:
-                connections["default"].close()
+                close_old_connections()
 
         def board_patch_worker():
             close_old_connections()
@@ -4366,7 +4483,7 @@ class BoardPatchConditionalDeleteConcurrencyTests(
             except BaseException as error:
                 outcomes.put(("error", "patch", error))
             finally:
-                connections["default"].close()
+                close_old_connections()
                 patch_finished.set()
 
         with mock.patch.object(
@@ -4384,13 +4501,9 @@ class BoardPatchConditionalDeleteConcurrencyTests(
                     name="board-patch-worker",
                 ),
             ]
-            for current in workers:
-                current.start()
-            for current in workers:
-                current.join(timeout=10)
+            harness.start(workers)
+            collected = harness.join_and_collect(outcomes, len(workers))
 
-        self.assertFalse(any(current.is_alive() for current in workers))
-        collected = [outcomes.get(timeout=1) for _worker in workers]
         errors = [item for item in collected if item[0] == "error"]
         self.assertEqual(errors, [])
         results = {item[0]: item[1:] for item in collected}

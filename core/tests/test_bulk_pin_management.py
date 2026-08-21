@@ -10,6 +10,8 @@ from django.db import (
     connections,
     OperationalError,
 )
+from django.db.models import F
+from django.db.models.query import QuerySet
 from django.test import override_settings, SimpleTestCase
 from django.test.utils import CaptureQueriesContext
 import mock
@@ -22,7 +24,10 @@ from core.models import Board, Image, MediaAsset, Pin
 from core.services.bulk_pin_management import BulkOperationError
 from core.services.pin_membership import PinMembershipService
 from core.tests.helpers import create_image, create_user
-from core.tests.test_pin_import_atomicity import _LinuxStrongPublishMixin
+from core.tests.test_pin_import_atomicity import (
+    _LinuxStrongPublishMixin,
+    _SQLiteConcurrencyHarness,
+)
 from core.views import PinViewSet
 from django_images.models import Thumbnail
 from django_images.test_helpers import TemporaryMediaMixin
@@ -548,6 +553,7 @@ class BulkPinWriteAPITests(
             {source_only.pk, both.pk, target_only.pk},
         )
 
+    @override_settings(DEBUG=False)
     def test_board_delete_racing_move_has_no_live_membership_or_raw_lock_body(
         self,
     ):
@@ -557,54 +563,60 @@ class BulkPinWriteAPITests(
             connection.settings_dict["NAME"]
         ):
             self.skipTest("This concurrency contract requires file SQLite.")
-        with connection.cursor() as cursor:
-            cursor.execute("PRAGMA journal_mode")
-            original_journal_mode = cursor.fetchone()[0].lower()
-            cursor.execute("PRAGMA journal_mode = WAL")
-            self.assertEqual(cursor.fetchone()[0].lower(), "wal")
-
-        def restore_journal_mode():
-            connections["default"].close()
-            with connections["default"].cursor() as cursor:
-                cursor.execute(
-                    "PRAGMA journal_mode = {}".format(
-                        original_journal_mode
-                    )
-                )
-                self.assertEqual(
-                    cursor.fetchone()[0].lower(),
-                    original_journal_mode,
-                )
-            connections["default"].close()
-
-        self.addCleanup(restore_journal_mode)
-
+        harness = _SQLiteConcurrencyHarness(self)
         pin_id = self.first.pk
         source_id = self.source.pk
         target_id = self.target.pk
-        move_locked = threading.Barrier(2)
-        board_deleted = threading.Event()
+        membership_snapshot_ready = harness.barrier(2)
+        board_delete_finished = harness.release_event()
         outcomes = queue.Queue()
         original_lock_pins = PinMembershipService._lock_pins
+        original_values_list = QuerySet.values_list
+        move_membership_reads = []
 
-        def pause_move_after_pin_snapshot(
+        def establish_sqlite_writer_fence_at_pin_lock(
             service,
             pin_ids,
             using="default",
         ):
             pins = original_lock_pins(service, pin_ids, using=using)
             if threading.current_thread().name == "bulk-move-worker":
-                move_locked.wait(timeout=5)
-                if not board_deleted.wait(5):
-                    raise AssertionError("board delete did not finish")
+                # SQLite의 select_for_update() 대신 lock 경계에
+                # test-only writer fence를 세워 호출 순서만 관찰한다.
+                Pin.objects.using(using).filter(pk__in=pin_ids).update(
+                    private=F("private")
+                )
             return pins
+
+        def pause_after_membership_snapshot(
+            queryset,
+            *fields,
+            **expressions
+        ):
+            result = original_values_list(
+                queryset,
+                *fields,
+                **expressions
+            )
+            if (
+                threading.current_thread().name == "bulk-move-worker"
+                and fields == ("pk",)
+                and expressions.get("flat") is True
+                and not move_membership_reads
+            ):
+                result = list(result)
+                move_membership_reads.append(True)
+                membership_snapshot_ready.wait(timeout=5)
+                if not board_delete_finished.wait(5):
+                    raise AssertionError("board delete did not finish")
+            return result
 
         def move_worker():
             close_old_connections()
             try:
                 client = APIClient()
                 client.force_authenticate(user=self.owner)
-                client.raise_request_exception = False
+                client.store_exc_info = mock.Mock()
                 response = client.post(
                     self._url(),
                     {
@@ -623,15 +635,15 @@ class BulkPinWriteAPITests(
             except BaseException as error:
                 outcomes.put(("error", "move", error))
             finally:
-                connections["default"].close()
+                close_old_connections()
 
         def delete_board_worker():
             close_old_connections()
             try:
-                move_locked.wait(timeout=5)
+                membership_snapshot_ready.wait(timeout=5)
                 client = APIClient()
                 client.force_authenticate(user=self.owner)
-                client.raise_request_exception = False
+                client.store_exc_info = mock.Mock()
                 response = client.delete(
                     "/api/v2/boards/{}/".format(source_id)
                 )
@@ -639,18 +651,25 @@ class BulkPinWriteAPITests(
                     "delete",
                     response.status_code,
                     getattr(response, "data", None),
+                    response.content.decode("utf-8", "replace"),
                 ))
             except BaseException as error:
                 outcomes.put(("error", "delete", error))
             finally:
+                close_old_connections()
                 connections["default"].close()
-                board_deleted.set()
+                board_delete_finished.set()
 
         with mock.patch.object(
             PinMembershipService,
             "_lock_pins",
             autospec=True,
-            side_effect=pause_move_after_pin_snapshot,
+            side_effect=establish_sqlite_writer_fence_at_pin_lock,
+        ), mock.patch.object(
+            QuerySet,
+            "values_list",
+            autospec=True,
+            side_effect=pause_after_membership_snapshot,
         ):
             workers = [
                 threading.Thread(
@@ -662,30 +681,38 @@ class BulkPinWriteAPITests(
                     name="board-delete-worker",
                 ),
             ]
-            for current in workers:
-                current.start()
-            for current in workers:
-                current.join(timeout=10)
+            harness.start(workers)
+            collected = harness.join_and_collect(outcomes, len(workers))
 
-        self.assertFalse(any(current.is_alive() for current in workers))
-        collected = [outcomes.get(timeout=1) for _worker in workers]
         errors = [item for item in collected if item[0] == "error"]
         self.assertEqual(errors, [])
         responses = {item[0]: item[1:] for item in collected}
         self.assertEqual(
-            responses["delete"],
-            (status.HTTP_204_NO_CONTENT, None),
+            responses["delete"][0],
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
         self.assertEqual(responses["move"], (
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            {"code": "database_busy"},
+            status.HTTP_200_OK,
+            {
+                "operation": "move_between_boards",
+                "succeeded": 1,
+                "preserved": 0,
+                "failed": 0,
+                "results": [{"id": pin_id, "status": "moved"}],
+            },
         ))
         self.assertNotIn("database is locked", str(responses).lower())
-        self.assertFalse(Board.objects.filter(pk=source_id).exists())
+        self.assertTrue(Board.objects.filter(pk=source_id).exists())
         self.assertTrue(Pin.objects.filter(pk=pin_id).exists())
-        self.assertFalse(
+        self.assertTrue(
             Board.pins.through.objects.filter(
                 board_id=target_id,
+                pin_id=pin_id,
+            ).exists()
+        )
+        self.assertFalse(
+            Board.pins.through.objects.filter(
+                board_id=source_id,
                 pin_id=pin_id,
             ).exists()
         )

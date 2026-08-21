@@ -28,7 +28,10 @@ from core.services.media_storage import MediaStorage
 from core.services.pin_membership import PinMembershipService
 from core.services.pin_import import ImportMetadata, PinImportService
 from core.tests.helpers import TEST_IMAGE_PATH, create_image, create_pin, create_user
-from core.tests.test_pin_import_atomicity import _LinuxStrongPublishMixin
+from core.tests.test_pin_import_atomicity import (
+    _LinuxStrongPublishMixin,
+    _SQLiteConcurrencyHarness,
+)
 from django_images import file_ops
 from django_images.file_ops import remove_media_file
 from django_images.models import Image as BaseImage, Thumbnail
@@ -559,28 +562,7 @@ class PinMediaLifecycleTest(
             connection.settings_dict["NAME"]
         ):
             self.skipTest("This concurrency contract requires file SQLite.")
-        with connection.cursor() as cursor:
-            cursor.execute("PRAGMA journal_mode")
-            original_journal_mode = cursor.fetchone()[0].lower()
-            cursor.execute("PRAGMA journal_mode = WAL")
-            self.assertEqual(cursor.fetchone()[0].lower(), "wal")
-
-        def restore_journal_mode():
-            connections["default"].close()
-            with connections["default"].cursor() as cursor:
-                cursor.execute(
-                    "PRAGMA journal_mode = {}".format(
-                        original_journal_mode
-                    )
-                )
-                self.assertEqual(
-                    cursor.fetchone()[0].lower(),
-                    original_journal_mode,
-                )
-            connections["default"].close()
-
-        self.addCleanup(restore_journal_mode)
-
+        harness = _SQLiteConcurrencyHarness(self)
         image = create_image()
         pin = create_pin(self.owner, image, [])
         pin_id = pin.pk
@@ -605,8 +587,8 @@ class PinMediaLifecycleTest(
             description=" ".join(secret_values),
             referer=secret_values[1],
         )
-        pin_snapshot_ready = threading.Barrier(2)
-        membership_finished = threading.Event()
+        pin_snapshot_ready = harness.barrier(2)
+        membership_finished = harness.release_event()
         outcomes = queue.Queue()
         original_lock = PinMembershipService.lock_source_board_and_pin
 
@@ -649,7 +631,7 @@ class PinMediaLifecycleTest(
             except BaseException as error:
                 outcomes.put(("error", "delete", error))
             finally:
-                connections["default"].close()
+                close_old_connections()
 
         def membership_worker():
             close_old_connections()
@@ -664,7 +646,7 @@ class PinMediaLifecycleTest(
             except BaseException as error:
                 outcomes.put(("error", "membership", error))
             finally:
-                connections["default"].close()
+                close_old_connections()
                 membership_finished.set()
 
         with mock.patch.object(
@@ -682,13 +664,9 @@ class PinMediaLifecycleTest(
                     name="membership-add-worker",
                 ),
             ]
-            for current in workers:
-                current.start()
-            for current in workers:
-                current.join(timeout=10)
+            harness.start(workers)
+            collected = harness.join_and_collect(outcomes, len(workers))
 
-        self.assertFalse(any(current.is_alive() for current in workers))
-        collected = [outcomes.get(timeout=1) for _worker in workers]
         errors = [item for item in collected if item[0] == "error"]
         self.assertEqual(errors, [], collected)
         results = {item[0]: item[1:] for item in collected}
