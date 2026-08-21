@@ -1,18 +1,26 @@
 import hashlib
 from pathlib import Path
+import queue
+import threading
 
 from django.conf import settings
-from django.db import connection, OperationalError
+from django.db import (
+    close_old_connections,
+    connection,
+    connections,
+    OperationalError,
+)
 from django.test import override_settings, SimpleTestCase
 from django.test.utils import CaptureQueriesContext
 import mock
 from rest_framework import status
 from rest_framework.exceptions import UnsupportedMediaType
-from rest_framework.test import APITestCase, APITransactionTestCase
+from rest_framework.test import APIClient, APITestCase, APITransactionTestCase
 
 from core.bulk_serializers import BulkPinRequestSerializer
 from core.models import Board, Image, MediaAsset, Pin
 from core.services.bulk_pin_management import BulkOperationError
+from core.services.pin_membership import PinMembershipService
 from core.tests.helpers import create_image, create_user
 from core.tests.test_pin_import_atomicity import _LinuxStrongPublishMixin
 from core.views import PinViewSet
@@ -538,6 +546,158 @@ class BulkPinWriteAPITests(
                 pk__in=[source_only.pk, both.pk, target_only.pk]
             ).values_list("pk", flat=True)),
             {source_only.pk, both.pk, target_only.pk},
+        )
+
+    def test_board_delete_racing_move_has_no_live_membership_or_raw_lock_body(
+        self,
+    ):
+        if connection.vendor != "sqlite":
+            self.skipTest("This concurrency contract requires SQLite.")
+        if connection.creation.is_in_memory_db(
+            connection.settings_dict["NAME"]
+        ):
+            self.skipTest("This concurrency contract requires file SQLite.")
+        with connection.cursor() as cursor:
+            cursor.execute("PRAGMA journal_mode")
+            original_journal_mode = cursor.fetchone()[0].lower()
+            cursor.execute("PRAGMA journal_mode = WAL")
+            self.assertEqual(cursor.fetchone()[0].lower(), "wal")
+
+        def restore_journal_mode():
+            connections["default"].close()
+            with connections["default"].cursor() as cursor:
+                cursor.execute(
+                    "PRAGMA journal_mode = {}".format(
+                        original_journal_mode
+                    )
+                )
+                self.assertEqual(
+                    cursor.fetchone()[0].lower(),
+                    original_journal_mode,
+                )
+            connections["default"].close()
+
+        self.addCleanup(restore_journal_mode)
+
+        pin_id = self.first.pk
+        source_id = self.source.pk
+        target_id = self.target.pk
+        move_locked = threading.Barrier(2)
+        board_deleted = threading.Event()
+        outcomes = queue.Queue()
+        original_lock_pins = PinMembershipService._lock_pins
+
+        def pause_move_after_pin_snapshot(
+            service,
+            pin_ids,
+            using="default",
+        ):
+            pins = original_lock_pins(service, pin_ids, using=using)
+            if threading.current_thread().name == "bulk-move-worker":
+                move_locked.wait(timeout=5)
+                if not board_deleted.wait(5):
+                    raise AssertionError("board delete did not finish")
+            return pins
+
+        def move_worker():
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=self.owner)
+                client.raise_request_exception = False
+                response = client.post(
+                    self._url(),
+                    {
+                        "operation": "move_between_boards",
+                        "pin_ids": [pin_id],
+                        "source_board_id": source_id,
+                        "target_board_id": target_id,
+                    },
+                    format="json",
+                )
+                outcomes.put((
+                    "move",
+                    response.status_code,
+                    response.data,
+                ))
+            except BaseException as error:
+                outcomes.put(("error", "move", error))
+            finally:
+                connections["default"].close()
+
+        def delete_board_worker():
+            close_old_connections()
+            try:
+                move_locked.wait(timeout=5)
+                client = APIClient()
+                client.force_authenticate(user=self.owner)
+                client.raise_request_exception = False
+                response = client.delete(
+                    "/api/v2/boards/{}/".format(source_id)
+                )
+                outcomes.put((
+                    "delete",
+                    response.status_code,
+                    getattr(response, "data", None),
+                ))
+            except BaseException as error:
+                outcomes.put(("error", "delete", error))
+            finally:
+                connections["default"].close()
+                board_deleted.set()
+
+        with mock.patch.object(
+            PinMembershipService,
+            "_lock_pins",
+            autospec=True,
+            side_effect=pause_move_after_pin_snapshot,
+        ):
+            workers = [
+                threading.Thread(
+                    target=move_worker,
+                    name="bulk-move-worker",
+                ),
+                threading.Thread(
+                    target=delete_board_worker,
+                    name="board-delete-worker",
+                ),
+            ]
+            for current in workers:
+                current.start()
+            for current in workers:
+                current.join(timeout=10)
+
+        self.assertFalse(any(current.is_alive() for current in workers))
+        collected = [outcomes.get(timeout=1) for _worker in workers]
+        errors = [item for item in collected if item[0] == "error"]
+        self.assertEqual(errors, [])
+        responses = {item[0]: item[1:] for item in collected}
+        self.assertEqual(
+            responses["delete"],
+            (status.HTTP_204_NO_CONTENT, None),
+        )
+        self.assertEqual(responses["move"], (
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            {"code": "database_busy"},
+        ))
+        self.assertNotIn("database is locked", str(responses).lower())
+        self.assertFalse(Board.objects.filter(pk=source_id).exists())
+        self.assertTrue(Pin.objects.filter(pk=pin_id).exists())
+        self.assertFalse(
+            Board.pins.through.objects.filter(
+                board_id=target_id,
+                pin_id=pin_id,
+            ).exists()
+        )
+        self.assertFalse(
+            Board.pins.through.objects.exclude(
+                board_id__in=Board.objects.values_list("pk", flat=True)
+            ).exists()
+        )
+        self.assertFalse(
+            Board.pins.through.objects.exclude(
+                pin_id__in=Pin.objects.values_list("pk", flat=True)
+            ).exists()
         )
 
     def test_move_conflict_is_code_only_and_rolls_back_whole_chunk(self):
@@ -1197,6 +1357,60 @@ class BulkPinReadAPITests(APITestCase):
             self.foreign_private.pk,
             [item["id"] for item in response.data["results"]],
         )
+
+    def test_selection_and_preview_omit_sensitive_model_fields(self):
+        secret_values = (
+            "selection-secret-token",
+            "/private/media/selection-source.png",
+            "selection-source.png",
+            "OperationalError",
+            "database is locked",
+        )
+        self.owned_pin.private = True
+        self.owned_pin.description = " ".join(secret_values)
+        self.owned_pin.referer = secret_values[1]
+        self.owned_pin.save(update_fields=(
+            "private",
+            "description",
+            "referer",
+        ))
+        Image.objects.filter(pk=self.owned_pin.image_id).update(
+            original_filename=secret_values[2]
+        )
+        self.board.pins.add(self.foreign_private)
+
+        unscoped = self.client.get(self._selection_url())
+        board_selection = self.client.get(
+            self._selection_url(),
+            {"board_id": self.board.pk},
+        )
+        preview = self.client.get(self._preview_url(self.board))
+
+        self.assertEqual(unscoped.status_code, status.HTTP_200_OK)
+        self.assertEqual(unscoped.data, {
+            "count": 1,
+            "results": [{"id": self.owned_pin.pk, "owned": True}],
+        })
+        self.assertEqual(board_selection.status_code, status.HTTP_200_OK)
+        self.assertEqual(board_selection.data, {
+            "count": 2,
+            "results": [
+                {"id": self.foreign_public.pk, "owned": False},
+                {"id": self.owned_pin.pk, "owned": True},
+            ],
+        })
+        self.assertEqual(preview.status_code, status.HTTP_200_OK)
+        self.assertEqual(preview.data, {
+            "exclusive_owned_count": 1,
+            "shared_owned_count": 0,
+            "non_owned_count": 1,
+        })
+        rendered_bodies = " ".join(
+            str(response.data)
+            for response in (unscoped, board_selection, preview)
+        )
+        for secret in secret_values:
+            self.assertNotIn(secret, rendered_bodies)
 
     def test_selection_rejects_other_user_or_missing_board(self):
         foreign_board = Board.objects.create(

@@ -19,12 +19,13 @@ from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.test import APITransactionTestCase
+from rest_framework.test import APIClient, APITransactionTestCase
 
 from core.admin import PinAdmin
 from core.models import BatchImportItem, Board, Image, MediaAsset, Pin
 from core.services.idempotency import IdempotencyStore, StoredError
 from core.services.media_storage import MediaStorage
+from core.services.pin_membership import PinMembershipService
 from core.services.pin_import import ImportMetadata, PinImportService
 from core.tests.helpers import TEST_IMAGE_PATH, create_image, create_pin, create_user
 from core.tests.test_pin_import_atomicity import _LinuxStrongPublishMixin
@@ -548,6 +549,181 @@ class PinMediaLifecycleTest(
             ).exists()
         )
         self.assertFalse(target.pins.filter(pk=pin_id).exists())
+
+    @skipUnless(
+        connection.vendor == "sqlite",
+        "SQLite file database write serialization observation",
+    )
+    def test_conditional_bulk_delete_racing_membership_add_is_safe(self):
+        if connection.creation.is_in_memory_db(
+            connection.settings_dict["NAME"]
+        ):
+            self.skipTest("This concurrency contract requires file SQLite.")
+        with connection.cursor() as cursor:
+            cursor.execute("PRAGMA journal_mode")
+            original_journal_mode = cursor.fetchone()[0].lower()
+            cursor.execute("PRAGMA journal_mode = WAL")
+            self.assertEqual(cursor.fetchone()[0].lower(), "wal")
+
+        def restore_journal_mode():
+            connections["default"].close()
+            with connections["default"].cursor() as cursor:
+                cursor.execute(
+                    "PRAGMA journal_mode = {}".format(
+                        original_journal_mode
+                    )
+                )
+                self.assertEqual(
+                    cursor.fetchone()[0].lower(),
+                    original_journal_mode,
+                )
+            connections["default"].close()
+
+        self.addCleanup(restore_journal_mode)
+
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        pin_id = pin.pk
+        self._register_asset(image)
+        source = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-service-race-source",
+        )
+        other_board = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-service-race-target",
+        )
+        source.pins.add(pin)
+        secret_values = (
+            "bulk-secret-token",
+            "/private/media/bulk-source.png",
+            "bulk-source.png",
+            "OperationalError",
+            "database is locked",
+        )
+        Pin.objects.filter(pk=pin_id).update(
+            description=" ".join(secret_values),
+            referer=secret_values[1],
+        )
+        pin_snapshot_ready = threading.Barrier(2)
+        membership_finished = threading.Event()
+        outcomes = queue.Queue()
+        original_lock = PinMembershipService.lock_source_board_and_pin
+
+        def pause_delete_after_pin_snapshot(
+            source_board_id,
+            current_pin_id,
+            using,
+        ):
+            result = original_lock(
+                source_board_id,
+                current_pin_id,
+                using,
+            )
+            if threading.current_thread().name == "conditional-delete-worker":
+                pin_snapshot_ready.wait(timeout=5)
+                if not membership_finished.wait(5):
+                    raise AssertionError("membership add did not finish")
+            return result
+
+        def delete_worker():
+            close_old_connections()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=self.owner)
+                client.raise_request_exception = False
+                response = client.post(
+                    "/api/v2/pins/bulk/",
+                    {
+                        "operation": "delete_if_exclusive_to_board",
+                        "pin_ids": [pin_id],
+                        "source_board_id": source.pk,
+                    },
+                    format="json",
+                )
+                outcomes.put((
+                    "delete",
+                    response.status_code,
+                    response.data,
+                ))
+            except BaseException as error:
+                outcomes.put(("error", "delete", error))
+            finally:
+                connections["default"].close()
+
+        def membership_worker():
+            close_old_connections()
+            try:
+                pin_snapshot_ready.wait(timeout=5)
+                result = PinMembershipService().add_owned_pins(
+                    self.owner,
+                    other_board.pk,
+                    [pin_id],
+                )
+                outcomes.put(("membership", result))
+            except BaseException as error:
+                outcomes.put(("error", "membership", error))
+            finally:
+                connections["default"].close()
+                membership_finished.set()
+
+        with mock.patch.object(
+            PinMembershipService,
+            "lock_source_board_and_pin",
+            side_effect=pause_delete_after_pin_snapshot,
+        ):
+            workers = [
+                threading.Thread(
+                    target=delete_worker,
+                    name="conditional-delete-worker",
+                ),
+                threading.Thread(
+                    target=membership_worker,
+                    name="membership-add-worker",
+                ),
+            ]
+            for current in workers:
+                current.start()
+            for current in workers:
+                current.join(timeout=10)
+
+        self.assertFalse(any(current.is_alive() for current in workers))
+        collected = [outcomes.get(timeout=1) for _worker in workers]
+        errors = [item for item in collected if item[0] == "error"]
+        self.assertEqual(errors, [], collected)
+        results = {item[0]: item[1:] for item in collected}
+        self.assertEqual(results["membership"], (["added"],))
+        self.assertEqual(results["delete"], (
+            status.HTTP_200_OK,
+            {
+                "operation": "delete_if_exclusive_to_board",
+                "succeeded": 0,
+                "preserved": 0,
+                "failed": 1,
+                "results": [{
+                    "id": pin_id,
+                    "status": "failed",
+                    "code": "database_busy",
+                    "retryable": True,
+                }],
+            },
+        ))
+        response_body = str(results["delete"])
+        for secret in secret_values:
+            self.assertNotIn(secret, response_body)
+        self.assertTrue(Pin.objects.filter(pk=pin_id).exists())
+        self.assertTrue(source.pins.filter(pk=pin_id).exists())
+        self.assertTrue(other_board.pins.filter(pk=pin_id).exists())
+        self.assertFalse(
+            Board.pins.through.objects.exclude(
+                board_id__in=Board.objects.values_list("pk", flat=True)
+            ).exists()
+        )
+        self.assertFalse(
+            Board.pins.through.objects.exclude(
+                pin_id__in=Pin.objects.values_list("pk", flat=True)
+            ).exists()
+        )
 
     def test_direct_delete_preserves_shared_image_rows_files_and_uuid_directories(
         self,
