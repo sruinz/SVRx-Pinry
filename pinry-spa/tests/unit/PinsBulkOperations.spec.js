@@ -534,6 +534,53 @@ describe('bulk operation dialogs', () => {
     expect(wrapper.emitted('completed')).toHaveLength(1);
   });
 
+  it.each([
+    [
+      'add',
+      'move',
+      null,
+      { operation: 'add_to_board', board_id: 7 },
+    ],
+    [
+      'move',
+      'add',
+      3,
+      { operation: 'move_between_boards', source_board_id: 3, target_board_id: 7 },
+    ],
+  ])('retries the initial %s operation after mode changes to %s', async (
+    mode,
+    retryMode,
+    sourceBoardId,
+    expected,
+  ) => {
+    const selectedIds = Array.from({ length: 51 }, (_value, index) => index + 1);
+    API.Pin.bulk.mockReset();
+    API.Pin.bulk
+      .mockImplementationOnce(
+        payload => bulkResponse(payload.pin_ids, {}, payload.operation),
+      )
+      .mockRejectedValueOnce(new Error('network'))
+      .mockImplementation(
+        payload => bulkResponse(payload.pin_ids, {}, payload.operation),
+      );
+    const wrapper = mountBoardDialog({ mode, sourceBoardId, selectedIds });
+    await settle();
+    await wrapper.find('[data-test="bulk-board-target"]').setValue('7');
+
+    await wrapper.vm.submit();
+    await wrapper.setProps({ mode: retryMode });
+    await wrapper.find('[data-test="bulk-board-retry"]').trigger('click');
+    await settle();
+
+    expect(API.Pin.bulk.mock.calls.slice(2).map(call => call[0])).toEqual([
+      { ...expected, pin_ids: selectedIds.slice(0, 50) },
+      { ...expected, pin_ids: [51] },
+    ]);
+    expect(wrapper.emitted('settled')).toHaveLength(1);
+    expect(wrapper.emitted('completed')).toHaveLength(1);
+    expect(wrapper.vm.operationCompleted).toBe(true);
+  });
+
   it('retries edit with the exact initial changes after a later chunk failure', async () => {
     const selectedIds = Array.from({ length: 51 }, (_value, index) => index + 1);
     const initialChanges = {

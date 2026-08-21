@@ -69,6 +69,7 @@ export default {
     this.disposed = false;
     this.boardRequestToken = 0;
     this.operationToken = 0;
+    this.operationSnapshot = null;
     this.operationFieldsSnapshot = null;
     this.closeConsumed = false;
   },
@@ -175,18 +176,22 @@ export default {
     },
     submit() {
       if (!this.canSubmit || this.canStartOperation() !== true) return null;
+      this.operationSnapshot = this.mode === 'move'
+        ? 'move_between_boards'
+        : 'add_to_board';
       this.operationFieldsSnapshot = { ...this.operationFields() };
-      return this.runOperation(this.operationFieldsSnapshot);
+      return this.runOperation(this.operationSnapshot, this.operationFieldsSnapshot);
     },
     retry() {
       if (
         !this.canRetry
+        || this.operationSnapshot === null
         || this.operationFieldsSnapshot === null
         || this.canStartOperation() !== true
       ) return null;
-      return this.runOperation(this.operationFieldsSnapshot);
+      return this.runOperation(this.operationSnapshot, this.operationFieldsSnapshot);
     },
-    runOperation(fields) {
+    runOperation(operation, fields) {
       const token = this.operationToken + 1;
       this.operationToken = token;
       this.operationInFlight = true;
@@ -194,7 +199,6 @@ export default {
       this.$emit('started');
       this.progress = { completed: 0, total: this.selectedIds.length };
       this.result = null;
-      const operation = this.mode === 'move' ? 'move_between_boards' : 'add_to_board';
       return executeBulk({
         ids: [...this.selectedIds],
         operation,
