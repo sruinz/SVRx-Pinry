@@ -11,7 +11,7 @@
             id="pin-bulk-privacy"
             v-model="privacyMode"
             data-test="bulk-edit-privacy"
-            :disabled="operationInFlight"
+            :disabled="operationInFlight || result !== null"
           >
             <option :value="null">{{ $t('bulkPinNoPrivacyChange') }}</option>
             <option value="public">{{ $t('bulkPinMakePublic') }}</option>
@@ -24,7 +24,7 @@
             id="pin-bulk-tag-mode"
             v-model="tagMode"
             data-test="bulk-edit-tag-mode"
-            :disabled="operationInFlight"
+            :disabled="operationInFlight || result !== null"
           >
             <option :value="null">{{ $t('bulkPinNoTagChange') }}</option>
             <option value="add">{{ $t('bulkPinTagAdd') }}</option>
@@ -36,7 +36,7 @@
           v-if="tagMode !== null"
           v-model="tagValues"
           data-test="bulk-edit-tags"
-          :disabled="operationInFlight"
+          :disabled="operationInFlight || result !== null"
         />
         <p v-if="progress" data-test="bulk-edit-progress" aria-live="polite">
           {{ $t('bulkPinProgress', progress) }}
@@ -96,6 +96,7 @@ export default {
   beforeCreate() {
     this.disposed = false;
     this.operationToken = 0;
+    this.operationChangesSnapshot = null;
     this.closeConsumed = false;
   },
   props: {
@@ -157,13 +158,28 @@ export default {
     },
     submit() {
       if (!this.canSubmit || this.canStartOperation() !== true) return null;
-      return this.runOperation();
+      const changes = buildChanges({
+        privacyMode: this.privacyMode,
+        tagMode: this.tagMode,
+        tagValues: this.tagValues,
+      });
+      this.operationChangesSnapshot = {
+        ...changes,
+        ...(changes.tags ? {
+          tags: { ...changes.tags, values: [...changes.tags.values] },
+        } : {}),
+      };
+      return this.runOperation(this.operationChangesSnapshot);
     },
     retry() {
-      if (!this.canRetry || this.canStartOperation() !== true) return null;
-      return this.runOperation();
+      if (
+        !this.canRetry
+        || this.operationChangesSnapshot === null
+        || this.canStartOperation() !== true
+      ) return null;
+      return this.runOperation(this.operationChangesSnapshot);
     },
-    runOperation() {
+    runOperation(changes) {
       const token = this.operationToken + 1;
       this.operationToken = token;
       this.operationInFlight = true;
@@ -175,11 +191,7 @@ export default {
         ids: [...this.selectedIds],
         operation: 'update',
         fields: {
-          changes: buildChanges({
-            privacyMode: this.privacyMode,
-            tagMode: this.tagMode,
-            tagValues: this.tagValues,
-          }),
+          changes,
         },
         request: payload => API.Pin.bulk(payload),
         onProgress: (progress) => {

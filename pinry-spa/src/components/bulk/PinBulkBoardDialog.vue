@@ -15,7 +15,7 @@
             id="pin-bulk-board-target"
             v-model.number="targetBoardId"
             data-test="bulk-board-target"
-            :disabled="loadingBoards || operationInFlight"
+            :disabled="loadingBoards || operationInFlight || result !== null"
           >
             <option :value="null">{{ $t('bulkPinChooseBoard') }}</option>
             <option v-for="board in boardOptions" :key="board.id" :value="board.id">
@@ -69,6 +69,7 @@ export default {
     this.disposed = false;
     this.boardRequestToken = 0;
     this.operationToken = 0;
+    this.operationFieldsSnapshot = null;
     this.closeConsumed = false;
   },
   props: {
@@ -174,13 +175,18 @@ export default {
     },
     submit() {
       if (!this.canSubmit || this.canStartOperation() !== true) return null;
-      return this.runOperation();
+      this.operationFieldsSnapshot = { ...this.operationFields() };
+      return this.runOperation(this.operationFieldsSnapshot);
     },
     retry() {
-      if (!this.canRetry || this.canStartOperation() !== true) return null;
-      return this.runOperation();
+      if (
+        !this.canRetry
+        || this.operationFieldsSnapshot === null
+        || this.canStartOperation() !== true
+      ) return null;
+      return this.runOperation(this.operationFieldsSnapshot);
     },
-    runOperation() {
+    runOperation(fields) {
       const token = this.operationToken + 1;
       this.operationToken = token;
       this.operationInFlight = true;
@@ -192,7 +198,7 @@ export default {
       return executeBulk({
         ids: [...this.selectedIds],
         operation,
-        fields: this.operationFields(),
+        fields: { ...fields },
         request: payload => API.Pin.bulk(payload),
         onProgress: (progress) => {
           if (!this.disposed && this.operationToken === token) this.progress = progress;
