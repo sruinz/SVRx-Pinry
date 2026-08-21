@@ -63,6 +63,10 @@ class BulkPinRequestSerializerTests(SimpleTestCase):
             "delete_if_exclusive_to_board": ("pin_ids", "source_board_id"),
         }
         for operation, payload in valid.items():
+            missing_operation = dict(payload)
+            del missing_operation["operation"]
+            serializer = BulkPinRequestSerializer(data=missing_operation)
+            self.assertFalse(serializer.is_valid(), missing_operation)
             for key in required[operation]:
                 missing = dict(payload)
                 del missing[key]
@@ -81,6 +85,8 @@ class BulkPinRequestSerializerTests(SimpleTestCase):
              "source_board_id": True, "target_board_id": 8},
             {"operation": "move_between_boards", "pin_ids": [1],
              "source_board_id": 7, "target_board_id": "8"},
+            {"operation": "move_between_boards", "pin_ids": [1],
+             "source_board_id": 7, "target_board_id": True},
             {"operation": "delete_if_exclusive_to_board", "pin_ids": [1],
              "source_board_id": True},
             {"operation": "delete_if_exclusive_to_board", "pin_ids": [1],
