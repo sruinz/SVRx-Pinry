@@ -266,14 +266,51 @@ describe('BoardDeleteDialog', () => {
     const wrapper = mountDialog();
     await settle();
 
+    const error = wrapper.find('[data-test="board-delete-selection-error"]');
+    expect(error.exists()).toBe(true);
+    expect(error.text())
+      .toBe('전체 범위가 너무 커 현재 화면의 Pin만 선택할 수 있습니다.');
     expect(wrapper.find('[data-test="board-delete-with-pins"]').attributes('disabled'))
       .toBe('disabled');
+    expect(wrapper.find('[data-test="board-delete-only"]').attributes('disabled'))
+      .toBeUndefined();
     await wrapper.find('[data-test="board-delete-with-pins"]').trigger('click');
     expect(API.Pin.fetchSelectionIds).not.toHaveBeenCalled();
+    expect(API.Pin.bulk).not.toHaveBeenCalled();
+    expect(API.Board.delete).not.toHaveBeenCalled();
 
     await wrapper.find('[data-test="board-delete-only"]').trigger('click');
     await settle();
     expect(API.Board.delete).toHaveBeenCalledWith(7);
+  });
+
+  it('clears an oversized preview warning after a later normal preview', async () => {
+    API.Board.deletePreview
+      .mockResolvedValueOnce({
+        data: {
+          exclusive_owned_count: 50001,
+          shared_owned_count: 0,
+          non_owned_count: 0,
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          exclusive_owned_count: 2,
+          shared_owned_count: 3,
+          non_owned_count: 4,
+        },
+      });
+    const wrapper = mountDialog();
+    await settle();
+
+    expect(wrapper.find('[data-test="board-delete-selection-error"]').exists()).toBe(true);
+
+    await wrapper.vm.loadPreview();
+    await settle();
+
+    expect(wrapper.find('[data-test="board-delete-selection-error"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="board-delete-with-pins"]').attributes('disabled'))
+      .toBeUndefined();
   });
 
   it('keeps board-only deletion available when selection grows beyond the server limit', async () => {

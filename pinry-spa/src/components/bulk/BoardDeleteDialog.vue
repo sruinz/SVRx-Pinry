@@ -270,6 +270,9 @@ export default {
           }
           this.preview = preview;
           this.selectionBlocked = preview.exclusive_owned_count > MAX_SELECTION_IDS;
+          this.selectionError = this.selectionBlocked
+            ? 'bulkPinSelectionTooLarge'
+            : null;
           this.phase = 'ready';
         },
         () => {
