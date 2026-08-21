@@ -10,8 +10,7 @@
             <div class="column">
               <FileUpload
                 :previewImageURL="pinModel.form.url.value"
-                v-on:imageUploadSucceed="onUploadDone"
-                v-on:imageUploadProcessing="onUploadProcessing"
+                v-on:imageSelected="onImageSelected"
               ></FileUpload>
               <div class="description" v-show="pinModel.form.description.value" v-html="niceLinks(pinModel.form.description.value)"></div>
             </div>
@@ -85,10 +84,19 @@
           </div>
         </section>
         <footer class="modal-card-foot">
-          <button class="button" type="button" @click="$parent.close()">{{ $t("closeButton") }}</button>
+          <p
+            v-if="createError"
+            class="help is-danger"
+            data-test="create-error">{{ createError }}</p>
+          <button
+            class="button"
+            type="button"
+            :disabled="createInFlight"
+            @click="closeModal">{{ $t("closeButton") }}</button>
           <button
             v-if="!isEdit"
             @click="createPin"
+            :disabled="createInFlight"
             class="button is-primary">{{ $t("pinCreateModalCreatePinButton") }}
           </button>
           <button
@@ -118,6 +126,29 @@ import niceLinks from '../utils/niceLinks';
 function isURLBlank(url) {
   return url !== null && url === '';
 }
+
+
+function textOrBlank(value) {
+  return value === null || typeof value === 'undefined' ? '' : value;
+}
+
+
+function createErrorMessage(error) {
+  const responseData = error && error.response && error.response.data;
+  if (typeof responseData === 'string') {
+    return responseData;
+  }
+  if (responseData !== null && typeof responseData === 'object') {
+    const values = Object.values(responseData);
+    const firstValue = values.length > 0 ? values[0] : null;
+    const message = Array.isArray(firstValue) ? firstValue[0] : firstValue;
+    if (typeof message === 'string') {
+      return message;
+    }
+  }
+  return (error && error.message) || 'Cannot create pin';
+}
+
 
 const fields = ['url', 'referer', 'description', 'tags', 'private'];
 
@@ -151,10 +182,12 @@ export default {
     return {
       disableUrlField: false,
       pinModel,
-      formUpload: {
-        imageId: null,
-      },
-      boardId: null,
+      selectedFile: null,
+      createInFlight: false,
+      createError: null,
+      componentAlive: true,
+      activeLoading: null,
+      boardIds: null,
       boardOptions: [],
       tagOptions: [],
       editorMeta: {
@@ -182,7 +215,23 @@ export default {
       this.pinModel.form.description.value = this.fromUrl.description;
     }
   },
+  beforeDestroy() {
+    this.componentAlive = false;
+    this.closeLoading();
+  },
   methods: {
+    closeLoading() {
+      if (this.activeLoading !== null) {
+        const loading = this.activeLoading;
+        this.activeLoading = null;
+        loading.close();
+      }
+    },
+    closeModal() {
+      if (!this.createInFlight) {
+        this.$parent.close();
+      }
+    },
     fetchTagList() {
       API.Tag.fetchList().then(
         (resp) => {
@@ -222,11 +271,9 @@ export default {
     onSelectBoard(boardIds) {
       this.boardIds = boardIds;
     },
-    onUploadProcessing() {
-      this.disableUrlField = true;
-    },
-    onUploadDone(imageId) {
-      this.formUpload.imageId = imageId;
+    onImageSelected(file) {
+      this.selectedFile = file;
+      this.disableUrlField = file !== null;
     },
     savePin() {
       const self = this;
@@ -243,32 +290,55 @@ export default {
       );
     },
     createPin() {
-      const loading = Loading.open(this);
-      const self = this;
-      let promise;
-      if (isURLBlank(this.pinModel.form.url.value) && this.formUpload.imageId === null) {
+      if (this.createInFlight) {
         return;
       }
-      if (this.formUpload.imageId === null) {
+      const self = this;
+      let promise;
+      if (isURLBlank(this.pinModel.form.url.value) && this.selectedFile === null) {
+        return;
+      }
+      this.createInFlight = true;
+      this.createError = null;
+      this.activeLoading = Loading.open(this);
+      if (this.selectedFile === null) {
         const data = this.pinModel.asDataByFields(fields);
         promise = API.Pin.createFromURL(data);
       } else {
-        const data = this.pinModel.asDataByFields(
-          ['referer', 'description', 'tags', 'private'],
+        const formData = new FormData();
+        const referer = this.pinModel.form.referer.value;
+        const description = this.pinModel.form.description.value;
+        formData.append('image_file', this.selectedFile);
+        formData.append('referer', textOrBlank(referer));
+        formData.append('description', textOrBlank(description));
+        formData.append('private', String(this.pinModel.form.private.value));
+        this.pinModel.form.tags.value.forEach(
+          tag => formData.append('tags', tag),
         );
-        data.image_by_id = this.formUpload.imageId;
-        promise = API.Pin.createFromUploaded(data);
+        if (this.boardIds) {
+          this.boardIds.forEach(
+            boardId => formData.append('board_ids', boardId),
+          );
+        }
+        promise = API.Pin.createFromUpload(formData);
       }
       promise.then(
         (resp) => {
+          if (!self.componentAlive) {
+            return;
+          }
           const promises = [];
           function done() {
+            if (!self.componentAlive) {
+              return;
+            }
+            self.createInFlight = false;
             self.$emit('pinCreated', resp);
             self.$parent.close();
-            loading.close();
+            self.closeLoading();
           }
           bus.bus.$emit(bus.events.refreshPin);
-          if (self.boardIds) {
+          if (self.selectedFile === null && self.boardIds) {
             // FIXME(winkidney): Should handle error for add-to board
             self.boardIds.forEach(
               (boardId) => {
@@ -283,8 +353,13 @@ export default {
           }
         },
       ).catch((error) => {
+        if (!self.componentAlive) {
+          return;
+        }
         console.log('Cannot create pin:', error);
-        loading.close();
+        self.createInFlight = false;
+        self.createError = createErrorMessage(error);
+        self.closeLoading();
       });
     },
     niceLinks,

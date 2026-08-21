@@ -9,7 +9,6 @@
       <b-field>
         <b-upload v-model="dropFile"
                   accept="image/*"
-                  :loading="loading"
                   drag-drop>
           <section class="section">
             <div class="content has-text-centered">
@@ -29,16 +28,12 @@
 </template>
 
 <script>
-import API from '../api';
-import utils from '../utils/PinHandler';
-
 export default {
   name: 'FileUpload',
   data() {
     return {
       dropFile: null,
-      loading: false,
-      uploadedImage: null,
+      objectUrl: null,
     };
   },
   props: {
@@ -49,33 +44,34 @@ export default {
   },
   watch: {
     dropFile(newFile) {
-      this.$emit('imageUploadProcessing');
-      this.loading = true;
-      API.Pin.uploadImage(newFile).then(
-        (resp) => {
-          this.uploadedImage = resp.data;
-          this.loading = false;
-          this.$emit('imageUploadSucceed', this.uploadedImage.id);
-        },
-        () => {
-          this.loading = false;
-          this.$emit('imageUploadFailed');
-        },
-      );
+      this.releaseObjectUrl();
+      if (newFile !== null) {
+        this.objectUrl = URL.createObjectURL(newFile);
+      }
+      this.$emit('imageSelected', newFile);
     },
+  },
+  beforeDestroy() {
+    this.releaseObjectUrl();
   },
   computed: {
     previewImage() {
       if (this.previewExists()) {
         return this.previewImageURL;
       }
-      if (this.uploadedImage !== null) {
-        return utils.escapeUrl(this.uploadedImage.thumbnail.image);
+      if (this.objectUrl !== null) {
+        return this.objectUrl;
       }
       return null;
     },
   },
   methods: {
+    releaseObjectUrl() {
+      if (this.objectUrl !== null) {
+        URL.revokeObjectURL(this.objectUrl);
+        this.objectUrl = null;
+      }
+    },
     previewExists() {
       return this.previewImageURL !== null && this.previewImageURL !== '';
     },

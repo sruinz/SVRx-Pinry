@@ -12,6 +12,7 @@ function openPinEdit(vm, props = null, onCreated = null) {
       component: PinCreateModal,
       props,
       hasModalCard: true,
+      canCancel: false,
       events: {
         pinCreated() {
           if (onCreated !== null) {

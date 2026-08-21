@@ -78,22 +78,9 @@ const Pin = {
   createFromURL(jsonData) {
     return this.create(jsonData);
   },
-  createFromUploaded(jsonData) {
-    return this.create(jsonData);
-  },
-  uploadImage(fileObject) {
-    const url = `${API_PREFIX}images/`;
-    const data = new FormData();
-    data.append('image', fileObject);
-    return axios.post(
-      url,
-      data,
-      {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-      },
-    );
+  createFromUpload(formData) {
+    const url = `${API_PREFIX}pins/`;
+    return axios.post(url, formData);
   },
   deleteById(pinId) {
     const url = `${API_PREFIX}pins/${pinId}/`;
