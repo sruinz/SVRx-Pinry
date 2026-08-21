@@ -93,6 +93,9 @@ function bulkModalEvents(onCompleted, lifecycle) {
     events.started = lifecycle.started;
   }
   if (onCompleted !== null) events.completed = onCompleted;
+  if (lifecycle && typeof lifecycle.settled === 'function') {
+    events.settled = lifecycle.settled;
+  }
   if (lifecycle && typeof lifecycle.closed === 'function') {
     events.closed = lifecycle.closed;
   }

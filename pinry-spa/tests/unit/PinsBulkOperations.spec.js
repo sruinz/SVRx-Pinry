@@ -108,6 +108,19 @@ function mountBulkEdit() {
   return wrapper;
 }
 
+function mountConfiguredBulkDialog(config) {
+  const wrapper = shallowMount(config.component, {
+    propsData: config.props,
+    mocks: { $t: (key, values) => (values ? `${key}:${values.count}` : key) },
+    stubs: ['b-taginput'],
+  });
+  Object.entries(config.events || {}).forEach(([event, handler]) => {
+    wrapper.vm.$on(event, handler);
+  });
+  mountedWrappers.push(wrapper);
+  return wrapper;
+}
+
 function mountPins({
   pinFilters = { userFilter: 'owner' },
   pins = [pin(41), pin(40), pin(39)],
@@ -148,6 +161,32 @@ function mountPins({
 async function settle() {
   await flushPromises();
   await flushPromises();
+}
+
+async function readyRetryDialog(mode) {
+  if (mode === 'edit') {
+    const wrapper = mountBulkEdit();
+    await wrapper.setData({ privacyMode: 'private' });
+    return {
+      wrapper,
+      operation: 'update',
+      resultSelector: '[data-test="bulk-edit-result"]',
+      retrySelector: '[data-test="bulk-edit-retry"]',
+    };
+  }
+
+  const wrapper = mountBoardDialog({
+    mode,
+    sourceBoardId: mode === 'move' ? 3 : null,
+  });
+  await settle();
+  await wrapper.find('[data-test="bulk-board-target"]').setValue('7');
+  return {
+    wrapper,
+    operation: mode === 'move' ? 'move_between_boards' : 'add_to_board',
+    resultSelector: '[data-test="bulk-board-result"]',
+    retrySelector: '[data-test="bulk-board-retry"]',
+  };
 }
 
 function selectScope(wrapper, ids, owned = true) {
@@ -403,6 +442,53 @@ describe('bulk operation dialogs', () => {
       },
     });
   });
+
+  it.each([
+    ['add', 'transport'],
+    ['add', 'invalid response'],
+    ['move', 'transport'],
+    ['move', 'invalid response'],
+    ['edit', 'transport'],
+    ['edit', 'invalid response'],
+  ])('keeps %s %s failure retryable until eventual success', async (mode, failureMode) => {
+    API.Pin.bulk.mockReset();
+    if (failureMode === 'transport') {
+      API.Pin.bulk.mockRejectedValueOnce(new Error('network'));
+    } else {
+      API.Pin.bulk.mockResolvedValueOnce({ status: 200, data: { results: [] } });
+    }
+    API.Pin.bulk.mockImplementationOnce(
+      payload => bulkResponse(payload.pin_ids, {}, payload.operation),
+    );
+    const {
+      wrapper, operation, resultSelector, retrySelector,
+    } = await readyRetryDialog(mode);
+
+    await wrapper.vm.submit();
+    await settle();
+
+    expect(wrapper.vm.operationCompleted).toBe(false);
+    expect(wrapper.emitted('completed')).toBeUndefined();
+    expect(wrapper.emitted('settled')).toHaveLength(1);
+    expect(wrapper.find(resultSelector).text())
+      .toContain('bulkPinResultFailed:2');
+    expect(wrapper.find(retrySelector).text()).toBe('bulkPinRetry');
+
+    await wrapper.find(retrySelector).trigger('click');
+    await settle();
+
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(2);
+    expect(API.Pin.bulk.mock.calls[1][0]).toEqual(API.Pin.bulk.mock.calls[0][0]);
+    expect(API.Pin.bulk.mock.calls[1][0]).toMatchObject({
+      operation,
+      pin_ids: [41, 42],
+    });
+    expect(wrapper.emitted('started')).toHaveLength(2);
+    expect(wrapper.emitted('settled')).toHaveLength(1);
+    expect(wrapper.emitted('completed')).toHaveLength(1);
+    expect(wrapper.vm.operationCompleted).toBe(true);
+    expect(wrapper.find(retrySelector).exists()).toBe(false);
+  });
 });
 
 describe('Pins bulk operation orchestration', () => {
@@ -416,6 +502,9 @@ describe('Pins bulk operation orchestration', () => {
     API.fetchPins = jest.fn();
     API.fetchPin = jest.fn();
     API.Board.get = jest.fn();
+    API.Board.fetchFullList = jest.fn().mockResolvedValue({
+      data: [{ id: 7, name: 'Target' }],
+    });
     API.Pin.fetchSelectionIds = jest.fn();
     API.Pin.bulk = jest.fn(
       payload => bulkResponse(payload.pin_ids, {}, payload.operation),
@@ -439,17 +528,23 @@ describe('Pins bulk operation orchestration', () => {
     await mine.vm.$nextTick();
     await mine.find('[data-test="pin-selection-edit"]').trigger('click');
 
-    expect(mine.modal.open.mock.calls[0][0].props).toEqual({
+    expect(mine.modal.open.mock.calls[0][0].props).toMatchObject({
       mode: 'add', sourceBoardId: null, selectedIds: [41, 40], username: 'owner',
     });
-    expect(mine.modal.open.mock.calls[1][0].props).toEqual({ selectedIds: [41, 40] });
+    expect(mine.modal.open.mock.calls[0][0].props.canStartOperation).toEqual(
+      expect.any(Function),
+    );
+    expect(mine.modal.open.mock.calls[1][0].props).toMatchObject({ selectedIds: [41, 40] });
+    expect(mine.modal.open.mock.calls[1][0].props.canStartOperation).toEqual(
+      expect.any(Function),
+    );
 
     const board = mountPins({ pinFilters: { boardFilter: 3 }, pins: [pin(41, 'other')] });
     await settle();
     selectScope(board, [41], false);
     await board.vm.$nextTick();
     await board.find('[data-test="pin-selection-move"]').trigger('click');
-    expect(board.modal.open.mock.calls[0][0].props).toEqual({
+    expect(board.modal.open.mock.calls[0][0].props).toMatchObject({
       mode: 'move', sourceBoardId: 3, selectedIds: [41], username: 'owner',
     });
   });
@@ -580,6 +675,95 @@ describe('Pins bulk operation orchestration', () => {
 
     expect(wrapper.vm.selection.operationInFlight).toBe(false);
     expect(wrapper.vm.selection.result).toBeNull();
+  });
+
+  it('blocks a stale board-dialog submit after a route reset and closes its modal handle', async () => {
+    const wrapper = mountPins();
+    const modalHandle = { close: jest.fn() };
+    wrapper.modal.open.mockReturnValue(modalHandle);
+    await settle();
+    selectScope(wrapper, [41]);
+    wrapper.vm.openBulkBoard('add');
+    const [config] = wrapper.modal.open.mock.calls[0];
+    const dialog = mountConfiguredBulkDialog(config);
+    await settle();
+    dialog.vm.targetBoardId = 7;
+
+    await wrapper.setProps({ pinFilters: { userFilter: 'other' } });
+    await settle();
+    const submission = dialog.vm.submit();
+
+    expect(submission).toBeNull();
+    expect(API.Pin.bulk).not.toHaveBeenCalled();
+    expect(modalHandle.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocks a stale edit-dialog submit after a component reset and closes its modal handle', async () => {
+    const wrapper = mountPins();
+    const modalHandle = { close: jest.fn() };
+    wrapper.modal.open.mockReturnValue(modalHandle);
+    await settle();
+    selectScope(wrapper, [41]);
+    wrapper.vm.openBulkEdit();
+    const [config] = wrapper.modal.open.mock.calls[0];
+    const dialog = mountConfiguredBulkDialog(config);
+    await dialog.setData({ privacyMode: 'private' });
+
+    wrapper.vm.reset();
+    await settle();
+    const submission = dialog.vm.submit();
+
+    expect(submission).toBeNull();
+    expect(API.Pin.bulk).not.toHaveBeenCalled();
+    expect(modalHandle.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the parent modal lock after retryable settle and releases it on Close', async () => {
+    API.Pin.bulk.mockRejectedValueOnce(new Error('network'));
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41]);
+    wrapper.vm.openBulkEdit();
+    const [config] = wrapper.modal.open.mock.calls[0];
+    const dialog = mountConfiguredBulkDialog(config);
+    await dialog.setData({ privacyMode: 'private' });
+
+    await dialog.vm.submit();
+    await settle();
+
+    expect(wrapper.vm.bulkModalOpen).toBe(true);
+    expect(wrapper.vm.bulkModalStarted).toBe(false);
+    expect(wrapper.vm.selection.operationInFlight).toBe(true);
+    dialog.vm.close();
+    expect(wrapper.vm.selection.operationInFlight).toBe(false);
+  });
+
+  it('keeps the parent lock through retry and consumes only eventual success', async () => {
+    API.Pin.bulk
+      .mockRejectedValueOnce(new Error('network'))
+      .mockImplementationOnce(
+        payload => bulkResponse(payload.pin_ids, {}, payload.operation),
+      );
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41]);
+    wrapper.vm.openBulkEdit();
+    const [config] = wrapper.modal.open.mock.calls[0];
+    const dialog = mountConfiguredBulkDialog(config);
+    await dialog.setData({ privacyMode: 'private' });
+
+    await dialog.vm.submit();
+    await settle();
+    expect(wrapper.vm.selection.operationInFlight).toBe(true);
+
+    await dialog.find('[data-test="bulk-edit-retry"]').trigger('click');
+    await settle();
+
+    expect(wrapper.vm.selection.operationInFlight).toBe(false);
+    expect(wrapper.vm.selection.result).toMatchObject({
+      operation: 'update', succeeded: 1, preserved: 0, failed: 0,
+    });
+    expect(dialog.emitted('completed')).toHaveLength(1);
   });
 
   it('guards add, edit, and delete in methods when selection includes a non-owned pin', async () => {

@@ -52,6 +52,15 @@
           {{ $t('closeButton') }}
         </button>
         <button
+          v-if="canRetry"
+          class="button"
+          type="button"
+          data-test="bulk-edit-retry"
+          @click="retry"
+        >
+          {{ $t('bulkPinRetry') }}
+        </button>
+        <button
           class="button is-primary"
           type="button"
           data-test="bulk-edit-submit"
@@ -94,6 +103,10 @@ export default {
       type: Array,
       required: true,
     },
+    canStartOperation: {
+      type: Function,
+      default: () => true,
+    },
   },
   data() {
     return {
@@ -114,6 +127,7 @@ export default {
       if (
         this.operationInFlight
         || this.operationCompleted
+        || this.result !== null
         || this.selectedIds.length === 0
       ) return false;
       if (this.tagMode === 'add' || this.tagMode === 'remove') {
@@ -122,6 +136,12 @@ export default {
       if (this.tagMode === 'replace') return true;
       if (this.tagMode !== null) return false;
       return this.privacyMode === 'public' || this.privacyMode === 'private';
+    },
+    canRetry() {
+      return !this.operationInFlight
+        && !this.operationCompleted
+        && this.result !== null
+        && this.result.retryable === true;
     },
   },
   beforeDestroy() {
@@ -136,10 +156,18 @@ export default {
       if (this.$parent && typeof this.$parent.close === 'function') this.$parent.close();
     },
     submit() {
-      if (!this.canSubmit) return null;
+      if (!this.canSubmit || this.canStartOperation() !== true) return null;
+      return this.runOperation();
+    },
+    retry() {
+      if (!this.canRetry || this.canStartOperation() !== true) return null;
+      return this.runOperation();
+    },
+    runOperation() {
       const token = this.operationToken + 1;
       this.operationToken = token;
       this.operationInFlight = true;
+      this.operationCompleted = false;
       this.$emit('started');
       this.progress = { completed: 0, total: this.selectedIds.length };
       this.result = null;
@@ -159,11 +187,27 @@ export default {
         },
       }).then((result) => {
         if (this.disposed || this.operationToken !== token) return result;
+        const remaining = Array.isArray(result.remainingIds)
+          ? result.remainingIds.length
+          : 0;
+        const retryable = Boolean(result.error)
+          || remaining > 0
+          || result.failed > 0
+          || result.completed !== result.total;
+        const summary = {
+          ...result,
+          failed: result.failed + remaining,
+          retryable,
+        };
         this.operationInFlight = false;
+        this.result = summary;
+        if (retryable) {
+          this.$emit('settled', summary);
+          return summary;
+        }
         this.operationCompleted = true;
-        this.result = result;
-        this.$emit('completed', result);
-        return result;
+        this.$emit('completed', summary);
+        return summary;
       });
     },
   },

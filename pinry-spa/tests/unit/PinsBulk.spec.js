@@ -432,11 +432,18 @@ describe('Pins selection mode', () => {
       .toContain('bulkPinAllSelected:4');
   });
 
-  it('preserves the loaded selection when the server scope exceeds 50,000', async () => {
+  it.each([
+    ['My Pins', { userFilter: 'owner' }, null],
+    ['owned Board', { boardFilter: 7 }, 7],
+  ])('shows a visible limit alert on %s while preserving loaded selection', async (
+    name,
+    pinFilters,
+    boardId,
+  ) => {
     API.Pin.fetchSelectionIds = jest.fn().mockRejectedValue({
       response: { status: 409, data: { code: 'selection_too_large' } },
     });
-    const wrapper = mountPins();
+    const wrapper = mountPins({ pinFilters });
     await settle();
     await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
     await wrapper.find('[data-test="pin-card-41"]').trigger('click');
@@ -447,6 +454,9 @@ describe('Pins selection mode', () => {
     expect(wrapper.vm.selection).toMatchObject({
       selectedIds: [41], scope: 'loaded', allCount: 0,
     });
+    expect(API.Pin.fetchSelectionIds).toHaveBeenCalledWith({ boardId });
+    expect(wrapper.find('[data-test="pin-selection-too-large"]').text())
+      .toBe('bulkPinSelectionTooLarge');
     expect(wrapper.find('[data-test="pin-selection-live"]').text())
       .toContain('bulkPinSelectionTooLarge');
   });
@@ -473,7 +483,38 @@ describe('Pins selection mode', () => {
       allCount: 0,
       result: { code: 'selection_too_large' },
     });
+    expect(wrapper.find('[data-test="pin-selection-too-large"]').text())
+      .toBe('bulkPinSelectionTooLarge');
+
+    wrapper.vm.openBulkEdit();
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="pin-selection-too-large"]').exists()).toBe(false);
     expect(API.Pin.bulk).not.toHaveBeenCalled();
+  });
+
+  it('clears a visible limit alert after a later valid select-all response', async () => {
+    API.Pin.fetchSelectionIds
+      .mockRejectedValueOnce({
+        response: { status: 409, data: { code: 'selection_too_large' } },
+      })
+      .mockResolvedValueOnce({
+        data: { count: 2, results: [{ id: 41, owned: true }, { id: 9, owned: true }] },
+      });
+    const wrapper = mountPins();
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-card-41"]').trigger('click');
+
+    await wrapper.find('[data-test="pin-selection-select-all"]').trigger('click');
+    await settle();
+    expect(wrapper.find('[data-test="pin-selection-too-large"]').exists()).toBe(true);
+
+    await wrapper.find('[data-test="pin-selection-select-all"]').trigger('click');
+    await settle();
+    expect(wrapper.find('[data-test="pin-selection-too-large"]').exists()).toBe(false);
+    expect(wrapper.vm.selection).toMatchObject({
+      selectedIds: [41, 9], scope: 'all', allCount: 2, result: null,
+    });
   });
 
   it.each([

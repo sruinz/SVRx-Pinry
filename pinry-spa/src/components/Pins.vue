@@ -29,6 +29,14 @@
         @delete="confirmBulkDelete"
       />
       <div
+        v-if="selection.result && selection.result.code === 'selection_too_large'"
+        class="notification is-warning"
+        data-test="pin-selection-too-large"
+        role="alert"
+      >
+        {{ $t('bulkPinSelectionTooLarge') }}
+      </div>
+      <div
         v-if="selection.progress"
         class="notification is-info"
         data-test="pin-bulk-progress"
@@ -272,6 +280,7 @@ export default {
     this.requestGeneration = 0;
     this.selectionRequestToken = 0;
     this.bulkOperationToken = 0;
+    this.bulkModalHandle = null;
     this.isDestroyed = false;
   },
   components: {
@@ -369,6 +378,8 @@ export default {
     },
     invalidateBulkOperation() {
       this.bulkOperationToken += 1;
+      const modalHandle = this.bulkModalHandle;
+      this.bulkModalHandle = null;
       this.bulkDeleteDialogOpen = false;
       this.bulkModalOpen = false;
       this.bulkModalStarted = false;
@@ -377,6 +388,7 @@ export default {
         this.syncOperationInFlight();
         this.selection.progress = null;
       }
+      if (modalHandle && typeof modalHandle.close === 'function') modalHandle.close();
     },
     syncOperationInFlight() {
       this.selection.operationInFlight = this.selection.selectionRequestInFlight
@@ -522,9 +534,15 @@ export default {
       this.bulkModalStarted = true;
       return true;
     },
+    settleBulkModal(token, context) {
+      if (!this.isBulkModalCurrent(token, context) || !this.bulkModalStarted) return false;
+      this.bulkModalStarted = false;
+      return true;
+    },
     consumeBulkModal(token, context) {
       if (!this.isBulkModalCurrent(token, context)) return false;
       this.bulkOperationToken += 1;
+      this.bulkModalHandle = null;
       this.bulkModalOpen = false;
       this.bulkModalStarted = false;
       this.selection.bulkOperationInFlight = false;
@@ -548,18 +566,22 @@ export default {
       if (mode === 'add' && (!this.isMyPinsRoute || !this.canUseOwnedPinActions)) return;
       if (mode === 'move' && !this.isOwnedBoardRoute) return;
 
+      this.selection.result = null;
       const selectedIds = [...this.selection.selectedIds];
       const { token, context } = this.startBulkModal();
       try {
-        openPinBulkBoard(this, {
+        const modalHandle = openPinBulkBoard(this, {
           mode,
           sourceBoardId: mode === 'move' ? Number(this.pinFilters.boardFilter) : null,
           selectedIds,
           username: this.editorMeta.user.meta.username,
+          canStartOperation: () => this.isBulkModalCurrent(token, context),
         }, result => this.completeBulkModal(result, mode, token, context), {
           started: () => this.markBulkModalStarted(token, context),
+          settled: () => this.settleBulkModal(token, context),
           closed: () => this.closeBulkModal(token, context),
         });
+        if (this.isBulkModalCurrent(token, context)) this.bulkModalHandle = modalHandle;
       } catch (_error) {
         this.consumeBulkModal(token, context);
       }
@@ -572,18 +594,24 @@ export default {
         || !this.canUseOwnedPinActions
       ) return;
 
+      this.selection.result = null;
       const selectedIds = [...this.selection.selectedIds];
       const { token, context } = this.startBulkModal();
       try {
-        openPinBulkEdit(
+        const modalHandle = openPinBulkEdit(
           this,
-          { selectedIds },
+          {
+            selectedIds,
+            canStartOperation: () => this.isBulkModalCurrent(token, context),
+          },
           result => this.completeBulkModal(result, 'update', token, context),
           {
             started: () => this.markBulkModalStarted(token, context),
+            settled: () => this.settleBulkModal(token, context),
             closed: () => this.closeBulkModal(token, context),
           },
         );
+        if (this.isBulkModalCurrent(token, context)) this.bulkModalHandle = modalHandle;
       } catch (_error) {
         this.consumeBulkModal(token, context);
       }
@@ -597,6 +625,7 @@ export default {
         || !this.canUseOwnedPinActions
       ) return;
 
+      this.selection.result = null;
       const selectedIds = [...this.selection.selectedIds];
       const token = this.bulkOperationToken + 1;
       const context = this.bulkContext();
