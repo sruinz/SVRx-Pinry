@@ -60,7 +60,7 @@ function commitResults(summary, results) {
   return committed;
 }
 
-export async function executeBulk({
+export function executeBulk({
   ids,
   operation,
   fields = {},
@@ -69,37 +69,47 @@ export async function executeBulk({
 }) {
   let summary = initialResult(ids);
 
-  for (let start = 0; start < ids.length; start += CHUNK_SIZE) {
+  function executeChunk(start) {
+    if (start >= ids.length) return Promise.resolve(summary);
     const chunk = ids.slice(start, start + CHUNK_SIZE);
-    let response;
+    let pending;
     try {
       // 순차 실행은 앞선 묶음의 완료 뒤에만 다음 요청을 보낸다.
-      // eslint-disable-next-line no-await-in-loop
-      response = await request({ ...fields, operation, pin_ids: chunk });
-    } catch (error) {
+      pending = request({ ...fields, operation, pin_ids: chunk });
+    } catch (_error) {
       summary.error = 'request_failed';
       summary.remainingIds = ids.slice(start);
-      return summary;
+      return Promise.resolve(summary);
     }
 
-    const results = validResults(response, chunk);
-    if (results === null) {
-      summary.error = 'invalid_bulk_response';
-      summary.remainingIds = ids.slice(start);
-      return summary;
-    }
+    return Promise.resolve(pending).then(
+      (response) => {
+        const results = validResults(response, chunk);
+        if (results === null) {
+          summary.error = 'invalid_bulk_response';
+          summary.remainingIds = ids.slice(start);
+          return summary;
+        }
 
-    summary = commitResults(summary, results);
-    onProgress({
-      completed: summary.completed,
-      total: summary.total,
-      succeeded: summary.succeeded,
-      preserved: summary.preserved,
-      failed: summary.failed,
-    });
+        summary = commitResults(summary, results);
+        onProgress({
+          completed: summary.completed,
+          total: summary.total,
+          succeeded: summary.succeeded,
+          preserved: summary.preserved,
+          failed: summary.failed,
+        });
+        return executeChunk(start + CHUNK_SIZE);
+      },
+      () => {
+        summary.error = 'request_failed';
+        summary.remainingIds = ids.slice(start);
+        return summary;
+      },
+    );
   }
 
-  return summary;
+  return executeChunk(0);
 }
 
 export function intersectRemaining(originalIds, refreshedRows) {

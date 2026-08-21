@@ -23,7 +23,38 @@
         @select-loaded="selectLoadedPins"
         @clear="clearPinSelection"
         @select-all="selectAllPins"
+        @add-to-board="openBulkBoard('add')"
+        @move="openBulkBoard('move')"
+        @edit="openBulkEdit"
+        @delete="confirmBulkDelete"
       />
+      <div
+        v-if="selection.progress"
+        class="notification is-info"
+        data-test="pin-bulk-progress"
+        aria-live="polite"
+      >
+        {{ $t('bulkPinProgress', selection.progress) }}
+      </div>
+      <div
+        v-if="selection.result && Number.isInteger(selection.result.total)"
+        class="notification"
+        data-test="pin-bulk-result"
+      >
+        <span>{{ $t('bulkPinResultSucceeded', { count: selection.result.succeeded }) }}</span>
+        <span>{{ $t('bulkPinResultPreserved', { count: selection.result.preserved }) }}</span>
+        <span>{{ $t('bulkPinResultFailed', { count: selection.result.failed }) }}</span>
+        <button
+          v-if="selection.result.retryIds && selection.result.retryIds.length > 0"
+          type="button"
+          class="button"
+          data-test="pin-bulk-retry"
+          :disabled="selection.operationInFlight"
+          @click="retryBulkDelete"
+        >
+          {{ $t('bulkPinRetry') }}
+        </button>
+      </div>
       <div id="pins-container" class="container" v-if="blocks">
         <div
           v-masonry=""
@@ -129,6 +160,8 @@ import EditorUI from './editors/PinEditorUI.vue';
 import niceLinks from './utils/niceLinks';
 import PinBulkToolbar from './bulk/PinBulkToolbar.vue';
 import PinSelection from './bulk/PinSelection';
+import { executeBulk, intersectRemaining } from './bulk/bulkExecutor';
+import { openPinBulkBoard, openPinBulkEdit } from './modals';
 
 function createImageItem(pin) {
   const image = {};
@@ -185,6 +218,7 @@ function initialData() {
       progress: null,
       result: null,
     },
+    bulkDeleteDialogOpen: false,
   };
 }
 
@@ -194,6 +228,7 @@ export default {
     this.selectionModel = new PinSelection();
     this.requestGeneration = 0;
     this.selectionRequestToken = 0;
+    this.bulkOperationToken = 0;
     this.isDestroyed = false;
   },
   components: {
@@ -286,9 +321,22 @@ export default {
       this.selectionRequestToken += 1;
       if (this.selection) this.selection.operationInFlight = false;
     },
+    invalidateBulkOperation() {
+      this.bulkOperationToken += 1;
+      this.bulkDeleteDialogOpen = false;
+      if (this.selection) {
+        this.selection.operationInFlight = false;
+        this.selection.progress = null;
+      }
+    },
     isSelectionRequestCurrent(token, model, generation, filters) {
       return this.selection.active
         && this.selectionRequestToken === token
+        && this.selectionModel === model
+        && this.isRequestCurrent(generation, filters);
+    },
+    isBulkOperationCurrent(token, model, generation, filters) {
+      return this.bulkOperationToken === token
         && this.selectionModel === model
         && this.isRequestCurrent(generation, filters);
     },
@@ -380,6 +428,167 @@ export default {
           this.selection.operationInFlight = false;
         }
       });
+    },
+    bulkContext() {
+      return {
+        model: this.selectionModel,
+        generation: this.requestGeneration,
+        filters: this.captureFilterSnapshot(),
+      };
+    },
+    openBulkBoard(mode) {
+      if (
+        this.selection.operationInFlight
+        || !this.selection.active
+        || this.selection.selectedIds.length === 0
+      ) return;
+      if (mode === 'add' && (!this.isMyPinsRoute || !this.canUseOwnedPinActions)) return;
+      if (mode === 'move' && !this.isOwnedBoardRoute) return;
+
+      const token = this.bulkOperationToken + 1;
+      const context = this.bulkContext();
+      const selectedIds = [...this.selection.selectedIds];
+      this.bulkOperationToken = token;
+      openPinBulkBoard(this, {
+        mode,
+        sourceBoardId: mode === 'move' ? Number(this.pinFilters.boardFilter) : null,
+        selectedIds,
+        username: this.editorMeta.user.meta.username,
+      }, (result) => {
+        if (!this.isBulkOperationCurrent(
+          token, context.model, context.generation, context.filters,
+        )) return;
+        this.finishBulkOperation({ ...result, operation: mode });
+      });
+    },
+    openBulkEdit() {
+      if (
+        this.selection.operationInFlight
+        || !this.selection.active
+        || this.selection.selectedIds.length === 0
+        || !this.canUseOwnedPinActions
+      ) return;
+
+      const token = this.bulkOperationToken + 1;
+      const context = this.bulkContext();
+      const selectedIds = [...this.selection.selectedIds];
+      this.bulkOperationToken = token;
+      openPinBulkEdit(this, { selectedIds }, (result) => {
+        if (!this.isBulkOperationCurrent(
+          token, context.model, context.generation, context.filters,
+        )) return;
+        this.finishBulkOperation({ ...result, operation: 'update' });
+      });
+    },
+    confirmBulkDelete() {
+      if (
+        this.bulkDeleteDialogOpen
+        || this.selection.operationInFlight
+        || !this.selection.active
+        || this.selection.selectedIds.length === 0
+        || !this.canUseOwnedPinActions
+      ) return;
+
+      const selectedIds = [...this.selection.selectedIds];
+      const token = this.bulkOperationToken + 1;
+      const context = this.bulkContext();
+      let active = true;
+      this.bulkOperationToken = token;
+      this.bulkDeleteDialogOpen = true;
+      this.$buefy.dialog.confirm({
+        message: this.$t('bulkPinDeleteConfirm', { count: selectedIds.length }),
+        onConfirm: () => {
+          if (
+            !active
+            || !this.isBulkOperationCurrent(
+              token, context.model, context.generation, context.filters,
+            )
+          ) return;
+          active = false;
+          this.bulkDeleteDialogOpen = false;
+          this.runBulkDelete(selectedIds);
+        },
+        onCancel: () => {
+          if (active && this.isBulkOperationCurrent(
+            token, context.model, context.generation, context.filters,
+          )) {
+            active = false;
+            this.bulkDeleteDialogOpen = false;
+          }
+        },
+      });
+    },
+    failedDeleteIds(ids, result) {
+      const candidates = new Set([
+        ...(result.failedIds || []),
+        ...(result.remainingIds || []),
+      ]);
+      return ids.filter(id => candidates.has(id));
+    },
+    refreshDeleteRetryIds(ids, result, token, context) {
+      const candidates = this.failedDeleteIds(ids, result);
+      if (candidates.length === 0) return Promise.resolve([]);
+      return API.Pin.fetchSelectionIds({
+        boardId: context.filters.boardFilter
+          ? Number(context.filters.boardFilter)
+          : null,
+      }).then(
+        (response) => {
+          if (!this.isBulkOperationCurrent(
+            token, context.model, context.generation, context.filters,
+          )) return [];
+          const rows = response && response.data && Array.isArray(response.data.results)
+            ? response.data.results
+            : [];
+          return intersectRemaining(candidates, rows);
+        },
+        () => [],
+      );
+    },
+    runBulkDelete(ids) {
+      if (this.selection.operationInFlight || ids.length === 0) return null;
+      const token = this.bulkOperationToken + 1;
+      const context = this.bulkContext();
+      this.bulkOperationToken = token;
+      this.selection.operationInFlight = true;
+      this.selection.progress = { completed: 0, total: ids.length };
+      this.selection.result = null;
+      return executeBulk({
+        ids: [...ids],
+        operation: 'delete',
+        request: payload => API.Pin.bulk(payload),
+        onProgress: (progress) => {
+          if (this.isBulkOperationCurrent(
+            token, context.model, context.generation, context.filters,
+          )) this.selection.progress = progress;
+        },
+      }).then((result) => {
+        if (!this.isBulkOperationCurrent(
+          token, context.model, context.generation, context.filters,
+        )) return result;
+        return this.refreshDeleteRetryIds(ids, result, token, context).then((retryIds) => {
+          if (!this.isBulkOperationCurrent(
+            token, context.model, context.generation, context.filters,
+          )) return result;
+          this.finishBulkOperation({ ...result, operation: 'delete', retryIds });
+          return result;
+        });
+      });
+    },
+    retryBulkDelete() {
+      if (
+        this.selection.operationInFlight
+        || !this.selection.result
+        || !Array.isArray(this.selection.result.retryIds)
+        || this.selection.result.retryIds.length === 0
+      ) return;
+      this.runBulkDelete([...this.selection.result.retryIds]);
+    },
+    finishBulkOperation(result) {
+      this.reset();
+      if (this.isDestroyed) return;
+      this.selection.result = result;
+      this.selection.progress = null;
     },
     isPinSelected(id) {
       return this.selection.selectedIds.includes(id);
@@ -539,6 +748,7 @@ export default {
     },
     reset() {
       this.invalidateSelectionRequest();
+      this.invalidateBulkOperation();
       this.requestGeneration += 1;
       const data = initialData();
       this.selectionModel = new PinSelection();
@@ -613,6 +823,7 @@ export default {
   },
   beforeDestroy() {
     this.invalidateSelectionRequest();
+    this.invalidateBulkOperation();
     this.updateSelection(this.selectionModel.selectLoaded([]), {
       active: false,
       allCount: 0,

@@ -3,6 +3,8 @@ import LoginForm from './LoginForm.vue';
 import SignUpForm from './SignUpForm.vue';
 import BoardEdit from './BoardEdit.vue';
 import Add2Board from './pin_edit/Add2Board.vue';
+import PinBulkBoardDialog from './bulk/PinBulkBoardDialog.vue';
+import PinBulkEdit from './bulk/PinBulkEdit.vue';
 
 
 function openPinEdit(vm, props = null, onCreated = null) {
@@ -84,6 +86,36 @@ function openSignUp(vm, onSignUpSucceed) {
   });
 }
 
+export function openPinBulkBoard(vm, props, onCompleted = null) {
+  const config = {
+    parent: vm,
+    component: PinBulkBoardDialog,
+    props: {
+      ...props,
+      selectedIds: [...props.selectedIds],
+    },
+    hasModalCard: true,
+    canCancel: false,
+  };
+  if (onCompleted !== null) config.events = { completed: onCompleted };
+  return vm.$buefy.modal.open(config);
+}
+
+export function openPinBulkEdit(vm, props, onCompleted = null) {
+  const config = {
+    parent: vm,
+    component: PinBulkEdit,
+    props: {
+      ...props,
+      selectedIds: [...props.selectedIds],
+    },
+    hasModalCard: true,
+    canCancel: false,
+  };
+  if (onCompleted !== null) config.events = { completed: onCompleted };
+  return vm.$buefy.modal.open(config);
+}
+
 export default {
   openBoardCreate,
   openBoardEdit,
@@ -91,4 +123,6 @@ export default {
   openPinEdit,
   openLogin,
   openSignUp,
+  openPinBulkBoard,
+  openPinBulkEdit,
 };
