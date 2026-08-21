@@ -117,7 +117,7 @@ export function openPinBulkEdit(vm, props, onCompleted = null) {
   return vm.$buefy.modal.open(config);
 }
 
-export function openBoardDelete(vm, props, onCompleted = null) {
+export function openBoardDelete(vm, props, onCompleted = null, onClosed = null) {
   const config = {
     parent: vm,
     component: BoardDeleteDialog,
@@ -128,7 +128,10 @@ export function openBoardDelete(vm, props, onCompleted = null) {
     hasModalCard: true,
     canCancel: false,
   };
-  if (onCompleted !== null) config.events = { completed: onCompleted };
+  const events = {};
+  if (onCompleted !== null) events.completed = onCompleted;
+  if (onClosed !== null) events.closed = onClosed;
+  if (Object.keys(events).length > 0) config.events = events;
   return vm.$buefy.modal.open(config);
 }
 

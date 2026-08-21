@@ -81,6 +81,15 @@
           Delete board and exclusive pins
         </button>
         <button
+          v-if="phase === 'failed-retry-refresh'"
+          type="button"
+          class="button is-danger"
+          data-test="board-delete-retry-refresh"
+          @click="retryRefresh"
+        >
+          Retry refresh
+        </button>
+        <button
           v-if="showRetry"
           type="button"
           class="button is-danger"
@@ -91,7 +100,7 @@
           Retry
         </button>
         <button
-          v-if="phase === 'completed'"
+          v-if="canClose"
           type="button"
           class="button"
           data-test="board-delete-close"
@@ -171,6 +180,7 @@ export default {
   beforeCreate() {
     this.disposed = false;
     this.requestToken = 0;
+    this.closeConsumed = false;
   },
   props: {
     board: {
@@ -213,6 +223,13 @@ export default {
     showRetry() {
       return this.phase === 'failed-board-delete'
         || (this.phase === 'retrying-pins' && this.retryReady);
+    },
+    canClose() {
+      return [
+        'completed',
+        'failed-board-delete',
+        'failed-retry-refresh',
+      ].includes(this.phase);
     },
   },
   created() {
@@ -259,6 +276,9 @@ export default {
       this.close();
     },
     close() {
+      if (this.closeConsumed) return;
+      this.closeConsumed = true;
+      this.$emit('closed');
       if (this.$parent && typeof this.$parent.close === 'function') this.$parent.close();
     },
     deleteBoardOnly() {
@@ -336,7 +356,7 @@ export default {
         if (result.failed > 0 || result.error || candidates.length > 0) {
           this.failedIds = candidates;
           this.retryIds = [];
-          this.phase = 'retrying-pins';
+          this.phase = 'refreshing-retry';
           return this.refreshRetryIds(candidates, token).then(() => result);
         }
         this.failedIds = [];
@@ -355,10 +375,12 @@ export default {
           if (rows === null) {
             this.selectionError = 'Invalid exclusive pin selection.';
             this.retryReady = false;
+            this.phase = 'failed-retry-refresh';
             return;
           }
           this.retryIds = intersectRemaining(candidates, rows);
           this.retryReady = true;
+          this.phase = 'retrying-pins';
         },
         (error) => {
           if (!this.isCurrent(token)) return;
@@ -367,8 +389,17 @@ export default {
             : null;
           this.selectionError = code || 'Failed to refresh exclusive pins.';
           this.retryReady = false;
+          this.phase = 'failed-retry-refresh';
         },
       );
+    },
+    retryRefresh() {
+      if (this.phase !== 'failed-retry-refresh') return null;
+      const token = this.requestToken + 1;
+      this.requestToken = token;
+      this.phase = 'refreshing-retry';
+      this.selectionError = null;
+      return this.refreshRetryIds([...this.failedIds], token);
     },
     retryPins() {
       if (this.phase !== 'retrying-pins' || !this.retryReady) return null;
@@ -390,17 +421,41 @@ export default {
       }
       return Promise.resolve(pending).then(
         () => {
-          if (!this.isCurrent(token)) return;
-          this.boardDeletePending = false;
-          this.phase = 'completed';
-          this.$emit('completed', this.boardId);
+          this.completeBoardDeletion(token);
         },
         () => {
-          if (!this.isCurrent(token)) return;
-          this.boardDeletePending = false;
-          this.phase = 'failed-board-delete';
+          if (!this.isCurrent(token)) return null;
+          let lookup;
+          try {
+            lookup = API.Board.get(this.boardId);
+          } catch (error) {
+            lookup = Promise.reject(error);
+          }
+          return Promise.resolve(lookup).then(
+            () => {
+              this.failBoardDeletion(token);
+            },
+            (error) => {
+              if (error && error.response && error.response.status === 404) {
+                this.completeBoardDeletion(token);
+                return;
+              }
+              this.failBoardDeletion(token);
+            },
+          );
         },
       );
+    },
+    completeBoardDeletion(token) {
+      if (!this.isCurrent(token)) return;
+      this.boardDeletePending = false;
+      this.phase = 'completed';
+      this.$emit('completed', this.boardId);
+    },
+    failBoardDeletion(token) {
+      if (!this.isCurrent(token)) return;
+      this.boardDeletePending = false;
+      this.phase = 'failed-board-delete';
     },
     retryBoardDeletion() {
       if (this.phase !== 'failed-board-delete') return null;

@@ -7,9 +7,9 @@ import { executeBulk, intersectRemaining } from '@/components/bulk/bulkExecutor'
 
 jest.mock('axios');
 
-function resultFor(ids, status = 'updated') {
+function resultFor(ids, status = 'updated', operation = 'update') {
   return {
-    operation: 'update',
+    operation,
     succeeded: ids.length,
     preserved: 0,
     failed: 0,
@@ -28,7 +28,7 @@ function deferred() {
 function statusForIndex(index) {
   if (index === 0) return 'preserved';
   if (index === 1) return 'failed';
-  return 'updated';
+  return 'deleted';
 }
 
 describe('bulk API adapter', () => {
@@ -77,8 +77,10 @@ describe('executeBulk', () => {
   it('posts 51 ids as ordered 50 and 1 chunks', async () => {
     const ids = Array.from({ length: 51 }, (_, index) => index + 1);
     const request = jest.fn()
-      .mockResolvedValueOnce({ data: resultFor(ids.slice(0, 50)) })
-      .mockResolvedValueOnce({ data: resultFor([51]) });
+      .mockResolvedValueOnce({
+        data: resultFor(ids.slice(0, 50), 'updated', 'add_to_board'),
+      })
+      .mockResolvedValueOnce({ data: resultFor([51], 'updated', 'add_to_board') });
 
     const result = await executeBulk({
       ids,
@@ -117,6 +119,7 @@ describe('executeBulk', () => {
     const progress = jest.fn();
     const request = jest.fn(payload => Promise.resolve({
       data: {
+        operation: 'delete_if_exclusive_to_board',
         results: payload.pin_ids.map((id, index) => ({
           id,
           status: statusForIndex(index),
@@ -125,7 +128,7 @@ describe('executeBulk', () => {
     }));
 
     const result = await executeBulk({
-      ids, operation: 'delete', request, onProgress: progress,
+      ids, operation: 'delete_if_exclusive_to_board', request, onProgress: progress,
     });
 
     expect(progress).toHaveBeenCalledWith({
@@ -139,7 +142,7 @@ describe('executeBulk', () => {
 
   it('stops on a mismatched server ID set without committing the current chunk', async () => {
     const request = jest.fn().mockResolvedValue({
-      data: resultFor([1, 2]),
+      data: resultFor([1, 2], 'deleted', 'delete'),
     });
     const progress = jest.fn();
 
@@ -179,6 +182,105 @@ describe('executeBulk', () => {
       expect(result).toMatchObject({ error: 'request_failed', remainingIds: [1, 2] });
     },
   );
+
+  it.each([
+    [
+      'delete',
+      ['deleted', 'failed'],
+      {
+        completed: 2, succeeded: 1, preserved: 0, failed: 1,
+      },
+    ],
+    [
+      'delete_if_exclusive_to_board',
+      ['deleted', 'preserved', 'failed'],
+      {
+        completed: 3, succeeded: 1, preserved: 1, failed: 1,
+      },
+    ],
+    [
+      'add_to_board',
+      ['updated', 'unchanged'],
+      {
+        completed: 2, succeeded: 2, preserved: 0, failed: 0,
+      },
+    ],
+    [
+      'move_between_boards',
+      ['moved', 'unchanged'],
+      {
+        completed: 2, succeeded: 2, preserved: 0, failed: 0,
+      },
+    ],
+    [
+      'update',
+      ['updated'],
+      {
+        completed: 1, succeeded: 1, preserved: 0, failed: 0,
+      },
+    ],
+  ])('accepts only the documented result set for %s', async (operation, statuses, expected) => {
+    const ids = statuses.map((status, index) => index + 1);
+    const request = jest.fn().mockResolvedValue({
+      data: {
+        operation,
+        results: ids.map((id, index) => ({ id, status: statuses[index] })),
+      },
+    });
+
+    const result = await executeBulk({ ids, operation, request });
+
+    expect(result).toMatchObject({ ...expected, remainingIds: [] });
+    expect(result.error).toBeUndefined();
+  });
+
+  it.each([
+    ['delete', 'preserved'],
+    ['delete_if_exclusive_to_board', 'updated'],
+    ['add_to_board', 'moved'],
+    ['move_between_boards', 'deleted'],
+    ['update', 'unchanged'],
+  ])('rejects status %s does not allow: %s', async (operation, status) => {
+    const progress = jest.fn();
+    const request = jest.fn().mockResolvedValue({
+      data: { operation, results: [{ id: 1, status }] },
+    });
+
+    const result = await executeBulk({
+      ids: [1], operation, request, onProgress: progress,
+    });
+
+    expect(result).toMatchObject({
+      completed: 0,
+      error: 'invalid_bulk_response',
+      remainingIds: [1],
+    });
+    expect(progress).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['mismatched', 'update'],
+  ])('rejects a %s response operation before committing progress', async (name, responseOperation) => {
+    const progress = jest.fn();
+    const request = jest.fn().mockResolvedValue({
+      data: {
+        operation: responseOperation,
+        results: [{ id: 1, status: 'deleted' }],
+      },
+    });
+
+    const result = await executeBulk({
+      ids: [1], operation: 'delete', request, onProgress: progress,
+    });
+
+    expect(result).toMatchObject({
+      completed: 0,
+      error: 'invalid_bulk_response',
+      remainingIds: [1],
+    });
+    expect(progress).not.toHaveBeenCalled();
+  });
 });
 
 describe('intersectRemaining', () => {

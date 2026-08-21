@@ -34,10 +34,15 @@ export default {
     },
   },
   data() {
-    return { disposed: false };
+    return {
+      disposed: false,
+      deleteDialogOpen: false,
+      deleteDialogToken: 0,
+    };
   },
   beforeDestroy() {
     this.disposed = true;
+    this.deleteDialogToken += 1;
   },
   methods: {
     onBoardSaved() {
@@ -50,17 +55,30 @@ export default {
         this.onBoardSaved,
       );
     },
-    onBoardDeleted(boardId) {
-      if (this.disposed) return;
+    releaseDeleteDialog(token) {
+      if (this.disposed || this.deleteDialogToken !== token) return false;
+      this.deleteDialogOpen = false;
+      return true;
+    },
+    onBoardDeleted(boardId, token) {
+      if (!this.releaseDeleteDialog(token)) return;
       this.$emit('board-delete-succeed', boardId);
     },
     deleteBoard() {
-      if (this.disposed) return;
-      openBoardDelete(
-        this,
-        { board: this.board },
-        this.onBoardDeleted,
-      );
+      if (this.disposed || this.deleteDialogOpen) return;
+      const token = this.deleteDialogToken + 1;
+      this.deleteDialogToken = token;
+      this.deleteDialogOpen = true;
+      try {
+        openBoardDelete(
+          this,
+          { board: this.board },
+          boardId => this.onBoardDeleted(boardId, token),
+          () => this.releaseDeleteDialog(token),
+        );
+      } catch (_error) {
+        this.releaseDeleteDialog(token);
+      }
     },
   },
 };

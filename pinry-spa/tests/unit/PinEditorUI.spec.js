@@ -233,12 +233,13 @@ describe('PinEditorUI delete behavior', () => {
 });
 
 describe('board delete modal helper', () => {
-  it('opens the board delete component and forwards only its completed event', () => {
+  it('opens the board delete component and forwards completed and closed events', () => {
     const vm = { $buefy: { modal: { open: jest.fn() } } };
     const board = { id: 7, name: 'Reference' };
     const completed = jest.fn();
+    const closed = jest.fn();
 
-    openBoardDelete(vm, { board }, completed);
+    openBoardDelete(vm, { board }, completed, closed);
     board.name = 'Changed later';
 
     const config = vm.$buefy.modal.open.mock.calls[0][0];
@@ -248,7 +249,7 @@ describe('board delete modal helper', () => {
       props: { board: { id: 7, name: 'Reference' } },
       hasModalCard: true,
       canCancel: false,
-      events: { completed },
+      events: { completed, closed },
     });
   });
 });
@@ -286,6 +287,36 @@ describe('BoardEditUI delete behavior', () => {
 
     config.events.completed(7);
     expect(wrapper.emitted('board-delete-succeed')).toEqual([[7]]);
+    expect(wrapper.vm.deleteDialogOpen).toBe(false);
+  });
+
+  it('opens only one modal until its closed lifecycle releases the latch', async () => {
+    const { modal, wrapper } = mountBoardEditor();
+
+    await wrapper.find('[data-test="delete-board"]').trigger('click');
+    await wrapper.find('[data-test="delete-board"]').trigger('click');
+
+    expect(modal.open).toHaveBeenCalledTimes(1);
+    expect(wrapper.vm.deleteDialogOpen).toBe(true);
+    modal.open.mock.calls[0][0].events.closed();
+    expect(wrapper.vm.deleteDialogOpen).toBe(false);
+
+    await wrapper.find('[data-test="delete-board"]').trigger('click');
+    expect(modal.open).toHaveBeenCalledTimes(2);
+    expect(wrapper.vm.deleteDialogOpen).toBe(true);
+  });
+
+  it('releases the modal latch when opening the modal throws', async () => {
+    const { modal, wrapper } = mountBoardEditor();
+    modal.open.mockImplementationOnce(() => { throw new Error('open failed'); });
+
+    await wrapper.find('[data-test="delete-board"]').trigger('click');
+    expect(wrapper.vm.deleteDialogOpen).toBe(false);
+
+    modal.open.mockReturnValueOnce({});
+    await wrapper.find('[data-test="delete-board"]').trigger('click');
+    expect(modal.open).toHaveBeenCalledTimes(2);
+    expect(wrapper.vm.deleteDialogOpen).toBe(true);
   });
 
   it('ignores a late completed event after the board editor is destroyed', async () => {

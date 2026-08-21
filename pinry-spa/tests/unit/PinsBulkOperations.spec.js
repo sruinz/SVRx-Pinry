@@ -21,10 +21,19 @@ function deferred() {
   return request;
 }
 
-function bulkResponse(ids, statuses = {}) {
+function defaultStatus(operation) {
+  if (operation === 'delete' || operation === 'delete_if_exclusive_to_board') {
+    return 'deleted';
+  }
+  if (operation === 'move_between_boards') return 'moved';
+  return 'updated';
+}
+
+function bulkResponse(ids, statuses = {}, operation = 'update') {
   return Promise.resolve({
     data: {
-      results: ids.map(id => ({ id, status: statuses[id] || 'updated' })),
+      operation,
+      results: ids.map(id => ({ id, status: statuses[id] || defaultStatus(operation) })),
     },
   });
 }
@@ -149,7 +158,9 @@ describe('bulk operation dialogs', () => {
         { id: 7, name: 'Target' },
       ],
     });
-    API.Pin.bulk = jest.fn(payload => bulkResponse(payload.pin_ids));
+    API.Pin.bulk = jest.fn(
+      payload => bulkResponse(payload.pin_ids, {}, payload.operation),
+    );
   });
 
   afterEach(() => {
@@ -206,6 +217,7 @@ describe('bulk operation dialogs', () => {
     running.destroy();
     operation.resolve({
       data: {
+        operation: 'add_to_board',
         results: [
           { id: 41, status: 'updated' }, { id: 42, status: 'updated' },
         ],
@@ -283,6 +295,7 @@ describe('bulk operation dialogs', () => {
     });
     operation.resolve({
       data: {
+        operation: 'update',
         results: [
           { id: 41, status: 'updated' }, { id: 42, status: 'updated' },
         ],
@@ -331,7 +344,9 @@ describe('Pins bulk operation orchestration', () => {
     API.fetchPin = jest.fn();
     API.Board.get = jest.fn();
     API.Pin.fetchSelectionIds = jest.fn();
-    API.Pin.bulk = jest.fn(payload => bulkResponse(payload.pin_ids, {}));
+    API.Pin.bulk = jest.fn(
+      payload => bulkResponse(payload.pin_ids, {}, payload.operation),
+    );
   });
 
   afterEach(() => {
@@ -410,11 +425,26 @@ describe('Pins bulk operation orchestration', () => {
     selectScope(wrapper, ids);
     wrapper.vm.confirmBulkDelete();
     wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
-    first.resolve({ data: { results: ids.slice(0, 50).map(id => ({ id, status: 'deleted' })) } });
+    first.resolve({
+      data: {
+        operation: 'delete',
+        results: ids.slice(0, 50).map(id => ({ id, status: 'deleted' })),
+      },
+    });
     await settle();
-    second.resolve({ data: { results: ids.slice(50, 100).map(id => ({ id, status: 'deleted' })) } });
+    second.resolve({
+      data: {
+        operation: 'delete',
+        results: ids.slice(50, 100).map(id => ({ id, status: 'deleted' })),
+      },
+    });
     await settle();
-    third.resolve({ data: { results: ids.slice(100, 150).map(id => ({ id, status: 'deleted' })) } });
+    third.resolve({
+      data: {
+        operation: 'delete',
+        results: ids.slice(100, 150).map(id => ({ id, status: 'deleted' })),
+      },
+    });
     await settle();
 
     expect(wrapper.vm.selection.operationInFlight).toBe(true);
@@ -432,7 +462,9 @@ describe('Pins bulk operation orchestration', () => {
     const operation = deferred();
     API.Pin.bulk
       .mockReturnValueOnce(operation.promise)
-      .mockImplementation(payload => bulkResponse(payload.pin_ids, { 41: 'deleted' }));
+      .mockImplementation(
+        payload => bulkResponse(payload.pin_ids, { 41: 'deleted' }, payload.operation),
+      );
     const wrapper = mountPins({ pins: [pin(41)] });
     await settle();
     selectScope(wrapper, [41]);
@@ -454,7 +486,9 @@ describe('Pins bulk operation orchestration', () => {
     expect(wrapper.dialog.confirm).toHaveBeenCalledTimes(1);
     expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
 
-    operation.resolve({ data: { results: [{ id: 41, status: 'deleted' }] } });
+    operation.resolve({
+      data: { operation: 'delete', results: [{ id: 41, status: 'deleted' }] },
+    });
     await settle();
 
     expect(wrapper.vm.selection.operationInFlight).toBe(false);
@@ -463,12 +497,14 @@ describe('Pins bulk operation orchestration', () => {
     expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
   });
 
-  it('shows succeeded, preserved, and failed counts and retries only refreshed failures', async () => {
+  it('shows succeeded and failed counts and retries only refreshed failures', async () => {
     API.Pin.bulk
       .mockImplementationOnce(payload => bulkResponse(payload.pin_ids, {
-        41: 'deleted', 40: 'preserved', 39: 'failed',
-      }))
-      .mockImplementationOnce(payload => bulkResponse(payload.pin_ids, { 39: 'deleted' }));
+        41: 'deleted', 40: 'deleted', 39: 'failed',
+      }, payload.operation))
+      .mockImplementationOnce(
+        payload => bulkResponse(payload.pin_ids, { 39: 'deleted' }, payload.operation),
+      );
     API.Pin.fetchSelectionIds.mockResolvedValue({
       data: { count: 2, results: [{ id: 40, owned: true }, { id: 39, owned: true }] },
     });
@@ -481,10 +517,10 @@ describe('Pins bulk operation orchestration', () => {
 
     expect(API.Pin.fetchSelectionIds).toHaveBeenCalledWith({ boardId: null });
     expect(wrapper.vm.selection.result).toMatchObject({
-      succeeded: 1, preserved: 1, failed: 1, retryIds: [39],
+      succeeded: 2, preserved: 0, failed: 1, retryIds: [39],
     });
     expect(wrapper.find('[data-test="pin-bulk-result"]').text())
-      .toContain('bulkPinResultSucceeded:1');
+      .toContain('bulkPinResultSucceeded:2');
     expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
     await wrapper.find('[data-test="pin-bulk-retry"]').trigger('click');
     await settle();
@@ -494,7 +530,9 @@ describe('Pins bulk operation orchestration', () => {
   it('never auto-retries an ambiguous delete and intersects remaining board IDs', async () => {
     API.Pin.bulk
       .mockRejectedValueOnce(new Error('network'))
-      .mockImplementationOnce(payload => bulkResponse(payload.pin_ids, { 40: 'deleted' }));
+      .mockImplementationOnce(
+        payload => bulkResponse(payload.pin_ids, { 40: 'deleted' }, payload.operation),
+      );
     API.Pin.fetchSelectionIds.mockResolvedValue({
       data: { count: 2, results: [{ id: 40, owned: true }, { id: 9, owned: true }] },
     });
@@ -618,7 +656,9 @@ describe('Pins bulk operation orchestration', () => {
       wrapper.destroy();
 
       if (outcome === 'resolve') {
-        operation.resolve({ data: { results: [{ id: 41, status: 'deleted' }] } });
+        operation.resolve({
+          data: { operation: 'delete', results: [{ id: 41, status: 'deleted' }] },
+        });
       } else {
         operation.reject(new Error('network'));
       }

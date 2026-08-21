@@ -1,6 +1,11 @@
 const CHUNK_SIZE = 50;
-const SUCCESS_STATUSES = new Set(['deleted', 'updated', 'moved', 'unchanged']);
-const VALID_STATUSES = new Set([...SUCCESS_STATUSES, 'preserved', 'failed']);
+const OPERATION_STATUSES = {
+  delete: new Set(['deleted', 'failed']),
+  delete_if_exclusive_to_board: new Set(['deleted', 'preserved', 'failed']),
+  add_to_board: new Set(['updated', 'unchanged']),
+  move_between_boards: new Set(['moved', 'unchanged']),
+  update: new Set(['updated']),
+};
 
 function initialResult(ids) {
   return {
@@ -14,8 +19,15 @@ function initialResult(ids) {
   };
 }
 
-function validResults(response, ids) {
-  if (!response || !response.data || !Array.isArray(response.data.results)) {
+function validResults(response, ids, operation) {
+  const allowedStatuses = OPERATION_STATUSES[operation];
+  if (
+    !response
+    || !response.data
+    || response.data.operation !== operation
+    || !allowedStatuses
+    || !Array.isArray(response.data.results)
+  ) {
     return null;
   }
 
@@ -30,7 +42,7 @@ function validResults(response, ids) {
       || !Number.isInteger(item.id)
       || !expectedIds.has(item.id)
       || receivedIds.has(item.id)
-      || !VALID_STATUSES.has(item.status)
+      || !allowedStatuses.has(item.status)
     ) {
       return false;
     }
@@ -48,13 +60,13 @@ function commitResults(summary, results) {
   };
   results.forEach((item) => {
     committed.completed += 1;
-    if (SUCCESS_STATUSES.has(item.status)) {
-      committed.succeeded += 1;
-    } else if (item.status === 'preserved') {
+    if (item.status === 'preserved') {
       committed.preserved += 1;
-    } else {
+    } else if (item.status === 'failed') {
       committed.failed += 1;
       committed.failedIds.push(item.id);
+    } else {
+      committed.succeeded += 1;
     }
   });
   return committed;
@@ -84,7 +96,7 @@ export function executeBulk({
 
     return Promise.resolve(pending).then(
       (response) => {
-        const results = validResults(response, chunk);
+        const results = validResults(response, chunk, operation);
         if (results === null) {
           summary.error = 'invalid_bulk_response';
           summary.remainingIds = ids.slice(start);

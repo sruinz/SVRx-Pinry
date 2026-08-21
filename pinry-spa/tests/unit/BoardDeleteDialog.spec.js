@@ -69,6 +69,7 @@ describe('BoardDeleteDialog', () => {
     API.Pin.fetchSelectionIds = jest.fn().mockResolvedValue(selectionResponse(2));
     API.Pin.bulk = jest.fn(payload => Promise.resolve(bulkResponse(payload.pin_ids)));
     API.Board.delete = jest.fn().mockResolvedValue({ status: 204 });
+    API.Board.get = jest.fn().mockResolvedValue({ data: { id: 7, name: 'Reference' } });
   });
 
   afterEach(() => {
@@ -110,6 +111,18 @@ describe('BoardDeleteDialog', () => {
     expect(API.Pin.fetchSelectionIds).not.toHaveBeenCalled();
     expect(API.Pin.bulk).not.toHaveBeenCalled();
     expect(API.Board.delete).not.toHaveBeenCalled();
+  });
+
+  it('emits closed before asking the modal parent to close on cancel', async () => {
+    const order = [];
+    const wrapper = mountDialog();
+    wrapper.vm.$on('closed', () => order.push('closed'));
+    wrapper.vm.$parent.close = jest.fn(() => order.push('parent-close'));
+    await settle();
+
+    await wrapper.find('[data-test="board-delete-cancel"]').trigger('click');
+
+    expect(order).toEqual(['closed', 'parent-close']);
   });
 
   it('deletes only the board without fetching or mutating pins', async () => {
@@ -269,6 +282,37 @@ describe('BoardDeleteDialog', () => {
     expect(wrapper.find('[data-test="board-delete-result"]').text()).toContain('1');
   });
 
+  it.each([
+    ['a mismatched operation', {
+      data: {
+        ...bulkResponse([1]).data,
+        operation: 'delete',
+      },
+    }],
+    ['a status outside the conditional-delete contract', {
+      data: {
+        operation: 'delete_if_exclusive_to_board',
+        succeeded: 1,
+        preserved: 0,
+        failed: 0,
+        results: [{ id: 1, status: 'updated' }],
+      },
+    }],
+  ])('keeps the board when bulk returns %s', async (name, response) => {
+    API.Pin.fetchSelectionIds.mockResolvedValue(selectionResponse(1));
+    API.Pin.bulk.mockResolvedValueOnce(response);
+    const wrapper = mountDialog();
+    await settle();
+
+    await wrapper.find('[data-test="board-delete-with-pins"]').trigger('click');
+    await settle();
+
+    expect(wrapper.vm.phase).toBe('retrying-pins');
+    expect(wrapper.vm.failedIds).toEqual([1]);
+    expect(API.Board.delete).not.toHaveBeenCalled();
+    expect(wrapper.find('[data-test="board-delete-retry"]').exists()).toBe(true);
+  });
+
   it('re-fetches and intersects failed pins before exposing a manual retry', async () => {
     const rows = selectionRows(51);
     API.Pin.fetchSelectionIds
@@ -303,6 +347,110 @@ describe('BoardDeleteDialog', () => {
     expect(API.Pin.bulk).toHaveBeenCalledTimes(3);
     expect(API.Pin.bulk.mock.calls[2][0].pin_ids).toEqual([1]);
     expect(API.Board.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('recovers a failed retry refresh only after an explicit refresh and pin retry', async () => {
+    API.Pin.fetchSelectionIds
+      .mockResolvedValueOnce(selectionResponse(1))
+      .mockRejectedValueOnce(new Error('refresh failed'))
+      .mockResolvedValueOnce(selectionResponse(1));
+    API.Pin.bulk
+      .mockRejectedValueOnce(new Error('network'))
+      .mockResolvedValueOnce(bulkResponse([1]));
+    const wrapper = mountDialog();
+    await settle();
+
+    await wrapper.find('[data-test="board-delete-with-pins"]').trigger('click');
+    await settle();
+
+    expect(wrapper.vm.phase).toBe('failed-retry-refresh');
+    expect(wrapper.find('[data-test="board-delete-retry-refresh"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="board-delete-close"]').exists()).toBe(true);
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
+    expect(API.Board.delete).not.toHaveBeenCalled();
+
+    await wrapper.find('[data-test="board-delete-retry-refresh"]').trigger('click');
+    await settle();
+
+    expect(wrapper.vm.phase).toBe('retrying-pins');
+    expect(wrapper.vm.retryIds).toEqual([1]);
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
+
+    await wrapper.find('[data-test="board-delete-retry"]').trigger('click');
+    await settle();
+
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(2);
+    expect(API.Board.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows safe close when a retry refresh response is malformed', async () => {
+    API.Pin.fetchSelectionIds
+      .mockResolvedValueOnce(selectionResponse(1))
+      .mockResolvedValueOnce({ data: { count: 1, results: [] } });
+    API.Pin.bulk.mockRejectedValueOnce(new Error('network'));
+    const wrapper = mountDialog();
+    await settle();
+
+    await wrapper.find('[data-test="board-delete-with-pins"]').trigger('click');
+    await settle();
+
+    expect(wrapper.vm.phase).toBe('failed-retry-refresh');
+    expect(wrapper.find('[data-test="board-delete-retry-refresh"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="board-delete-close"]').exists()).toBe(true);
+    await wrapper.find('[data-test="board-delete-close"]').trigger('click');
+
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
+    expect(API.Board.delete).not.toHaveBeenCalled();
+  });
+
+  it('completes when board lookup confirms a lost delete response already deleted it', async () => {
+    API.Board.delete.mockRejectedValueOnce(new Error('response lost'));
+    API.Board.get.mockRejectedValueOnce({ response: { status: 404 } });
+    const wrapper = mountDialog();
+    await settle();
+
+    await wrapper.find('[data-test="board-delete-only"]').trigger('click');
+    await settle();
+
+    expect(API.Board.get).toHaveBeenCalledWith(7);
+    expect(wrapper.vm.phase).toBe('completed');
+    expect(wrapper.emitted('completed')).toEqual([[7]]);
+  });
+
+  it.each([
+    ['the board still exists', 'exists'],
+    ['board lookup is inconclusive', 'unknown'],
+  ])('keeps retry and safe close when %s after delete failure', async (name, outcome) => {
+    API.Board.delete.mockRejectedValueOnce(new Error('delete failed'));
+    if (outcome === 'unknown') {
+      API.Board.get.mockRejectedValueOnce(new Error('lookup failed'));
+    }
+    const wrapper = mountDialog();
+    await settle();
+
+    await wrapper.find('[data-test="board-delete-only"]').trigger('click');
+    await settle();
+
+    expect(wrapper.vm.phase).toBe('failed-board-delete');
+    expect(wrapper.find('[data-test="board-delete-retry"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="board-delete-close"]').exists()).toBe(true);
+    await wrapper.find('[data-test="board-delete-close"]').trigger('click');
+    expect(API.Board.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits closed before closing a persistent board-delete failure', async () => {
+    const order = [];
+    API.Board.delete.mockRejectedValueOnce(new Error('delete failed'));
+    const wrapper = mountDialog();
+    wrapper.vm.$on('closed', () => order.push('closed'));
+    wrapper.vm.$parent.close = jest.fn(() => order.push('parent-close'));
+    await settle();
+    await wrapper.find('[data-test="board-delete-only"]').trigger('click');
+    await settle();
+
+    await wrapper.find('[data-test="board-delete-close"]').trigger('click');
+
+    expect(order).toEqual(['closed', 'parent-close']);
   });
 
   it('retries only the board call after exclusive pins were deleted', async () => {
