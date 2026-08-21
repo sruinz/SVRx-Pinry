@@ -121,7 +121,9 @@ printf 'source_commit=%s\ndefault_image=pinry-custom:latest\n' \
     "${source_commit}" \
     > "${temporary_directory}/BUILD_INFO"
 
-tar --exclude='.DS_Store' --exclude='*/.DS_Store' -czf "${temporary_archive}" \
+COPYFILE_DISABLE=1 \
+    tar --exclude='.DS_Store' --exclude='*/.DS_Store' \
+    -czf "${temporary_archive}" \
     -C "${temporary_root}" "${package_name}"
 mv "${temporary_directory}" "${package_directory}"
 if mv "${temporary_archive}" "${archive_path}"; then

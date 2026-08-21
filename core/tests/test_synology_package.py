@@ -85,6 +85,7 @@ def _write_tar_race_wrapper(path, real_tar):
         "    esac\n"
         "done\n"
         "if [ \"$create\" = 1 ]; then\n"
+        "    test \"${COPYFILE_DISABLE:-}\" = 1\n"
         "    package_root=$package_root/$package_name\n"
         "    test -d \"$package_root/context\"\n"
         "    mkdir -p \"$package_root/context/pinry-spa/src/race\"\n"
@@ -638,6 +639,7 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertIsNotNone(real_tar)
         _write_tar_race_wrapper(binary_directory / "tar", real_tar)
         environment = os.environ.copy()
+        environment.pop("COPYFILE_DISABLE", None)
         environment["PATH"] = "{}{}{}".format(
             binary_directory,
             os.pathsep,
@@ -666,6 +668,9 @@ class SynologyPackageTests(unittest.TestCase):
             names = archive.getnames()
         self.assertFalse(
             any(Path(name).name == ".DS_Store" for name in names)
+        )
+        self.assertFalse(
+            any(Path(name).name.startswith("._") for name in names)
         )
         self.assertIn("pinry-custom/.DS_Store.backup", names)
         self.assertIn(
