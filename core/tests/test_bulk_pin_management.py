@@ -34,6 +34,64 @@ class BulkPinRequestSerializerTests(SimpleTestCase):
         self.assertFalse(serializer.is_valid())
         self.assertEqual(serializer.errors["code"][0], "bulk_invalid_request")
 
+    def test_rejects_operation_specific_missing_and_extra_keys(self):
+        valid = {
+            "delete": {"operation": "delete", "pin_ids": [1]},
+            "add_to_board": {
+                "operation": "add_to_board", "pin_ids": [1], "board_id": 7,
+            },
+            "move_between_boards": {
+                "operation": "move_between_boards", "pin_ids": [1],
+                "source_board_id": 7, "target_board_id": 8,
+            },
+            "update": {
+                "operation": "update", "pin_ids": [1],
+                "changes": {"private": True},
+            },
+            "delete_if_exclusive_to_board": {
+                "operation": "delete_if_exclusive_to_board", "pin_ids": [1],
+                "source_board_id": 7,
+            },
+        }
+        required = {
+            "delete": ("pin_ids",),
+            "add_to_board": ("pin_ids", "board_id"),
+            "move_between_boards": (
+                "pin_ids", "source_board_id", "target_board_id",
+            ),
+            "update": ("pin_ids", "changes"),
+            "delete_if_exclusive_to_board": ("pin_ids", "source_board_id"),
+        }
+        for operation, payload in valid.items():
+            for key in required[operation]:
+                missing = dict(payload)
+                del missing[key]
+                serializer = BulkPinRequestSerializer(data=missing)
+                self.assertFalse(serializer.is_valid(), missing)
+            extra = dict(payload)
+            extra["unexpected"] = 1
+            serializer = BulkPinRequestSerializer(data=extra)
+            self.assertFalse(serializer.is_valid(), extra)
+
+    def test_rejects_all_board_id_boolean_and_string_values(self):
+        payloads = (
+            {"operation": "add_to_board", "pin_ids": [1], "board_id": True},
+            {"operation": "add_to_board", "pin_ids": [1], "board_id": "7"},
+            {"operation": "move_between_boards", "pin_ids": [1],
+             "source_board_id": True, "target_board_id": 8},
+            {"operation": "move_between_boards", "pin_ids": [1],
+             "source_board_id": 7, "target_board_id": "8"},
+            {"operation": "delete_if_exclusive_to_board", "pin_ids": [1],
+             "source_board_id": True},
+            {"operation": "delete_if_exclusive_to_board", "pin_ids": [1],
+             "source_board_id": "7"},
+        )
+        for payload in payloads:
+            serializer = BulkPinRequestSerializer(data=payload)
+            self.assertFalse(serializer.is_valid(), payload)
+            self.assertEqual(serializer.errors["code"][0],
+                             "bulk_invalid_request")
+
     def test_rejects_strict_values_and_exact_keys(self):
         invalid = (
             {"operation": "delete", "pin_ids": [True]},
