@@ -2,7 +2,7 @@ import re
 import time
 
 from django.conf import settings
-from django.db import OperationalError, transaction
+from django.db import connection, OperationalError, transaction
 from django.db.models import BooleanField, Case, Count, IntegerField, Q, Value, When
 
 from core.models import Board, Pin
@@ -13,6 +13,8 @@ from core.services.pin_membership import (
 
 
 _POSITIVE_DECIMAL = re.compile(r"\A[0-9]+\Z")
+_SQLITE_BUSY_WORD = re.compile(r"\b(?:busy|locked)\b")
+_POSTGRESQL_BUSY_SQLSTATES = frozenset(("40001", "40P01", "55P03"))
 
 
 class BulkOperationError(Exception):
@@ -55,7 +57,24 @@ def parse_selection_query(query_params):
 
 def normalize_bulk_exception(error):
     if isinstance(error, OperationalError):
-        return "database_busy", True
+        if (
+            connection.vendor == "sqlite"
+            and _SQLITE_BUSY_WORD.search(str(error).lower())
+        ):
+            return "database_busy", True
+        if connection.vendor == "postgresql":
+            candidates = (
+                error,
+                getattr(error, "__cause__", None),
+                getattr(error, "__context__", None),
+            )
+            for candidate in candidates:
+                sqlstate = (
+                    getattr(candidate, "pgcode", None)
+                    or getattr(candidate, "sqlstate", None)
+                )
+                if sqlstate in _POSTGRESQL_BUSY_SQLSTATES:
+                    return "database_busy", True
     return "internal_error", False
 
 
@@ -188,7 +207,14 @@ class BulkPinManagementService(object):
         started_at,
     ):
         source_board_id = request_data["source_board_id"]
-        self._owned_board(user, source_board_id)
+        source_board = self._owned_board(user, source_board_id)
+        member_pins = {
+            pin.pk: pin
+            for pin in Pin.objects.filter(
+                pk__in=request_data["pin_ids"],
+                pins=source_board,
+            ).only("pk", "image_id").order_by("pk")
+        }
         results = []
         deadline_expired = False
         deadline = started_at + settings.PINRY_FETCH_TOTAL_TIMEOUT
@@ -198,9 +224,10 @@ class BulkPinManagementService(object):
                 results.append(self._deadline_failure(pin_id))
                 continue
             try:
-                item_status, code = Pin(
-                    pk=pin_id
-                ).delete_if_exclusive_to_board(
+                pin = member_pins.get(pin_id)
+                if pin is None:
+                    pin = Pin(pk=pin_id)
+                item_status, code = pin.delete_if_exclusive_to_board(
                     user.pk,
                     source_board_id,
                 )

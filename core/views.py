@@ -237,18 +237,23 @@ class PinViewSet(viewsets.ModelViewSet):
         permission_classes=[IsAuthenticated],
     )
     def bulk(self, request):
-        serializer = BulkPinRequestSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response(
-                {"code": "bulk_invalid_request"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         try:
+            serializer = BulkPinRequestSerializer(data=request.data)
+            if not serializer.is_valid():
+                return Response(
+                    {"code": "bulk_invalid_request"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             service = self.bulk_service_class(clock=self.bulk_clock)
             result = service.execute(
                 request.user,
                 serializer.validated_data,
                 self.bulk_clock(),
+            )
+        except ParseError:
+            return Response(
+                {"code": "bulk_invalid_request"},
+                status=status.HTTP_400_BAD_REQUEST,
             )
         except BulkOperationError as error:
             error_status = self._BULK_ERROR_STATUS.get(error.code)

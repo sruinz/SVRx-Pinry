@@ -1,16 +1,21 @@
+import hashlib
+from pathlib import Path
+
 from django.conf import settings
 from django.db import connection, OperationalError
-from django.test import SimpleTestCase
+from django.test import override_settings, SimpleTestCase
 from django.test.utils import CaptureQueriesContext
 import mock
 from rest_framework import status
 from rest_framework.test import APITestCase, APITransactionTestCase
 
 from core.bulk_serializers import BulkPinRequestSerializer
-from core.models import Board, Pin
+from core.models import Board, Image, MediaAsset, Pin
 from core.services.bulk_pin_management import BulkOperationError
 from core.tests.helpers import create_image, create_user
+from core.tests.test_pin_import_atomicity import _LinuxStrongPublishMixin
 from core.views import PinViewSet
+from django_images.models import Thumbnail
 from django_images.test_helpers import TemporaryMediaMixin
 
 
@@ -182,6 +187,14 @@ class BulkExceptionNormalizationTests(SimpleTestCase):
                 ("database_busy", True),
             ),
             (
+                OperationalError("no such table: /private/path"),
+                ("internal_error", False),
+            ),
+            (
+                OperationalError("busywork failed at /private/path"),
+                ("internal_error", False),
+            ),
+            (
                 RuntimeError("secret token and /private/path"),
                 ("internal_error", False),
             ),
@@ -190,8 +203,35 @@ class BulkExceptionNormalizationTests(SimpleTestCase):
             with self.subTest(error_type=type(error).__name__):
                 self.assertEqual(normalize_bulk_exception(error), expected)
 
+    def test_postgresql_uses_only_explicit_retryable_sqlstates(self):
+        from core.services.bulk_pin_management import (
+            normalize_bulk_exception,
+        )
 
-class BulkPinWriteAPITests(TemporaryMediaMixin, APITransactionTestCase):
+        cases = (
+            ("40001", ("database_busy", True)),
+            ("40P01", ("database_busy", True)),
+            ("55P03", ("database_busy", True)),
+            ("42P01", ("internal_error", False)),
+        )
+        for sqlstate, expected in cases:
+            cause = OperationalError("opaque backend error")
+            cause.pgcode = sqlstate
+            error = OperationalError("secret /private/path")
+            error.__cause__ = cause
+            with self.subTest(sqlstate=sqlstate), mock.patch.object(
+                connection,
+                "vendor",
+                "postgresql",
+            ):
+                self.assertEqual(normalize_bulk_exception(error), expected)
+
+
+class BulkPinWriteAPITests(
+    _LinuxStrongPublishMixin,
+    TemporaryMediaMixin,
+    APITransactionTestCase,
+):
     def setUp(self):
         super(BulkPinWriteAPITests, self).setUp()
         self.owner = create_user("bulk-write-owner")
@@ -259,6 +299,38 @@ class BulkPinWriteAPITests(TemporaryMediaMixin, APITransactionTestCase):
         self.assertEqual(response.data, {"code": "bulk_invalid_request"})
         self.first.refresh_from_db()
         self.assertEqual(self.first.description, "original description")
+
+    def test_malformed_json_is_canonical_bulk_invalid_request(self):
+        response = self.client.generic(
+            "POST",
+            self._url(),
+            b'{"operation":"delete","pin_ids":[',
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data, {"code": "bulk_invalid_request"})
+        self.assertTrue(Pin.objects.filter(pk=self.first.pk).exists())
+
+    @override_settings(PINRY_BATCH_MAX_BODY_BYTES=64)
+    def test_oversized_json_is_canonical_bulk_invalid_request(self):
+        body = (
+            '{{"operation":"delete","pin_ids":[{}]}}'.format(
+                self.first.pk
+            ).encode("ascii")
+            + b" " * 128
+        )
+
+        response = self.client.generic(
+            "POST",
+            self._url(),
+            body,
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data, {"code": "bulk_invalid_request"})
+        self.assertTrue(Pin.objects.filter(pk=self.first.pk).exists())
 
     def test_delete_keeps_success_before_later_failure(self):
         with mock.patch.object(
@@ -737,6 +809,81 @@ class BulkPinWriteAPITests(TemporaryMediaMixin, APITransactionTestCase):
             pk=missing_membership.pk
         ).exists())
 
+    def test_conditional_delete_registered_media_uses_hydrated_pin(self):
+        image = create_image()
+        image_id = image.pk
+        pin = Pin.objects.create(submitter=self.owner, image=image)
+        pin_id = pin.pk
+        self.source.pins.add(pin)
+        image.refresh_from_db()
+        media_root = Path(self.temporary_media.name)
+        content = (media_root / image.image.name).read_bytes()
+        asset = MediaAsset.objects.create(
+            submitter=self.owner,
+            image=image,
+            content_sha256=hashlib.sha256(content).hexdigest(),
+        )
+        asset_id = asset.pk
+        asset_uuid = str(image.asset_uuid)
+        asset_directories = (
+            media_root / "originals" / asset_uuid,
+            media_root / "derivatives" / asset_uuid,
+        )
+        file_names = {image.image.name}
+        file_names.update(
+            image.thumbnail_set.values_list("image", flat=True)
+        )
+        self.assertEqual(len(file_names), 4)
+        self.assertTrue(all(
+            (media_root / name).is_file() for name in file_names
+        ))
+        real_delete = Pin.delete_if_exclusive_to_board
+        passed_image_ids = []
+
+        def record_image_id(instance, *args, **kwargs):
+            passed_image_ids.append(instance.image_id)
+            return real_delete(instance, *args, **kwargs)
+
+        with mock.patch.object(
+            Pin,
+            "delete_if_exclusive_to_board",
+            autospec=True,
+            side_effect=record_image_id,
+        ):
+            response = self.client.post(
+                self._url(),
+                {
+                    "operation": "delete_if_exclusive_to_board",
+                    "pin_ids": [pin_id],
+                    "source_board_id": self.source.pk,
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {
+            "operation": "delete_if_exclusive_to_board",
+            "succeeded": 1,
+            "preserved": 0,
+            "failed": 0,
+            "results": [{"id": pin_id, "status": "deleted"}],
+        })
+        self.assertEqual(passed_image_ids, [image_id])
+        self.assertFalse(Pin.objects.filter(pk=pin_id).exists())
+        self.assertFalse(Image.objects.filter(pk=image_id).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset_id).exists())
+        self.assertFalse(
+            Thumbnail.objects.filter(original_id=image_id).exists()
+        )
+        self.assertTrue(all(
+            not (media_root / name).exists() for name in file_names
+        ))
+        self.assertTrue(all(
+            not directory.exists() for directory in asset_directories
+        ))
+        self.assertTrue((media_root / "originals").is_dir())
+        self.assertTrue((media_root / "derivatives").is_dir())
+
     def test_atomic_service_errors_are_code_only(self):
         cases = (
             (
@@ -748,6 +895,11 @@ class BulkPinWriteAPITests(TemporaryMediaMixin, APITransactionTestCase):
                 OperationalError("database locked /private/path"),
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "database_busy",
+            ),
+            (
+                OperationalError("no such table: /private/path"),
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "internal_error",
             ),
             (
                 RuntimeError("secret token /private/path"),
