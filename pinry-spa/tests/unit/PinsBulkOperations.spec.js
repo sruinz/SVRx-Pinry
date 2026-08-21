@@ -29,13 +29,33 @@ function defaultStatus(operation) {
   return 'updated';
 }
 
-function bulkResponse(ids, statuses = {}, operation = 'update') {
-  return Promise.resolve({
+function bulkAxiosResponse(ids, statuses = {}, operation = 'update') {
+  const results = ids.map((id) => {
+    const status = statuses[id] || defaultStatus(operation);
+    if (status === 'preserved') return { id, status, code: 'shared_pin' };
+    if (status === 'failed') {
+      return {
+        id, status, code: 'internal_error', retryable: false,
+      };
+    }
+    return { id, status };
+  });
+  return {
+    status: 200,
     data: {
       operation,
-      results: ids.map(id => ({ id, status: statuses[id] || defaultStatus(operation) })),
+      succeeded: results.filter(
+        item => !['preserved', 'failed'].includes(item.status),
+      ).length,
+      preserved: results.filter(item => item.status === 'preserved').length,
+      failed: results.filter(item => item.status === 'failed').length,
+      results,
     },
-  });
+  };
+}
+
+function bulkResponse(ids, statuses = {}, operation = 'update') {
+  return Promise.resolve(bulkAxiosResponse(ids, statuses, operation));
 }
 
 function pin(id, author = 'owner') {
@@ -215,14 +235,7 @@ describe('bulk operation dialogs', () => {
     const submission = running.vm.submit();
     expect(running.vm.operationInFlight).toBe(true);
     running.destroy();
-    operation.resolve({
-      data: {
-        operation: 'add_to_board',
-        results: [
-          { id: 41, status: 'updated' }, { id: 42, status: 'updated' },
-        ],
-      },
-    });
+    operation.resolve(bulkAxiosResponse([41, 42], {}, 'add_to_board'));
     await submission;
 
     expect(running.vm.operationInFlight).toBe(true);
@@ -293,14 +306,7 @@ describe('bulk operation dialogs', () => {
       pin_ids: [41, 42],
       changes: { private: true, tags: { mode: 'remove', values: ['alpha'] } },
     });
-    operation.resolve({
-      data: {
-        operation: 'update',
-        results: [
-          { id: 41, status: 'updated' }, { id: 42, status: 'updated' },
-        ],
-      },
-    });
+    operation.resolve(bulkAxiosResponse([41, 42], {}, 'update'));
     await settle();
     expect(wrapper.emitted('completed')).toHaveLength(1);
   });
@@ -425,26 +431,11 @@ describe('Pins bulk operation orchestration', () => {
     selectScope(wrapper, ids);
     wrapper.vm.confirmBulkDelete();
     wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
-    first.resolve({
-      data: {
-        operation: 'delete',
-        results: ids.slice(0, 50).map(id => ({ id, status: 'deleted' })),
-      },
-    });
+    first.resolve(bulkAxiosResponse(ids.slice(0, 50), {}, 'delete'));
     await settle();
-    second.resolve({
-      data: {
-        operation: 'delete',
-        results: ids.slice(50, 100).map(id => ({ id, status: 'deleted' })),
-      },
-    });
+    second.resolve(bulkAxiosResponse(ids.slice(50, 100), {}, 'delete'));
     await settle();
-    third.resolve({
-      data: {
-        operation: 'delete',
-        results: ids.slice(100, 150).map(id => ({ id, status: 'deleted' })),
-      },
-    });
+    third.resolve(bulkAxiosResponse(ids.slice(100, 150), {}, 'delete'));
     await settle();
 
     expect(wrapper.vm.selection.operationInFlight).toBe(true);
@@ -486,9 +477,7 @@ describe('Pins bulk operation orchestration', () => {
     expect(wrapper.dialog.confirm).toHaveBeenCalledTimes(1);
     expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
 
-    operation.resolve({
-      data: { operation: 'delete', results: [{ id: 41, status: 'deleted' }] },
-    });
+    operation.resolve(bulkAxiosResponse([41], {}, 'delete'));
     await settle();
 
     expect(wrapper.vm.selection.operationInFlight).toBe(false);
@@ -656,9 +645,7 @@ describe('Pins bulk operation orchestration', () => {
       wrapper.destroy();
 
       if (outcome === 'resolve') {
-        operation.resolve({
-          data: { operation: 'delete', results: [{ id: 41, status: 'deleted' }] },
-        });
+        operation.resolve(bulkAxiosResponse([41], {}, 'delete'));
       } else {
         operation.reject(new Error('network'));
       }

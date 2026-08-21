@@ -6,6 +6,39 @@ const OPERATION_STATUSES = {
   move_between_boards: new Set(['moved', 'unchanged']),
   update: new Set(['updated']),
 };
+const ENVELOPE_FIELDS = [
+  'operation', 'succeeded', 'preserved', 'failed', 'results',
+];
+const SUCCESS_FIELDS = ['id', 'status'];
+const PRESERVED_FIELDS = ['id', 'status', 'code'];
+const FAILED_FIELDS = ['id', 'status', 'code', 'retryable'];
+const PRESERVED_CODES = new Set([
+  'shared_pin', 'non_owned_pin', 'source_membership_changed',
+]);
+const FAILED_RETRYABILITY = {
+  database_busy: true,
+  internal_error: false,
+  bulk_deadline_exceeded: true,
+};
+
+function hasExactFields(value, fields) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === fields.length && fields.every(field => keys.includes(field));
+}
+
+function hasValidItemSchema(item) {
+  if (item.status === 'preserved') {
+    return hasExactFields(item, PRESERVED_FIELDS) && PRESERVED_CODES.has(item.code);
+  }
+  if (item.status === 'failed') {
+    return hasExactFields(item, FAILED_FIELDS)
+      && Object.prototype.hasOwnProperty.call(FAILED_RETRYABILITY, item.code)
+      && typeof item.retryable === 'boolean'
+      && item.retryable === FAILED_RETRYABILITY[item.code];
+  }
+  return hasExactFields(item, SUCCESS_FIELDS);
+}
 
 function initialResult(ids) {
   return {
@@ -23,7 +56,8 @@ function validResults(response, ids, operation) {
   const allowedStatuses = OPERATION_STATUSES[operation];
   if (
     !response
-    || !response.data
+    || response.status !== 200
+    || !hasExactFields(response.data, ENVELOPE_FIELDS)
     || response.data.operation !== operation
     || !allowedStatuses
     || !Array.isArray(response.data.results)
@@ -36,6 +70,7 @@ function validResults(response, ids, operation) {
 
   const expectedIds = new Set(ids);
   const receivedIds = new Set();
+  const counts = { succeeded: 0, preserved: 0, failed: 0 };
   const isValid = results.every((item) => {
     if (
       !item
@@ -43,14 +78,29 @@ function validResults(response, ids, operation) {
       || !expectedIds.has(item.id)
       || receivedIds.has(item.id)
       || !allowedStatuses.has(item.status)
+      || !hasValidItemSchema(item)
     ) {
       return false;
     }
     receivedIds.add(item.id);
+    if (item.status === 'preserved') {
+      counts.preserved += 1;
+    } else if (item.status === 'failed') {
+      counts.failed += 1;
+    } else {
+      counts.succeeded += 1;
+    }
     return true;
   });
 
-  return isValid && receivedIds.size === expectedIds.size ? results : null;
+  const validCounts = ['succeeded', 'preserved', 'failed'].every(
+    key => Number.isInteger(response.data[key])
+      && response.data[key] >= 0
+      && response.data[key] === counts[key],
+  );
+  return isValid && validCounts && receivedIds.size === expectedIds.size
+    ? results
+    : null;
 }
 
 function commitResults(summary, results) {

@@ -32,8 +32,18 @@ function selectionResponse(count, rows = selectionRows(count)) {
 }
 
 function bulkResponse(ids, statuses = {}) {
-  const results = ids.map(id => ({ id, status: statuses[id] || 'deleted' }));
+  const results = ids.map((id) => {
+    const status = statuses[id] || 'deleted';
+    if (status === 'preserved') return { id, status, code: 'shared_pin' };
+    if (status === 'failed') {
+      return {
+        id, status, code: 'internal_error', retryable: false,
+      };
+    }
+    return { id, status };
+  });
   return {
+    status: 200,
     data: {
       operation: 'delete_if_exclusive_to_board',
       succeeded: results.filter(item => item.status === 'deleted').length,
@@ -376,18 +386,29 @@ describe('BoardDeleteDialog', () => {
 
   it.each([
     ['a mismatched operation', {
+      status: 200,
       data: {
         ...bulkResponse([1]).data,
         operation: 'delete',
       },
     }],
     ['a status outside the conditional-delete contract', {
+      status: 200,
       data: {
         operation: 'delete_if_exclusive_to_board',
         succeeded: 1,
         preserved: 0,
         failed: 0,
         results: [{ id: 1, status: 'updated' }],
+      },
+    }],
+    ['an incomplete success envelope', {
+      status: 200,
+      data: {
+        operation: 'delete_if_exclusive_to_board',
+        succeeded: 1,
+        preserved: 0,
+        results: [{ id: 1, status: 'deleted' }],
       },
     }],
   ])('keeps the board when bulk returns %s', async (name, response) => {
