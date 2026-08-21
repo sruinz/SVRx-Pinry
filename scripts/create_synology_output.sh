@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
 
 if [ "$#" -gt 1 ]; then
     echo "usage: $0 [output-directory]" >&2
@@ -20,7 +21,7 @@ if [ "${#source_commit}" -ne 40 ]; then
     exit 1
 fi
 case "${source_commit}" in
-    *[!0-9a-f]*)
+    *[!0123456789abcdef]*)
         echo "invalid_source_commit" >&2
         exit 1
         ;;

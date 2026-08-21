@@ -158,6 +158,53 @@ def _docker_call_count(capture):
     return len(calls.read_text().splitlines())
 
 
+def _find_range_vulnerable_utf8_locale():
+    completed = subprocess.run(
+        ["locale", "-a"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        return None
+    for locale_name in completed.stdout.decode("utf-8").splitlines():
+        normalized = locale_name.lower().replace("-", "")
+        if "utf8" not in normalized:
+            continue
+        environment = os.environ.copy()
+        environment["LC_ALL"] = locale_name
+        environment["PINRY_NONHEX_VALUE"] = "\u00e9" * 40
+        probe = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                "value=$PINRY_NONHEX_VALUE; "
+                "case \"$value\" in "
+                "*[!0-9a-f]*) exit 1;; *) exit 0;; esac",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if probe.returncode == 0:
+            return locale_name
+    return None
+
+
+def _write_invalid_commit_git_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "if [ \"${1:-}\" = rev-parse ] "
+        "&& [ \"${2:-}\" = --verify ] "
+        "&& [ \"${3:-}\" = 'HEAD^{commit}' ]; then\n"
+        "    printf '%s\\n' \"$PINRY_INVALID_COMMIT\"\n"
+        "    exit 0\n"
+        "fi\n"
+        "exec \"$PINRY_REAL_GIT\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
 def _git_blob(repository, commit, relative_path):
     return subprocess.check_output(
         ["git", "show", "{}:{}".format(commit, relative_path)],
@@ -1176,6 +1223,62 @@ class SynologyPackageTests(unittest.TestCase):
                 self.assertEqual(_docker_call_count(capture), 0)
                 self.assertFalse(capture.exists())
                 self.assertFalse(sentinel.exists())
+
+    def test_build_rejects_unicode_nonhex_in_collating_utf8_locale(self):
+        locale_name = _find_range_vulnerable_utf8_locale()
+        if locale_name is None:
+            self.skipTest("collating UTF-8 locale is unavailable")
+        self._create_package()
+        environment, capture, _working_directory = (
+            self._docker_environment()
+        )
+        environment["LC_ALL"] = locale_name
+        build_info = self.package_directory / "BUILD_INFO"
+        build_info.write_text(
+            "source_commit={}\n"
+            "default_image=pinry-custom:latest\n".format("\u00e9" * 40)
+        )
+
+        completed = subprocess.run(
+            ["sh", str(self.package_directory / "build-image.sh")],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"invalid_build_info", completed.stderr)
+        self.assertEqual(_docker_call_count(capture), 0)
+        self.assertFalse(capture.exists())
+
+    def test_packager_rejects_unicode_nonhex_commit_before_output(self):
+        locale_name = _find_range_vulnerable_utf8_locale()
+        if locale_name is None:
+            self.skipTest("collating UTF-8 locale is unavailable")
+        repository = self._clone_repository("unicode-commit-repository")
+        binary_directory = self.temporary_root / "unicode-commit-bin"
+        binary_directory.mkdir()
+        _write_invalid_commit_git_wrapper(binary_directory / "git")
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        environment = os.environ.copy()
+        environment["LC_ALL"] = locale_name
+        environment["PATH"] = "{}{}{}".format(
+            binary_directory,
+            os.pathsep,
+            environment.get("PATH", ""),
+        )
+        environment["PINRY_INVALID_COMMIT"] = "\u00e9" * 40
+        environment["PINRY_REAL_GIT"] = real_git
+        output_root = self.temporary_root / "unicode-commit-output"
+
+        completed = self._run_packager_in(
+            repository, output_root, environment
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"invalid_source_commit", completed.stderr)
+        self.assertFalse(output_root.exists())
 
     def test_build_rejects_missing_input_before_invoking_docker(self):
         self._create_package()
