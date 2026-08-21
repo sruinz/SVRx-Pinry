@@ -15,6 +15,7 @@ from django.core.management import call_command
 from django.db import close_old_connections, connection, connections
 from django.db import OperationalError, transaction
 from django.db.models.query import QuerySet
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
@@ -556,6 +557,117 @@ class PinMediaLifecycleTest(
             media_snapshot(self.temporary_media.name), files_before
         )
 
+    def test_registered_delete_rechecks_image_manifest_before_file_delete(
+        self,
+    ):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        self._assert_four_image_files(image)
+        foreign_uuid = uuid.uuid4()
+        foreign_name = "originals/{}/foreign.png".format(foreign_uuid)
+        foreign_path = Path(self.temporary_media.name, foreign_name)
+        foreign_path.parent.mkdir(parents=True)
+        foreign_path.write_bytes(b"foreign-original")
+        files_before = media_snapshot(self.temporary_media.name)
+
+        class ImageManifestReplacingStripe(object):
+            def __enter__(inner_self):
+                BaseImage.objects.filter(pk=image.pk).update(
+                    asset_uuid=foreign_uuid,
+                    image=foreign_name,
+                    original_filename="foreign.png",
+                )
+                return inner_self
+
+            def __exit__(inner_self, error_type, error, traceback):
+                del error_type, error, traceback
+                return False
+
+        caught = None
+        try:
+            with mock.patch(
+                "core.models.media_dedup_lock",
+                return_value=ImageManifestReplacingStripe(),
+            ):
+                pin.delete()
+        except RuntimeError as error:
+            caught = error
+
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name),
+            files_before,
+        )
+        self.assertIsNotNone(caught)
+        self.assertEqual(str(caught), "registered_media_identity_changed")
+        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertFalse(self._pending_deletions().exists())
+
+    def test_registered_delete_rechecks_each_thumbnail_manifest_field(self):
+        mutation_fields = ("size", "image", "width", "height")
+
+        for field_name in mutation_fields:
+            with self.subTest(field_name=field_name):
+                case_owner = create_user(
+                    "thumbnail-manifest-{}".format(field_name)
+                )
+                image = create_image()
+                pin = create_pin(case_owner, image, [])
+                asset = self._register_asset(image, submitter=case_owner)
+                thumbnail = image.thumbnail_set.get(size="thumbnail")
+                if field_name == "size":
+                    replacement = "changed-size"
+                elif field_name == "image":
+                    foreign_uuid = uuid.uuid4()
+                    replacement = (
+                        "derivatives/{}/thumbnail.png".format(foreign_uuid)
+                    )
+                    foreign_path = Path(
+                        self.temporary_media.name,
+                        replacement,
+                    )
+                    foreign_path.parent.mkdir(parents=True)
+                    foreign_path.write_bytes(b"foreign-thumbnail")
+                else:
+                    replacement = getattr(thumbnail, field_name) + 1
+                files_before = media_snapshot(self.temporary_media.name)
+
+                class ThumbnailManifestReplacingStripe(object):
+                    def __enter__(inner_self):
+                        Thumbnail.objects.filter(pk=thumbnail.pk).update(
+                            **{field_name: replacement}
+                        )
+                        return inner_self
+
+                    def __exit__(
+                        inner_self,
+                        error_type,
+                        error,
+                        traceback,
+                    ):
+                        del error_type, error, traceback
+                        return False
+
+                with mock.patch(
+                    "core.models.media_dedup_lock",
+                    return_value=ThumbnailManifestReplacingStripe(),
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "registered_media_identity_changed",
+                    ):
+                        pin.delete()
+
+                self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+                self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+                self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
+                self.assertEqual(
+                    media_snapshot(self.temporary_media.name),
+                    files_before,
+                )
+
     def test_registered_last_delete_racing_same_hash_reupload_is_consistent(
         self,
     ):
@@ -769,6 +881,118 @@ class PinMediaLifecycleTest(
             Pin.objects.filter(pk=pin.pk).delete()
 
         self.assertEqual(events, [(False, True)])
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+
+    def test_registered_queryset_uses_distinct_pin_cardinality_for_joins(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, ["first", "second"])
+        asset = self._register_asset(image)
+        queryset = Pin.objects.filter(
+            tags__name__in=("first", "second")
+        )
+        self.assertEqual(
+            list(queryset.values_list("pk", flat=True)),
+            [pin.pk, pin.pk],
+        )
+
+        queryset.delete()
+
+        self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+
+    def test_registered_queryset_cardinality_query_reads_at_most_two_ids(self):
+        pins = []
+        for index in range(3):
+            owner = create_user("bounded-cardinality-{}".format(index))
+            image = create_image()
+            pins.append(create_pin(owner, image, []))
+            self._register_asset(image, submitter=owner)
+        queryset = Pin.objects.filter(
+            pk__in=[pin.pk for pin in pins]
+        ).order_by("pk")
+
+        with CaptureQueriesContext(connection) as captured:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "registered_pin_bulk_delete_unsupported",
+            ):
+                queryset.delete()
+
+        cardinality_queries = [
+            query["sql"] for query in captured.captured_queries
+            if 'FROM "core_pin"' in query["sql"]
+            and query["sql"].lstrip().startswith("SELECT")
+        ]
+        self.assertTrue(any(
+            'SELECT DISTINCT "core_pin"."id"' in query
+            and "LIMIT 2" in query
+            for query in cardinality_queries
+        ), cardinality_queries)
+        self.assertEqual(
+            set(Pin.objects.values_list("pk", flat=True)),
+            {pin.pk for pin in pins},
+        )
+
+    def test_registered_queryset_preserves_slice_and_values_guards(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        files_before = self._assert_four_image_files(image)
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "Cannot use 'limit' or 'offset' with delete",
+        ):
+            Pin.objects.filter(pk=pin.pk)[:1].delete()
+        with self.assertRaisesRegex(
+            TypeError,
+            "Cannot call delete.*values",
+        ):
+            Pin.objects.filter(pk=pin.pk).values("pk").delete()
+
+        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name),
+            files_before,
+        )
+
+    def test_registered_queryset_delete_clears_evaluated_cache(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        self._register_asset(image)
+        queryset = Pin.objects.filter(pk=pin.pk)
+        self.assertEqual(list(queryset), [pin])
+        self.assertIsNotNone(queryset._result_cache)
+
+        queryset.delete()
+
+        self.assertIsNone(queryset._result_cache)
+        self.assertEqual(list(queryset), [])
+
+    def test_registered_queryset_delete_ignores_select_for_update_probe(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        self._assert_four_image_files(image)
+
+        with mock.patch.object(
+            connection.features,
+            "has_select_for_update",
+            True,
+        ), mock.patch.object(
+            connection.ops,
+            "for_update_sql",
+            return_value="",
+        ):
+            Pin.objects.select_for_update().filter(pk=pin.pk).delete()
+
         self.assertFalse(Pin.objects.filter(pk=pin.pk).exists())
         self.assertFalse(Image.objects.filter(pk=image.pk).exists())
         self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())

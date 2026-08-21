@@ -245,8 +245,6 @@ class PinImportService(object):
                         board.pins.add(pin)
                     self._fault("after_boards")
                     self._check_deadline(deadline)
-                    (reusable or published).verify_current()
-                    self._check_deadline(deadline)
                     self._fault("before_idempotency_success")
                     self._check_deadline(deadline)
                     if (
@@ -255,13 +253,16 @@ class PinImportService(object):
                     ):
                         raise self._lease_lost()
                     self._check_deadline(deadline)
+                    (reusable or published).verify_current()
         except BaseException as error:
             if commit_marker[0]:
-                self._finish_receipts(published, reusable, prepared)
-                if not isinstance(error, Exception):
-                    raise
-                self._log_committed_callback_error(error)
-                return pin
+                return self._resolve_committed_error(
+                    published,
+                    reusable,
+                    prepared,
+                    error,
+                    pin,
+                )
             self._rollback_receipts(published, reusable, prepared)
             if isinstance(error, MediaLifecycleLockError):
                 if error.retryable:
@@ -274,7 +275,13 @@ class PinImportService(object):
         if not commit_marker[0]:
             self._rollback_receipts(published, reusable, prepared)
             raise self._internal_error()
-        self._finish_receipts(published, reusable, prepared)
+        cleanup_error = self._finish_receipts(
+            published,
+            reusable,
+            prepared,
+        )
+        if cleanup_error is not None:
+            raise cleanup_error
         return pin
 
     @staticmethod
@@ -423,16 +430,25 @@ class PinImportService(object):
 
     @staticmethod
     def _cleanup(prepared):
-        for _attempt in range(2):
+        first_base_error = None
+        for attempt in range(2):
             try:
                 prepared.cleanup()
-            except BaseException:
+            except Exception:
                 pass
+            except BaseException as error:
+                if first_base_error is None:
+                    first_base_error = error
             try:
                 if not prepared.is_open:
-                    break
-            except BaseException:
+                    if first_base_error is None or attempt == 1:
+                        break
+            except Exception:
                 pass
+            except BaseException as error:
+                if first_base_error is None:
+                    first_base_error = error
+        return first_base_error
 
     @staticmethod
     def _compensate(published):
@@ -444,20 +460,45 @@ class PinImportService(object):
     @staticmethod
     def _release(published, attempts=2):
         if published is None:
-            return
+            return None
+        first_base_error = None
         for _attempt in range(attempts):
             try:
                 published.release()
-            except BaseException:
+            except Exception:
                 pass
+            except BaseException as error:
+                if first_base_error is None:
+                    first_base_error = error
+        return first_base_error
 
     @classmethod
     def _finish_receipts(cls, published, reusable, prepared):
         if reusable is not None:
-            cls._release(reusable)
-            cls._cleanup(prepared)
-            return
-        cls._release(published)
+            release_error = cls._release(reusable)
+            cleanup_error = cls._cleanup(prepared)
+            return release_error or cleanup_error
+        return cls._release(published)
+
+    def _resolve_committed_error(
+        self,
+        published,
+        reusable,
+        prepared,
+        error,
+        pin,
+    ):
+        cleanup_error = self._finish_receipts(
+            published,
+            reusable,
+            prepared,
+        )
+        if not isinstance(error, Exception):
+            raise error
+        if cleanup_error is not None:
+            raise cleanup_error
+        self._log_committed_callback_error(error)
+        return pin
 
     @classmethod
     def _rollback_receipts(cls, published, reusable, prepared):

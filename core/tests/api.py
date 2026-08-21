@@ -2,6 +2,7 @@ from io import BytesIO
 import os
 from pathlib import Path
 
+from django.core.files.storage import FileSystemStorage
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.urls import resolve, reverse
@@ -71,6 +72,15 @@ def _media_files(media_root):
 
 
 class ImageTests(TemporaryMediaMixin, APITestCase):
+    def test_anonymous_image_list_is_not_available(self):
+        owner = create_user("private-image-owner")
+        image = create_image()
+        Pin.objects.create(submitter=owner, image=image, private=True)
+
+        response = self.client.get(reverse("image-list"))
+
+        self.assertEqual(response.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
     def test_authenticated_post_create_is_not_available(self):
         user = create_user("image-create-closed")
         self.client.login(username=user.username, password="password")
@@ -457,6 +467,62 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
             self.assertEqual(Thumbnail.objects.count(), 0)
             self.assertEqual(MediaAsset.objects.count(), 0)
             self.assertEqual(_media_files(self.temporary_media.name), {})
+
+    def test_local_upload_rejects_remote_or_different_root_storage(self):
+        foreign_root = Path(self.temporary_media.name, "foreign-storage")
+        foreign_root.mkdir()
+        remote_storage = mock.Mock()
+        remote_storage.location = self.temporary_media.name
+        remote_storage.save = mock.Mock()
+        different_root_storage = FileSystemStorage(
+            location=str(foreign_root)
+        )
+        different_root_storage.save = mock.Mock()
+        cases = (
+            (Image._meta.get_field("image"), remote_storage, "remote"),
+            (
+                Thumbnail._meta.get_field("image"),
+                different_root_storage,
+                "different-root",
+            ),
+        )
+
+        for field, configured_storage, label in cases:
+            with self.subTest(storage=label):
+                with mock.patch.object(
+                    field,
+                    "storage",
+                    configured_storage,
+                ), self._strong_publish_support():
+                    response = self.client.post(
+                        reverse("pin-list"),
+                        {"image_file": _png_upload()},
+                        format="multipart",
+                    )
+                try:
+                    self.assertEqual(
+                        response.status_code,
+                        status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    )
+                    self.assertEqual(response.json(), {
+                        "image_file": ["media_configuration_error"]
+                    })
+                    configured_storage.save.assert_not_called()
+                    self.assertEqual(Pin.objects.count(), 0)
+                    self.assertEqual(Image.objects.count(), 0)
+                    self.assertEqual(Thumbnail.objects.count(), 0)
+                    self.assertEqual(MediaAsset.objects.count(), 0)
+                    self.assertEqual(
+                        _media_files(self.temporary_media.name),
+                        {},
+                    )
+                    self.assertEqual(
+                        _media_files(str(foreign_root)),
+                        {},
+                    )
+                finally:
+                    for pin in list(Pin.objects.all()):
+                        pin.delete()
 
     def test_foreign_board_rejects_before_local_prepare(self):
         other = create_user("foreign-board-owner")

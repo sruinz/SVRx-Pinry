@@ -40,9 +40,12 @@ logger = logging.getLogger(__name__)
 _DECIMAL_CONTENT_LENGTH = re.compile(r"\A[0-9]+\Z")
 
 
-class ImageViewSet(mixins.ListModelMixin, GenericViewSet):
+class ImageViewSet(mixins.CreateModelMixin, GenericViewSet):
     queryset = Image.objects.all()
     serializer_class = api.ImageSerializer
+
+    def create(self, request, *args, **kwargs):
+        return Response(status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
 class PinViewSet(viewsets.ModelViewSet):

@@ -1217,9 +1217,9 @@ class PinImportCommitTests(TransactionTestCase):
                 "after_pin_row",
                 "after_tags",
                 "after_boards",
-                "verify_current",
                 "before_idempotency_success",
                 "record_success",
+                "verify_current",
                 "release",
             ],
         )
@@ -1336,6 +1336,63 @@ class PinImportCommitTests(TransactionTestCase):
         self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
         self.assertEqual(published.compensate_calls, 0)
         self.assertEqual(published.release_calls, 2)
+
+    def test_committed_release_base_exception_retries_then_rethrows_first(self):
+        primary = KeyboardInterrupt()
+
+        with mock.patch.object(
+            self.published,
+            "release",
+            side_effect=primary,
+        ) as release:
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                self.service.commit(
+                    self.prepared,
+                    self.user,
+                    self.metadata,
+                    self.claim,
+                    deadline=20.0,
+                )
+
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(release.call_count, 2)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(Thumbnail.objects.count(), 3)
+
+    def test_rollback_cleanup_base_exception_does_not_mask_primary(self):
+        primary = ValueError("primary-transaction-error")
+        secondary = KeyboardInterrupt()
+
+        def fail_after_image(event):
+            self.events.append(event)
+            if event == "after_image_row":
+                raise primary
+
+        self.service.fault_injector = fail_after_image
+        with mock.patch.object(
+            self.published,
+            "compensate",
+            side_effect=secondary,
+        ) as compensate, mock.patch.object(
+            self.published,
+            "release",
+            side_effect=secondary,
+        ) as release:
+            with self.assertRaises(ValueError) as caught:
+                self.service.commit(
+                    self.prepared,
+                    self.user,
+                    self.metadata,
+                    self.claim,
+                    deadline=20.0,
+                )
+
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(compensate.call_count, 1)
+        self.assertEqual(release.call_count, 1)
+        self.assertEqual(Pin.objects.count(), 0)
+        self.assertEqual(Image.objects.count(), 0)
 
     def test_later_on_commit_base_exception_rethrows_without_compensate(self):
         def inject_later_callback(event):
@@ -2025,6 +2082,38 @@ class PinImportRealVerticalTests(
             board_ids=(self.board.pk,),
         )
 
+    def test_prepare_rejects_media_root_different_from_model_storage(self):
+        with tempfile.TemporaryDirectory() as foreign_root:
+            storage = MediaStorage(
+                media_root=foreign_root,
+                clock=lambda: 10.0,
+            )
+            prepared_assets = []
+
+            def cleanup_prepared():
+                for prepared in prepared_assets:
+                    prepared.cleanup()
+
+            self.addCleanup(cleanup_prepared)
+            with self.assertRaises(MediaStorageError) as caught:
+                prepared_assets.append(storage.prepare(
+                    self.fetched,
+                    asset_uuid=uuid.uuid4(),
+                    original_filename="foreign-root.png",
+                    deadline=20.0,
+                ))
+
+            self.assertEqual(
+                caught.exception.code,
+                "media_configuration_error",
+            )
+            self.assertFalse(caught.exception.retryable)
+            self.assertEqual(_file_snapshot(foreign_root), {})
+            self.assertEqual(
+                _file_snapshot(self.temporary_media.name),
+                {},
+            )
+
     def test_real_storage_and_idempotency_commit_one_complete_asset(self):
         fingerprint = self._fingerprint()
         claim = self.idempotency.claim(
@@ -2570,6 +2659,134 @@ class PinImportRealVerticalTests(
 
         self._assert_reuse_conflict_preserves_current_files()
 
+    def test_reuse_oversized_final_is_rejected_before_hash_or_decode(self):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        original = Path(self.temporary_media.name, image.image.name)
+        original.write_bytes(original.read_bytes() + (b"x" * 1024))
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "oversized-final.png"),
+            deadline=20.0,
+        )
+        final_descriptors = set()
+        inspected_finals = []
+        hashed_finals = []
+        compared_finals = []
+        real_open = file_ops._open_regular_nofollow
+        real_inspect = self.storage._inspect
+        real_hash = file_ops.sha256_file_descriptor
+        real_compare = self.storage._same_descriptor_bytes
+
+        def capture_open(directory_descriptor, name):
+            descriptor = real_open(directory_descriptor, name)
+            final_descriptors.add(descriptor)
+            return descriptor
+
+        def record_inspect(descriptor):
+            if descriptor in final_descriptors:
+                inspected_finals.append(descriptor)
+            return real_inspect(descriptor)
+
+        def record_hash(descriptor):
+            if descriptor in final_descriptors:
+                hashed_finals.append(descriptor)
+            return real_hash(descriptor)
+
+        def record_compare(left, right):
+            if right in final_descriptors:
+                compared_finals.append(right)
+            return real_compare(left, right)
+
+        with mock.patch(
+            "core.services.media_storage._open_regular_nofollow",
+            side_effect=capture_open,
+        ), mock.patch.object(
+            self.storage,
+            "_inspect",
+            side_effect=record_inspect,
+        ), mock.patch(
+            "core.services.media_storage.sha256_file_descriptor",
+            side_effect=record_hash,
+        ), mock.patch.object(
+            self.storage,
+            "_same_descriptor_bytes",
+            side_effect=record_compare,
+        ):
+            with self.assertRaises(MediaStorageError) as caught:
+                self.service.commit(
+                    prepared,
+                    self.user,
+                    self.metadata,
+                    claim=None,
+                    deadline=20.0,
+                )
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertEqual(len(final_descriptors), 1)
+        self.assertEqual(inspected_finals, [])
+        self.assertEqual(hashed_finals, [])
+        self.assertEqual(compared_finals, [])
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+
+    def test_reuse_corrupt_same_size_final_is_hashed_before_decode(self):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        original = Path(self.temporary_media.name, image.image.name)
+        original.write_bytes(b"x" * len(original.read_bytes()))
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "corrupt-final.png"),
+            deadline=20.0,
+        )
+        final_descriptors = set()
+        inspected_finals = []
+        hashed_finals = []
+        real_open = file_ops._open_regular_nofollow
+        real_inspect = self.storage._inspect
+        real_hash = file_ops.sha256_file_descriptor
+
+        def capture_open(directory_descriptor, name):
+            descriptor = real_open(directory_descriptor, name)
+            final_descriptors.add(descriptor)
+            return descriptor
+
+        def record_inspect(descriptor):
+            if descriptor in final_descriptors:
+                inspected_finals.append(descriptor)
+            return real_inspect(descriptor)
+
+        def record_hash(descriptor):
+            if descriptor in final_descriptors:
+                hashed_finals.append(descriptor)
+            return real_hash(descriptor)
+
+        with mock.patch(
+            "core.services.media_storage._open_regular_nofollow",
+            side_effect=capture_open,
+        ), mock.patch.object(
+            self.storage,
+            "_inspect",
+            side_effect=record_inspect,
+        ), mock.patch(
+            "core.services.media_storage.sha256_file_descriptor",
+            side_effect=record_hash,
+        ):
+            with self.assertRaises(MediaStorageError) as caught:
+                self.service.commit(
+                    prepared,
+                    self.user,
+                    self.metadata,
+                    claim=None,
+                    deadline=20.0,
+                )
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertEqual(len(final_descriptors), 1)
+        self.assertEqual(len(hashed_finals), 1)
+        self.assertEqual(inspected_finals, [])
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+
     def test_reuse_rejects_database_dimension_mismatch(self):
         first = self._commit_initial_asset()
         Image.objects.filter(pk=first.image_id).update(width=641)
@@ -2655,6 +2872,57 @@ class PinImportRealVerticalTests(
         self.assertEqual(Image.objects.count(), 1)
         self.assertEqual(MediaAsset.objects.count(), 1)
         self.assertEqual(current.read_bytes(), replacement)
+
+    def test_reuse_record_success_mutation_is_reverified_before_commit(self):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        original = Path(self.temporary_media.name, image.image.name)
+        original_content = original.read_bytes()
+        replacement = (
+            bytes([original_content[0] ^ 1]) + original_content[1:]
+        )
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "record-success-race.png"),
+            deadline=20.0,
+        )
+        claim = self.idempotency.claim(
+            self.user,
+            self.batch_id,
+            self.item_id,
+            self._fingerprint(),
+            self.now,
+        )
+        real_store = self.idempotency
+
+        class MutatingSuccessStore(object):
+            def fence(inner_self, current_claim):
+                return real_store.fence(current_claim)
+
+            def record_success(inner_self, current_claim, pin):
+                result = real_store.record_success(current_claim, pin)
+                original.write_bytes(replacement)
+                return result
+
+        self.service.idempotency = MutatingSuccessStore()
+
+        with self.assertRaises(MediaStorageError) as caught:
+            self.service.commit(
+                prepared,
+                self.user,
+                self.metadata,
+                claim=claim,
+                deadline=20.0,
+            )
+
+        row = BatchImportItem.objects.get(pk=claim.row_id)
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertEqual(row.state, BatchImportItem.PENDING)
+        self.assertIsNone(row.pin_id)
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(original.read_bytes(), replacement)
 
     def test_reuse_root_replacement_after_receipt_rolls_back_without_delete(
         self,
@@ -2804,6 +3072,46 @@ class PinImportRealVerticalTests(
         self.assertEqual(MediaAsset.objects.count(), 1)
         self.assertEqual(current.read_bytes(), replacement)
 
+    def test_reuse_final_growth_before_commit_is_rejected_before_hash(self):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        current = Path(self.temporary_media.name, image.image.name)
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "grown-before-commit.png"),
+            deadline=20.0,
+        )
+        real_hash = file_ops.sha256_file_descriptor
+        state = {"final_verify": False, "hashes": 0}
+
+        def grow_before_final_verify(event):
+            if event == "after_reusable_verified":
+                current.write_bytes(current.read_bytes() + b"x")
+                state["final_verify"] = True
+
+        def record_final_hash(descriptor):
+            if state["final_verify"]:
+                state["hashes"] += 1
+            return real_hash(descriptor)
+
+        self.service.fault_injector = grow_before_final_verify
+        with mock.patch(
+            "core.services.media_storage.sha256_file_descriptor",
+            side_effect=record_final_hash,
+        ):
+            with self.assertRaises(MediaStorageError) as caught:
+                self.service.commit(
+                    prepared,
+                    self.user,
+                    self.metadata,
+                    claim=None,
+                    deadline=20.0,
+                )
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertEqual(state["hashes"], 0)
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+
     def test_reuse_rollback_preserves_primary_and_existing_final_ownership(
         self,
     ):
@@ -2851,6 +3159,139 @@ class PinImportRealVerticalTests(
         self.assertEqual(Image.objects.count(), 1)
         self.assertEqual(MediaAsset.objects.count(), 1)
         self.assertEqual(_file_snapshot(self.temporary_media.name), before)
+
+    def test_partial_reuse_open_retries_retained_original_descriptor(self):
+        first = self._commit_initial_asset()
+        image = Image.objects.get(pk=first.image_id)
+        Path(
+            self.temporary_media.name,
+            image.thumbnail_set.get(size="thumbnail").image.name,
+        ).unlink()
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "partial-open.png"),
+            deadline=20.0,
+        )
+        opened = []
+        close_calls = {}
+        real_open = file_ops._open_regular_nofollow
+        real_close = file_ops._close_descriptor
+
+        def capture_open(directory_descriptor, name):
+            descriptor = real_open(directory_descriptor, name)
+            opened.append(descriptor)
+            return descriptor
+
+        def fail_first_original_close(descriptor):
+            close_calls[descriptor] = close_calls.get(descriptor, 0) + 1
+            if descriptor == opened[0] and close_calls[descriptor] == 1:
+                raise file_ops.DescriptorCloseNotAttempted(
+                    "retained-original"
+                )
+            return real_close(descriptor)
+
+        def close_leaked_descriptors():
+            for descriptor in opened:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+        self.addCleanup(close_leaked_descriptors)
+
+        with mock.patch(
+            "core.services.media_storage._open_regular_nofollow",
+            side_effect=capture_open,
+        ), mock.patch(
+            "core.services.media_storage._close_descriptor",
+            side_effect=fail_first_original_close,
+        ):
+            with self.assertRaises(MediaStorageError) as caught:
+                self.service.commit(
+                    prepared,
+                    self.user,
+                    self.metadata,
+                    claim=None,
+                    deadline=20.0,
+                )
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(close_calls[opened[0]], 2)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+
+    def test_partial_reuse_decode_failure_retries_owned_descriptor(self):
+        self._commit_initial_asset()
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "partial-decode.png"),
+            deadline=20.0,
+        )
+        opened = []
+        close_calls = {}
+        real_open = file_ops._open_regular_nofollow
+        real_close = file_ops._close_descriptor
+        real_inspect = self.storage._inspect
+
+        def capture_open(directory_descriptor, name):
+            descriptor = real_open(directory_descriptor, name)
+            opened.append(descriptor)
+            return descriptor
+
+        def fail_opened_decode(descriptor):
+            if opened and descriptor == opened[0]:
+                raise OSError("decode-after-open")
+            return real_inspect(descriptor)
+
+        def fail_first_original_close(descriptor):
+            close_calls[descriptor] = close_calls.get(descriptor, 0) + 1
+            if descriptor == opened[0] and close_calls[descriptor] == 1:
+                raise file_ops.DescriptorCloseNotAttempted(
+                    "retained-original"
+                )
+            return real_close(descriptor)
+
+        def close_leaked_descriptors():
+            for descriptor in opened:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+        self.addCleanup(close_leaked_descriptors)
+
+        with mock.patch(
+            "core.services.media_storage._open_regular_nofollow",
+            side_effect=capture_open,
+        ), mock.patch.object(
+            self.storage,
+            "_inspect",
+            side_effect=fail_opened_decode,
+        ), mock.patch(
+            "core.services.media_storage._close_descriptor",
+            side_effect=fail_first_original_close,
+        ):
+            with self.assertRaises(MediaStorageError) as caught:
+                self.service.commit(
+                    prepared,
+                    self.user,
+                    self.metadata,
+                    claim=None,
+                    deadline=20.0,
+                )
+
+        self.assertEqual(caught.exception.code, "media_path_conflict")
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(close_calls[opened[0]], 2)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+        self.assertFalse(prepared.is_open)
+        self.assertEqual(Pin.objects.count(), 1)
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
 
     def test_reuse_database_fault_hooks_roll_back_only_new_pin_state(self):
         first = self._commit_initial_asset()
@@ -3182,6 +3623,42 @@ class PinImportRealVerticalTests(
         self.assertEqual(Image.objects.count(), 1)
         self.assertEqual(MediaAsset.objects.count(), 1)
         self.assertEqual(_file_snapshot(self.temporary_media.name), before)
+
+    def test_reuse_cleanup_system_exit_retries_then_rethrows_first(self):
+        first = self._commit_initial_asset()
+        prepared = self.service.prepare_upload(
+            _uploaded_png(self.fetched.content, "cleanup-exit.png"),
+            deadline=20.0,
+        )
+        actual_cleanup = prepared.cleanup
+        primary = SystemExit("cleanup shutdown")
+
+        try:
+            with mock.patch.object(
+                prepared,
+                "cleanup",
+                side_effect=primary,
+            ) as cleanup:
+                with self.assertRaises(SystemExit) as caught:
+                    self.service.commit(
+                        prepared,
+                        self.user,
+                        self.metadata,
+                        claim=None,
+                        deadline=20.0,
+                    )
+
+            self.assertIs(caught.exception, primary)
+            self.assertEqual(cleanup.call_count, 2)
+            self.assertEqual(Pin.objects.count(), 2)
+            self.assertEqual(
+                set(Pin.objects.values_list("image_id", flat=True)),
+                {first.image_id},
+            )
+            self.assertEqual(Image.objects.count(), 1)
+            self.assertEqual(MediaAsset.objects.count(), 1)
+        finally:
+            actual_cleanup()
 
     def test_reuse_close_after_error_is_not_retried_as_owned_descriptor(self):
         first = self._commit_initial_asset()

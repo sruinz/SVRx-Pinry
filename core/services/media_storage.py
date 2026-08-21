@@ -9,6 +9,7 @@ import uuid
 
 from django.conf import settings
 from django.core.files.images import ImageFile
+from django.core.files.storage import FileSystemStorage
 from PIL import Image as PILImage
 
 from django_images.file_ops import (
@@ -36,6 +37,7 @@ from django_images.paths import (
     canonical_original_path,
     sanitize_original_filename,
 )
+from django_images.models import Image, Thumbnail
 from django_images.utils import scale_and_crop_iter, write_image_to_file
 
 
@@ -410,6 +412,19 @@ class ReusableAsset(object):
                         dir_fd=reusable_file.directory.descriptor,
                         follow_symlinks=False,
                     )
+                    if (
+                        not stat.S_ISREG(descriptor_stat.st_mode)
+                        or not stat.S_ISREG(named_stat.st_mode)
+                        or _identity(descriptor_stat)
+                        != _identity(reusable_file.file_stat)
+                        or _identity(named_stat)
+                        != _identity(reusable_file.file_stat)
+                        or descriptor_stat.st_size
+                        != reusable_file.file_stat.st_size
+                        or named_stat.st_size
+                        != reusable_file.file_stat.st_size
+                    ):
+                        raise _media_conflict()
                     digest = sha256_file_descriptor(
                         reusable_file.descriptor
                     )
@@ -423,19 +438,15 @@ class ReusableAsset(object):
                         follow_symlinks=False,
                     )
                     if (
-                        not stat.S_ISREG(named_stat.st_mode)
+                        not stat.S_ISREG(current_descriptor_stat.st_mode)
                         or not stat.S_ISREG(current_named_stat.st_mode)
-                        or _identity(descriptor_stat)
-                        != _identity(reusable_file.file_stat)
                         or _identity(current_descriptor_stat)
-                        != _identity(reusable_file.file_stat)
-                        or _identity(named_stat)
                         != _identity(reusable_file.file_stat)
                         or _identity(current_named_stat)
                         != _identity(reusable_file.file_stat)
-                        or descriptor_stat.st_size
-                        != reusable_file.file_stat.st_size
                         or current_descriptor_stat.st_size
+                        != reusable_file.file_stat.st_size
+                        or current_named_stat.st_size
                         != reusable_file.file_stat.st_size
                         or digest != reusable_file.sha256
                     ):
@@ -579,49 +590,77 @@ class MediaStorage(object):
                     directory.descriptor,
                     path_parts[2],
                 )
+                reusable_file = ReusableFile(
+                    descriptor=descriptor,
+                    file_stat=None,
+                    directory=directory,
+                    name=path_parts[2],
+                    sha256=None,
+                )
+                reusable_files.append(reusable_file)
                 file_stat = os.fstat(descriptor)
-                reusable_file = None
-                try:
-                    image_format, width, height = self._inspect(descriptor)
-                    digest = sha256_file_descriptor(descriptor)
-                    if kind == "original":
-                        expected_path = canonical_original_path(
-                            asset_uuid,
-                            original_filename,
-                            FORMAT_EXTENSIONS[image_format],
-                        )
-                    else:
-                        expected_path = "derivatives/{}/{}{}".format(
-                            asset_uuid,
-                            kind,
-                            FORMAT_EXTENSIONS[image_format],
-                        )
-                    if (
-                        entry["path"] != expected_path
-                        or type(entry["width"]) is not int
-                        or type(entry["height"]) is not int
-                        or (entry["width"], entry["height"])
-                        != (width, height)
-                        or prepared_file["size"] != file_stat.st_size
-                        or prepared_file["sha256"] != digest
-                        or prepared_file["format"] != image_format
-                        or prepared_file["dimensions"] != (width, height)
-                        or not self._same_descriptor_bytes(
-                            prepared_file["descriptor"], descriptor
-                        )
-                    ):
-                        raise _media_conflict()
-                    reusable_file = ReusableFile(
-                        descriptor=descriptor,
-                        file_stat=file_stat,
-                        directory=directory,
-                        name=path_parts[2],
-                        sha256=digest,
+                named_stat = os.stat(
+                    path_parts[2],
+                    dir_fd=directory.descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(file_stat.st_mode)
+                    or not stat.S_ISREG(named_stat.st_mode)
+                    or _identity(file_stat) != _identity(named_stat)
+                    or prepared_file["size"] != file_stat.st_size
+                    or prepared_file["size"] != named_stat.st_size
+                ):
+                    raise _media_conflict()
+                digest = sha256_file_descriptor(descriptor)
+                if (
+                    prepared_file["sha256"] != digest
+                    or not self._same_descriptor_bytes(
+                        prepared_file["descriptor"], descriptor
                     )
-                    reusable_files.append(reusable_file)
-                finally:
-                    if reusable_file is None:
-                        _close_descriptor(descriptor)
+                ):
+                    raise _media_conflict()
+                image_format, width, height = self._inspect(descriptor)
+                directory.verify_current()
+                current_file_stat = os.fstat(descriptor)
+                current_named_stat = os.stat(
+                    path_parts[2],
+                    dir_fd=directory.descriptor,
+                    follow_symlinks=False,
+                )
+                if kind == "original":
+                    expected_path = canonical_original_path(
+                        asset_uuid,
+                        original_filename,
+                        FORMAT_EXTENSIONS[image_format],
+                    )
+                else:
+                    expected_path = "derivatives/{}/{}{}".format(
+                        asset_uuid,
+                        kind,
+                        FORMAT_EXTENSIONS[image_format],
+                    )
+                if (
+                    entry["path"] != expected_path
+                    or type(entry["width"]) is not int
+                    or type(entry["height"]) is not int
+                    or (entry["width"], entry["height"])
+                    != (width, height)
+                    or prepared_file["format"] != image_format
+                    or prepared_file["dimensions"] != (width, height)
+                    or _identity(current_file_stat) != _identity(file_stat)
+                    or _identity(current_named_stat) != _identity(file_stat)
+                    or current_file_stat.st_size != file_stat.st_size
+                    or current_named_stat.st_size != file_stat.st_size
+                ):
+                    raise _media_conflict()
+                reusable_files[-1] = ReusableFile(
+                    descriptor=descriptor,
+                    file_stat=file_stat,
+                    directory=directory,
+                    name=path_parts[2],
+                    sha256=digest,
+                )
                 self._check_deadline(deadline)
             reusable = ReusableAsset(
                 reusable_files,
@@ -637,10 +676,13 @@ class MediaStorage(object):
                 self.clock,
                 deadline,
             )
-            try:
-                partial.release()
-            except BaseException:
-                pass
+            for _attempt in range(2):
+                try:
+                    partial.release()
+                except BaseException:
+                    pass
+                if partial._released:
+                    break
             if not isinstance(error, Exception):
                 raise
             if isinstance(error, MediaStorageError):
@@ -655,6 +697,7 @@ class MediaStorage(object):
         deadline=None,
     ):
         try:
+            self._validate_storage_configuration()
             asset_uuid = self._asset_uuid(asset_uuid)
             image_format = self._image_format(fetched)
             derivative_options = self._derivative_options()
@@ -871,6 +914,24 @@ class MediaStorage(object):
             }
             self._check_deadline(deadline)
         return verified
+
+    def _validate_storage_configuration(self):
+        try:
+            configured_root = os.path.realpath(settings.MEDIA_ROOT)
+            if os.path.realpath(self.media_root) != configured_root:
+                raise _configuration_error()
+            for model in (Image, Thumbnail):
+                storage = model._meta.get_field("image").storage
+                if (
+                    not isinstance(storage, FileSystemStorage)
+                    or os.path.realpath(storage.location)
+                    != configured_root
+                ):
+                    raise _configuration_error()
+        except MediaStorageError:
+            raise
+        except Exception:
+            raise _configuration_error() from None
 
     @staticmethod
     def _reusable_manifest(image, thumbnails):

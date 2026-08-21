@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 from django.conf import settings
@@ -7,6 +8,11 @@ from django.dispatch import receiver
 
 from django_images.models import Image as BaseImage, Thumbnail
 from django_images.file_ops import media_dedup_lock, open_media_root
+from django_images.paths import (
+    FORMAT_EXTENSIONS,
+    canonical_original_path,
+    sanitize_original_filename,
+)
 from taggit.managers import TaggableManager
 
 from users.models import User
@@ -93,14 +99,39 @@ class PinQuerySet(models.QuerySet):
                 "Cannot call delete() after .values() or .values_list()"
             )
         database_alias = self._db or router.db_for_write(self.model)
-        pins = list(self.using(database_alias))
-        if not pins or not MediaAsset.objects.using(database_alias).filter(
-            image_id__in=[pin.image_id for pin in pins]
-        ).exists():
+        probe = self._chain()
+        probe._for_write = True
+        probe.query.select_for_update = False
+        probe.query.select_related = False
+        probe.query.clear_ordering(force_empty=True)
+        probe = probe.using(database_alias)
+        pin_ids = list(
+            probe
+            .values_list("pk", flat=True)
+            .distinct()[:2]
+        )
+        if not pin_ids:
             return super(PinQuerySet, self).delete()
-        if len(pins) != 1:
+        if len(pin_ids) != 1:
+            image_ids = (
+                probe
+                .values("image_id")
+            )
+            if not MediaAsset.objects.using(database_alias).filter(
+                image_id__in=image_ids
+            ).exists():
+                return super(PinQuerySet, self).delete()
             raise RuntimeError("registered_pin_bulk_delete_unsupported")
-        result = pins[0].delete(using=database_alias)
+        pin = (
+            self.model._base_manager.using(database_alias)
+            .filter(pk=pin_ids[0])
+            .first()
+        )
+        if pin is None or not MediaAsset.objects.using(
+            database_alias
+        ).filter(image_id=pin.image_id).exists():
+            return super(PinQuerySet, self).delete()
+        result = pin.delete(using=database_alias)
         self._result_cache = None
         return result
 
@@ -225,6 +256,17 @@ def _delete_pin_with_registry_lock(pin, using=None, keep_parents=False):
             using=database_alias,
             keep_parents=keep_parents,
         )
+    image_snapshot = (
+        BaseImage.objects.using(database_alias)
+        .filter(pk=registry["image_id"])
+        .first()
+    )
+    media_manifest = _registered_media_manifest(
+        image_snapshot,
+        database_alias,
+    )
+    if media_manifest is None:
+        raise RuntimeError("registered_media_identity_changed")
 
     database = connections[database_alias]
     if not database.get_autocommit() or database.in_atomic_block:
@@ -269,6 +311,11 @@ def _delete_pin_with_registry_lock(pin, using=None, keep_parents=False):
                     .filter(pk=registry["image_id"])
                     .first()
                 )
+                current_manifest = _registered_media_manifest(
+                    image,
+                    database_alias,
+                    lock_thumbnails=True,
+                )
                 if (
                     current_registry is None
                     or current_pin is None
@@ -277,6 +324,7 @@ def _delete_pin_with_registry_lock(pin, using=None, keep_parents=False):
                     != registry["submitter_id"]
                     or current_registry.content_sha256
                     != registry["content_sha256"]
+                    or current_manifest != media_manifest
                 ):
                     raise RuntimeError("registered_media_identity_changed")
                 current_pin._media_delete_managed = True
@@ -324,6 +372,12 @@ def _delete_legacy_unreferenced_image(image_id, using):
 
 
 def _delete_registered_unreferenced_image(image_id, registry, using):
+    image_snapshot = (
+        BaseImage.objects.using(using).filter(pk=image_id).first()
+    )
+    media_manifest = _registered_media_manifest(image_snapshot, using)
+    if media_manifest is None:
+        return
     root_directory = open_media_root(settings.MEDIA_ROOT)
     try:
         clock = time.monotonic
@@ -362,6 +416,12 @@ def _delete_registered_unreferenced_image(image_id, registry, using):
                 )
                 if image is None:
                     return
+                if _registered_media_manifest(
+                    image,
+                    using,
+                    lock_thumbnails=True,
+                ) != media_manifest:
+                    return
                 if Pin.objects.filter(
                     image_id=image_id
                 ).using(using).exists():
@@ -369,3 +429,65 @@ def _delete_registered_unreferenced_image(image_id, registry, using):
                 image.delete(using=using)
     finally:
         root_directory.close()
+
+
+def _registered_media_manifest(image, using, lock_thumbnails=False):
+    if image is None:
+        return None
+    try:
+        asset_uuid = str(image.asset_uuid)
+        original_name = image.image.name
+        original_filename = image.original_filename
+        original_extension = os.path.splitext(original_name)[1]
+        if (
+            original_extension not in FORMAT_EXTENSIONS.values()
+            or original_filename
+            != sanitize_original_filename(original_filename)
+            or original_name
+            != canonical_original_path(
+                asset_uuid,
+                original_filename,
+                original_extension,
+            )
+        ):
+            return None
+        thumbnails = Thumbnail.objects.using(using).filter(
+            original_id=image.pk
+        ).order_by("size")
+        if lock_thumbnails:
+            thumbnails = thumbnails.select_for_update()
+        manifest = tuple(thumbnails.values_list(
+            "size",
+            "image",
+            "width",
+            "height",
+        ))
+        if tuple(entry[0] for entry in manifest) != (
+            "square",
+            "standard",
+            "thumbnail",
+        ):
+            return None
+        for size, name, width, height in manifest:
+            extension = os.path.splitext(name)[1]
+            if (
+                extension not in FORMAT_EXTENSIONS.values()
+                or name != "derivatives/{}/{}{}".format(
+                    asset_uuid,
+                    size,
+                    extension,
+                )
+                or type(width) is not int
+                or width <= 0
+                or type(height) is not int
+                or height <= 0
+            ):
+                return None
+        return (
+            image.asset_uuid,
+            original_name,
+            original_filename,
+            manifest,
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
