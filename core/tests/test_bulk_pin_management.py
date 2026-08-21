@@ -1089,6 +1089,94 @@ class BulkPinWriteAPITests(
         self.assertTrue((media_root / "originals").is_dir())
         self.assertTrue((media_root / "derivatives").is_dir())
 
+    def test_conditional_delete_preserves_registered_pin_created_after_hydration(
+        self,
+    ):
+        image = create_image()
+        image_id = image.pk
+        image.refresh_from_db()
+        media_root = Path(self.temporary_media.name)
+        content = (media_root / image.image.name).read_bytes()
+        asset = MediaAsset.objects.create(
+            submitter=self.owner,
+            image=image,
+            content_sha256=hashlib.sha256(content).hexdigest(),
+        )
+        asset_id = asset.pk
+        file_names = {image.image.name}
+        file_names.update(
+            image.thumbnail_set.values_list("image", flat=True)
+        )
+        pin_id = self.foreign.pk + 100000
+        real_delete = Pin.delete_if_exclusive_to_board
+        passed_image_ids = []
+        pin_presence_before_creation = []
+        clock_calls = [0]
+
+        def create_registered_pin_after_hydration():
+            clock_calls[0] += 1
+            if clock_calls[0] == 2:
+                pin_presence_before_creation.append(
+                    Pin.objects.filter(pk=pin_id).exists()
+                )
+                pin = Pin.objects.create(
+                    pk=pin_id,
+                    submitter=self.owner,
+                    image=image,
+                )
+                self.source.pins.add(pin)
+            return 0.0
+
+        def record_image_id(instance, *args, **kwargs):
+            passed_image_ids.append(instance.image_id)
+            return real_delete(instance, *args, **kwargs)
+
+        with mock.patch.object(
+            PinViewSet,
+            "bulk_clock",
+            side_effect=create_registered_pin_after_hydration,
+        ), mock.patch.object(
+            Pin,
+            "delete_if_exclusive_to_board",
+            autospec=True,
+            side_effect=record_image_id,
+        ):
+            response = self.client.post(
+                self._url(),
+                {
+                    "operation": "delete_if_exclusive_to_board",
+                    "pin_ids": [pin_id],
+                    "source_board_id": self.source.pk,
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {
+            "operation": "delete_if_exclusive_to_board",
+            "succeeded": 0,
+            "preserved": 1,
+            "failed": 0,
+            "results": [{
+                "id": pin_id,
+                "status": "preserved",
+                "code": "source_membership_changed",
+            }],
+        })
+        self.assertEqual(clock_calls[0], 2)
+        self.assertEqual(pin_presence_before_creation, [False])
+        self.assertEqual(passed_image_ids, [])
+        self.assertTrue(Pin.objects.filter(pk=pin_id).exists())
+        self.assertTrue(self.source.pins.filter(pk=pin_id).exists())
+        self.assertTrue(Image.objects.filter(pk=image_id).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset_id).exists())
+        self.assertTrue(
+            Thumbnail.objects.filter(original_id=image_id).exists()
+        )
+        self.assertTrue(all(
+            (media_root / name).is_file() for name in file_names
+        ))
+
     def test_conditional_delete_hydrates_before_membership_race(self):
         image = create_image()
         image_id = image.pk

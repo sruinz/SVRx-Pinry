@@ -222,10 +222,15 @@ class BulkPinManagementService(object):
                 deadline_expired = True
                 results.append(self._deadline_failure(pin_id))
                 continue
+            pin = existing_pins.get(pin_id)
+            if pin is None:
+                results.append({
+                    "id": pin_id,
+                    "status": "preserved",
+                    "code": "source_membership_changed",
+                })
+                continue
             try:
-                pin = existing_pins.get(pin_id)
-                if pin is None:
-                    pin = Pin(pk=pin_id)
                 item_status, code = pin.delete_if_exclusive_to_board(
                     user.pk,
                     source_board_id,
