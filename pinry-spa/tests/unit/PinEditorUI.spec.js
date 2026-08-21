@@ -306,6 +306,30 @@ describe('BoardEditUI delete behavior', () => {
     expect(wrapper.vm.deleteDialogOpen).toBe(true);
   });
 
+  it('ignores a late completed event after closed consumes the modal generation', async () => {
+    const { modal, wrapper } = mountBoardEditor();
+
+    await wrapper.find('[data-test="delete-board"]').trigger('click');
+    const { closed, completed } = modal.open.mock.calls[0][0].events;
+    closed();
+    completed(7);
+
+    expect(wrapper.vm.deleteDialogOpen).toBe(false);
+    expect(wrapper.emitted('board-delete-succeed')).toBeUndefined();
+  });
+
+  it('emits board deletion success once when completed is delivered twice', async () => {
+    const { modal, wrapper } = mountBoardEditor();
+
+    await wrapper.find('[data-test="delete-board"]').trigger('click');
+    const { completed } = modal.open.mock.calls[0][0].events;
+    completed(7);
+    completed(7);
+
+    expect(wrapper.vm.deleteDialogOpen).toBe(false);
+    expect(wrapper.emitted('board-delete-succeed')).toEqual([[7]]);
+  });
+
   it('releases the modal latch when opening the modal throws', async () => {
     const { modal, wrapper } = mountBoardEditor();
     modal.open.mockImplementationOnce(() => { throw new Error('open failed'); });
@@ -317,6 +341,22 @@ describe('BoardEditUI delete behavior', () => {
     await wrapper.find('[data-test="delete-board"]').trigger('click');
     expect(modal.open).toHaveBeenCalledTimes(2);
     expect(wrapper.vm.deleteDialogOpen).toBe(true);
+  });
+
+  it('ignores callbacks captured before modal opening throws', async () => {
+    const { modal, wrapper } = mountBoardEditor();
+    let capturedEvents;
+    modal.open.mockImplementationOnce((config) => {
+      capturedEvents = config.events;
+      throw new Error('open failed');
+    });
+
+    await wrapper.find('[data-test="delete-board"]').trigger('click');
+    capturedEvents.completed(7);
+    capturedEvents.closed();
+
+    expect(wrapper.vm.deleteDialogOpen).toBe(false);
+    expect(wrapper.emitted('board-delete-succeed')).toBeUndefined();
   });
 
   it('ignores a late completed event after the board editor is destroyed', async () => {

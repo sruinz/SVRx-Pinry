@@ -56,7 +56,8 @@ export default {
       );
     },
     releaseDeleteDialog(token) {
-      if (this.disposed || this.deleteDialogToken !== token) return false;
+      if (this.disposed || !this.deleteDialogOpen || this.deleteDialogToken !== token) return false;
+      this.deleteDialogToken += 1;
       this.deleteDialogOpen = false;
       return true;
     },
