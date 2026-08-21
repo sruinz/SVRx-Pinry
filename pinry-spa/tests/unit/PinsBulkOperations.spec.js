@@ -159,11 +159,12 @@ function selectScope(wrapper, ids, owned = true) {
   });
 }
 
-function dispatchKey(target, key) {
+function dispatchKey(target, key, options = {}) {
   const event = new KeyboardEvent('keydown', {
     key,
     bubbles: true,
     cancelable: true,
+    ...options,
   });
   target.dispatchEvent(event);
   return event;
@@ -311,13 +312,69 @@ describe('bulk operation dialogs', () => {
     expect(wrapper.emitted('completed')).toHaveLength(1);
   });
 
-  it('opens board and edit modal helpers with copied operation props', () => {
+  it('emits started once and prevents resubmitting a completed board operation', async () => {
+    const wrapper = mountBoardDialog();
+    await settle();
+    await wrapper.find('[data-test="bulk-board-target"]').setValue('7');
+
+    await wrapper.find('[data-test="bulk-board-submit"]').trigger('click');
+    await settle();
+    wrapper.vm.submit();
+
+    expect(wrapper.emitted('started')).toHaveLength(1);
+    expect(wrapper.emitted('completed')).toHaveLength(1);
+    expect(wrapper.vm.canSubmit).toBe(false);
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits started once and prevents resubmitting a completed edit operation', async () => {
+    const wrapper = mountBulkEdit();
+    await wrapper.setData({ privacyMode: 'private' });
+
+    await wrapper.find('[data-test="bulk-edit-submit"]').trigger('click');
+    await settle();
+    wrapper.vm.submit();
+
+    expect(wrapper.emitted('started')).toHaveLength(1);
+    expect(wrapper.emitted('completed')).toHaveLength(1);
+    expect(wrapper.vm.canSubmit).toBe(false);
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['board', () => mountBoardDialog()],
+    ['edit', () => mountBulkEdit()],
+  ])('emits closed once before explicitly closing the %s modal', async (name, mountDialog) => {
+    const wrapper = mountDialog();
+    await settle();
+    const order = [];
+    wrapper.vm.$on('closed', () => order.push('closed'));
+    wrapper.vm.$parent.close = jest.fn(() => order.push('parent-close'));
+
+    wrapper.vm.close();
+    wrapper.vm.close();
+
+    expect(order).toEqual(['closed', 'parent-close']);
+  });
+
+  it('opens board and edit modal helpers with copied props and lifecycle events', () => {
     const vm = { $buefy: { modal: { open: jest.fn() } } };
     const selectedIds = [41, 42];
+    const boardCompleted = jest.fn();
+    const boardStarted = jest.fn();
+    const boardClosed = jest.fn();
+    const editCompleted = jest.fn();
+    const editStarted = jest.fn();
+    const editClosed = jest.fn();
     openPinBulkBoard(vm, {
       mode: 'move', sourceBoardId: 3, selectedIds, username: 'owner',
-    });
-    openPinBulkEdit(vm, { selectedIds });
+    }, boardCompleted, { started: boardStarted, closed: boardClosed });
+    openPinBulkEdit(
+      vm,
+      { selectedIds },
+      editCompleted,
+      { started: editStarted, closed: editClosed },
+    );
     selectedIds.push(43);
 
     const boardConfig = vm.$buefy.modal.open.mock.calls[0][0];
@@ -328,12 +385,22 @@ describe('bulk operation dialogs', () => {
       props: {
         mode: 'move', sourceBoardId: 3, selectedIds: [41, 42], username: 'owner',
       },
+      events: {
+        started: boardStarted,
+        completed: boardCompleted,
+        closed: boardClosed,
+      },
     });
     expect(vm.$buefy.modal.open.mock.calls[1][0]).toMatchObject({
       parent: vm,
       component: PinBulkEdit,
       hasModalCard: true,
       props: { selectedIds: [41, 42] },
+      events: {
+        started: editStarted,
+        completed: editCompleted,
+        closed: editClosed,
+      },
     });
   });
 });
@@ -367,6 +434,9 @@ describe('Pins bulk operation orchestration', () => {
     selectScope(mine, [41, 40]);
     await mine.vm.$nextTick();
     await mine.find('[data-test="pin-selection-add-to-board"]').trigger('click');
+    const addConfig = mine.modal.open.mock.calls[0][0];
+    addConfig.events.closed();
+    await mine.vm.$nextTick();
     await mine.find('[data-test="pin-selection-edit"]').trigger('click');
 
     expect(mine.modal.open.mock.calls[0][0].props).toEqual({
@@ -382,6 +452,134 @@ describe('Pins bulk operation orchestration', () => {
     expect(board.modal.open.mock.calls[0][0].props).toEqual({
       mode: 'move', sourceBoardId: 3, selectedIds: [41], username: 'owner',
     });
+  });
+
+  it('opens only one bulk modal for two rapid actions and locks parent interactions', async () => {
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41]);
+    await wrapper.vm.$nextTick();
+
+    wrapper.vm.openBulkEdit();
+    wrapper.vm.openBulkBoard('add');
+    wrapper.modal.open.mock.calls[0][0].events.started();
+    dispatchKey(document, 'Escape');
+    dispatchKey(document, 'a', { ctrlKey: true });
+    await wrapper.find('[data-test="pin-card-40"]').trigger('click');
+    wrapper.vm.confirmBulkDelete();
+
+    expect(wrapper.modal.open).toHaveBeenCalledTimes(1);
+    expect(wrapper.dialog.confirm).not.toHaveBeenCalled();
+    expect(wrapper.vm.selection).toMatchObject({
+      active: true,
+      selectedIds: [41],
+      operationInFlight: true,
+      bulkOperationInFlight: true,
+    });
+  });
+
+  it('releases the parent latch when modal opening throws', async () => {
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41]);
+    wrapper.modal.open.mockImplementationOnce(() => { throw new Error('open failed'); });
+
+    wrapper.vm.openBulkEdit();
+    expect(wrapper.vm.selection.operationInFlight).toBe(false);
+
+    wrapper.vm.openBulkBoard('add');
+    expect(wrapper.modal.open).toHaveBeenCalledTimes(2);
+    expect(wrapper.vm.selection.operationInFlight).toBe(true);
+  });
+
+  it('consumes close once and ignores stale callbacks while a newer modal owns the latch', async () => {
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41]);
+
+    wrapper.vm.openBulkEdit();
+    const staleEvents = wrapper.modal.open.mock.calls[0][0].events;
+    staleEvents.closed();
+    staleEvents.closed();
+    expect(wrapper.vm.selection.operationInFlight).toBe(false);
+
+    wrapper.vm.openBulkBoard('add');
+    const currentEvents = wrapper.modal.open.mock.calls[1][0].events;
+    staleEvents.started();
+    staleEvents.completed({
+      total: 1, completed: 1, succeeded: 1, preserved: 0, failed: 0,
+    });
+
+    expect(wrapper.vm.selection.operationInFlight).toBe(true);
+    expect(wrapper.vm.selection.result).toBeNull();
+    currentEvents.closed();
+    expect(wrapper.vm.selection.operationInFlight).toBe(false);
+  });
+
+  it('consumes a completed modal generation exactly once', async () => {
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41]);
+    wrapper.vm.openBulkEdit();
+    const [{ events }] = wrapper.modal.open.mock.calls[0];
+    const result = {
+      total: 1, completed: 1, succeeded: 1, preserved: 0, failed: 0,
+    };
+    const generation = wrapper.vm.requestGeneration;
+
+    events.started();
+    events.started();
+    events.completed(result);
+    events.completed(result);
+    await settle();
+
+    expect(wrapper.vm.requestGeneration).toBe(generation + 1);
+    expect(wrapper.vm.selection.result).toMatchObject({
+      ...result,
+      operation: 'update',
+    });
+    expect(wrapper.vm.selection.operationInFlight).toBe(false);
+  });
+
+  it('keeps the parent lock when a closed callback arrives after the operation started', async () => {
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41]);
+    wrapper.vm.openBulkEdit();
+    const [{ events }] = wrapper.modal.open.mock.calls[0];
+    const result = {
+      total: 1, completed: 1, succeeded: 1, preserved: 0, failed: 0,
+    };
+
+    events.started();
+    events.closed();
+
+    expect(wrapper.vm.selection.operationInFlight).toBe(true);
+    expect(wrapper.vm.selection.result).toBeNull();
+
+    events.completed(result);
+    await settle();
+    expect(wrapper.vm.selection.operationInFlight).toBe(false);
+    expect(wrapper.vm.selection.result).toMatchObject({ ...result, operation: 'update' });
+  });
+
+  it('ignores every modal lifecycle callback after destruction', async () => {
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41]);
+    wrapper.vm.openBulkEdit();
+    const [{ events }] = wrapper.modal.open.mock.calls[0];
+
+    wrapper.destroy();
+    events.started();
+    events.completed({
+      total: 1, completed: 1, succeeded: 1, preserved: 0, failed: 0,
+    });
+    events.closed();
+    await settle();
+
+    expect(wrapper.vm.selection.operationInFlight).toBe(false);
+    expect(wrapper.vm.selection.result).toBeNull();
   });
 
   it('guards add, edit, and delete in methods when selection includes a non-owned pin', async () => {

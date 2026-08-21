@@ -47,8 +47,14 @@ export default class PinSelection {
   }
 
   applyScope(results) {
+    return this.tryApplyScope(results).snapshot;
+  }
+
+  tryApplyScope(results) {
     const parsedRows = PinSelection.parseRows(results);
-    if (parsedRows === null) return this.snapshot();
+    if (parsedRows === null) {
+      return { applied: false, snapshot: this.snapshot() };
+    }
 
     this.selected = new Set(parsedRows.map(row => row.id));
     this.anchorId = null;
@@ -57,7 +63,7 @@ export default class PinSelection {
     parsedRows.forEach((row) => {
       this.ownershipById[row.id] = row.owned;
     });
-    return this.snapshot();
+    return { applied: true, snapshot: this.snapshot() };
   }
 
   clear() {

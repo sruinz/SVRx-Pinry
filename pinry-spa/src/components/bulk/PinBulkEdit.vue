@@ -48,7 +48,7 @@
         </p>
       </section>
       <footer class="modal-card-foot">
-        <button class="button" type="button" :disabled="operationInFlight" @click="$parent.close()">
+        <button class="button" type="button" :disabled="operationInFlight" @click="close">
           {{ $t('closeButton') }}
         </button>
         <button
@@ -87,6 +87,7 @@ export default {
   beforeCreate() {
     this.disposed = false;
     this.operationToken = 0;
+    this.closeConsumed = false;
   },
   props: {
     selectedIds: {
@@ -100,6 +101,7 @@ export default {
       tagMode: null,
       tagValues: [],
       operationInFlight: false,
+      operationCompleted: false,
       progress: null,
       result: null,
     };
@@ -109,7 +111,11 @@ export default {
       return this.tagValues.map(value => value.trim()).filter(Boolean);
     },
     canSubmit() {
-      if (this.operationInFlight || this.selectedIds.length === 0) return false;
+      if (
+        this.operationInFlight
+        || this.operationCompleted
+        || this.selectedIds.length === 0
+      ) return false;
       if (this.tagMode === 'add' || this.tagMode === 'remove') {
         return this.trimmedTagValues.length > 0;
       }
@@ -123,11 +129,18 @@ export default {
     this.operationToken += 1;
   },
   methods: {
+    close() {
+      if (this.operationInFlight || this.closeConsumed) return;
+      this.closeConsumed = true;
+      this.$emit('closed');
+      if (this.$parent && typeof this.$parent.close === 'function') this.$parent.close();
+    },
     submit() {
       if (!this.canSubmit) return null;
       const token = this.operationToken + 1;
       this.operationToken = token;
       this.operationInFlight = true;
+      this.$emit('started');
       this.progress = { completed: 0, total: this.selectedIds.length };
       this.result = null;
       return executeBulk({
@@ -147,6 +160,7 @@ export default {
       }).then((result) => {
         if (this.disposed || this.operationToken !== token) return result;
         this.operationInFlight = false;
+        this.operationCompleted = true;
         this.result = result;
         this.$emit('completed', result);
         return result;

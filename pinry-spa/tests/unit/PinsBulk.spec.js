@@ -168,6 +168,7 @@ describe('Pins selection mode', () => {
     API.Board.get = jest.fn();
     API.User.fetchUserInfo = jest.fn();
     API.Pin.fetchSelectionIds = jest.fn();
+    API.Pin.bulk = jest.fn();
   });
 
   afterEach(() => {
@@ -448,6 +449,90 @@ describe('Pins selection mode', () => {
     });
     expect(wrapper.find('[data-test="pin-selection-live"]').text())
       .toContain('bulkPinSelectionTooLarge');
+  });
+
+  it('rejects a resolved 50,001-row scope before mutating the loaded selection', async () => {
+    const results = Array.from({ length: 50001 }, (_, index) => ({
+      id: index + 1,
+      owned: true,
+    }));
+    API.Pin.fetchSelectionIds.mockResolvedValue({
+      data: { count: 50001, results },
+    });
+    const wrapper = mountPins();
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-card-41"]').trigger('click');
+
+    await wrapper.find('[data-test="pin-selection-select-all"]').trigger('click');
+    await settle();
+
+    expect(wrapper.vm.selection).toMatchObject({
+      selectedIds: [41],
+      scope: 'loaded',
+      allCount: 0,
+      result: { code: 'selection_too_large' },
+    });
+    expect(API.Pin.bulk).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['duplicate id', {
+      count: 2,
+      results: [{ id: 41, owned: true }, { id: 41, owned: true }],
+    }],
+    ['non-positive id', {
+      count: 2,
+      results: [{ id: 41, owned: true }, { id: 0, owned: true }],
+    }],
+    ['non-boolean ownership', {
+      count: 2,
+      results: [{ id: 41, owned: true }, { id: 9, owned: 1 }],
+    }],
+    ['count mismatch', {
+      count: 3,
+      results: [{ id: 41, owned: true }, { id: 9, owned: true }],
+    }],
+    ['extra response field', {
+      count: 2,
+      results: [{ id: 41, owned: true }, { id: 9, owned: true }],
+      next: null,
+    }],
+    ['extra row field', {
+      count: 2,
+      results: [
+        { id: 41, owned: true },
+        { id: 9, owned: true, private: false },
+      ],
+    }],
+  ])('keeps an existing all scope unchanged for a malformed response: %s', async (name, data) => {
+    API.Pin.fetchSelectionIds
+      .mockResolvedValueOnce({
+        data: {
+          count: 2,
+          results: [{ id: 41, owned: true }, { id: 8, owned: true }],
+        },
+      })
+      .mockResolvedValueOnce({ data });
+    const wrapper = mountPins();
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-selection-select-all"]').trigger('click');
+    await settle();
+    const before = {
+      selectedIds: [...wrapper.vm.selection.selectedIds],
+      scope: wrapper.vm.selection.scope,
+      allCount: wrapper.vm.selection.allCount,
+    };
+
+    await wrapper.find('[data-test="pin-selection-select-all"]').trigger('click');
+    await settle();
+
+    expect(wrapper.vm.selection).toMatchObject({
+      ...before,
+      result: { code: 'selection_failed' },
+    });
+    expect(API.Pin.bulk).not.toHaveBeenCalled();
   });
 
   it('blocks card and keyboard selection changes while select-all is in flight', async () => {

@@ -163,6 +163,45 @@ import PinSelection from './bulk/PinSelection';
 import { executeBulk, intersectRemaining } from './bulk/bulkExecutor';
 import { openPinBulkBoard, openPinBulkEdit } from './modals';
 
+const MAX_SELECTION_IDS = 50000;
+const SELECTION_FIELDS = ['count', 'results'];
+const SELECTION_ROW_FIELDS = ['id', 'owned'];
+
+function hasExactFields(value, fields) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort();
+  return keys.length === fields.length && keys.every((key, index) => key === fields[index]);
+}
+
+function validateSelectionResponse(response) {
+  if (!response || !hasExactFields(response.data, SELECTION_FIELDS)) {
+    return { code: 'selection_failed' };
+  }
+  const { count, results } = response.data;
+  if (
+    !Number.isInteger(count)
+    || count < 0
+    || !Array.isArray(results)
+    || count !== results.length
+  ) return { code: 'selection_failed' };
+
+  const ids = new Set();
+  const valid = results.every((row) => {
+    if (
+      !hasExactFields(row, SELECTION_ROW_FIELDS)
+      || !Number.isInteger(row.id)
+      || row.id <= 0
+      || typeof row.owned !== 'boolean'
+      || ids.has(row.id)
+    ) return false;
+    ids.add(row.id);
+    return true;
+  });
+  if (!valid) return { code: 'selection_failed' };
+  if (count > MAX_SELECTION_IDS) return { code: 'selection_too_large' };
+  return { count, results };
+}
+
 function createImageItem(pin) {
   const image = {};
   image.url = pinHandler.escapeUrl(pin.image.thumbnail.image);
@@ -221,6 +260,8 @@ function initialData() {
       result: null,
     },
     bulkDeleteDialogOpen: false,
+    bulkModalOpen: false,
+    bulkModalStarted: false,
   };
 }
 
@@ -329,6 +370,8 @@ export default {
     invalidateBulkOperation() {
       this.bulkOperationToken += 1;
       this.bulkDeleteDialogOpen = false;
+      this.bulkModalOpen = false;
+      this.bulkModalStarted = false;
       if (this.selection) {
         this.selection.bulkOperationInFlight = false;
         this.syncOperationInFlight();
@@ -417,13 +460,20 @@ export default {
       }).then(
         (response) => {
           if (!this.isSelectionRequestCurrent(token, model, generation, filters)) return;
-          const { count, results } = response.data;
-          if (!Number.isInteger(count) || !Array.isArray(results) || count !== results.length) {
-            throw new Error('invalid_selection_response');
+          const validation = validateSelectionResponse(response);
+          if (validation.code) {
+            this.selection.result = { code: validation.code };
+            return;
           }
-          const snapshot = this.selectionModel.applyScope(results);
-          if (snapshot.scope !== 'all') throw new Error('invalid_selection_response');
-          this.updateSelection(snapshot, { allCount: count, result: null });
+          const applied = this.selectionModel.tryApplyScope(validation.results);
+          if (!applied.applied) {
+            this.selection.result = { code: 'selection_failed' };
+            return;
+          }
+          this.updateSelection(applied.snapshot, {
+            allCount: validation.count,
+            result: null,
+          });
         },
         (error) => {
           if (!this.isSelectionRequestCurrent(token, model, generation, filters)) return;
@@ -449,6 +499,46 @@ export default {
         filters: this.captureFilterSnapshot(),
       };
     },
+    startBulkModal() {
+      const token = this.bulkOperationToken + 1;
+      const context = this.bulkContext();
+      this.bulkOperationToken = token;
+      this.bulkModalOpen = true;
+      this.bulkModalStarted = false;
+      this.selection.bulkOperationInFlight = true;
+      this.syncOperationInFlight();
+      return { token, context };
+    },
+    isBulkModalCurrent(token, context) {
+      return this.bulkModalOpen && this.isBulkOperationCurrent(
+        token,
+        context.model,
+        context.generation,
+        context.filters,
+      );
+    },
+    markBulkModalStarted(token, context) {
+      if (!this.isBulkModalCurrent(token, context)) return false;
+      this.bulkModalStarted = true;
+      return true;
+    },
+    consumeBulkModal(token, context) {
+      if (!this.isBulkModalCurrent(token, context)) return false;
+      this.bulkOperationToken += 1;
+      this.bulkModalOpen = false;
+      this.bulkModalStarted = false;
+      this.selection.bulkOperationInFlight = false;
+      this.syncOperationInFlight();
+      return true;
+    },
+    closeBulkModal(token, context) {
+      if (!this.isBulkModalCurrent(token, context) || this.bulkModalStarted) return false;
+      return this.consumeBulkModal(token, context);
+    },
+    completeBulkModal(result, operation, token, context) {
+      if (!this.consumeBulkModal(token, context)) return;
+      this.finishBulkOperation({ ...result, operation });
+    },
     openBulkBoard(mode) {
       if (
         this.selection.operationInFlight
@@ -458,21 +548,21 @@ export default {
       if (mode === 'add' && (!this.isMyPinsRoute || !this.canUseOwnedPinActions)) return;
       if (mode === 'move' && !this.isOwnedBoardRoute) return;
 
-      const token = this.bulkOperationToken + 1;
-      const context = this.bulkContext();
       const selectedIds = [...this.selection.selectedIds];
-      this.bulkOperationToken = token;
-      openPinBulkBoard(this, {
-        mode,
-        sourceBoardId: mode === 'move' ? Number(this.pinFilters.boardFilter) : null,
-        selectedIds,
-        username: this.editorMeta.user.meta.username,
-      }, (result) => {
-        if (!this.isBulkOperationCurrent(
-          token, context.model, context.generation, context.filters,
-        )) return;
-        this.finishBulkOperation({ ...result, operation: mode });
-      });
+      const { token, context } = this.startBulkModal();
+      try {
+        openPinBulkBoard(this, {
+          mode,
+          sourceBoardId: mode === 'move' ? Number(this.pinFilters.boardFilter) : null,
+          selectedIds,
+          username: this.editorMeta.user.meta.username,
+        }, result => this.completeBulkModal(result, mode, token, context), {
+          started: () => this.markBulkModalStarted(token, context),
+          closed: () => this.closeBulkModal(token, context),
+        });
+      } catch (_error) {
+        this.consumeBulkModal(token, context);
+      }
     },
     openBulkEdit() {
       if (
@@ -482,16 +572,21 @@ export default {
         || !this.canUseOwnedPinActions
       ) return;
 
-      const token = this.bulkOperationToken + 1;
-      const context = this.bulkContext();
       const selectedIds = [...this.selection.selectedIds];
-      this.bulkOperationToken = token;
-      openPinBulkEdit(this, { selectedIds }, (result) => {
-        if (!this.isBulkOperationCurrent(
-          token, context.model, context.generation, context.filters,
-        )) return;
-        this.finishBulkOperation({ ...result, operation: 'update' });
-      });
+      const { token, context } = this.startBulkModal();
+      try {
+        openPinBulkEdit(
+          this,
+          { selectedIds },
+          result => this.completeBulkModal(result, 'update', token, context),
+          {
+            started: () => this.markBulkModalStarted(token, context),
+            closed: () => this.closeBulkModal(token, context),
+          },
+        );
+      } catch (_error) {
+        this.consumeBulkModal(token, context);
+      }
     },
     confirmBulkDelete() {
       if (

@@ -132,6 +132,47 @@ describe('PinSelection', () => {
     });
   });
 
+  it('reports an invalid scope explicitly without changing an existing all scope', () => {
+    const selection = new PinSelection();
+    selection.setLoadedRows([
+      { id: 3, owned: true },
+      { id: 2, owned: true },
+    ]);
+    selection.applyScope([
+      { id: 3, owned: true },
+      { id: 1, owned: false },
+    ]);
+    const before = selection.snapshot();
+
+    const result = selection.tryApplyScope([
+      { id: 3, owned: true },
+      { id: 3, owned: false },
+    ]);
+
+    expect(result).toEqual({ applied: false, snapshot: before });
+    expect(selection.snapshot()).toEqual(before);
+  });
+
+  it('reports a valid scope application explicitly', () => {
+    const selection = new PinSelection();
+    selection.setLoadedRows([{ id: 3, owned: true }]);
+
+    const result = selection.tryApplyScope([
+      { id: 3, owned: true },
+      { id: 1, owned: false },
+    ]);
+
+    expect(result).toEqual({
+      applied: true,
+      snapshot: {
+        selectedIds: [3, 1],
+        anchorId: null,
+        ownershipById: { 3: true, 1: false },
+        scope: 'all',
+      },
+    });
+  });
+
   it('stores false ownership for loaded non-owned rows', () => {
     const selection = new PinSelection();
     selection.setLoadedRows([{ id: 1, owned: false }]);

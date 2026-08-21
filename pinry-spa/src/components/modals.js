@@ -87,7 +87,19 @@ function openSignUp(vm, onSignUpSucceed) {
   });
 }
 
-export function openPinBulkBoard(vm, props, onCompleted = null) {
+function bulkModalEvents(onCompleted, lifecycle) {
+  const events = {};
+  if (lifecycle && typeof lifecycle.started === 'function') {
+    events.started = lifecycle.started;
+  }
+  if (onCompleted !== null) events.completed = onCompleted;
+  if (lifecycle && typeof lifecycle.closed === 'function') {
+    events.closed = lifecycle.closed;
+  }
+  return events;
+}
+
+export function openPinBulkBoard(vm, props, onCompleted = null, lifecycle = null) {
   const config = {
     parent: vm,
     component: PinBulkBoardDialog,
@@ -98,11 +110,12 @@ export function openPinBulkBoard(vm, props, onCompleted = null) {
     hasModalCard: true,
     canCancel: false,
   };
-  if (onCompleted !== null) config.events = { completed: onCompleted };
+  const events = bulkModalEvents(onCompleted, lifecycle);
+  if (Object.keys(events).length > 0) config.events = events;
   return vm.$buefy.modal.open(config);
 }
 
-export function openPinBulkEdit(vm, props, onCompleted = null) {
+export function openPinBulkEdit(vm, props, onCompleted = null, lifecycle = null) {
   const config = {
     parent: vm,
     component: PinBulkEdit,
@@ -113,7 +126,8 @@ export function openPinBulkEdit(vm, props, onCompleted = null) {
     hasModalCard: true,
     canCancel: false,
   };
-  if (onCompleted !== null) config.events = { completed: onCompleted };
+  const events = bulkModalEvents(onCompleted, lifecycle);
+  if (Object.keys(events).length > 0) config.events = events;
   return vm.$buefy.modal.open(config);
 }
 
