@@ -1,6 +1,7 @@
 from io import BytesIO
 import os
 from pathlib import Path
+import stat
 
 from django.core.files.storage import FileSystemStorage
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -415,6 +416,34 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
         )
         transport.assert_not_called()
         resolver.assert_not_called()
+
+    def test_multipart_upload_accepts_synology_0755_lock_directory(self):
+        lock_directory = Path(
+            self.temporary_media.name,
+            ".pinry-locks",
+        )
+        lock_directory.mkdir(mode=0o755)
+        os.chmod(str(lock_directory), 0o755)
+
+        with self._strong_publish_support():
+            response = self.client.post(
+                reverse("pin-list"),
+                {"image_file": _png_upload("synology.png")},
+                format="multipart",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_201_CREATED,
+            getattr(response, "data", None),
+        )
+        pin = Pin.objects.get(pk=response.json()["id"])
+        self.assertEqual(Image.objects.count(), 1)
+        self.assertEqual(Thumbnail.objects.count(), 3)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        self.assertEqual(len(_media_files(self.temporary_media.name)), 4)
+        self.assertEqual(pin.image.original_filename, "synology.png")
+        self.assertEqual(stat.S_IMODE(lock_directory.stat().st_mode), 0o755)
 
     def test_invalid_local_uploads_leave_no_database_or_media_state(self):
         valid = _png_upload().read()

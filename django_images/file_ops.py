@@ -842,7 +842,7 @@ def _verify_lifecycle_lock_directory(file_stat):
     if (
         not stat.S_ISDIR(file_stat.st_mode)
         or file_stat.st_uid != os.geteuid()
-        or stat.S_IMODE(file_stat.st_mode) != 0o700
+        or stat.S_IMODE(file_stat.st_mode) not in (0o700, 0o755)
     ):
         raise _lifecycle_lock_error("media_lifecycle_lock_failed")
 

@@ -3,6 +3,7 @@ import fcntl
 import multiprocessing
 import os
 from pathlib import Path
+import stat
 import tempfile
 import threading
 
@@ -354,7 +355,7 @@ class MediaLifecycleLockTests(SimpleTestCase):
                 )
                 self.assertEqual(outside.read_bytes(), b"outside")
 
-    def test_symlinked_or_wrong_mode_lock_directory_fails_closed(self):
+    def test_symlinked_lock_directory_fails_closed(self):
         outside = Path(self.temporary_root.name).with_name(
             Path(self.temporary_root.name).name + "-outside-directory"
         )
@@ -371,15 +372,53 @@ class MediaLifecycleLockTests(SimpleTestCase):
         )
         self.assertFalse((outside / "media-lifecycle.lock").exists())
 
-        self.lock_directory_path.unlink()
+    def test_unapproved_lock_directory_modes_fail_closed(self):
+        for mode in (0o750, 0o775, 0o777):
+            with self.subTest(mode=oct(mode)):
+                if self.lock_directory_path.exists():
+                    self.lock_directory_path.rmdir()
+                self.lock_directory_path.mkdir(mode=mode)
+                os.chmod(str(self.lock_directory_path), mode)
+                self._assert_lock_error(
+                    "media_lifecycle_lock_failed",
+                    lambda: file_ops.media_lifecycle_lock(
+                        self.root_directory,
+                        deadline=file_ops.time.monotonic() + 1,
+                    ).__enter__(),
+                )
+
+    def test_synology_0755_lock_directory_allows_real_lock(self):
         self.lock_directory_path.mkdir(mode=0o755)
-        self._assert_lock_error(
-            "media_lifecycle_lock_failed",
-            lambda: file_ops.media_lifecycle_lock(
-                self.root_directory,
-                deadline=file_ops.time.monotonic() + 1,
-            ).__enter__(),
+        os.chmod(str(self.lock_directory_path), 0o755)
+
+        with file_ops.media_lifecycle_lock(
+            self.root_directory,
+            deadline=file_ops.time.monotonic() + 1,
+        ):
+            self.assertTrue(self.lock_path.is_file())
+
+        self.assertEqual(
+            stat.S_IMODE(self.lock_directory_path.stat().st_mode),
+            0o755,
         )
+        self.assertEqual(stat.S_IMODE(self.lock_path.stat().st_mode), 0o600)
+
+    def test_wrong_owner_0755_lock_directory_fails_closed(self):
+        self.lock_directory_path.mkdir(mode=0o755)
+        os.chmod(str(self.lock_directory_path), 0o755)
+        different_euid = os.geteuid() + 1
+
+        with mock.patch(
+            "django_images.file_ops.os.geteuid",
+            return_value=different_euid,
+        ):
+            self._assert_lock_error(
+                "media_lifecycle_lock_failed",
+                lambda: file_ops.media_lifecycle_lock(
+                    self.root_directory,
+                    deadline=file_ops.time.monotonic() + 1,
+                ).__enter__(),
+            )
 
     def test_missing_required_descriptor_flags_is_unsupported(self):
         for flag_name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC"):
