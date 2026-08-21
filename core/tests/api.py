@@ -259,6 +259,44 @@ class BoardPrivacyTests(TemporaryMediaMixin, APITestCase):
                     Board.objects.filter(pk=self.private_board.pk).exists()
                 )
 
+        missing_url = reverse(
+            "board-detail",
+            kwargs={"pk": self.private_board.pk + 100000},
+        )
+        self.client.login(
+            username=self.owner.username,
+            password='password',
+        )
+        response = self.client.delete(missing_url)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_delete_public_foreign_board_keeps_forbidden_contract_and_membership(self):
+        public_board = Board.objects.create(
+            name="public-foreign-board",
+            submitter=self.non_owner,
+            private=False,
+        )
+        pin = Pin.objects.create(
+            submitter=self.non_owner,
+            image=create_image(),
+        )
+        public_board.pins.add(pin)
+        board_url = reverse(
+            "board-detail",
+            kwargs={"pk": public_board.pk},
+        )
+        self.client.login(
+            username=self.owner.username,
+            password='password',
+        )
+
+        response = self.client.delete(board_url)
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Board.objects.filter(pk=public_board.pk).exists())
+        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertTrue(public_board.pins.filter(pk=pin.pk).exists())
+
 
 class PinPrivacyTests(TemporaryMediaMixin, APITestCase):
 

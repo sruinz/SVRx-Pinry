@@ -398,10 +398,11 @@ class BoardViewSet(viewsets.ModelViewSet):
         return Response(result)
 
     def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
         try:
             self.pin_membership_service_class().delete_board(
                 request.user,
-                kwargs["pk"],
+                instance.pk,
             )
         except MembershipConflict as error:
             if error.code == "board_not_found":
