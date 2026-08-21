@@ -1,7 +1,7 @@
 <template>
   <div class="editor">
     <div class="editor-buttons">
-      <span class="icon-container" @click="deleteBoard">
+      <span class="icon-container" data-test="delete-board" @click="deleteBoard">
          <b-icon
            type="is-light"
            icon="delete"
@@ -20,8 +20,7 @@
 </template>
 
 <script>
-import API from '../api';
-import modals from '../modals';
+import modals, { openBoardDelete } from '../modals';
 
 
 export default {
@@ -34,6 +33,12 @@ export default {
       type: Object,
     },
   },
+  data() {
+    return { disposed: false };
+  },
+  beforeDestroy() {
+    this.disposed = true;
+  },
   methods: {
     onBoardSaved() {
       this.$emit('board-save-succeed');
@@ -45,23 +50,17 @@ export default {
         this.onBoardSaved,
       );
     },
+    onBoardDeleted(boardId) {
+      if (this.disposed) return;
+      this.$emit('board-delete-succeed', boardId);
+    },
     deleteBoard() {
-      this.$buefy.dialog.confirm({
-        message: 'Delete this Board?',
-        onConfirm: () => {
-          API.Board.delete(this.board.id).then(
-            () => {
-              this.$buefy.toast.open('Board deleted');
-              this.$emit('board-delete-succeed', this.board.id);
-            },
-            () => {
-              this.$buefy.toast.open(
-                { type: 'is-danger', message: 'Failed to delete Board' },
-              );
-            },
-          );
-        },
-      });
+      if (this.disposed) return;
+      openBoardDelete(
+        this,
+        { board: this.board },
+        this.onBoardDeleted,
+      );
     },
   },
 };

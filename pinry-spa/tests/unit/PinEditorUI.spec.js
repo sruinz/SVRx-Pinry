@@ -4,7 +4,10 @@ import flushPromises from 'flush-promises';
 import VueI18n from 'vue-i18n';
 import { createLocalVue, shallowMount } from '@vue/test-utils';
 
+import BoardDeleteDialog from '@/components/bulk/BoardDeleteDialog.vue';
+import BoardEditUI from '@/components/editors/BoardEditUI.vue';
 import PinEditorUI from '@/components/editors/PinEditorUI.vue';
+import { openBoardDelete } from '@/components/modals';
 import en from '@/components/utils/i18n/locales/en.json';
 
 jest.mock('axios');
@@ -226,5 +229,74 @@ describe('PinEditorUI delete behavior', () => {
     expect(wrapper.vm.deleteInFlight).toBe(true);
     expect(toast.open).not.toHaveBeenCalled();
     expect(wrapper.emitted('pin-delete-succeed')).toBeUndefined();
+  });
+});
+
+describe('board delete modal helper', () => {
+  it('opens the board delete component and forwards only its completed event', () => {
+    const vm = { $buefy: { modal: { open: jest.fn() } } };
+    const board = { id: 7, name: 'Reference' };
+    const completed = jest.fn();
+
+    openBoardDelete(vm, { board }, completed);
+    board.name = 'Changed later';
+
+    const config = vm.$buefy.modal.open.mock.calls[0][0];
+    expect(config).toMatchObject({
+      parent: vm,
+      component: BoardDeleteDialog,
+      props: { board: { id: 7, name: 'Reference' } },
+      hasModalCard: true,
+      canCancel: false,
+      events: { completed },
+    });
+  });
+});
+
+describe('BoardEditUI delete behavior', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  function mountBoardEditor() {
+    const modal = { open: jest.fn() };
+    const dialog = { confirm: jest.fn() };
+    return {
+      dialog,
+      modal,
+      wrapper: shallowMount(BoardEditUI, {
+        propsData: { board: { id: 7, name: 'Reference' } },
+        mocks: { $buefy: { dialog, modal } },
+        stubs: ['b-icon'],
+      }),
+    };
+  }
+
+  it('opens the deletion modal and emits success only from its completed event', async () => {
+    const { dialog, modal, wrapper } = mountBoardEditor();
+
+    await wrapper.find('[data-test="delete-board"]').trigger('click');
+
+    expect(dialog.confirm).not.toHaveBeenCalled();
+    expect(axios.delete).not.toHaveBeenCalled();
+    expect(wrapper.emitted('board-delete-succeed')).toBeUndefined();
+    const config = modal.open.mock.calls[0][0];
+    expect(config.component).toBe(BoardDeleteDialog);
+    expect(config.props.board).toEqual({ id: 7, name: 'Reference' });
+
+    config.events.completed(7);
+    expect(wrapper.emitted('board-delete-succeed')).toEqual([[7]]);
+  });
+
+  it('ignores a late completed event after the board editor is destroyed', async () => {
+    const { modal, wrapper } = mountBoardEditor();
+    await wrapper.find('[data-test="delete-board"]').trigger('click');
+    const { completed } = modal.open.mock.calls[0][0].events;
+
+    wrapper.destroy();
+    completed(7);
+
+    expect(wrapper.emitted('board-delete-succeed')).toBeUndefined();
+    expect(axios.delete).not.toHaveBeenCalled();
   });
 });

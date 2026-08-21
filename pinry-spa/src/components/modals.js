@@ -5,6 +5,7 @@ import BoardEdit from './BoardEdit.vue';
 import Add2Board from './pin_edit/Add2Board.vue';
 import PinBulkBoardDialog from './bulk/PinBulkBoardDialog.vue';
 import PinBulkEdit from './bulk/PinBulkEdit.vue';
+import BoardDeleteDialog from './bulk/BoardDeleteDialog.vue';
 
 
 function openPinEdit(vm, props = null, onCreated = null) {
@@ -116,6 +117,21 @@ export function openPinBulkEdit(vm, props, onCompleted = null) {
   return vm.$buefy.modal.open(config);
 }
 
+export function openBoardDelete(vm, props, onCompleted = null) {
+  const config = {
+    parent: vm,
+    component: BoardDeleteDialog,
+    props: {
+      ...props,
+      board: { ...props.board },
+    },
+    hasModalCard: true,
+    canCancel: false,
+  };
+  if (onCompleted !== null) config.events = { completed: onCompleted };
+  return vm.$buefy.modal.open(config);
+}
+
 export default {
   openBoardCreate,
   openBoardEdit,
@@ -125,4 +141,5 @@ export default {
   openSignUp,
   openPinBulkBoard,
   openPinBulkEdit,
+  openBoardDelete,
 };
