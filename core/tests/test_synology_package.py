@@ -49,6 +49,7 @@ def _write_tar_race_wrapper(path, real_tar):
         "#!/bin/sh\n"
         "set -eu\n"
         "create=0\n"
+        "no_xattrs=0\n"
         "package_root=\n"
         "package_name=\n"
         "previous=\n"
@@ -79,6 +80,9 @@ def _write_tar_race_wrapper(path, real_tar):
         "            ;;\n"
         "        --exclude=*)\n"
         "            ;;\n"
+        "        --no-xattrs)\n"
+        "            no_xattrs=1\n"
+        "            ;;\n"
         "        *)\n"
         "            package_name=$argument\n"
         "            ;;\n"
@@ -86,13 +90,18 @@ def _write_tar_race_wrapper(path, real_tar):
         "done\n"
         "if [ \"$create\" = 1 ]; then\n"
         "    test \"${COPYFILE_DISABLE:-}\" = 1\n"
+        "    test \"$no_xattrs\" = 1\n"
         "    package_root=$package_root/$package_name\n"
         "    test -d \"$package_root/context\"\n"
         "    mkdir -p \"$package_root/context/pinry-spa/src/race\"\n"
         "    : > \"$package_root/.DS_Store\"\n"
         "    : > \"$package_root/.DS_Store.backup\"\n"
+        "    : > \"$package_root/._BUILD_INFO\"\n"
+        "    : > \"$package_root/BUILD_INFO._backup\"\n"
         "    : > \"$package_root/context/pinry-spa/src/race/.DS_Store\"\n"
         "    : > \"$package_root/context/pinry-spa/src/race/.DS_Store.backup\"\n"
+        "    : > \"$package_root/context/pinry-spa/src/race/._asset.js\"\n"
+        "    : > \"$package_root/context/pinry-spa/src/race/asset._preview.js\"\n"
         "fi\n"
         "exec \"$PINRY_REAL_TAR\" \"$@\"\n"
     )
@@ -411,6 +420,12 @@ class SynologyPackageTests(unittest.TestCase):
         finder_file.write_text("tracked Finder metadata")
         backup_file = repository / "pinry-spa/src/.DS_Store.backup"
         backup_file.write_text("keep this backup")
+        appledouble_file = repository / "pinry-spa/src/._package-sentinel.txt"
+        appledouble_file.write_text("tracked AppleDouble metadata")
+        appledouble_like_file = (
+            repository / "pinry-spa/src/package._sentinel.txt"
+        )
+        appledouble_like_file.write_text("keep this normal file")
         sentinel = repository / "pinry-spa/src/package-sentinel.txt"
         sentinel.write_text("keep this sentinel")
         script = repository / "scripts/create_synology_output.sh"
@@ -427,6 +442,8 @@ class SynologyPackageTests(unittest.TestCase):
                 str(root_finder_file.relative_to(repository)),
                 str(finder_file.relative_to(repository)),
                 str(backup_file.relative_to(repository)),
+                str(appledouble_file.relative_to(repository)),
+                str(appledouble_like_file.relative_to(repository)),
                 str(sentinel.relative_to(repository)),
                 str(script.relative_to(repository)),
             ],
@@ -591,7 +608,9 @@ class SynologyPackageTests(unittest.TestCase):
             "Dockerfile.autobuild\n"
             ".dockerignore\n"
             ".DS_Store\n"
-            "**/.DS_Store\n",
+            "**/.DS_Store\n"
+            "._*\n"
+            "**/._*\n",
         )
         for relative_path in (
             "pinry-spa/.editorconfig",
@@ -657,6 +676,12 @@ class SynologyPackageTests(unittest.TestCase):
         context = package_directory / "context"
         self.assertFalse((context / "pinry-spa/src/.DS_Store").exists())
         self.assertTrue((context / "pinry-spa/src/.DS_Store.backup").is_file())
+        self.assertFalse(
+            (context / "pinry-spa/src/._package-sentinel.txt").exists()
+        )
+        self.assertTrue(
+            (context / "pinry-spa/src/package._sentinel.txt").is_file()
+        )
         self.assertTrue((context / "pinry-spa/src/package-sentinel.txt").is_file())
         archive_path = output_root / "pinry-custom-{}.tar.gz".format(
             subprocess.check_output(
@@ -665,12 +690,20 @@ class SynologyPackageTests(unittest.TestCase):
             ).decode("utf-8").strip()
         )
         with tarfile.open(str(archive_path), "r:gz") as archive:
-            names = archive.getnames()
+            members = archive.getmembers()
+        names = [member.name for member in members]
         self.assertFalse(
             any(Path(name).name == ".DS_Store" for name in names)
         )
         self.assertFalse(
             any(Path(name).name.startswith("._") for name in names)
+        )
+        self.assertFalse(
+            any(
+                ".xattr." in key.lower()
+                for member in members
+                for key in member.pax_headers
+            )
         )
         self.assertIn("pinry-custom/.DS_Store.backup", names)
         self.assertIn(
@@ -678,6 +711,15 @@ class SynologyPackageTests(unittest.TestCase):
         )
         self.assertIn(
             "pinry-custom/context/pinry-spa/src/race/.DS_Store.backup",
+            names,
+        )
+        self.assertIn("pinry-custom/BUILD_INFO._backup", names)
+        self.assertIn(
+            "pinry-custom/context/pinry-spa/src/race/asset._preview.js",
+            names,
+        )
+        self.assertIn(
+            "pinry-custom/context/pinry-spa/src/package._sentinel.txt",
             names,
         )
         self.assertIn(
