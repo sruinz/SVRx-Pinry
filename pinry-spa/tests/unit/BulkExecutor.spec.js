@@ -34,6 +34,14 @@ function statusForIndex(index) {
 describe('bulk API adapter', () => {
   afterEach(() => jest.clearAllMocks());
 
+  it('omits exclusive_owned when a board ID is not selected', () => {
+    API.Pin.fetchSelectionIds({ exclusiveOwned: true });
+
+    expect(axios.get).toHaveBeenCalledWith('/api/v2/pins/selection-ids/', {
+      params: {},
+    });
+  });
+
   it('uses exact selection and bulk request URLs and params', () => {
     API.Pin.fetchSelectionIds();
     API.Pin.fetchSelectionIds({ boardId: 7, exclusiveOwned: true });

@@ -102,7 +102,7 @@ const Pin = {
   fetchSelectionIds({ boardId = null, exclusiveOwned = false } = {}) {
     const params = {};
     if (boardId !== null) params.board_id = boardId;
-    if (exclusiveOwned) params.exclusive_owned = 'true';
+    if (boardId !== null && exclusiveOwned) params.exclusive_owned = 'true';
     return axios.get('/api/v2/pins/selection-ids/', { params });
   },
   bulk(payload) {
