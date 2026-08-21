@@ -7,6 +7,7 @@ from django.test import override_settings, SimpleTestCase
 from django.test.utils import CaptureQueriesContext
 import mock
 from rest_framework import status
+from rest_framework.exceptions import UnsupportedMediaType
 from rest_framework.test import APITestCase, APITransactionTestCase
 
 from core.bulk_serializers import BulkPinRequestSerializer
@@ -1042,6 +1043,32 @@ class BulkPinWriteAPITests(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
         self.assertEqual(response.data, {"code": "internal_error"})
+
+    def test_service_unsupported_media_type_is_internal_code_only(self):
+        with mock.patch.object(
+            PinViewSet,
+            "bulk_service_class",
+        ) as service_class:
+            service_class.return_value.execute.side_effect = (
+                UnsupportedMediaType("secret /private/path")
+            )
+            response = self.client.post(
+                self._url(),
+                {
+                    "operation": "update",
+                    "pin_ids": [self.first.pk],
+                    "changes": {"private": True},
+                },
+                format="json",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+        self.assertEqual(response.data, {"code": "internal_error"})
+        self.assertNotIn("secret", str(response.data))
+        self.assertNotIn("private/path", str(response.data))
 
 
 class BulkPinReadAPITests(APITestCase):

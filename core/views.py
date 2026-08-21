@@ -239,7 +239,16 @@ class PinViewSet(viewsets.ModelViewSet):
     )
     def bulk(self, request):
         try:
-            serializer = BulkPinRequestSerializer(data=request.data)
+            payload = request.data
+        except UnsupportedMediaType:
+            raise
+        except ParseError:
+            return Response(
+                {"code": "bulk_invalid_request"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            serializer = BulkPinRequestSerializer(data=payload)
             if not serializer.is_valid():
                 return Response(
                     {"code": "bulk_invalid_request"},
@@ -250,13 +259,6 @@ class PinViewSet(viewsets.ModelViewSet):
                 request.user,
                 serializer.validated_data,
                 self.bulk_clock(),
-            )
-        except UnsupportedMediaType:
-            raise
-        except ParseError:
-            return Response(
-                {"code": "bulk_invalid_request"},
-                status=status.HTTP_400_BAD_REQUEST,
             )
         except BulkOperationError as error:
             error_status = self._BULK_ERROR_STATUS.get(error.code)
