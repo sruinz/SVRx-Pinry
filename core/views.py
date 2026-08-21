@@ -26,6 +26,11 @@ from core.parsers import LimitedJSONParser
 from core.permissions import IsOwnerOrReadOnly, OwnerOnlyIfPrivate
 from core.serializers import filter_private_pin, filter_private_board
 from core.services.batch_import import BatchImportService
+from core.services.bulk_pin_management import (
+    BulkOperationError,
+    BulkPinManagementService,
+    parse_selection_query,
+)
 from core.services.bounded_resolver import BoundedResolver
 from core.services.idempotency import IdempotencyStore
 from core.services.local_upload import LocalUploadError
@@ -67,6 +72,7 @@ class PinViewSet(viewsets.ModelViewSet):
     idempotency_class = IdempotencyStore
     pin_import_service_class = PinImportService
     batch_clock = staticmethod(time.monotonic)
+    bulk_pin_management_service_class = BulkPinManagementService
 
     @classmethod
     def as_view(cls, actions=None, **initkwargs):
@@ -187,6 +193,23 @@ class PinViewSet(viewsets.ModelViewSet):
         pin = self._get_owned_pin(request, kwargs["pk"])
         pin.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(
+        detail=False,
+        methods=["get"],
+        permission_classes=[IsAuthenticated],
+        url_path="selection-ids",
+    )
+    def selection_ids(self, request):
+        try:
+            selection = parse_selection_query(request.query_params)
+            result = self.bulk_pin_management_service_class().selection_ids(
+                request.user,
+                **selection
+            )
+        except BulkOperationError as error:
+            return Response({"code": error.code}, status=error.status_code)
+        return Response(result)
 
     @action(
         detail=False,
@@ -339,9 +362,28 @@ class BoardViewSet(viewsets.ModelViewSet):
         IsOwnerOrReadOnly("submitter"),
         OwnerOnlyIfPrivate("submitter"),
     ]
+    bulk_pin_management_service_class = BulkPinManagementService
 
     def get_queryset(self):
         return filter_private_board(self.request, Board.objects.all())
+
+    @action(
+        detail=True,
+        methods=["get"],
+        permission_classes=[IsAuthenticated],
+        url_path="delete-preview",
+    )
+    def delete_preview(self, request, pk=None):
+        try:
+            if request.query_params:
+                raise BulkOperationError("selection_invalid_request", 400)
+            result = self.bulk_pin_management_service_class().board_delete_preview(
+                request.user,
+                pk,
+            )
+        except BulkOperationError as error:
+            return Response({"code": error.code}, status=error.status_code)
+        return Response(result)
 
 
 class BoardAutoCompleteViewSet(
