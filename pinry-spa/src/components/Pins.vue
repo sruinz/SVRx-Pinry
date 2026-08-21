@@ -215,6 +215,8 @@ function initialData() {
       ownedCount: 0,
       ownershipById: {},
       operationInFlight: false,
+      selectionRequestInFlight: false,
+      bulkOperationInFlight: false,
       progress: null,
       result: null,
     },
@@ -319,15 +321,23 @@ export default {
     },
     invalidateSelectionRequest() {
       this.selectionRequestToken += 1;
-      if (this.selection) this.selection.operationInFlight = false;
+      if (this.selection) {
+        this.selection.selectionRequestInFlight = false;
+        this.syncOperationInFlight();
+      }
     },
     invalidateBulkOperation() {
       this.bulkOperationToken += 1;
       this.bulkDeleteDialogOpen = false;
       if (this.selection) {
-        this.selection.operationInFlight = false;
+        this.selection.bulkOperationInFlight = false;
+        this.syncOperationInFlight();
         this.selection.progress = null;
       }
+    },
+    syncOperationInFlight() {
+      this.selection.operationInFlight = this.selection.selectionRequestInFlight
+        || this.selection.bulkOperationInFlight;
     },
     isSelectionRequestCurrent(token, model, generation, filters) {
       return this.selection.active
@@ -362,7 +372,7 @@ export default {
       this.updateSelection(this.selectionModel.setLoadedRows(rows));
     },
     enterSelection() {
-      if (!this.canManagePins) return;
+      if (!this.canManagePins || this.selection.bulkOperationInFlight) return;
       this.updateSelection(this.selectionModel.selectLoaded([]), {
         active: true,
         allCount: 0,
@@ -370,6 +380,7 @@ export default {
       });
     },
     exitSelection() {
+      if (this.selection.bulkOperationInFlight) return;
       this.invalidateSelectionRequest();
       this.updateSelection(this.selectionModel.selectLoaded([]), {
         active: false,
@@ -398,7 +409,8 @@ export default {
       const generation = this.requestGeneration;
       const filters = this.captureFilterSnapshot();
       this.selectionRequestToken = token;
-      this.selection.operationInFlight = true;
+      this.selection.selectionRequestInFlight = true;
+      this.syncOperationInFlight();
       this.selection.result = null;
       API.Pin.fetchSelectionIds({
         boardId: filters.boardFilter || null,
@@ -425,7 +437,8 @@ export default {
         this.selection.result = { code: 'selection_failed' };
       }).then(() => {
         if (this.isSelectionRequestCurrent(token, model, generation, filters)) {
-          this.selection.operationInFlight = false;
+          this.selection.selectionRequestInFlight = false;
+          this.syncOperationInFlight();
         }
       });
     },
@@ -525,6 +538,30 @@ export default {
       ]);
       return ids.filter(id => candidates.has(id));
     },
+    validatedOwnedSelectionRows(response) {
+      if (!response || !response.data) return null;
+      const { count, results } = response.data;
+      if (
+        !Number.isInteger(count)
+        || count < 0
+        || !Array.isArray(results)
+        || count !== results.length
+      ) return null;
+
+      const ids = new Set();
+      const valid = results.every((row) => {
+        if (
+          !row
+          || !Number.isInteger(row.id)
+          || row.id <= 0
+          || ids.has(row.id)
+          || typeof row.owned !== 'boolean'
+        ) return false;
+        ids.add(row.id);
+        return true;
+      });
+      return valid ? results.filter(row => row.owned === true) : null;
+    },
     refreshDeleteRetryIds(ids, result, token, context) {
       const candidates = this.failedDeleteIds(ids, result);
       if (candidates.length === 0) return Promise.resolve([]);
@@ -537,10 +574,8 @@ export default {
           if (!this.isBulkOperationCurrent(
             token, context.model, context.generation, context.filters,
           )) return [];
-          const rows = response && response.data && Array.isArray(response.data.results)
-            ? response.data.results
-            : [];
-          return intersectRemaining(candidates, rows);
+          const rows = this.validatedOwnedSelectionRows(response);
+          return rows === null ? [] : intersectRemaining(candidates, rows);
         },
         () => [],
       );
@@ -550,7 +585,8 @@ export default {
       const token = this.bulkOperationToken + 1;
       const context = this.bulkContext();
       this.bulkOperationToken = token;
-      this.selection.operationInFlight = true;
+      this.selection.bulkOperationInFlight = true;
+      this.syncOperationInFlight();
       this.selection.progress = { completed: 0, total: ids.length };
       this.selection.result = null;
       return executeBulk({
@@ -633,6 +669,7 @@ export default {
       if (!this.selection.active) return;
       if (event.key === 'Escape') {
         event.preventDefault();
+        if (this.selection.bulkOperationInFlight) return;
         this.exitSelection();
         return;
       }

@@ -110,10 +110,12 @@ export default {
     },
     canSubmit() {
       if (this.operationInFlight || this.selectedIds.length === 0) return false;
-      if (this.privacyMode === 'public' || this.privacyMode === 'private') return true;
+      if (this.tagMode === 'add' || this.tagMode === 'remove') {
+        return this.trimmedTagValues.length > 0;
+      }
       if (this.tagMode === 'replace') return true;
-      return (this.tagMode === 'add' || this.tagMode === 'remove')
-        && this.trimmedTagValues.length > 0;
+      if (this.tagMode !== null) return false;
+      return this.privacyMode === 'public' || this.privacyMode === 'private';
     },
   },
   beforeDestroy() {

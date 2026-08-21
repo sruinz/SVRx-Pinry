@@ -130,6 +130,16 @@ function selectScope(wrapper, ids, owned = true) {
   });
 }
 
+function dispatchKey(target, key) {
+  const event = new KeyboardEvent('keydown', {
+    key,
+    bubbles: true,
+    cancelable: true,
+  });
+  target.dispatchEvent(event);
+  return event;
+}
+
 describe('bulk operation dialogs', () => {
   beforeEach(() => {
     jest.clearAllMocks();
@@ -235,6 +245,25 @@ describe('bulk operation dialogs', () => {
     await wrapper.setData({ tagMode: null, privacyMode: 'public' });
     expect(wrapper.vm.canSubmit).toBe(true);
   });
+
+  it.each([
+    ['public', 'add'],
+    ['public', 'remove'],
+    ['private', 'add'],
+    ['private', 'remove'],
+  ])(
+    'blocks %s with whitespace-only %s tags instead of sending an invalid payload',
+    async (privacyMode, tagMode) => {
+      const wrapper = mountBulkEdit();
+      await wrapper.setData({ privacyMode, tagMode, tagValues: [' ', '\t', '\n'] });
+
+      expect(wrapper.vm.canSubmit).toBe(false);
+      expect(wrapper.find('[data-test="bulk-edit-submit"]').attributes('disabled'))
+        .toBe('disabled');
+      expect(wrapper.vm.submit()).toBeNull();
+      expect(API.Pin.bulk).not.toHaveBeenCalled();
+    },
+  );
 
   it('submits exact update changes and blocks a second in-flight submit', async () => {
     const operation = deferred();
@@ -399,6 +428,41 @@ describe('Pins bulk operation orchestration', () => {
     expect(API.Pin.bulk).toHaveBeenCalledTimes(4);
   });
 
+  it('keeps the bulk lock when Escape tries to exit and re-enter selection', async () => {
+    const operation = deferred();
+    API.Pin.bulk
+      .mockReturnValueOnce(operation.promise)
+      .mockImplementation(payload => bulkResponse(payload.pin_ids, { 41: 'deleted' }));
+    const wrapper = mountPins({ pins: [pin(41)] });
+    await settle();
+    selectScope(wrapper, [41]);
+    wrapper.vm.confirmBulkDelete();
+    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+
+    dispatchKey(document, 'Escape');
+    wrapper.vm.exitSelection();
+    wrapper.vm.enterSelection();
+    await wrapper.find('[data-test="pin-card-41"]').trigger('click');
+    wrapper.vm.confirmBulkDelete();
+    if (wrapper.dialog.confirm.mock.calls[1]) {
+      wrapper.dialog.confirm.mock.calls[1][0].onConfirm();
+    }
+
+    expect(wrapper.vm.selection.active).toBe(true);
+    expect(wrapper.vm.selection.selectedIds).toEqual([41]);
+    expect(wrapper.vm.selection.operationInFlight).toBe(true);
+    expect(wrapper.dialog.confirm).toHaveBeenCalledTimes(1);
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
+
+    operation.resolve({ data: { results: [{ id: 41, status: 'deleted' }] } });
+    await settle();
+
+    expect(wrapper.vm.selection.operationInFlight).toBe(false);
+    expect(wrapper.vm.selection.progress).toBeNull();
+    expect(wrapper.vm.selection.result).toMatchObject({ succeeded: 1, failed: 0 });
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
+  });
+
   it('shows succeeded, preserved, and failed counts and retries only refreshed failures', async () => {
     API.Pin.bulk
       .mockImplementationOnce(payload => bulkResponse(payload.pin_ids, {
@@ -450,6 +514,76 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     expect(API.Pin.bulk).toHaveBeenCalledTimes(2);
     expect(API.Pin.bulk).toHaveBeenLastCalledWith({ operation: 'delete', pin_ids: [40] });
+  });
+
+  it.each([
+    ['missing count', { results: [{ id: 41, owned: true }] }],
+    ['negative count', { count: -1, results: [{ id: 41, owned: true }] }],
+    ['fractional count', { count: 1.5, results: [{ id: 41, owned: true }] }],
+    ['missing results', { count: 1 }],
+    ['non-array results', { count: 1, results: { id: 41, owned: true } }],
+    ['count mismatch', { count: 2, results: [{ id: 41, owned: true }] }],
+    ['duplicate ids', {
+      count: 2,
+      results: [{ id: 41, owned: true }, { id: 41, owned: true }],
+    }],
+    ['zero id', {
+      count: 2,
+      results: [{ id: 41, owned: true }, { id: 0, owned: true }],
+    }],
+    ['string id', {
+      count: 2,
+      results: [{ id: 41, owned: true }, { id: '40', owned: true }],
+    }],
+    ['missing ownership', { count: 1, results: [{ id: 41 }] }],
+    ['non-boolean ownership', { count: 1, results: [{ id: 41, owned: 1 }] }],
+  ])('rejects malformed retry scope: %s', async (name, data) => {
+    API.Pin.bulk.mockRejectedValueOnce(new Error('network'));
+    API.Pin.fetchSelectionIds.mockResolvedValue({ data });
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41, 40]);
+    wrapper.vm.confirmBulkDelete();
+    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+    await settle();
+
+    expect(wrapper.vm.selection.result).toMatchObject({ retryIds: [] });
+    expect(wrapper.find('[data-test="pin-bulk-retry"]').exists()).toBe(false);
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
+  });
+
+  it('intersects retry candidates with only explicitly owned refreshed rows', async () => {
+    API.Pin.bulk.mockRejectedValueOnce(new Error('network'));
+    API.Pin.fetchSelectionIds.mockResolvedValue({
+      data: {
+        count: 2,
+        results: [{ id: 41, owned: false }, { id: 40, owned: true }],
+      },
+    });
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41, 40]);
+    wrapper.vm.confirmBulkDelete();
+    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+    await settle();
+
+    expect(wrapper.vm.selection.result).toMatchObject({ retryIds: [40] });
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers no retry when refreshing the delete scope fails', async () => {
+    API.Pin.bulk.mockRejectedValueOnce(new Error('network'));
+    API.Pin.fetchSelectionIds.mockRejectedValueOnce(new Error('refresh failed'));
+    const wrapper = mountPins();
+    await settle();
+    selectScope(wrapper, [41, 40]);
+    wrapper.vm.confirmBulkDelete();
+    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+    await settle();
+
+    expect(wrapper.vm.selection.result).toMatchObject({ retryIds: [] });
+    expect(wrapper.find('[data-test="pin-bulk-retry"]').exists()).toBe(false);
+    expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
   });
 
   it('ignores a completed modal callback after a route reset', async () => {
