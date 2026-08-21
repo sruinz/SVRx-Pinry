@@ -12,6 +12,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets, mixins, routers, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ParseError, PermissionDenied
+from rest_framework.exceptions import UnsupportedMediaType
 from rest_framework.exceptions import ValidationError
 from rest_framework.filters import SearchFilter, OrderingFilter
 from rest_framework.permissions import IsAuthenticated
@@ -250,6 +251,8 @@ class PinViewSet(viewsets.ModelViewSet):
                 serializer.validated_data,
                 self.bulk_clock(),
             )
+        except UnsupportedMediaType:
+            raise
         except ParseError:
             return Response(
                 {"code": "bulk_invalid_request"},

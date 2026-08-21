@@ -207,12 +207,11 @@ class BulkPinManagementService(object):
         started_at,
     ):
         source_board_id = request_data["source_board_id"]
-        source_board = self._owned_board(user, source_board_id)
-        member_pins = {
+        self._owned_board(user, source_board_id)
+        existing_pins = {
             pin.pk: pin
             for pin in Pin.objects.filter(
                 pk__in=request_data["pin_ids"],
-                pins=source_board,
             ).only("pk", "image_id").order_by("pk")
         }
         results = []
@@ -224,7 +223,7 @@ class BulkPinManagementService(object):
                 results.append(self._deadline_failure(pin_id))
                 continue
             try:
-                pin = member_pins.get(pin_id)
+                pin = existing_pins.get(pin_id)
                 if pin is None:
                     pin = Pin(pk=pin_id)
                 item_status, code = pin.delete_if_exclusive_to_board(

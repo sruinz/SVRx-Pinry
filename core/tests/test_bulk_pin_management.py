@@ -332,6 +332,23 @@ class BulkPinWriteAPITests(
         self.assertEqual(response.data, {"code": "bulk_invalid_request"})
         self.assertTrue(Pin.objects.filter(pk=self.first.pk).exists())
 
+    def test_unsupported_content_type_preserves_drf_415(self):
+        response = self.client.generic(
+            "POST",
+            self._url(),
+            b'{"operation":"delete","pin_ids":[1]}',
+            content_type="text/plain",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+        )
+        self.assertEqual(
+            response.data["detail"].code,
+            "unsupported_media_type",
+        )
+
     def test_delete_keeps_success_before_later_failure(self):
         with mock.patch.object(
             Pin,
@@ -883,6 +900,78 @@ class BulkPinWriteAPITests(
         ))
         self.assertTrue((media_root / "originals").is_dir())
         self.assertTrue((media_root / "derivatives").is_dir())
+
+    def test_conditional_delete_hydrates_before_membership_race(self):
+        image = create_image()
+        image_id = image.pk
+        pin = Pin.objects.create(submitter=self.owner, image=image)
+        pin_id = pin.pk
+        image.refresh_from_db()
+        media_root = Path(self.temporary_media.name)
+        content = (media_root / image.image.name).read_bytes()
+        asset = MediaAsset.objects.create(
+            submitter=self.owner,
+            image=image,
+            content_sha256=hashlib.sha256(content).hexdigest(),
+        )
+        asset_id = asset.pk
+        file_names = {image.image.name}
+        file_names.update(
+            image.thumbnail_set.values_list("image", flat=True)
+        )
+        real_delete = Pin.delete_if_exclusive_to_board
+        passed_image_ids = []
+        clock_calls = [0]
+
+        def add_membership_after_hydration():
+            clock_calls[0] += 1
+            if clock_calls[0] == 2:
+                self.source.pins.add(pin)
+            return 0.0
+
+        def record_image_id(instance, *args, **kwargs):
+            passed_image_ids.append(instance.image_id)
+            return real_delete(instance, *args, **kwargs)
+
+        with mock.patch.object(
+            PinViewSet,
+            "bulk_clock",
+            side_effect=add_membership_after_hydration,
+        ), mock.patch.object(
+            Pin,
+            "delete_if_exclusive_to_board",
+            autospec=True,
+            side_effect=record_image_id,
+        ):
+            response = self.client.post(
+                self._url(),
+                {
+                    "operation": "delete_if_exclusive_to_board",
+                    "pin_ids": [pin_id],
+                    "source_board_id": self.source.pk,
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, {
+            "operation": "delete_if_exclusive_to_board",
+            "succeeded": 1,
+            "preserved": 0,
+            "failed": 0,
+            "results": [{"id": pin_id, "status": "deleted"}],
+        })
+        self.assertEqual(clock_calls[0], 2)
+        self.assertEqual(passed_image_ids, [image_id])
+        self.assertFalse(Pin.objects.filter(pk=pin_id).exists())
+        self.assertFalse(Image.objects.filter(pk=image_id).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset_id).exists())
+        self.assertFalse(
+            Thumbnail.objects.filter(original_id=image_id).exists()
+        )
+        self.assertTrue(all(
+            not (media_root / name).exists() for name in file_names
+        ))
 
     def test_atomic_service_errors_are_code_only(self):
         cases = (
