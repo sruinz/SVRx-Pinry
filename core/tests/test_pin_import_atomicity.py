@@ -29,6 +29,7 @@ from core.services.idempotency import (
     fingerprint_request,
 )
 from core.services.media_storage import MediaStorage, MediaStorageError
+from core.services.pin_membership import PinMembershipService
 from core.services.pin_import import (
     ImportMetadata,
     PinImportError,
@@ -716,6 +717,31 @@ class PinImportCommitTests(TransactionTestCase):
         self.assertEqual(storage.publish_calls, [])
         self.assertEqual(self.prepared.cleanup_calls, 1)
         self.assertEqual(Pin.objects.count(), 0)
+
+    def test_commit_delegates_locked_boards_to_membership_helper(self):
+        calls = []
+        real_add = PinMembershipService.add_new_pin_to_locked_boards
+
+        def record_add(service, pin, boards):
+            calls.append((pin.pk, tuple(board.pk for board in boards)))
+            return real_add(service, pin, boards)
+
+        with mock.patch.object(
+            PinMembershipService,
+            "add_new_pin_to_locked_boards",
+            autospec=True,
+            side_effect=record_add,
+        ):
+            pin = self.service.commit(
+                self.prepared,
+                self.user,
+                self.metadata,
+                self.claim,
+                deadline=20.0,
+            )
+
+        self.assertEqual(calls, [(pin.pk, (self.board.pk,))])
+        self.assertTrue(self.board.pins.filter(pk=pin.pk).exists())
 
     def test_lifecycle_method_type_error_is_not_retried(self):
         class TypeErrorLifecycleStorage(_PublishingMediaStorage):
@@ -1561,7 +1587,7 @@ class PinImportCommitTests(TransactionTestCase):
         self.assertEqual(Image.objects.count(), 0)
         self.assertEqual(self.published.compensate_calls, 1)
 
-    def test_deadline_between_board_adds_stops_before_second_add(self):
+    def test_deadline_crossed_by_board_helper_rolls_back_all_memberships(self):
         second_board = Board.objects.create(
             submitter=self.user,
             name="second-board",
@@ -1576,18 +1602,21 @@ class PinImportCommitTests(TransactionTestCase):
         )
         clock = _ManualClock(10.0)
         self.service.clock = clock
-        manager_type = type(self.board.pins)
-        real_add = manager_type.add
-        add_calls = []
+        real_add = PinMembershipService.add_new_pin_to_locked_boards
+        helper_calls = []
 
-        def add_and_expire(manager, *pins, **kwargs):
-            add_calls.append(manager.instance.pk)
-            result = real_add(manager, *pins, **kwargs)
-            if len(add_calls) == 1:
-                clock.now = 20.0
+        def add_and_expire(service, pin, boards):
+            helper_calls.append(tuple(board.pk for board in boards))
+            result = real_add(service, pin, boards)
+            clock.now = 20.0
             return result
 
-        with mock.patch.object(manager_type, "add", new=add_and_expire):
+        with mock.patch.object(
+            PinMembershipService,
+            "add_new_pin_to_locked_boards",
+            autospec=True,
+            side_effect=add_and_expire,
+        ):
             with self.assertRaises(PinImportError) as caught:
                 self.service.commit(
                     self.prepared,
@@ -1598,7 +1627,7 @@ class PinImportCommitTests(TransactionTestCase):
                 )
 
         self.assertEqual(caught.exception.code, "image_processing_timeout")
-        self.assertEqual(add_calls, [self.board.pk])
+        self.assertEqual(helper_calls, [(self.board.pk, second_board.pk)])
         self.assertEqual(Pin.objects.count(), 0)
         self.assertEqual(Image.objects.count(), 0)
         self.assertFalse(self.board.pins.exists())

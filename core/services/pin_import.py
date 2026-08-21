@@ -9,6 +9,7 @@ from django.db import DEFAULT_DB_ALIAS, connections, transaction
 
 from core.models import Board, MediaAsset, Pin
 from core.services.local_upload import read_local_upload
+from core.services.pin_membership import PinMembershipService
 from django_images.file_ops import MediaLifecycleLockError, MediaPathError
 from django_images.models import Image, Thumbnail
 from django_images.paths import (
@@ -240,9 +241,11 @@ class PinImportService(object):
                         pin.tags.add(*metadata.tags)
                     self._fault("after_tags")
                     self._check_deadline(deadline)
-                    for board in boards:
-                        self._check_deadline(deadline)
-                        board.pins.add(pin)
+                    self._check_deadline(deadline)
+                    PinMembershipService().add_new_pin_to_locked_boards(
+                        pin,
+                        boards,
+                    )
                     self._fault("after_boards")
                     self._check_deadline(deadline)
                     self._fault("before_idempotency_success")

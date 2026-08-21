@@ -11,7 +11,7 @@ from django.views.decorators.cache import cache_page
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets, mixins, routers, status
 from rest_framework.decorators import action
-from rest_framework.exceptions import ParseError, PermissionDenied
+from rest_framework.exceptions import NotFound, ParseError, PermissionDenied
 from rest_framework.exceptions import ValidationError
 from rest_framework.filters import SearchFilter, OrderingFilter
 from rest_framework.permissions import IsAuthenticated
@@ -35,6 +35,10 @@ from core.services.bounded_resolver import BoundedResolver
 from core.services.idempotency import IdempotencyStore
 from core.services.local_upload import LocalUploadError
 from core.services.media_storage import MediaStorage
+from core.services.pin_membership import (
+    MembershipConflict,
+    PinMembershipService,
+)
 from core.services.pin_import import PinImportError, PinImportService
 from core.services.pinned_http import PinnedHTTPTransport
 from core.services.safe_url_fetch import SafeFetchError, SafeUrlFetcher
@@ -363,6 +367,14 @@ class BoardViewSet(viewsets.ModelViewSet):
         OwnerOnlyIfPrivate("submitter"),
     ]
     bulk_pin_management_service_class = BulkPinManagementService
+    pin_membership_service_class = PinMembershipService
+
+    def get_serializer_context(self):
+        context = super(BoardViewSet, self).get_serializer_context()
+        context["pin_membership_service"] = (
+            self.pin_membership_service_class()
+        )
+        return context
 
     def get_queryset(self):
         return filter_private_board(self.request, Board.objects.all())
@@ -384,6 +396,18 @@ class BoardViewSet(viewsets.ModelViewSet):
         except BulkOperationError as error:
             return Response({"code": error.code}, status=error.status_code)
         return Response(result)
+
+    def destroy(self, request, *args, **kwargs):
+        try:
+            self.pin_membership_service_class().delete_board(
+                request.user,
+                kwargs["pk"],
+            )
+        except MembershipConflict as error:
+            if error.code == "board_not_found":
+                raise NotFound()
+            raise
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class BoardAutoCompleteViewSet(

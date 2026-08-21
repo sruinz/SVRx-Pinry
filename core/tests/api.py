@@ -26,6 +26,7 @@ from core.serializers import (
     URLImportUnavailable,
 )
 from core.services.media_storage import MediaStorageError
+from core.services.pin_membership import PinMembershipService
 from core.services.pin_import import PinImportError, PinImportService
 from core.services.safe_url_fetch import (
     FetchedImage,
@@ -171,6 +172,92 @@ class BoardPrivacyTests(TemporaryMediaMixin, APITestCase):
         resp = self.client.get(self.board_url)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()['total_pins'], 1, resp.json())
+
+    def test_patch_delegates_membership_changes_to_service(self):
+        self.client.login(username=self.owner.username, password='password')
+        pin = Pin.objects.create(
+            submitter=self.owner,
+            image=create_image(),
+        )
+        calls = []
+        real_update = PinMembershipService.update_board_membership
+
+        def record_update(service, user, board_id, pins_to_add, pins_to_remove):
+            calls.append((user.pk, board_id, pins_to_add, pins_to_remove))
+            return real_update(
+                service,
+                user,
+                board_id,
+                pins_to_add,
+                pins_to_remove,
+            )
+
+        with mock.patch.object(
+            PinMembershipService,
+            "update_board_membership",
+            autospec=True,
+            side_effect=record_update,
+        ):
+            response = self.client.patch(
+                self.board_url,
+                data={"pins_to_add": [pin.pk]},
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            calls,
+            [(self.owner.pk, self.private_board.pk, [pin.pk], [])],
+        )
+        self.assertTrue(
+            self.private_board.pins.filter(pk=pin.pk).exists()
+        )
+
+    def test_delete_delegates_to_service_and_preserves_member_pin(self):
+        self.client.login(username=self.owner.username, password='password')
+        pin = Pin.objects.create(
+            submitter=self.owner,
+            image=create_image(),
+        )
+        self.private_board.pins.add(pin)
+        calls = []
+        real_delete = PinMembershipService.delete_board
+
+        def record_delete(service, user, board_id):
+            calls.append((user.pk, int(board_id)))
+            return real_delete(service, user, board_id)
+
+        with mock.patch.object(
+            PinMembershipService,
+            "delete_board",
+            autospec=True,
+            side_effect=record_delete,
+        ):
+            response = self.client.delete(self.board_url)
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(calls, [(self.owner.pk, self.private_board.pk)])
+        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+
+    def test_delete_hides_private_board_from_non_owner_and_anonymous(self):
+        cases = (
+            (self.non_owner, status.HTTP_404_NOT_FOUND),
+            (None, status.HTTP_401_UNAUTHORIZED),
+        )
+        for user, expected_status in cases:
+            with self.subTest(user=user):
+                self.client.logout()
+                if user is not None:
+                    self.client.login(
+                        username=user.username,
+                        password='password',
+                    )
+
+                response = self.client.delete(self.board_url)
+
+                self.assertEqual(response.status_code, expected_status)
+                self.assertTrue(
+                    Board.objects.filter(pk=self.private_board.pk).exists()
+                )
 
 
 class PinPrivacyTests(TemporaryMediaMixin, APITestCase):

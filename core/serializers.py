@@ -14,7 +14,6 @@ from core.services.media_storage import MediaStorageError
 from core.services.pin_import import ImportMetadata, PinImportError
 from core.services.safe_url_fetch import SafeFetchError
 from users.serializers import UserSerializer
-from users.models import User
 
 
 def filter_private_pin(request, query):
@@ -383,16 +382,6 @@ class BoardSerializer(serializers.HyperlinkedModelSerializer):
             return None
         return PinSerializer(pin, context=self.context).data
 
-    @staticmethod
-    def _get_list(pins_id, submitter: User):
-        pins = Pin.objects.filter(id__in=pins_id)
-        valid_pins = []
-        for pin in pins:
-            if pin.private and pin.submitter != submitter:
-                continue
-            valid_pins.append(pin)
-        return valid_pins
-
     def update(self, instance: Board, validated_data):
         pins_to_add = validated_data.pop("pins_to_add", [])
         pins_to_remove = validated_data.pop("pins_to_remove", [])
@@ -405,18 +394,13 @@ class BoardSerializer(serializers.HyperlinkedModelSerializer):
                 detail={'name': "Board with this name already exists"}
             )
         instance = super(BoardSerializer, self).update(instance, validated_data)
-        changed = False
-        if pins_to_add:
-            changed = True
-            for pin in self._get_list(pins_to_add, instance.submitter):
-                instance.pins.add(pin)
-        if pins_to_remove:
-            changed = True
-            for pin in self._get_list(pins_to_remove, instance.submitter):
-                instance.pins.remove(pin)
-        if changed:
-            instance.save()
-        return instance
+        service = self.context["pin_membership_service"]
+        return service.update_board_membership(
+            self.context["request"].user,
+            instance.pk,
+            pins_to_add,
+            pins_to_remove,
+        )
 
     def create(self, validated_data):
         validated_data.pop('pins_to_remove', None)
