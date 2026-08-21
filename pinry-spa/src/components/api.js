@@ -65,6 +65,10 @@ const Board = {
     const url = `${API_PREFIX}boards/${boardId}/`;
     return axios.delete(url);
   },
+  deletePreview(boardId) {
+    const url = `${API_PREFIX}boards/${boardId}/delete-preview/`;
+    return axios.get(url);
+  },
 };
 
 const Pin = {
@@ -94,6 +98,15 @@ const Pin = {
       url,
       data,
     );
+  },
+  fetchSelectionIds({ boardId = null, exclusiveOwned = false } = {}) {
+    const params = {};
+    if (boardId !== null) params.board_id = boardId;
+    if (exclusiveOwned) params.exclusive_owned = 'true';
+    return axios.get('/api/v2/pins/selection-ids/', { params });
+  },
+  bulk(payload) {
+    return axios.post('/api/v2/pins/bulk/', payload);
   },
 };
 
