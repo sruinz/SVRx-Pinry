@@ -10,7 +10,7 @@
 ./scripts/create_synology_output.sh
 ```
 
-`output/synology/` 아래에 업로드 가능한 `pinry-custom/` 폴더와 `pinry-custom-<커밋>.tar.gz` 파일이 생성된다. 패키지는 현재 Git `HEAD`에 커밋된 런타임 파일만 포함하며 미커밋 변경, 테스트, Markdown 문서, GitHub 설정과 개발용 파일은 포함하지 않는다. 기존 산출물이 있으면 덮어쓰지 않고 중단한다.
+`output/synology/` 아래에 업로드 가능한 `pinry-custom/` 폴더와 `pinry-custom-<커밋>.tar.gz` 파일이 생성된다. 패키지는 시작 시점의 Git `HEAD` 커밋 하나에서만 만든다. 생성기, `build-image.sh`, Compose 파일 또는 `.env.example`에 tracked 미커밋 변경이 있으면 서로 다른 revision이 섞이지 않도록 산출물을 만들기 전에 중단한다. 테스트, Markdown 문서, GitHub 설정과 개발용 파일은 포함하지 않으며, 기존 산출물이 있으면 덮어쓰지 않고 중단한다.
 
 산출물 구조는 다음과 같다.
 
@@ -83,6 +83,17 @@ sudo ./build-image.sh
 docker image ls pinry-custom
 ```
 
+`BUILD_INFO`의 `source_commit`은 이 이미지를 만든 40자리 Git 커밋이다. 빌드 스크립트는 같은 값을 이미지의 `PINRY_SOURCE_COMMIT` 환경값과 `org.opencontainers.image.revision` 레이블에 넣는다. 다음 세 명령이 모두 같은 full SHA를 가리켜야 한다.
+
+```sh
+sed -n 's/^source_commit=//p' BUILD_INFO
+docker image inspect pinry-custom:latest \
+  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}'
+docker image inspect pinry-custom:latest \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep '^PINRY_SOURCE_COMMIT='
+```
+
 ## 환경설정 준비
 
 예제 파일을 실제 Compose 환경 파일로 복사한다.
@@ -125,10 +136,12 @@ docker compose --env-file .env up -d --force-recreate
 구형 DSM에서 명령이 없으면 다음 형식을 사용한다.
 
 ```sh
-docker-compose --env-file .env up -d --force-recreate
+docker-compose up -d --force-recreate
 ```
 
-컨테이너를 교체한 뒤 브라우저를 강제 새로고침한다. 이전 휴지통 메뉴나 삭제 안내가 보이면 해당 사이트의 저장 데이터를 지우고 서비스 워커를 제거한 뒤 다시 접속한다. 새 삭제 확인 문구 `Delete this Pin?`가 보이는 것을 확인한 후 첫 삭제를 테스트한다.
+Compose v1은 같은 폴더의 `.env`를 자동으로 읽는다.
+
+컨테이너를 교체한 뒤 브라우저를 강제 새로고침한다. 이전 휴지통 메뉴나 삭제 안내가 보이면 해당 사이트의 저장 데이터를 지우고 서비스 워커를 제거한 뒤 다시 접속한다. 새 삭제 확인 문구 `이 Pin을 삭제하시겠습니까?`가 보이는 것을 확인한 후 첫 삭제를 테스트한다.
 
 상태와 로그는 다음 명령으로 확인한다.
 
@@ -138,6 +151,18 @@ docker compose logs --tail=100 pinry
 ```
 
 기본 접속 주소는 `http://NAS주소:2048`이다.
+
+## 실행 버전과 마이그레이션 확인
+
+컨테이너는 데이터베이스가 이미 있는지와 관계없이 매번 시작할 때 `python manage.py migrate --noinput`을 한 번 실행한다. 마이그레이션이 실패하면 nginx와 Gunicorn을 시작하지 않고 컨테이너가 종료된다. `restart: unless-stopped` 정책으로 재시도가 반복될 수 있으므로 서비스가 올라오지 않으면 먼저 Compose 로그의 마이그레이션 오류를 확인한다.
+
+서비스가 시작된 뒤 다음 API에서 실행 중인 프로세스의 full SHA를 확인한다.
+
+```sh
+curl -s http://NAS주소:2048/api/v2/version/
+```
+
+응답의 `source_commit`은 `BUILD_INFO`와 이미지 레이블의 40자리 SHA와 같아야 한다. 로그인 후 상단의 **내 메뉴**에서 **프로필**을 열어 **빌드 정보**에 보이는 12자리 값도 같은 SHA의 앞 12자와 일치해야 한다. 네 값이 다르면 이전 산출물을 다시 빌드했거나 `latest` 이미지로 컨테이너를 교체하지 않은 것이다.
 
 ## 빌드 실패 참고
 

@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -50,6 +51,33 @@ def _read_recorded_argv(path):
         value.decode("utf-8")
         for value in path.read_bytes().split(b"\0")
         if value
+    ]
+
+
+def _write_startup_recorder(path, command_name):
+    path.write_text(
+        "#!/bin/sh\n"
+        "{\n"
+        "    printf '%s' '" + command_name + "'\n"
+        "    for argument in \"$@\"; do\n"
+        "        printf '\\0%s' \"$argument\"\n"
+        "    done\n"
+        "    printf '\\n'\n"
+        "} >> \"$PINRY_STARTUP_CAPTURE\"\n"
+        "if [ '" + command_name + "' = python ] "
+        "&& [ \"${PINRY_FAIL_MIGRATE:-0}\" = 1 ] "
+        "&& [ \"${2:-}\" = migrate ]; then\n"
+        "    exit 41\n"
+        "fi\n"
+    )
+    path.chmod(0o700)
+
+
+def _read_startup_events(path):
+    return [
+        [value.decode("utf-8") for value in line.split(b"\0")]
+        for line in path.read_bytes().splitlines()
+        if line
     ]
 
 
@@ -234,6 +262,118 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         environment["PINRY_ARGV_CAPTURE"] = str(capture)
         return environment, capture
+
+    def _startup_environment(self, database_exists):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        temporary_root = Path(temporary.name)
+        binary_directory = temporary_root / "bin"
+        binary_directory.mkdir()
+        capture = temporary_root / "startup-events.bin"
+        for command_name in (
+            "bash",
+            "python",
+            "chown",
+            "nginx",
+            "gunicorn",
+        ):
+            _write_startup_recorder(
+                binary_directory / command_name, command_name
+            )
+        data_directory = temporary_root / "data"
+        data_directory.mkdir()
+        database_path = data_directory / "production.db"
+        if database_exists:
+            database_path.write_bytes(b"")
+        startup_source = (
+            REPOSITORY_ROOT / "docker/scripts/start.sh"
+        ).read_text()
+        self.assertEqual(startup_source.count("/usr/sbin/nginx"), 1)
+        self.assertEqual(startup_source.count('PROJECT_ROOT="/pinry"'), 1)
+        startup_directory = temporary_root / "docker/scripts"
+        startup_directory.mkdir(parents=True)
+        startup_script = startup_directory / "start.sh"
+        startup_script.write_text(
+            startup_source.replace("/usr/sbin/nginx", "nginx", 1)
+            .replace(
+                'PROJECT_ROOT="/pinry"',
+                'PROJECT_ROOT="{}"'.format(temporary_root),
+                1,
+            )
+            .replace("/data/production.db", str(database_path))
+        )
+        shutil.copy2(
+            REPOSITORY_ROOT / "docker/scripts/_start_gunicorn.sh",
+            startup_directory / "_start_gunicorn.sh",
+        )
+        environment = os.environ.copy()
+        environment["PATH"] = "{}{}{}".format(
+            binary_directory,
+            os.pathsep,
+            environment.get("PATH", ""),
+        )
+        environment["PINRY_STARTUP_CAPTURE"] = str(capture)
+        return environment, capture, startup_script
+
+    def test_start_runs_one_migration_before_services_for_every_database(self):
+        for database_exists in (False, True):
+            with self.subTest(database_exists=database_exists):
+                environment, capture, startup_script = (
+                    self._startup_environment(database_exists)
+                )
+
+                completed = subprocess.run(
+                    ["/bin/bash", str(startup_script)],
+                    cwd=str(REPOSITORY_ROOT),
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr.decode("utf-8"),
+                )
+                events = _read_startup_events(capture)
+                migration = ["python", "manage.py", "migrate", "--noinput"]
+                self.assertEqual(events.count(migration), 1)
+                migration_index = events.index(migration)
+                self.assertIn(["nginx"], events)
+                self.assertTrue(
+                    any(event[0] == "gunicorn" for event in events)
+                )
+                nginx_index = events.index(["nginx"])
+                gunicorn_index = next(
+                    index
+                    for index, event in enumerate(events)
+                    if event[0] == "gunicorn"
+                )
+                self.assertLess(migration_index, nginx_index)
+                self.assertLess(migration_index, gunicorn_index)
+
+    def test_start_stops_before_services_when_migration_fails(self):
+        environment, capture, startup_script = self._startup_environment(
+            False
+        )
+        environment["PINRY_FAIL_MIGRATE"] = "1"
+
+        completed = subprocess.run(
+            ["/bin/bash", str(startup_script)],
+            cwd=str(REPOSITORY_ROOT),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 41)
+        events = _read_startup_events(capture)
+        self.assertEqual(
+            events.count(["python", "manage.py", "migrate", "--noinput"]),
+            1,
+        )
+        self.assertFalse(any(event[0] == "nginx" for event in events))
+        self.assertFalse(any(event[0] == "gunicorn" for event in events))
 
     def test_start_script_passes_one_effective_60_second_timeout(self):
         environment, capture = self._capture_environment("gunicorn")

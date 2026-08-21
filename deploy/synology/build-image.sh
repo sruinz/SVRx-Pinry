@@ -34,6 +34,36 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 
+source_commit_count="$(
+    awk '/^source_commit=/{count++} END{print count + 0}' \
+        "${script_directory}/BUILD_INFO"
+)"
+if [ "${source_commit_count}" -ne 1 ]; then
+    echo "invalid_build_info" >&2
+    exit 1
+fi
+source_commit="$(
+    sed -n 's/^source_commit=//p' "${script_directory}/BUILD_INFO"
+)"
+if [ "${#source_commit}" -ne 40 ]; then
+    echo "invalid_build_info" >&2
+    exit 1
+fi
+case "${source_commit}" in
+    *[!0-9a-f]*)
+        echo "invalid_build_info" >&2
+        exit 1
+        ;;
+esac
+
+default_image_count="$(
+    awk '/^default_image=/{count++} END{print count + 0}' \
+        "${script_directory}/BUILD_INFO"
+)"
+if [ "${default_image_count}" -ne 1 ]; then
+    echo "invalid_build_info" >&2
+    exit 1
+fi
 default_image="$(
     sed -n 's/^default_image=//p' "${script_directory}/BUILD_INFO"
 )"
@@ -47,6 +77,8 @@ cd "${build_context}"
 docker build \
     --pull \
     --file Dockerfile.autobuild \
+    --build-arg "PINRY_SOURCE_COMMIT=${source_commit}" \
+    --label "org.opencontainers.image.revision=${source_commit}" \
     --tag "${image_tag}" \
     .
 

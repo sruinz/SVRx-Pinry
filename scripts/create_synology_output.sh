@@ -13,12 +13,36 @@ script_directory="$(
 repository_root="$(cd "${script_directory}/.." && pwd -P)"
 output_root="${1:-${repository_root}/output/synology}"
 
+cd "${repository_root}"
+source_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+if [ "${#source_commit}" -ne 40 ]; then
+    echo "invalid_source_commit" >&2
+    exit 1
+fi
+case "${source_commit}" in
+    *[!0-9a-f]*)
+        echo "invalid_source_commit" >&2
+        exit 1
+        ;;
+esac
+package_control_paths=(
+    scripts/create_synology_output.sh
+    deploy/synology/build-image.sh
+    deploy/synology/docker-compose.synology.yml
+    deploy/synology/.env.example
+)
+if ! git diff --quiet "${source_commit}" -- "${package_control_paths[@]}" \
+    || ! git diff --cached --quiet "${source_commit}" -- \
+        "${package_control_paths[@]}";
+then
+    echo "tracked_package_control_mismatch" >&2
+    exit 1
+fi
+short_commit="${source_commit:0:12}"
+
 mkdir -p "${output_root}"
 output_root="$(cd "${output_root}" && pwd -P)"
 
-cd "${repository_root}"
-source_commit="$(git rev-parse HEAD)"
-short_commit="$(git rev-parse --short=12 HEAD)"
 package_name="pinry-custom"
 package_directory="${output_root}/${package_name}"
 archive_path="${output_root}/${package_name}-${short_commit}.tar.gz"
@@ -48,7 +72,14 @@ trap cleanup_temporary_files EXIT
 
 mkdir "${temporary_directory}"
 mkdir "${temporary_directory}/context"
-git archive --format=tar HEAD -- \
+control_directory="${temporary_root}/controls"
+mkdir "${control_directory}"
+git archive --format=tar "${source_commit}" -- \
+    deploy/synology/build-image.sh \
+    deploy/synology/docker-compose.synology.yml \
+    deploy/synology/.env.example \
+    | tar -xf - -C "${control_directory}"
+git archive --format=tar "${source_commit}" -- \
     Dockerfile.autobuild \
     requirements.txt \
     manage.py \
@@ -77,13 +108,13 @@ git archive --format=tar HEAD -- \
 printf 'Dockerfile.autobuild\n.dockerignore\n.DS_Store\n**/.DS_Store\n' \
     > "${temporary_directory}/context/.dockerignore"
 install -m 0755 \
-    "${repository_root}/deploy/synology/build-image.sh" \
+    "${control_directory}/deploy/synology/build-image.sh" \
     "${temporary_directory}/build-image.sh"
 install -m 0644 \
-    "${repository_root}/deploy/synology/docker-compose.synology.yml" \
+    "${control_directory}/deploy/synology/docker-compose.synology.yml" \
     "${temporary_directory}/docker-compose.yml"
 install -m 0644 \
-    "${repository_root}/deploy/synology/.env.example" \
+    "${control_directory}/deploy/synology/.env.example" \
     "${temporary_directory}/.env.example"
 printf 'source_commit=%s\ndefault_image=pinry-custom:latest\n' \
     "${source_commit}" \

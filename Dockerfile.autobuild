@@ -34,6 +34,8 @@ RUN pip --no-cache-dir install --user mysqlclient cx-Oracle
 # Final image
 FROM python:3.9-slim-bookworm
 ARG DEBIAN_FRONTEND=noninteractive
+ARG PINRY_SOURCE_COMMIT=development
+ENV PINRY_SOURCE_COMMIT=${PINRY_SOURCE_COMMIT}
 
 WORKDIR pinry
 RUN mkdir /data && chown -R www-data:www-data /data

@@ -10,18 +10,31 @@ import unittest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-PACKAGE_SCRIPT = REPOSITORY_ROOT / "scripts/create_synology_output.sh"
+TASK_PRODUCTION_PATHS = (
+    "Dockerfile.autobuild",
+    "docker/scripts/start.sh",
+    "scripts/create_synology_output.sh",
+    "deploy/synology/build-image.sh",
+    "deploy/synology/README_KO.md",
+)
+PACKAGE_CONTROL_PATHS = (
+    "scripts/create_synology_output.sh",
+    "deploy/synology/build-image.sh",
+    "deploy/synology/docker-compose.synology.yml",
+    "deploy/synology/.env.example",
+)
 
 
-def _git_output(*arguments):
+def _git_output(repository, *arguments):
     return subprocess.check_output(
-        ["git"] + list(arguments), cwd=str(REPOSITORY_ROOT)
+        ["git"] + list(arguments), cwd=str(repository)
     ).decode("utf-8").strip()
 
 
 def _write_fake_docker(path):
     path.write_text(
         "#!/bin/sh\n"
+        "printf '1\\n' >> \"${PINRY_DOCKER_CAPTURE}.calls\"\n"
         ": > \"$PINRY_DOCKER_CAPTURE\"\n"
         "for argument in \"$@\"; do\n"
         "    printf '%s\\0' \"$argument\" >> \"$PINRY_DOCKER_CAPTURE\"\n"
@@ -115,12 +128,41 @@ def _write_archive_publish_failure_wrapper(path):
     path.chmod(0o700)
 
 
+def _write_head_move_git_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -u\n"
+        "if [ \"${1:-}\" = archive ] "
+        "&& [ ! -e \"$PINRY_HEAD_MOVE_MARKER\" ]; then\n"
+        "    : > \"$PINRY_HEAD_MOVE_MARKER\"\n"
+        "    \"$PINRY_REAL_GIT\" checkout --quiet "
+        "\"$PINRY_HEAD_MOVE_TARGET\" || exit $?\n"
+        "fi\n"
+        "exec \"$PINRY_REAL_GIT\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
 def _read_argv(path):
     return [
         value.decode("utf-8")
         for value in path.read_bytes().split(b"\0")
         if value
     ]
+
+
+def _docker_call_count(capture):
+    calls = Path(str(capture) + ".calls")
+    if not calls.exists():
+        return 0
+    return len(calls.read_text().splitlines())
+
+
+def _git_blob(repository, commit, relative_path):
+    return subprocess.check_output(
+        ["git", "show", "{}:{}".format(commit, relative_path)],
+        cwd=str(repository),
+    )
 
 
 def _final_stage_copy_sources(dockerfile):
@@ -154,13 +196,80 @@ def _environment_values(source):
 
 
 class SynologyPackageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.fixture_temporary = tempfile.TemporaryDirectory()
+        cls.fixture_repository = (
+            Path(cls.fixture_temporary.name) / "fixture-repository"
+        )
+        completed = subprocess.run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "--no-local",
+                str(REPOSITORY_ROOT),
+                str(cls.fixture_repository),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr.decode("utf-8"))
+        for relative_path in TASK_PRODUCTION_PATHS:
+            destination = cls.fixture_repository / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPOSITORY_ROOT / relative_path, destination)
+        completed = subprocess.run(
+            ["git", "add"] + list(TASK_PRODUCTION_PATHS),
+            cwd=str(cls.fixture_repository),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr.decode("utf-8"))
+        if subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=str(cls.fixture_repository),
+        ).returncode != 0:
+            completed = subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Package Test",
+                    "-c",
+                    "user.email=package-test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "task production fixture",
+                ],
+                cwd=str(cls.fixture_repository),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if completed.returncode != 0:
+                raise AssertionError(completed.stderr.decode("utf-8"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fixture_temporary.cleanup()
+        super().tearDownClass()
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.temporary_root = Path(temporary.name)
+        self.repository_root = self.fixture_repository
+        self.package_script = (
+            self.repository_root / "scripts/create_synology_output.sh"
+        )
         self.output_root = self.temporary_root / "output"
-        self.full_sha = _git_output("rev-parse", "HEAD")
-        self.short_sha = _git_output("rev-parse", "--short=12", "HEAD")
+        self.full_sha = _git_output(self.repository_root, "rev-parse", "HEAD")
+        self.short_sha = _git_output(
+            self.repository_root, "rev-parse", "--short=12", "HEAD"
+        )
         self.package_name = "pinry-custom"
         self.package_directory = self.output_root / self.package_name
         self.context_directory = self.package_directory / "context"
@@ -170,8 +279,8 @@ class SynologyPackageTests(unittest.TestCase):
 
     def _run_packager(self, environment=None):
         return subprocess.run(
-            ["bash", str(PACKAGE_SCRIPT), str(self.output_root)],
-            cwd=str(REPOSITORY_ROOT),
+            ["bash", str(self.package_script), str(self.output_root)],
+            cwd=str(self.repository_root),
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -227,17 +336,27 @@ class SynologyPackageTests(unittest.TestCase):
         environment["PINRY_REAL_MV"] = real_mv
         return environment
 
-    def _clone_with_tracked_finder_metadata(self):
-        repository = self.temporary_root / "fixture-repository"
+    def _clone_repository(self, name):
+        repository = self.temporary_root / name
         completed = subprocess.run(
-            ["git", "clone", "--quiet", "--no-local", str(REPOSITORY_ROOT),
-             str(repository)],
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "--no-local",
+                str(self.repository_root),
+                str(repository),
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
         self.assertEqual(
             completed.returncode, 0, completed.stderr.decode("utf-8")
         )
+        return repository
+
+    def _clone_with_tracked_finder_metadata(self):
+        repository = self._clone_repository("finder-fixture-repository")
         root_finder_file = repository / ".DS_Store"
         root_finder_file.write_text("tracked root Finder metadata")
         finder_file = repository / "pinry-spa/src/.DS_Store"
@@ -247,7 +366,7 @@ class SynologyPackageTests(unittest.TestCase):
         sentinel = repository / "pinry-spa/src/package-sentinel.txt"
         sentinel.write_text("keep this sentinel")
         script = repository / "scripts/create_synology_output.sh"
-        shutil.copy2(PACKAGE_SCRIPT, script)
+        shutil.copy2(self.package_script, script)
         completed = subprocess.run(
             [
                 "git",
@@ -591,7 +710,7 @@ class SynologyPackageTests(unittest.TestCase):
 
     def test_final_image_copies_only_runtime_application_paths(self):
         sources = _final_stage_copy_sources(
-            (REPOSITORY_ROOT / "Dockerfile.autobuild").read_text()
+            (self.repository_root / "Dockerfile.autobuild").read_text()
         )
 
         self.assertEqual(
@@ -609,7 +728,9 @@ class SynologyPackageTests(unittest.TestCase):
         )
 
     def test_synology_dockerfile_uses_supported_bookworm_inputs(self):
-        source = (REPOSITORY_ROOT / "Dockerfile.autobuild").read_text()
+        source = (
+            self.repository_root / "Dockerfile.autobuild"
+        ).read_text()
 
         self.assertEqual(
             re.findall(r"^FROM python:([^\s]+)", source, re.MULTILINE),
@@ -620,6 +741,28 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertNotIn("libtiff5-dev", source)
         self.assertNotIn("--install-option", source)
         self.assertNotIn("rcssmin==1.0.6", source)
+
+    def test_final_image_exposes_exact_source_commit_build_contract(self):
+        source = (
+            self.repository_root / "Dockerfile.autobuild"
+        ).read_text()
+        stage_starts = list(re.finditer(r"^FROM\s+", source, re.MULTILINE))
+        self.assertTrue(stage_starts)
+        final_stage = source[stage_starts[-1].start():]
+        source_commit_directives = [
+            line.strip()
+            for line in final_stage.splitlines()
+            if re.match(r"^(ARG|ENV)\s+", line)
+            and "PINRY_SOURCE_COMMIT" in line
+        ]
+
+        self.assertEqual(
+            source_commit_directives,
+            [
+                "ARG PINRY_SOURCE_COMMIT=development",
+                "ENV PINRY_SOURCE_COMMIT=${PINRY_SOURCE_COMMIT}",
+            ],
+        )
 
     def test_packager_refuses_to_replace_existing_output(self):
         self._create_package()
@@ -633,6 +776,246 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertIn(b"output_already_exists", completed.stderr)
         self.assertEqual(sentinel.read_text(), "preserve")
         self.assertEqual(self.archive_path.read_bytes(), archive_before)
+
+    def test_packager_root_controls_are_exact_blobs_from_source_commit(self):
+        self._create_package()
+        packaged_controls = {
+            "build-image.sh": "deploy/synology/build-image.sh",
+            "docker-compose.yml": (
+                "deploy/synology/docker-compose.synology.yml"
+            ),
+            ".env.example": "deploy/synology/.env.example",
+        }
+
+        for packaged_name, tracked_path in packaged_controls.items():
+            with self.subTest(packaged_name=packaged_name):
+                self.assertEqual(
+                    (self.package_directory / packaged_name).read_bytes(),
+                    _git_blob(
+                        self.repository_root,
+                        self.full_sha,
+                        tracked_path,
+                    ),
+                )
+
+    def test_packager_rejects_dirty_tracked_control_before_output(self):
+        for index, relative_path in enumerate(PACKAGE_CONTROL_PATHS):
+            with self.subTest(relative_path=relative_path):
+                repository = self._clone_repository(
+                    "dirty-control-{}".format(index)
+                )
+                dirty_path = repository / relative_path
+                dirty_path.write_bytes(
+                    dirty_path.read_bytes() + b"\n# dirty control\n"
+                )
+                output_root = self.temporary_root / "dirty-output-{}".format(
+                    index
+                )
+
+                completed = self._run_packager_in(
+                    repository, output_root, os.environ.copy()
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(
+                    b"tracked_package_control_mismatch",
+                    completed.stderr,
+                )
+                self.assertFalse(output_root.exists())
+                self.assertFalse((output_root / self.package_name).exists())
+
+    def test_packager_rejects_staged_only_control_before_output(self):
+        repository = self._clone_repository("staged-control")
+        relative_path = "deploy/synology/build-image.sh"
+        dirty_path = repository / relative_path
+        dirty_path.write_bytes(
+            dirty_path.read_bytes() + b"\n# staged control\n"
+        )
+        completed = subprocess.run(
+            ["git", "add", relative_path],
+            cwd=str(repository),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        dirty_path.write_bytes(
+            _git_blob(repository, self.full_sha, relative_path)
+        )
+        self.assertEqual(
+            subprocess.run(
+                [
+                    "git",
+                    "diff",
+                    "--quiet",
+                    self.full_sha,
+                    "--",
+                    relative_path,
+                ],
+                cwd=str(repository),
+            ).returncode,
+            0,
+        )
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "diff", "--cached", "--quiet", "--", relative_path],
+                cwd=str(repository),
+            ).returncode,
+            0,
+        )
+        output_root = self.temporary_root / "staged-output"
+
+        completed = self._run_packager_in(
+            repository, output_root, os.environ.copy()
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            b"tracked_package_control_mismatch", completed.stderr
+        )
+        self.assertFalse(output_root.exists())
+
+    def test_packager_ignores_untracked_user_metadata_and_output(self):
+        repository = self._clone_repository("untracked-user-files")
+        finder_metadata = repository / ".DS_Store"
+        finder_metadata.write_text("user metadata")
+        user_output = repository / "output/synology/user-sentinel"
+        user_output.parent.mkdir(parents=True)
+        user_output.write_text("preserve")
+        output_root = self.temporary_root / "untracked-package-output"
+
+        completed = self._run_packager_in(
+            repository, output_root, os.environ.copy()
+        )
+
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        self.assertTrue((output_root / self.package_name).is_dir())
+        self.assertEqual(finder_metadata.read_text(), "user metadata")
+        self.assertEqual(user_output.read_text(), "preserve")
+
+    def test_packager_keeps_one_frozen_commit_when_head_moves(self):
+        repository = self._clone_repository("moving-head-repository")
+        source_commit = _git_output(repository, "rev-parse", "HEAD")
+        changed_context = repository / "core/models.py"
+        changed_context.write_bytes(
+            changed_context.read_bytes() + b"\n# later context commit\n"
+        )
+        changed_controls = (
+            "deploy/synology/build-image.sh",
+            "deploy/synology/docker-compose.synology.yml",
+            "deploy/synology/.env.example",
+        )
+        for relative_path in changed_controls:
+            changed_control = repository / relative_path
+            changed_control.write_bytes(
+                changed_control.read_bytes() + b"\n# later control commit\n"
+            )
+        completed = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Package Test",
+                "-c",
+                "user.email=package-test@example.invalid",
+                "add",
+                "core/models.py",
+            ] + list(changed_controls),
+            cwd=str(repository),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        completed = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Package Test",
+                "-c",
+                "user.email=package-test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "later fixture commit",
+            ],
+            cwd=str(repository),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        later_commit = _git_output(repository, "rev-parse", "HEAD")
+        completed = subprocess.run(
+            ["git", "checkout", "--quiet", source_commit],
+            cwd=str(repository),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        binary_directory = self.temporary_root / "moving-head-bin"
+        binary_directory.mkdir()
+        wrapper = binary_directory / "git"
+        _write_head_move_git_wrapper(wrapper)
+        marker = self.temporary_root / "head-moved"
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        environment = os.environ.copy()
+        environment["PATH"] = "{}{}{}".format(
+            binary_directory,
+            os.pathsep,
+            environment.get("PATH", ""),
+        )
+        environment["PINRY_REAL_GIT"] = real_git
+        environment["PINRY_HEAD_MOVE_MARKER"] = str(marker)
+        environment["PINRY_HEAD_MOVE_TARGET"] = later_commit
+        output_root = self.temporary_root / "moving-head-output"
+
+        completed = self._run_packager_in(
+            repository, output_root, environment
+        )
+
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        self.assertTrue(marker.is_file())
+        self.assertEqual(
+            _git_output(repository, "rev-parse", "HEAD"), later_commit
+        )
+        package_directory = output_root / self.package_name
+        self.assertEqual(
+            (package_directory / "BUILD_INFO").read_text(),
+            "source_commit={}\n"
+            "default_image=pinry-custom:latest\n".format(source_commit),
+        )
+        self.assertEqual(
+            (package_directory / "context/core/models.py").read_bytes(),
+            _git_blob(repository, source_commit, "core/models.py"),
+        )
+        packaged_controls = {
+            "build-image.sh": "deploy/synology/build-image.sh",
+            "docker-compose.yml": (
+                "deploy/synology/docker-compose.synology.yml"
+            ),
+            ".env.example": "deploy/synology/.env.example",
+        }
+        for packaged_name, relative_path in packaged_controls.items():
+            self.assertEqual(
+                (package_directory / packaged_name).read_bytes(),
+                _git_blob(repository, source_commit, relative_path),
+            )
+        self.assertTrue(
+            (
+                output_root
+                / "pinry-custom-{}.tar.gz".format(source_commit[:12])
+            ).is_file()
+        )
 
     def test_default_build_uses_native_docker_and_packaged_context(self):
         self._create_package()
@@ -658,11 +1041,18 @@ class SynologyPackageTests(unittest.TestCase):
                 "--pull",
                 "--file",
                 "Dockerfile.autobuild",
+                "--build-arg",
+                "PINRY_SOURCE_COMMIT={}".format(self.full_sha),
+                "--label",
+                "org.opencontainers.image.revision={}".format(
+                    self.full_sha
+                ),
                 "--tag",
                 "pinry-custom:latest",
                 ".",
             ],
         )
+        self.assertEqual(_docker_call_count(capture), 1)
         self.assertEqual(
             Path(working_directory.read_text()).resolve(),
             self.context_directory.resolve(),
@@ -689,10 +1079,103 @@ class SynologyPackageTests(unittest.TestCase):
             completed.returncode, 0, completed.stderr.decode("utf-8")
         )
         arguments = _read_argv(capture)
+        self.assertEqual(_docker_call_count(capture), 1)
         self.assertEqual(
             arguments[arguments.index("--tag") + 1],
             "registry.local/pinry-custom:nas",
         )
+
+    def test_build_rejects_every_malformed_build_info_without_docker(self):
+        self._create_package()
+        environment, capture, _working_directory = (
+            self._docker_environment()
+        )
+        build_info = self.package_directory / "BUILD_INFO"
+        sentinel = self.temporary_root / "shell-payload-ran"
+        valid_default = "default_image=pinry-custom:latest\n"
+        invalid_sources = {
+            "missing": valid_default,
+            "duplicate-valid": (
+                "source_commit={0}\nsource_commit={0}\n{1}".format(
+                    self.full_sha, valid_default
+                )
+            ),
+            "duplicate-mixed": (
+                "source_commit={0}\nsource_commit={1}\n{2}".format(
+                    self.full_sha, "g" * 40, valid_default
+                )
+            ),
+            "duplicate-empty-after-valid": (
+                "source_commit={}\nsource_commit=\n{}".format(
+                    self.full_sha, valid_default
+                )
+            ),
+            "empty-before-valid": (
+                "source_commit=\nsource_commit={}\n{}".format(
+                    self.full_sha, valid_default
+                )
+            ),
+            "uppercase": "source_commit={}\n{}".format(
+                "A" * 40, valid_default
+            ),
+            "nonhex": "source_commit={}\n{}".format(
+                "g" * 40, valid_default
+            ),
+            "short": "source_commit={}\n{}".format(
+                "a" * 39, valid_default
+            ),
+            "long": "source_commit={}\n{}".format(
+                "a" * 41, valid_default
+            ),
+            "leading-space": "source_commit= {}\n{}".format(
+                "a" * 40, valid_default
+            ),
+            "trailing-space": "source_commit={} \n{}".format(
+                "a" * 40, valid_default
+            ),
+            "carriage-return": "source_commit={}\r\n{}".format(
+                "a" * 40, valid_default
+            ),
+            "shell-payload": "source_commit=$(touch {})\n{}".format(
+                sentinel, valid_default
+            ),
+            "missing-default-image": "source_commit={}\n".format(
+                self.full_sha
+            ),
+            "duplicate-default-image": (
+                "source_commit={}\n"
+                "default_image=pinry-custom:latest\n"
+                "default_image=pinry-custom:other\n".format(self.full_sha)
+            ),
+            "duplicate-empty-default-image": (
+                "source_commit={}\n"
+                "default_image=pinry-custom:latest\n"
+                "default_image=\n".format(self.full_sha)
+            ),
+        }
+
+        for name, source in invalid_sources.items():
+            with self.subTest(name=name):
+                for artifact in (
+                    capture,
+                    Path(str(capture) + ".calls"),
+                ):
+                    if artifact.exists():
+                        artifact.unlink()
+                build_info.write_text(source)
+
+                completed = subprocess.run(
+                    ["sh", str(self.package_directory / "build-image.sh")],
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(b"invalid_build_info", completed.stderr)
+                self.assertEqual(_docker_call_count(capture), 0)
+                self.assertFalse(capture.exists())
+                self.assertFalse(sentinel.exists())
 
     def test_build_rejects_missing_input_before_invoking_docker(self):
         self._create_package()
@@ -711,6 +1194,7 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn(b"missing_build_input=Dockerfile.autobuild", completed.stderr)
         self.assertFalse(capture.exists())
+        self.assertEqual(_docker_call_count(capture), 0)
 
     def test_generated_synology_output_is_ignored_by_git(self):
         completed = subprocess.run(
@@ -720,7 +1204,7 @@ class SynologyPackageTests(unittest.TestCase):
                 "--quiet",
                 "output/synology/probe",
             ],
-            cwd=str(REPOSITORY_ROOT),
+            cwd=str(self.repository_root),
         )
 
         self.assertEqual(completed.returncode, 0)
