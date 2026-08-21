@@ -1,10 +1,12 @@
 /* eslint-env jest */
 
 import flushPromises from 'flush-promises';
-import { shallowMount } from '@vue/test-utils';
+import VueI18n from 'vue-i18n';
+import { createLocalVue, shallowMount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import BoardDeleteDialog from '@/components/bulk/BoardDeleteDialog.vue';
+import localeUtils from '@/components/utils/i18n';
 
 let mountedWrappers = [];
 
@@ -49,7 +51,16 @@ async function settle() {
 }
 
 function mountDialog() {
+  const localVue = createLocalVue();
+  localVue.use(VueI18n);
+  const i18n = new VueI18n({
+    locale: 'ko',
+    fallbackLocale: 'ko',
+    messages: localeUtils.messages,
+  });
   const wrapper = shallowMount(BoardDeleteDialog, {
+    localVue,
+    i18n,
     propsData: { board: { id: 7, name: 'Reference' } },
   });
   mountedWrappers.push(wrapper);
@@ -75,6 +86,50 @@ describe('BoardDeleteDialog', () => {
   afterEach(() => {
     mountedWrappers.forEach(wrapper => wrapper.destroy());
     mountedWrappers = [];
+  });
+
+  it('renders the board deletion preview and ready actions in Korean', async () => {
+    const preview = deferred();
+    API.Board.deletePreview.mockReturnValueOnce(preview.promise);
+    const wrapper = mountDialog();
+
+    expect(wrapper.find('.modal-card-title').text()).toBe('보드 삭제');
+    expect(wrapper.text()).toContain('삭제할 항목을 확인하는 중입니다…');
+
+    preview.resolve({
+      data: {
+        exclusive_owned_count: 2,
+        shared_owned_count: 3,
+        non_owned_count: 4,
+      },
+    });
+    await settle();
+
+    expect(wrapper.find('[data-test="board-delete-preview-exclusive"]').text())
+      .toBe('삭제 가능한 전용 Pin: 2개');
+    expect(wrapper.find('[data-test="board-delete-preview-shared"]').text())
+      .toBe('다른 보드와 공유되어 보존할 내 Pin: 3개');
+    expect(wrapper.find('[data-test="board-delete-preview-non-owned"]').text())
+      .toBe('다른 사용자의 Pin이어서 보존: 4개');
+    expect(wrapper.find('[data-test="board-delete-cancel"]').text()).toBe('취소');
+    expect(wrapper.find('[data-test="board-delete-only"]').text()).toBe('보드만 삭제');
+    expect(wrapper.find('[data-test="board-delete-with-pins"]').text())
+      .toBe('보드와 전용 Pin 2개 삭제');
+  });
+
+  it('shows a localized selection error without exposing a server error code', async () => {
+    API.Pin.fetchSelectionIds.mockRejectedValueOnce({
+      response: { data: { code: 'internal_selection_detail' } },
+    });
+    const wrapper = mountDialog();
+    await settle();
+
+    await wrapper.find('[data-test="board-delete-with-pins"]').trigger('click');
+    await settle();
+
+    const error = wrapper.find('[data-test="board-delete-selection-error"]').text();
+    expect(error).toBe('전용 Pin 목록을 불러오지 못했습니다.');
+    expect(error).not.toContain('internal_selection_detail');
   });
 
   it('does not mutate pins or the board before a valid preview and confirmation', async () => {

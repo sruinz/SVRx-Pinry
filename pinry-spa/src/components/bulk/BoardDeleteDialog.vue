@@ -2,22 +2,28 @@
   <div class="board-delete-modal">
     <div class="modal-card" style="width: auto">
       <header class="modal-card-head">
-        <p class="modal-card-title">Delete board</p>
+        <p class="modal-card-title">{{ $t('boardDeleteTitle') }}</p>
       </header>
       <section class="modal-card-body">
-        <p v-if="phase === 'loading-preview'">Loading deletion preview…</p>
+        <p v-if="phase === 'loading-preview'">{{ $t('boardDeleteLoadingPreview') }}</p>
         <p v-if="phase === 'failed-preview'" data-test="board-delete-preview-error">
-          Failed to load the deletion preview.
+          {{ $t('boardDeletePreviewError') }}
         </p>
         <div v-if="preview" data-test="board-delete-preview">
           <p data-test="board-delete-preview-exclusive">
-            Exclusive owned pins: {{ preview.exclusive_owned_count }}
+            {{ $t('boardDeletePreviewExclusive', {
+              count: preview.exclusive_owned_count,
+            }) }}
           </p>
           <p data-test="board-delete-preview-shared">
-            Shared owned pins preserved: {{ preview.shared_owned_count }}
+            {{ $t('boardDeletePreviewShared', {
+              count: preview.shared_owned_count,
+            }) }}
           </p>
           <p data-test="board-delete-preview-non-owned">
-            Non-owned pins preserved: {{ preview.non_owned_count }}
+            {{ $t('boardDeletePreviewNonOwned', {
+              count: preview.non_owned_count,
+            }) }}
           </p>
         </div>
         <p
@@ -25,30 +31,30 @@
           class="has-text-danger"
           data-test="board-delete-selection-error"
         >
-          {{ selectionError }}
+          {{ $t(selectionError) }}
         </p>
         <p v-if="progress" data-test="board-delete-progress" aria-live="polite">
-          {{ progress.completed }}/{{ progress.total }}
+          {{ $t('bulkPinProgress', progress) }}
         </p>
         <p
           v-if="actualExclusiveCount !== null"
           data-test="board-delete-actual-count"
         >
-          Exclusive pins at confirmation: {{ actualExclusiveCount }}
+          {{ $t('boardDeleteActualExclusiveCount', { count: actualExclusiveCount }) }}
         </p>
         <p
           v-if="actualExclusiveCount !== null"
           data-test="board-delete-result"
           aria-live="polite"
         >
-          Deleted: {{ deleted }}; preserved: {{ preserved }}
+          {{ $t('boardDeleteResult', { deleted, preserved }) }}
         </p>
         <p
           v-if="phase === 'failed-board-delete'"
           class="has-text-danger"
           data-test="board-delete-error"
         >
-          Pin processing finished, but the board could not be deleted.
+          {{ $t('boardDeleteError') }}
         </p>
       </section>
       <footer class="modal-card-foot">
@@ -59,7 +65,7 @@
           data-test="board-delete-cancel"
           @click="cancel"
         >
-          Cancel
+          {{ $t('boardDeleteCancel') }}
         </button>
         <button
           v-if="phase === 'ready'"
@@ -68,7 +74,7 @@
           data-test="board-delete-only"
           @click="deleteBoardOnly"
         >
-          Delete board only
+          {{ $t('boardDeleteOnly') }}
         </button>
         <button
           v-if="phase === 'ready'"
@@ -78,7 +84,9 @@
           :disabled="!canDeleteExclusivePins"
           @click="deleteExclusivePins"
         >
-          Delete board and exclusive pins
+          {{ $t('boardDeleteWithExclusivePins', {
+            count: preview.exclusive_owned_count,
+          }) }}
         </button>
         <button
           v-if="phase === 'failed-retry-refresh'"
@@ -87,7 +95,7 @@
           data-test="board-delete-retry-refresh"
           @click="retryRefresh"
         >
-          Retry refresh
+          {{ $t('boardDeleteRetryRefresh') }}
         </button>
         <button
           v-if="showRetry"
@@ -97,7 +105,7 @@
           :disabled="phase === 'retrying-pins' && !retryReady"
           @click="retry"
         >
-          Retry
+          {{ $t('bulkPinRetry') }}
         </button>
         <button
           v-if="canClose"
@@ -106,7 +114,7 @@
           data-test="board-delete-close"
           @click="close"
         >
-          Close
+          {{ $t('closeButton') }}
         </button>
       </footer>
     </div>
@@ -306,8 +314,8 @@ export default {
             this.selectionBlocked = oversized;
             this.phase = 'ready';
             this.selectionError = oversized
-              ? 'selection_too_large'
-              : 'Invalid exclusive pin selection.';
+              ? 'bulkPinSelectionTooLarge'
+              : 'boardDeleteSelectionInvalid';
             return null;
           }
           this.selectedIds = rows.map(row => row.id);
@@ -321,7 +329,9 @@ export default {
             ? error.response.data.code
             : null;
           this.selectionBlocked = code === 'selection_too_large';
-          this.selectionError = code || 'Failed to load exclusive pins.';
+          this.selectionError = code === 'selection_too_large'
+            ? 'bulkPinSelectionTooLarge'
+            : 'boardDeleteSelectionLoadError';
           this.phase = 'ready';
           return null;
         },
@@ -373,7 +383,7 @@ export default {
           if (!this.isCurrent(token)) return;
           const rows = validatedExclusiveSelection(response);
           if (rows === null) {
-            this.selectionError = 'Invalid exclusive pin selection.';
+            this.selectionError = 'boardDeleteSelectionInvalid';
             this.retryReady = false;
             this.phase = 'failed-retry-refresh';
             return;
@@ -387,7 +397,9 @@ export default {
           const code = error && error.response && error.response.data
             ? error.response.data.code
             : null;
-          this.selectionError = code || 'Failed to refresh exclusive pins.';
+          this.selectionError = code === 'selection_too_large'
+            ? 'bulkPinSelectionTooLarge'
+            : 'boardDeleteSelectionRefreshError';
           this.retryReady = false;
           this.phase = 'failed-retry-refresh';
         },
