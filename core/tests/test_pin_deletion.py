@@ -22,7 +22,7 @@ from rest_framework import status
 from rest_framework.test import APITransactionTestCase
 
 from core.admin import PinAdmin
-from core.models import BatchImportItem, Image, MediaAsset, Pin
+from core.models import BatchImportItem, Board, Image, MediaAsset, Pin
 from core.services.idempotency import IdempotencyStore, StoredError
 from core.services.media_storage import MediaStorage
 from core.services.pin_import import ImportMetadata, PinImportService
@@ -261,6 +261,293 @@ class PinMediaLifecycleTest(
         self.assertEqual(pending.attempts, 1)
         self.assertEqual(pending.last_error, "OSError")
         return pending
+
+    def test_conditional_delete_preserves_pin_shared_after_selection(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        source = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-shared-source",
+        )
+        other_board = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-shared-other",
+        )
+        source.pins.add(pin)
+        other_board.pins.add(pin)
+        files_before = self._assert_four_image_files(image)
+        directories = self._asset_directories(image)
+
+        result = pin.delete_if_exclusive_to_board(
+            self.owner.pk,
+            source.pk,
+        )
+
+        self.assertEqual(result, ("preserved", "shared_pin"))
+        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(
+            Thumbnail.objects.filter(original_id=image.pk).count(),
+            3,
+        )
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name),
+            files_before,
+        )
+        self.assertTrue(all(path.is_dir() for path in directories))
+
+    def test_conditional_delete_uses_autocommit(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        asset = self._register_asset(image)
+        source = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-autocommit-source",
+        )
+        source.pins.add(pin)
+        files_before = self._assert_four_image_files(image)
+
+        with transaction.atomic():
+            with self.assertRaisesMessage(
+                RuntimeError,
+                "registered_pin_delete_requires_autocommit",
+            ):
+                pin.delete_if_exclusive_to_board(
+                    self.owner.pk,
+                    source.pk,
+                )
+
+        self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name),
+            files_before,
+        )
+
+    def test_conditional_delete_exclusive_registered_pin_removes_media(self):
+        image = create_image()
+        image_id = image.pk
+        pin = create_pin(self.owner, image, [])
+        pin_id = pin.pk
+        asset = self._register_asset(image)
+        source = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-exclusive-source",
+        )
+        source.pins.add(pin)
+        self._assert_four_image_files(image)
+        directories = self._asset_directories(image)
+
+        result = pin.delete_if_exclusive_to_board(
+            self.owner.pk,
+            source.pk,
+        )
+
+        self.assertEqual(result, ("deleted", None))
+        self.assertIsNone(pin.pk)
+        self.assertFalse(Pin.objects.filter(pk=pin_id).exists())
+        self.assertFalse(Image.objects.filter(pk=image_id).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertFalse(
+            Thumbnail.objects.filter(original_id=image_id).exists()
+        )
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+        self.assertTrue(all(not path.exists() for path in directories))
+        root = Path(self.temporary_media.name)
+        self.assertTrue((root / "originals").is_dir())
+        self.assertTrue((root / "derivatives").is_dir())
+
+    def test_conditional_delete_preserves_media_shared_by_another_pin(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        pin_id = pin.pk
+        other_pin = create_pin(self.other_user, image, [])
+        asset = self._register_asset(image)
+        source = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-shared-image-source",
+        )
+        source.pins.add(pin)
+        files_before = self._assert_four_image_files(image)
+        directories = self._asset_directories(image)
+
+        result = pin.delete_if_exclusive_to_board(
+            self.owner.pk,
+            source.pk,
+        )
+
+        self.assertEqual(result, ("deleted", None))
+        self.assertFalse(Pin.objects.filter(pk=pin_id).exists())
+        self.assertTrue(Pin.objects.filter(pk=other_pin.pk).exists())
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(
+            Thumbnail.objects.filter(original_id=image.pk).count(),
+            3,
+        )
+        self.assertEqual(
+            media_snapshot(self.temporary_media.name),
+            files_before,
+        )
+        self.assertTrue(all(path.is_dir() for path in directories))
+
+    def test_conditional_delete_exclusive_legacy_pin_removes_media(self):
+        image = create_image()
+        image_id = image.pk
+        pin = create_pin(self.owner, image, [])
+        pin_id = pin.pk
+        source = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-legacy-source",
+        )
+        source.pins.add(pin)
+        self._assert_four_image_files(image)
+        directories = self._asset_directories(image)
+
+        result = pin.delete_if_exclusive_to_board(
+            self.owner.pk,
+            source.pk,
+        )
+
+        self.assertEqual(result, ("deleted", None))
+        self.assertIsNone(pin.pk)
+        self.assertFalse(Pin.objects.filter(pk=pin_id).exists())
+        self.assertFalse(Image.objects.filter(pk=image_id).exists())
+        self.assertFalse(
+            Thumbnail.objects.filter(original_id=image_id).exists()
+        )
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
+        self.assertTrue(all(not path.exists() for path in directories))
+
+    @skipUnless(
+        connection.vendor == "sqlite",
+        "SQLite file database write serialization observation",
+    )
+    def test_conditional_delete_serializes_competing_board_add(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        pin_id = pin.pk
+        self._register_asset(image)
+        source = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-race-source",
+        )
+        target = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-race-target",
+        )
+        source.pins.add(pin)
+        through = Board.pins.through
+        through_table = connection.ops.quote_name(through._meta.db_table)
+        board_column = connection.ops.quote_name(
+            through._meta.get_field("board").column
+        )
+        pin_column = connection.ops.quote_name(
+            through._meta.get_field("pin").column
+        )
+        insert_membership = "INSERT INTO {} ({}, {}) VALUES (%s, %s)".format(
+            through_table,
+            board_column,
+            pin_column,
+        )
+        start = threading.Barrier(2)
+        pin_row_deleted = threading.Event()
+        add_started = threading.Event()
+        add_finished = threading.Event()
+        release_delete = threading.Event()
+        outcomes = queue.Queue()
+        original_delete = Pin.delete
+
+        def pause_after_managed_pin_delete(instance, *args, **kwargs):
+            result = original_delete(instance, *args, **kwargs)
+            if getattr(instance, "_media_delete_managed", False):
+                pin_row_deleted.set()
+                if not release_delete.wait(5):
+                    raise AssertionError("conditional delete was not released")
+            return result
+
+        def delete_exclusive_pin():
+            close_old_connections()
+            try:
+                start.wait(timeout=5)
+                current = Pin.objects.get(pk=pin_id)
+                result = current.delete_if_exclusive_to_board(
+                    self.owner.pk,
+                    source.pk,
+                )
+                outcomes.put(("delete", result))
+            except BaseException as error:
+                outcomes.put((
+                    "error",
+                    ("delete", error, traceback.format_exc()),
+                ))
+            finally:
+                connections["default"].close()
+
+        def add_pin_to_other_board():
+            close_old_connections()
+            writer_connection = connections["default"]
+            try:
+                with writer_connection.cursor() as cursor:
+                    cursor.execute("PRAGMA busy_timeout = 5000")
+                start.wait(timeout=5)
+                if not pin_row_deleted.wait(5):
+                    raise AssertionError("conditional delete did not write")
+                add_started.set()
+                with writer_connection.cursor() as cursor:
+                    cursor.execute(
+                        insert_membership,
+                        [target.pk, pin_id],
+                    )
+                outcomes.put(("add", "committed"))
+            except BaseException as error:
+                outcomes.put(("add", error.__class__.__name__))
+            finally:
+                writer_connection.close()
+                add_finished.set()
+
+        with mock.patch.object(
+            Pin,
+            "delete",
+            new=pause_after_managed_pin_delete,
+        ):
+            workers = [
+                threading.Thread(target=delete_exclusive_pin),
+                threading.Thread(target=add_pin_to_other_board),
+            ]
+            for current in workers:
+                current.start()
+            self.assertTrue(pin_row_deleted.wait(5))
+            self.assertTrue(add_started.wait(5))
+            add_finished_while_locked = add_finished.wait(0.2)
+            try:
+                release_delete.set()
+            finally:
+                for current in workers:
+                    current.join(timeout=10)
+
+        self.assertFalse(any(current.is_alive() for current in workers))
+        collected = [outcomes.get(timeout=1) for _worker in workers]
+        errors = [value for kind, value in collected if kind == "error"]
+        self.assertEqual(errors, [])
+        delete_results = [
+            value for kind, value in collected if kind == "delete"
+        ]
+        add_results = [value for kind, value in collected if kind == "add"]
+        self.assertFalse(add_finished_while_locked, add_results)
+        self.assertEqual(delete_results, [("deleted", None)])
+        self.assertEqual(add_results, ["IntegrityError"])
+        self.assertFalse(Pin.objects.filter(pk=pin_id).exists())
+        self.assertFalse(
+            through.objects.filter(
+                board_id=target.pk,
+                pin_id=pin_id,
+            ).exists()
+        )
+        self.assertFalse(target.pins.filter(pk=pin_id).exists())
 
     def test_direct_delete_preserves_shared_image_rows_files_and_uuid_directories(
         self,

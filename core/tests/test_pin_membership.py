@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-from django.db import DEFAULT_DB_ALIAS
-from django.test import TestCase
+from django.db import DEFAULT_DB_ALIAS, connection, transaction
+from django.test import TestCase, TransactionTestCase
 import mock
 
 from core.models import Board, Pin
@@ -10,6 +10,7 @@ from core.services.pin_membership import (
     PinMembershipService,
 )
 from core.tests.helpers import create_image, create_user
+from django_images.test_helpers import TemporaryMediaMixin
 
 
 class _RecordingQuerySet(object):
@@ -297,3 +298,122 @@ class PinMembershipServiceTests(TestCase):
         self.assertFalse(
             through.objects.filter(board_id=self.source.pk).exists()
         )
+
+
+class PinConditionalDeletionTests(TemporaryMediaMixin, TransactionTestCase):
+    def setUp(self):
+        super(PinConditionalDeletionTests, self).setUp()
+        self.owner = create_user("conditional-owner")
+        self.other_user = create_user("conditional-other")
+        self.source = Board.objects.create(
+            submitter=self.owner,
+            name="conditional-source",
+        )
+        self.pin = Pin.objects.create(
+            submitter=self.owner,
+            image=create_image(),
+        )
+        self.source.pins.add(self.pin)
+
+    def test_conditional_delete_calls_common_board_pin_lock(self):
+        calls = []
+        source_id = self.source.pk
+        pin_id = self.pin.pk
+        real_lock = PinMembershipService.lock_source_board_and_pin
+
+        def record_lock(source_board_id, pin_id, using):
+            calls.append((
+                source_board_id,
+                pin_id,
+                using,
+                connection.in_atomic_block,
+            ))
+            return real_lock(source_board_id, pin_id, using)
+
+        with mock.patch.object(
+            PinMembershipService,
+            "lock_source_board_and_pin",
+            side_effect=record_lock,
+        ):
+            result = self.pin.delete_if_exclusive_to_board(
+                self.owner.pk,
+                self.source.pk,
+            )
+
+        self.assertEqual(result, ("deleted", None))
+        self.assertEqual(
+            calls,
+            [(source_id, pin_id, "default", True)],
+        )
+
+    def test_conditional_delete_normalizes_missing_source_board(self):
+        source_id = self.source.pk
+        pin_id = self.pin.pk
+        self.source.delete()
+
+        result = self.pin.delete_if_exclusive_to_board(
+            self.owner.pk,
+            source_id,
+        )
+
+        self.assertEqual(result, ("preserved", "source_membership_changed"))
+        self.assertTrue(Pin.objects.filter(pk=pin_id).exists())
+
+    def test_conditional_delete_normalizes_missing_pin(self):
+        source_id = self.source.pk
+        pin_id = self.pin.pk
+        Pin.objects.filter(pk=pin_id).delete()
+
+        result = self.pin.delete_if_exclusive_to_board(
+            self.owner.pk,
+            source_id,
+        )
+
+        self.assertEqual(result, ("preserved", "source_membership_changed"))
+        self.assertFalse(Pin.objects.filter(pk=pin_id).exists())
+
+    def test_conditional_delete_normalizes_missing_source_membership(self):
+        pin_id = self.pin.pk
+        self.source.pins.remove(self.pin)
+
+        result = self.pin.delete_if_exclusive_to_board(
+            self.owner.pk,
+            self.source.pk,
+        )
+
+        self.assertEqual(result, ("preserved", "source_membership_changed"))
+        self.assertTrue(Pin.objects.filter(pk=pin_id).exists())
+
+    def test_conditional_delete_preserves_foreign_pin_on_source(self):
+        self.source.pins.remove(self.pin)
+        foreign_pin = Pin.objects.create(
+            submitter=self.other_user,
+            image=create_image(),
+        )
+        self.source.pins.add(foreign_pin)
+
+        result = foreign_pin.delete_if_exclusive_to_board(
+            self.owner.pk,
+            self.source.pk,
+        )
+
+        self.assertEqual(result, ("preserved", "non_owned_pin"))
+        self.assertTrue(Pin.objects.filter(pk=foreign_pin.pk).exists())
+        self.assertTrue(
+            self.source.pins.filter(pk=foreign_pin.pk).exists()
+        )
+
+    def test_conditional_legacy_delete_requires_autocommit(self):
+        pin_id = self.pin.pk
+
+        with transaction.atomic():
+            with self.assertRaisesMessage(
+                RuntimeError,
+                "registered_pin_delete_requires_autocommit",
+            ):
+                self.pin.delete_if_exclusive_to_board(
+                    self.owner.pk,
+                    self.source.pk,
+                )
+
+        self.assertTrue(Pin.objects.filter(pk=pin_id).exists())

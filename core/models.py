@@ -183,6 +183,24 @@ class Pin(models.Model):
             keep_parents=keep_parents,
         )
 
+    def delete_if_exclusive_to_board(
+        self,
+        submitter_id,
+        source_board_id,
+        using=None,
+        keep_parents=False,
+    ):
+        condition = {
+            "submitter_id": submitter_id,
+            "source_board_id": source_board_id,
+        }
+        return _delete_pin_with_registry_lock(
+            self,
+            using=using,
+            keep_parents=keep_parents,
+            exclusive_condition=condition,
+        )
+
 
 class BatchImportItem(models.Model):
     PENDING = "pending"
@@ -264,8 +282,151 @@ def delete_unreferenced_pin_image(sender, instance, **kwargs):
     transaction.on_commit(delete_after_pin_commit, using=using)
 
 
-def _delete_pin_with_registry_lock(pin, using=None, keep_parents=False):
+def _locked_exclusive_pin_status(pin, condition, using):
+    from core.services.pin_membership import PinMembershipService
+
+    source_board, current_pin = (
+        PinMembershipService.lock_source_board_and_pin(
+            condition["source_board_id"],
+            pin.pk,
+            using,
+        )
+    )
+    if source_board is None or current_pin is None:
+        return current_pin, ("preserved", "source_membership_changed")
+
+    through = Board.pins.through
+    source_membership = through.objects.using(using).filter(
+        board_id=condition["source_board_id"],
+        pin_id=current_pin.pk,
+    )
+    if not source_membership.exists():
+        return current_pin, ("preserved", "source_membership_changed")
+    if current_pin.submitter_id != condition["submitter_id"]:
+        return current_pin, ("preserved", "non_owned_pin")
+
+    board_ids = list(
+        through.objects.using(using)
+        .filter(pin_id=current_pin.pk)
+        .order_by("board_id")
+        .values_list("board_id", flat=True)[:2]
+    )
+    if len(board_ids) > 1:
+        return current_pin, ("preserved", "shared_pin")
+    return current_pin, None
+
+
+def _require_pin_delete_autocommit(using):
+    database = connections[using]
+    if not database.get_autocommit() or database.in_atomic_block:
+        raise RuntimeError("registered_pin_delete_requires_autocommit")
+
+
+def _delete_legacy_pin_with_condition(
+    pin,
+    condition,
+    using,
+    keep_parents,
+):
+    _require_pin_delete_autocommit(using)
+    with transaction.atomic(using=using):
+        current_pin, condition_result = _locked_exclusive_pin_status(
+            pin,
+            condition,
+            using,
+        )
+        if condition_result is not None:
+            return condition_result
+        super(Pin, current_pin).delete(
+            using=using,
+            keep_parents=keep_parents,
+        )
+    pin.pk = None
+    return "deleted", None
+
+
+def _lock_registered_asset(registry, using):
+    return (
+        MediaAsset.objects.select_for_update()
+        .using(using)
+        .filter(
+            pk=registry["pk"],
+            image_id=registry["image_id"],
+        )
+        .first()
+    )
+
+
+def _delete_locked_registered_pin(
+    pin,
+    registry,
+    media_manifest,
+    using,
+    keep_parents,
+    exclusive_condition,
+):
+    if exclusive_condition is not None:
+        current_pin, condition_result = _locked_exclusive_pin_status(
+            pin,
+            exclusive_condition,
+            using,
+        )
+        if condition_result is not None:
+            return condition_result, False
+        current_registry = _lock_registered_asset(registry, using)
+    else:
+        current_registry = _lock_registered_asset(registry, using)
+        current_pin = (
+            Pin.objects.select_for_update()
+            .using(using)
+            .filter(pk=pin.pk, image_id=registry["image_id"])
+            .first()
+        )
+    image = (
+        BaseImage.objects.select_for_update()
+        .using(using)
+        .filter(pk=registry["image_id"])
+        .first()
+    )
+    current_manifest = _registered_media_manifest(
+        image,
+        using,
+        lock_thumbnails=True,
+    )
+    if (
+        current_registry is None
+        or current_pin is None
+        or current_pin.image_id != registry["image_id"]
+        or image is None
+        or current_registry.submitter_id != registry["submitter_id"]
+        or current_registry.content_sha256 != registry["content_sha256"]
+        or current_manifest != media_manifest
+    ):
+        raise RuntimeError("registered_media_identity_changed")
+
+    current_pin._media_delete_managed = True
+    delete_result = current_pin.delete(
+        using=using,
+        keep_parents=keep_parents,
+    )
+    if not Pin.objects.filter(
+        image_id=registry["image_id"]
+    ).using(using).exists():
+        image.delete(using=using)
+    if exclusive_condition is not None:
+        return ("deleted", None), True
+    return delete_result, True
+
+
+def _delete_pin_with_registry_lock(
+    pin,
+    using=None,
+    keep_parents=False,
+    exclusive_condition=None,
+):
     if pin.pk is None:
+        if exclusive_condition is not None:
+            return "preserved", "source_membership_changed"
         return super(Pin, pin).delete(
             using=using,
             keep_parents=keep_parents,
@@ -283,6 +444,13 @@ def _delete_pin_with_registry_lock(pin, using=None, keep_parents=False):
         .first()
     )
     if registry is None:
+        if exclusive_condition is not None:
+            return _delete_legacy_pin_with_condition(
+                pin,
+                exclusive_condition,
+                database_alias,
+                keep_parents,
+            )
         return super(Pin, pin).delete(
             using=database_alias,
             keep_parents=keep_parents,
@@ -299,12 +467,11 @@ def _delete_pin_with_registry_lock(pin, using=None, keep_parents=False):
     if media_manifest is None:
         raise RuntimeError("registered_media_identity_changed")
 
-    database = connections[database_alias]
-    if not database.get_autocommit() or database.in_atomic_block:
-        raise RuntimeError("registered_pin_delete_requires_autocommit")
+    _require_pin_delete_autocommit(database_alias)
 
     root_directory = open_media_root(settings.MEDIA_ROOT)
     result = None
+    deleted = False
     commit_marker = [False]
     try:
         clock = time.monotonic
@@ -321,65 +488,29 @@ def _delete_pin_with_registry_lock(pin, using=None, keep_parents=False):
                     lambda: commit_marker.__setitem__(0, True),
                     using=database_alias,
                 )
-                current_registry = (
-                    MediaAsset.objects.select_for_update()
-                    .using(database_alias)
-                    .filter(
-                        pk=registry["pk"],
-                        image_id=registry["image_id"],
-                    )
-                    .first()
-                )
-                current_pin = (
-                    Pin.objects.select_for_update()
-                    .using(database_alias)
-                    .filter(pk=pin.pk, image_id=registry["image_id"])
-                    .first()
-                )
-                image = (
-                    BaseImage.objects.select_for_update()
-                    .using(database_alias)
-                    .filter(pk=registry["image_id"])
-                    .first()
-                )
-                current_manifest = _registered_media_manifest(
-                    image,
+                result, deleted = _delete_locked_registered_pin(
+                    pin,
+                    registry,
+                    media_manifest,
                     database_alias,
-                    lock_thumbnails=True,
+                    keep_parents,
+                    exclusive_condition,
                 )
-                if (
-                    current_registry is None
-                    or current_pin is None
-                    or image is None
-                    or current_registry.submitter_id
-                    != registry["submitter_id"]
-                    or current_registry.content_sha256
-                    != registry["content_sha256"]
-                    or current_manifest != media_manifest
-                ):
-                    raise RuntimeError("registered_media_identity_changed")
-                current_pin._media_delete_managed = True
-                result = current_pin.delete(
-                    using=database_alias,
-                    keep_parents=keep_parents,
-                )
-                if not Pin.objects.filter(
-                    image_id=registry["image_id"]
-                ).using(database_alias).exists():
-                    image.delete(using=database_alias)
     except BaseException as error:
         try:
             root_directory.close()
         except BaseException:
             pass
         if commit_marker[0]:
-            pin.pk = None
+            if deleted:
+                pin.pk = None
             if isinstance(error, Exception):
                 _log_pin_image_cleanup_failure(registry["image_id"], error)
                 return result
         raise
 
-    pin.pk = None
+    if deleted:
+        pin.pk = None
     try:
         root_directory.close()
     except Exception as error:
