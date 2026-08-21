@@ -8,7 +8,14 @@
         :loaded-count="blocks.length"
         :scope="selection.scope"
         :all-count="selection.allCount"
-        :can-modify="canModifySelection"
+        :show-add-to-board="isMyPinsRoute"
+        :can-add-to-board="canUseOwnedPinActions"
+        :show-move="isOwnedBoardRoute"
+        :can-move="isOwnedBoardRoute"
+        :show-edit="true"
+        :can-edit="canUseOwnedPinActions"
+        :show-delete="true"
+        :can-delete="canUseOwnedPinActions"
         :operation-in-flight="selection.operationInFlight"
         :announcement="selectionAnnouncement"
         @enter="enterSelection"
@@ -185,6 +192,9 @@ export default {
   name: 'pins',
   beforeCreate() {
     this.selectionModel = new PinSelection();
+    this.requestGeneration = 0;
+    this.selectionRequestToken = 0;
+    this.isDestroyed = false;
   },
   components: {
     loadingSpinner,
@@ -213,12 +223,17 @@ export default {
     },
   },
   computed: {
-    canManagePins() {
+    isMyPinsRoute() {
       if (!this.metaReady.user || !this.editorMeta.user.loggedIn) return false;
       const { username } = this.editorMeta.user.meta;
-      if (this.pinFilters.userFilter) {
-        return this.pinFilters.userFilter === username;
-      }
+      return Boolean(
+        this.pinFilters.userFilter
+        && this.pinFilters.userFilter === username,
+      );
+    },
+    isOwnedBoardRoute() {
+      if (!this.metaReady.user || !this.editorMeta.user.loggedIn) return false;
+      const { username } = this.editorMeta.user.meta;
       const { submitter } = this.editorMeta.currentBoard;
       return Boolean(
         this.pinFilters.boardFilter
@@ -227,13 +242,16 @@ export default {
         && submitter.username === username,
       );
     },
+    canManagePins() {
+      return this.isMyPinsRoute || this.isOwnedBoardRoute;
+    },
     hasNonOwnedSelection() {
       return this.selection.selectedIds.some(
         id => this.selection.ownershipById[id] !== true,
       );
     },
-    canModifySelection() {
-      return this.selection.selectedIds.length > 0 && !this.hasNonOwnedSelection;
+    canUseOwnedPinActions() {
+      return !this.hasNonOwnedSelection;
     },
     selectionAnnouncement() {
       if (this.selection.result && this.selection.result.code === 'selection_too_large') {
@@ -248,6 +266,32 @@ export default {
     },
   },
   methods: {
+    captureFilterSnapshot() {
+      return {
+        tagFilter: this.pinFilters.tagFilter,
+        userFilter: this.pinFilters.userFilter,
+        boardFilter: this.pinFilters.boardFilter,
+        idFilter: this.pinFilters.idFilter,
+      };
+    },
+    isRequestCurrent(generation, filters) {
+      if (this.isDestroyed || this.requestGeneration !== generation) return false;
+      const current = this.pinFilters;
+      return current.tagFilter === filters.tagFilter
+        && current.userFilter === filters.userFilter
+        && current.boardFilter === filters.boardFilter
+        && current.idFilter === filters.idFilter;
+    },
+    invalidateSelectionRequest() {
+      this.selectionRequestToken += 1;
+      if (this.selection) this.selection.operationInFlight = false;
+    },
+    isSelectionRequestCurrent(token, model, generation, filters) {
+      return this.selection.active
+        && this.selectionRequestToken === token
+        && this.selectionModel === model
+        && this.isRequestCurrent(generation, filters);
+    },
     updateSelection(snapshot, extra = {}) {
       const ownedCount = snapshot.selectedIds.filter(
         id => snapshot.ownershipById[id] === true,
@@ -278,9 +322,11 @@ export default {
       });
     },
     exitSelection() {
+      this.invalidateSelectionRequest();
       this.updateSelection(this.selectionModel.selectLoaded([]), {
         active: false,
         allCount: 0,
+        operationInFlight: false,
         result: null,
       });
     },
@@ -291,6 +337,7 @@ export default {
       });
     },
     selectLoadedPins() {
+      if (this.selection.operationInFlight) return;
       this.updateSelection(
         this.selectionModel.selectLoaded(this.blocks.map(item => item.id)),
         { allCount: 0, result: null },
@@ -298,12 +345,18 @@ export default {
     },
     selectAllPins() {
       if (this.selection.operationInFlight) return;
+      const token = this.selectionRequestToken + 1;
+      const model = this.selectionModel;
+      const generation = this.requestGeneration;
+      const filters = this.captureFilterSnapshot();
+      this.selectionRequestToken = token;
       this.selection.operationInFlight = true;
       this.selection.result = null;
       API.Pin.fetchSelectionIds({
-        boardId: this.pinFilters.boardFilter || null,
+        boardId: filters.boardFilter || null,
       }).then(
         (response) => {
+          if (!this.isSelectionRequestCurrent(token, model, generation, filters)) return;
           const { count, results } = response.data;
           if (!Number.isInteger(count) || !Array.isArray(results) || count !== results.length) {
             throw new Error('invalid_selection_response');
@@ -313,15 +366,19 @@ export default {
           this.updateSelection(snapshot, { allCount: count, result: null });
         },
         (error) => {
+          if (!this.isSelectionRequestCurrent(token, model, generation, filters)) return;
           const code = error && error.response && error.response.data
             ? error.response.data.code
             : 'selection_failed';
           this.selection.result = { code };
         },
       ).catch(() => {
+        if (!this.isSelectionRequestCurrent(token, model, generation, filters)) return;
         this.selection.result = { code: 'selection_failed' };
       }).then(() => {
-        this.selection.operationInFlight = false;
+        if (this.isSelectionRequestCurrent(token, model, generation, filters)) {
+          this.selection.operationInFlight = false;
+        }
       });
     },
     isPinSelected(id) {
@@ -330,6 +387,7 @@ export default {
     togglePinSelection(id, event) {
       if (!this.selection.active) return;
       if (event) event.preventDefault();
+      if (this.selection.operationInFlight) return;
       this.updateSelection(this.selectionModel.toggle(id, {
         shiftKey: Boolean(event && event.shiftKey),
         ctrlKey: Boolean(event && event.ctrlKey),
@@ -447,13 +505,19 @@ export default {
       return true;
     },
     initialize() {
-      this.initializeMeta();
-      this.fetchMore(true);
+      const generation = this.requestGeneration;
+      const filters = this.captureFilterSnapshot();
+      this.initializeMeta(generation, filters);
+      this.fetchMore(true, generation, filters);
     },
-    initializeMeta() {
+    initializeMeta(
+      generation = this.requestGeneration,
+      filters = this.captureFilterSnapshot(),
+    ) {
       const self = this;
       API.User.fetchUserInfo().then(
         (user) => {
+          if (!self.isRequestCurrent(generation, filters)) return;
           if (user === null) {
             self.editorMeta.user.loggedIn = false;
             self.editorMeta.user.meta = {};
@@ -465,6 +529,7 @@ export default {
           self.syncLoadedSelection();
         },
         () => {
+          if (!self.isRequestCurrent(generation, filters)) return;
           self.editorMeta.user.loggedIn = false;
           self.editorMeta.user.meta = {};
           self.metaReady.user = true;
@@ -473,6 +538,8 @@ export default {
       );
     },
     reset() {
+      this.invalidateSelectionRequest();
+      this.requestGeneration += 1;
       const data = initialData();
       this.selectionModel = new PinSelection();
       Object.entries(data).forEach(
@@ -483,32 +550,40 @@ export default {
       );
       this.initialize();
     },
-    fetchMore(created) {
+    fetchMore(
+      created,
+      generation = this.requestGeneration,
+      filters = this.captureFilterSnapshot(),
+    ) {
+      if (!this.isRequestCurrent(generation, filters)) return;
       if (!this.shouldFetchMore(created)) {
         return;
       }
       this.status.loading = true;
       let promise;
-      if (this.pinFilters.tagFilter) {
-        promise = API.fetchPins(this.status.offset, this.pinFilters.tagFilter, null, null);
-      } else if (this.pinFilters.userFilter) {
-        promise = API.fetchPins(this.status.offset, null, this.pinFilters.userFilter, null);
-      } else if (this.pinFilters.boardFilter) {
-        const prevPromise = API.Board.get(this.pinFilters.boardFilter);
+      const { offset } = this.status;
+      if (filters.tagFilter) {
+        promise = API.fetchPins(offset, filters.tagFilter, null, null);
+      } else if (filters.userFilter) {
+        promise = API.fetchPins(offset, null, filters.userFilter, null);
+      } else if (filters.boardFilter) {
+        const prevPromise = API.Board.get(filters.boardFilter);
         promise = prevPromise.then(
           (resp) => {
+            if (!this.isRequestCurrent(generation, filters)) return null;
             this.editorMeta.currentBoard = resp.data;
             this.metaReady.board = true;
-            return API.fetchPins(this.status.offset, null, null, this.pinFilters.boardFilter);
+            return API.fetchPins(offset, null, null, filters.boardFilter);
           },
         );
-      } else if (this.pinFilters.idFilter) {
-        promise = API.fetchPin(this.pinFilters.idFilter);
+      } else if (filters.idFilter) {
+        promise = API.fetchPin(filters.idFilter);
       } else {
-        promise = API.fetchPins(this.status.offset);
+        promise = API.fetchPins(offset);
       }
       promise.then(
         (resp) => {
+          if (!resp || !this.isRequestCurrent(generation, filters)) return;
           const { results, next } = resp.data;
           let newBlocks = this.buildBlocks(results);
           newBlocks.forEach(
@@ -521,7 +596,11 @@ export default {
           this.status.hasNext = !(next === null);
           this.status.loading = false;
         },
-        () => { this.status.loading = false; },
+        () => {
+          if (this.isRequestCurrent(generation, filters)) {
+            this.status.loading = false;
+          }
+        },
       );
     },
     niceLinks,
@@ -533,6 +612,15 @@ export default {
     this.initialize();
   },
   beforeDestroy() {
+    this.invalidateSelectionRequest();
+    this.updateSelection(this.selectionModel.selectLoaded([]), {
+      active: false,
+      allCount: 0,
+      operationInFlight: false,
+      result: null,
+    });
+    this.isDestroyed = true;
+    this.requestGeneration += 1;
     document.removeEventListener('keydown', this.onDocumentKeydown);
   },
 };

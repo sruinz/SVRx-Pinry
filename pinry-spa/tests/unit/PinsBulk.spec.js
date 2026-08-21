@@ -53,13 +53,19 @@ function mountPins({
   authenticatedUsername = 'owner',
   boardRequest = null,
   pins = [pin(41), pin(40), pin(39)],
+  fetchPinsImplementation = null,
+  boardImplementation = null,
 } = {}) {
   mockAuthenticatedUsername = authenticatedUsername;
-  API.fetchPins.mockImplementation(() => page(pins));
-  API.Board.get.mockReturnValue(
-    boardRequest || Promise.resolve({
-      data: { id: pinFilters.boardFilter, submitter: { username: authenticatedUsername } },
-    }),
+  API.fetchPins.mockImplementation(
+    fetchPinsImplementation || (() => page(pins)),
+  );
+  API.Board.get.mockImplementation(
+    boardImplementation || (() => (
+      boardRequest || Promise.resolve({
+        data: { id: pinFilters.boardFilter, submitter: { username: authenticatedUsername } },
+      })
+    )),
   );
 
   const localVue = createLocalVue();
@@ -114,7 +120,14 @@ describe('PinBulkToolbar', () => {
         loadedCount: 3,
         scope: 'loaded',
         allCount: 0,
-        canModify: true,
+        showAddToBoard: true,
+        canAddToBoard: true,
+        showMove: true,
+        canMove: true,
+        showEdit: true,
+        canEdit: true,
+        showDelete: true,
+        canDelete: true,
         operationInFlight: false,
         announcement: '2 selected',
       },
@@ -153,6 +166,7 @@ describe('Pins selection mode', () => {
     API.fetchPins = jest.fn();
     API.fetchPin = jest.fn();
     API.Board.get = jest.fn();
+    API.User.fetchUserInfo = jest.fn();
     API.Pin.fetchSelectionIds = jest.fn();
   });
 
@@ -160,7 +174,9 @@ describe('Pins selection mode', () => {
     mountedPinWrappers.forEach((wrapper) => {
       wrapper.destroy();
     });
-    Pins.methods.initializeMeta.mockRestore();
+    if (Pins.methods.initializeMeta.mockRestore) {
+      Pins.methods.initializeMeta.mockRestore();
+    }
   });
 
   it('shows management only for the authenticated owner route', async () => {
@@ -199,6 +215,81 @@ describe('Pins selection mode', () => {
     await settle();
 
     expect(wrapper.find('[data-test="pin-selection-enter"]').exists()).toBe(false);
+  });
+
+  it('ignores an old owned-board response after a newer foreign board loads', async () => {
+    const oldBoard = deferred();
+    const currentBoard = deferred();
+    const wrapper = mountPins({
+      pinFilters: { boardFilter: 7 },
+      boardImplementation: boardId => (boardId === 7
+        ? oldBoard.promise
+        : currentBoard.promise),
+      fetchPinsImplementation: (offset, tagFilter, userFilter, boardFilter) => (
+        page([pin(boardFilter * 10, boardFilter === 7 ? 'owner' : 'other')])
+      ),
+    });
+    await wrapper.setProps({ pinFilters: { boardFilter: 8 } });
+    currentBoard.resolve({
+      data: { id: 8, submitter: { username: 'other' } },
+    });
+    await settle();
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([80]);
+    expect(wrapper.find('[data-test="pin-selection-enter"]').exists()).toBe(false);
+
+    oldBoard.resolve({
+      data: { id: 7, submitter: { username: 'owner' } },
+    });
+    await settle();
+
+    expect(API.fetchPins).toHaveBeenCalledTimes(1);
+    expect(API.fetchPins.mock.calls[0][3]).toBe(8);
+    expect(wrapper.vm.editorMeta.currentBoard.id).toBe(8);
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([80]);
+    expect(wrapper.find('[data-test="pin-selection-enter"]').exists()).toBe(false);
+  });
+
+  it('ignores an old page response after a newer route page loads', async () => {
+    const oldPage = deferred();
+    const currentPage = deferred();
+    let requestCount = 0;
+    const wrapper = mountPins({
+      fetchPinsImplementation: () => {
+        requestCount += 1;
+        return requestCount === 1 ? oldPage.promise : currentPage.promise;
+      },
+    });
+    await wrapper.setProps({ pinFilters: { userFilter: 'other' } });
+    currentPage.resolve({ data: { results: [pin(80, 'other')], next: null } });
+    await settle();
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([80]);
+
+    oldPage.resolve({ data: { results: [pin(41)], next: null } });
+    await settle();
+
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([80]);
+    expect(wrapper.vm.status.offset).toBe(1);
+  });
+
+  it('ignores old user metadata after a newer route metadata request resolves', async () => {
+    Pins.methods.initializeMeta.mockRestore();
+    const oldUser = deferred();
+    const currentUser = deferred();
+    API.User.fetchUserInfo
+      .mockReturnValueOnce(oldUser.promise)
+      .mockReturnValueOnce(currentUser.promise);
+    const wrapper = mountPins({ pinFilters: { userFilter: 'owner' } });
+    await wrapper.setProps({ pinFilters: { userFilter: 'other' } });
+    currentUser.resolve({ username: 'other' });
+    await settle();
+    expect(wrapper.vm.editorMeta.user.meta.username).toBe('other');
+    expect(wrapper.find('[data-test="pin-selection-enter"]').exists()).toBe(true);
+
+    oldUser.resolve({ username: 'owner' });
+    await settle();
+
+    expect(wrapper.vm.editorMeta.user.meta.username).toBe('other');
+    expect(wrapper.find('[data-test="pin-selection-enter"]').exists()).toBe(true);
   });
 
   it('keeps normal-mode image preview behavior', async () => {
@@ -359,16 +450,158 @@ describe('Pins selection mode', () => {
       .toContain('bulkPinSelectionTooLarge');
   });
 
-  it('fails closed for delete and update when a selected pin is not owned', async () => {
+  it('blocks card and keyboard selection changes while select-all is in flight', async () => {
+    const selectionRequest = deferred();
+    API.Pin.fetchSelectionIds.mockReturnValue(selectionRequest.promise);
+    const wrapper = mountPins();
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-card-41"]').trigger('click');
+    await wrapper.find('[data-test="pin-selection-select-all"]').trigger('click');
+    expect(wrapper.vm.selection.operationInFlight).toBe(true);
+
+    const checkbox = wrapper.find('[data-test="pin-selection-check-41"]');
+    await checkbox.trigger('click');
+    const card = wrapper.find('[data-test="pin-card-40"]');
+    await card.trigger('click');
+    await card.trigger('keydown', { key: 'Enter' });
+    dispatchKey(document, 'a', { ctrlKey: true });
+
+    expect(wrapper.vm.selection.selectedIds).toEqual([41]);
+    expect(checkbox.element.checked).toBe(true);
+  });
+
+  it('ignores a late select-all success after Escape exits selection mode', async () => {
+    const selectionRequest = deferred();
+    API.Pin.fetchSelectionIds.mockReturnValue(selectionRequest.promise);
+    const wrapper = mountPins();
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-card-41"]').trigger('click');
+    await wrapper.find('[data-test="pin-selection-select-all"]').trigger('click');
+
+    dispatchKey(document, 'Escape');
+    expect(wrapper.vm.selection).toMatchObject({
+      active: false,
+      selectedIds: [],
+      operationInFlight: false,
+      result: null,
+    });
+    selectionRequest.resolve({
+      data: { count: 1, results: [{ id: 41, owned: true }] },
+    });
+    await settle();
+
+    expect(wrapper.vm.selection).toMatchObject({
+      active: false,
+      selectedIds: [],
+      operationInFlight: false,
+      result: null,
+    });
+  });
+
+  it('ignores a late select-all failure after a route reset', async () => {
+    const selectionRequest = deferred();
+    API.Pin.fetchSelectionIds.mockReturnValue(selectionRequest.promise);
+    const wrapper = mountPins();
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-card-41"]').trigger('click');
+    await wrapper.find('[data-test="pin-selection-select-all"]').trigger('click');
+
+    await wrapper.setProps({ pinFilters: { userFilter: 'other' } });
+    await settle();
+    expect(wrapper.vm.selection).toMatchObject({
+      active: false,
+      selectedIds: [],
+      operationInFlight: false,
+      result: null,
+    });
+    selectionRequest.reject({
+      response: { status: 409, data: { code: 'selection_too_large' } },
+    });
+    await settle();
+
+    expect(wrapper.vm.selection).toMatchObject({
+      active: false,
+      selectedIds: [],
+      operationInFlight: false,
+      result: null,
+    });
+  });
+
+  it('ignores a late select-all success after destruction', async () => {
+    const selectionRequest = deferred();
+    API.Pin.fetchSelectionIds.mockReturnValue(selectionRequest.promise);
+    const wrapper = mountPins();
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-selection-select-all"]').trigger('click');
+
+    wrapper.destroy();
+    expect(wrapper.vm.selection).toMatchObject({
+      active: false,
+      selectedIds: [],
+      operationInFlight: false,
+      result: null,
+    });
+    selectionRequest.resolve({
+      data: { count: 1, results: [{ id: 41, owned: true }] },
+    });
+    await settle();
+
+    expect(wrapper.vm.selection).toMatchObject({
+      active: false,
+      selectedIds: [],
+      operationInFlight: false,
+      result: null,
+    });
+  });
+
+  it('shows add but hides move on My Pins and enables owned-pin actions', async () => {
+    const wrapper = mountPins();
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-card-41"]').trigger('click');
+
+    expect(wrapper.find('[data-test="pin-selection-add-to-board"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="pin-selection-add-to-board"]').attributes('disabled'))
+      .toBeUndefined();
+    expect(wrapper.find('[data-test="pin-selection-move"]').exists()).toBe(false);
+    ['edit', 'delete'].forEach((action) => {
+      expect(wrapper.find(`[data-test="pin-selection-${action}"]`).attributes('disabled'))
+        .toBeUndefined();
+    });
+  });
+
+  it('fails closed for add, edit, and delete on My Pins when a pin is not owned', async () => {
     const wrapper = mountPins({ pins: [pin(41), pin(40, 'other')] });
     await settle();
     await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
     await wrapper.find('[data-test="pin-card-41"]').trigger('click');
     await wrapper.find('[data-test="pin-card-40"]').trigger('click');
 
-    expect(wrapper.find('[data-test="pin-selection-add-to-board"]').attributes('disabled'))
+    expect(wrapper.find('[data-test="pin-selection-move"]').exists()).toBe(false);
+    ['add-to-board', 'edit', 'delete'].forEach((action) => {
+      expect(wrapper.find(`[data-test="pin-selection-${action}"]`).attributes('disabled'))
+        .toBe('disabled');
+    });
+  });
+
+  it('shows move but hides add on an owned board and permits visible foreign pins', async () => {
+    const wrapper = mountPins({
+      pinFilters: { boardFilter: 7 },
+      pins: [pin(41), pin(40, 'other')],
+    });
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-card-41"]').trigger('click');
+    await wrapper.find('[data-test="pin-card-40"]').trigger('click');
+
+    expect(wrapper.find('[data-test="pin-selection-add-to-board"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="pin-selection-move"]').attributes('disabled'))
       .toBeUndefined();
-    ['move', 'edit', 'delete'].forEach((action) => {
+    ['edit', 'delete'].forEach((action) => {
       expect(wrapper.find(`[data-test="pin-selection-${action}"]`).attributes('disabled'))
         .toBe('disabled');
     });
@@ -382,7 +615,7 @@ describe('Pins selection mode', () => {
     wrapper.vm.$delete(wrapper.vm.selection.ownershipById, 41);
     await wrapper.vm.$nextTick();
 
-    ['move', 'edit', 'delete'].forEach((action) => {
+    ['add-to-board', 'edit', 'delete'].forEach((action) => {
       expect(wrapper.find(`[data-test="pin-selection-${action}"]`).attributes('disabled'))
         .toBe('disabled');
     });

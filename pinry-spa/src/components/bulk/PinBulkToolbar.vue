@@ -43,37 +43,41 @@
           {{ $t('bulkPinSelectAll') }}
         </button>
         <button
+          v-if="showAddToBoard"
           type="button"
           class="button"
           data-test="pin-selection-add-to-board"
-          :disabled="operationInFlight || selectedCount === 0"
+          :disabled="operationInFlight || selectedCount === 0 || !canAddToBoard"
           @click="$emit('add-to-board')"
         >
           {{ $t('bulkPinAddToBoard') }}
         </button>
         <button
+          v-if="showMove"
           type="button"
           class="button"
           data-test="pin-selection-move"
-          :disabled="operationInFlight || selectedCount === 0 || !canModify"
+          :disabled="operationInFlight || selectedCount === 0 || !canMove"
           @click="$emit('move')"
         >
           {{ $t('bulkPinMove') }}
         </button>
         <button
+          v-if="showEdit"
           type="button"
           class="button"
           data-test="pin-selection-edit"
-          :disabled="operationInFlight || selectedCount === 0 || !canModify"
+          :disabled="operationInFlight || selectedCount === 0 || !canEdit"
           @click="$emit('edit')"
         >
           {{ $t('bulkPinEdit') }}
         </button>
         <button
+          v-if="showDelete"
           type="button"
           class="button is-danger"
           data-test="pin-selection-delete"
-          :disabled="operationInFlight || selectedCount === 0 || !canModify"
+          :disabled="operationInFlight || selectedCount === 0 || !canDelete"
           @click="$emit('delete')"
         >
           {{ $t('bulkPinDelete') }}
@@ -109,7 +113,14 @@ export default {
     loadedCount: { type: Number, required: true },
     scope: { type: String, required: true },
     allCount: { type: Number, required: true },
-    canModify: { type: Boolean, required: true },
+    showAddToBoard: { type: Boolean, required: true },
+    canAddToBoard: { type: Boolean, required: true },
+    showMove: { type: Boolean, required: true },
+    canMove: { type: Boolean, required: true },
+    showEdit: { type: Boolean, required: true },
+    canEdit: { type: Boolean, required: true },
+    showDelete: { type: Boolean, required: true },
+    canDelete: { type: Boolean, required: true },
     operationInFlight: { type: Boolean, required: true },
     announcement: { type: String, default: '' },
   },
