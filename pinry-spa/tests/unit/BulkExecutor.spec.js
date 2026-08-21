@@ -42,6 +42,14 @@ describe('bulk API adapter', () => {
     });
   });
 
+  it('sends only board_id for a board-only selection', () => {
+    API.Pin.fetchSelectionIds({ boardId: 7 });
+
+    expect(axios.get).toHaveBeenCalledWith('/api/v2/pins/selection-ids/', {
+      params: { board_id: 7 },
+    });
+  });
+
   it('uses exact selection and bulk request URLs and params', () => {
     API.Pin.fetchSelectionIds();
     API.Pin.fetchSelectionIds({ boardId: 7, exclusiveOwned: true });
