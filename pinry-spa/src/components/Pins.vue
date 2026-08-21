@@ -1,6 +1,22 @@
 <template>
   <div class="pins">
     <section class="section">
+      <PinBulkToolbar
+        v-if="canManagePins"
+        :active="selection.active"
+        :selected-count="selection.selectedIds.length"
+        :loaded-count="blocks.length"
+        :scope="selection.scope"
+        :all-count="selection.allCount"
+        :can-modify="canModifySelection"
+        :operation-in-flight="selection.operationInFlight"
+        :announcement="selectionAnnouncement"
+        @enter="enterSelection"
+        @exit="exitSelection"
+        @select-loaded="selectLoadedPins"
+        @clear="clearPinSelection"
+        @select-all="selectAllPins"
+      />
       <div id="pins-container" class="container" v-if="blocks">
         <div
           v-masonry=""
@@ -16,23 +32,42 @@
                  class="grid pin-masonry">
               <div class="grid-sizer"></div>
               <div class="gutter-sizer"></div>
-              <div class="pin-card grid-item">
+              <div
+                class="pin-card grid-item"
+                :class="{ 'is-selected': isPinSelected(item.id) }"
+                :data-test="`pin-card-${item.id}`"
+                :role="selection.active ? 'button' : null"
+                :tabindex="selection.active ? 0 : null"
+                :aria-selected="selection.active ? String(isPinSelected(item.id)) : null"
+                @click="onPinCardClick(item, $event)"
+                @keydown="onPinCardKeydown(item, $event)"
+              >
                 <div @mouseenter="showEditButtons(item.id)"
                      @mouseleave="hideEditButtons(item.id)"
                 >
                   <EditorUI
-                    v-show="shouldShowEdit(item.id)"
+                    v-show="!selection.active && shouldShowEdit(item.id)"
                     :pin="item"
                     :currentUsername="editorMeta.user.meta.username"
                     :currentBoard="editorMeta.currentBoard"
                     v-on:pin-delete-succeed="reset"
                     v-on:pin-remove-from-board-succeed="reset"
                   ></EditorUI>
+                  <input
+                    v-if="selection.active"
+                    type="checkbox"
+                    class="pin-selection-check"
+                    :data-test="`pin-selection-check-${item.id}`"
+                    :checked="isPinSelected(item.id)"
+                    :aria-label="$t('bulkPinSelectOne')"
+                    @click.stop="togglePinSelection(item.id, $event)"
+                  >
                   <img :src="item.url"
                      @load="onPinImageLoaded(item.id)"
-                     @click="openPreview(item)"
+                     @click.stop="onPinImageClick(item, $event)"
                      :alt="item.description"
                      :style="item.style"
+                     :data-test="`pin-image-${item.id}`"
                      class="pin-preview-image">
                 </div>
                 <div class="pin-footer">
@@ -85,6 +120,8 @@ import scroll from './utils/scroll';
 import bus from './utils/bus';
 import EditorUI from './editors/PinEditorUI.vue';
 import niceLinks from './utils/niceLinks';
+import PinBulkToolbar from './bulk/PinBulkToolbar.vue';
+import PinSelection from './bulk/PinSelection';
 
 function createImageItem(pin) {
   const image = {};
@@ -125,15 +162,35 @@ function initialData() {
         meta: {},
       },
     },
+    metaReady: {
+      user: false,
+      board: false,
+    },
+    selection: {
+      active: false,
+      selectedIds: [],
+      anchorId: null,
+      scope: 'loaded',
+      allCount: 0,
+      ownedCount: 0,
+      ownershipById: {},
+      operationInFlight: false,
+      progress: null,
+      result: null,
+    },
   };
 }
 
 export default {
   name: 'pins',
+  beforeCreate() {
+    this.selectionModel = new PinSelection();
+  },
   components: {
     loadingSpinner,
     noMore,
     EditorUI,
+    PinBulkToolbar,
   },
   data() {
     return initialData();
@@ -155,7 +212,175 @@ export default {
       this.reset();
     },
   },
+  computed: {
+    canManagePins() {
+      if (!this.metaReady.user || !this.editorMeta.user.loggedIn) return false;
+      const { username } = this.editorMeta.user.meta;
+      if (this.pinFilters.userFilter) {
+        return this.pinFilters.userFilter === username;
+      }
+      const { submitter } = this.editorMeta.currentBoard;
+      return Boolean(
+        this.pinFilters.boardFilter
+        && this.metaReady.board
+        && submitter
+        && submitter.username === username,
+      );
+    },
+    hasNonOwnedSelection() {
+      return this.selection.selectedIds.some(
+        id => this.selection.ownershipById[id] !== true,
+      );
+    },
+    canModifySelection() {
+      return this.selection.selectedIds.length > 0 && !this.hasNonOwnedSelection;
+    },
+    selectionAnnouncement() {
+      if (this.selection.result && this.selection.result.code === 'selection_too_large') {
+        return this.$t('bulkPinSelectionTooLarge');
+      }
+      if (this.selection.scope === 'all') {
+        return this.$t('bulkPinAllSelected', { count: this.selection.allCount });
+      }
+      return this.$t('bulkPinSelectedCount', {
+        count: this.selection.selectedIds.length,
+      });
+    },
+  },
   methods: {
+    updateSelection(snapshot, extra = {}) {
+      const ownedCount = snapshot.selectedIds.filter(
+        id => snapshot.ownershipById[id] === true,
+      ).length;
+      this.selection = {
+        ...this.selection,
+        ...snapshot,
+        ownedCount,
+        ...extra,
+      };
+    },
+    syncLoadedSelection() {
+      const username = this.metaReady.user && this.editorMeta.user.loggedIn
+        ? this.editorMeta.user.meta.username
+        : null;
+      const rows = this.blocks.map(item => ({
+        id: item.id,
+        owned: username !== null && item.author === username,
+      }));
+      this.updateSelection(this.selectionModel.setLoadedRows(rows));
+    },
+    enterSelection() {
+      if (!this.canManagePins) return;
+      this.updateSelection(this.selectionModel.selectLoaded([]), {
+        active: true,
+        allCount: 0,
+        result: null,
+      });
+    },
+    exitSelection() {
+      this.updateSelection(this.selectionModel.selectLoaded([]), {
+        active: false,
+        allCount: 0,
+        result: null,
+      });
+    },
+    clearPinSelection() {
+      this.updateSelection(this.selectionModel.selectLoaded([]), {
+        allCount: 0,
+        result: null,
+      });
+    },
+    selectLoadedPins() {
+      this.updateSelection(
+        this.selectionModel.selectLoaded(this.blocks.map(item => item.id)),
+        { allCount: 0, result: null },
+      );
+    },
+    selectAllPins() {
+      if (this.selection.operationInFlight) return;
+      this.selection.operationInFlight = true;
+      this.selection.result = null;
+      API.Pin.fetchSelectionIds({
+        boardId: this.pinFilters.boardFilter || null,
+      }).then(
+        (response) => {
+          const { count, results } = response.data;
+          if (!Number.isInteger(count) || !Array.isArray(results) || count !== results.length) {
+            throw new Error('invalid_selection_response');
+          }
+          const snapshot = this.selectionModel.applyScope(results);
+          if (snapshot.scope !== 'all') throw new Error('invalid_selection_response');
+          this.updateSelection(snapshot, { allCount: count, result: null });
+        },
+        (error) => {
+          const code = error && error.response && error.response.data
+            ? error.response.data.code
+            : 'selection_failed';
+          this.selection.result = { code };
+        },
+      ).catch(() => {
+        this.selection.result = { code: 'selection_failed' };
+      }).then(() => {
+        this.selection.operationInFlight = false;
+      });
+    },
+    isPinSelected(id) {
+      return this.selection.selectedIds.includes(id);
+    },
+    togglePinSelection(id, event) {
+      if (!this.selection.active) return;
+      if (event) event.preventDefault();
+      this.updateSelection(this.selectionModel.toggle(id, {
+        shiftKey: Boolean(event && event.shiftKey),
+        ctrlKey: Boolean(event && event.ctrlKey),
+        metaKey: Boolean(event && event.metaKey),
+      }), { result: null });
+    },
+    onPinCardClick(item, event) {
+      if (!this.selection.active) return;
+      this.togglePinSelection(item.id, event);
+    },
+    onPinImageClick(item, event) {
+      if (this.selection.active) {
+        this.togglePinSelection(item.id, event);
+        return;
+      }
+      this.openPreview(item);
+    },
+    onPinCardKeydown(item, event) {
+      if (!this.selection.active || (event.key !== 'Enter' && event.key !== ' ')) return;
+      event.preventDefault();
+      this.togglePinSelection(item.id, event);
+    },
+    isEditableTarget(target) {
+      if (!target || target === document) return false;
+      const tagName = target.tagName ? target.tagName.toLowerCase() : '';
+      if (['input', 'textarea', 'select'].includes(tagName)) return true;
+      if (target.isContentEditable) return true;
+      return Boolean(
+        target.closest
+        && target.closest('[contenteditable]:not([contenteditable="false"])'),
+      );
+    },
+    onDocumentKeydown(event) {
+      if (!this.selection.active) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        this.exitSelection();
+        return;
+      }
+      const selectAll = (event.ctrlKey || event.metaKey)
+        && typeof event.key === 'string'
+        && event.key.toLowerCase() === 'a';
+      if (
+        !selectAll
+        || event.isComposing
+        || event.keyCode === 229
+        || this.isEditableTarget(event.target)
+      ) return;
+      event.preventDefault();
+      this.selectLoadedPins();
+    },
     shouldShowEdit(id) {
       if (!this.editorMeta.user.loggedIn) {
         return false;
@@ -236,11 +461,20 @@ export default {
             self.editorMeta.user.meta = user;
             self.editorMeta.user.loggedIn = true;
           }
+          self.metaReady.user = true;
+          self.syncLoadedSelection();
+        },
+        () => {
+          self.editorMeta.user.loggedIn = false;
+          self.editorMeta.user.meta = {};
+          self.metaReady.user = true;
+          self.syncLoadedSelection();
         },
       );
     },
     reset() {
       const data = initialData();
+      this.selectionModel = new PinSelection();
       Object.entries(data).forEach(
         (kv) => {
           const [key, value] = kv;
@@ -264,6 +498,7 @@ export default {
         promise = prevPromise.then(
           (resp) => {
             this.editorMeta.currentBoard = resp.data;
+            this.metaReady.board = true;
             return API.fetchPins(this.status.offset, null, null, this.pinFilters.boardFilter);
           },
         );
@@ -281,6 +516,7 @@ export default {
           );
           newBlocks = this.blocks.concat(newBlocks);
           this.blocks = newBlocks;
+          this.syncLoadedSelection();
           this.status.offset = newBlocks.length;
           this.status.hasNext = !(next === null);
           this.status.loading = false;
@@ -293,7 +529,11 @@ export default {
   created() {
     bus.bus.$on(bus.events.refreshPin, this.reset);
     this.registerScrollEvent();
+    document.addEventListener('keydown', this.onDocumentKeydown);
     this.initialize();
+  },
+  beforeDestroy() {
+    document.removeEventListener('keydown', this.onDocumentKeydown);
   },
 };
 </script>
@@ -328,6 +568,20 @@ $avatar-height: 30px;
 @import './utils/loader.scss';
 
 .pin-card{
+  position: relative;
+
+  &.is-selected {
+    outline: 3px solid #3273dc;
+    outline-offset: 2px;
+  }
+
+  .pin-selection-check {
+    position: absolute;
+    z-index: 2;
+    top: .5rem;
+    left: .5rem;
+  }
+
   .pin-preview-image {
     cursor: zoom-in;
   }
