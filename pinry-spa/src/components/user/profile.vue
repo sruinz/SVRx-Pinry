@@ -23,13 +23,16 @@
       </header>
       <div class="card-content">
         <div class="content">
-          <span>{{ $t("buildVersionLabel") }}:</span>
-          <code
-            v-if="displayVersion"
-            data-test="build-version">{{ displayVersion }}</code>
-          <span
-            v-else
-            data-test="build-version-unavailable">—</span>
+          <div><span>{{ $t("buildBrandLabel") }}:</span> <strong data-test="build-brand">SVRx Pinry</strong></div>
+          <div>
+            <span>{{ $t("buildVersionLabel") }}:</span>
+            <code
+              v-if="displayVersion"
+              data-test="build-version">{{ displayVersion }}</code>
+            <span
+              v-else
+              data-test="build-version-unavailable">—</span>
+          </div>
         </div>
       </div>
     </div>

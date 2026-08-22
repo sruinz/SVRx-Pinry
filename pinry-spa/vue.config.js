@@ -17,7 +17,7 @@ module.exports = {
     },
   },
   pwa: {
-    name: 'Pinry Mobile',
+    name: 'SVRx Pinry',
     appleMobileWebAppCapable: 'yes',
     appleMobileWebAppStatusBarStyle: 'black',
     // configure the workbox plugin

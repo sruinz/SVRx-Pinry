@@ -52,9 +52,12 @@ describe('Profile build version', () => {
     await flushPromises();
 
     const version = wrapper.find('[data-test="build-version"]');
+    const brand = wrapper.find('[data-test="build-brand"]');
     expect(axios.get).toHaveBeenCalledWith('/api/v2/version/');
     expect(wrapper.text()).toContain('빌드 정보');
+    expect(wrapper.text()).toContain('제품');
     expect(wrapper.text()).toContain('실행 버전');
+    expect(brand.text()).toBe('SVRx Pinry');
     expect(version.element.tagName).toBe('CODE');
     expect(version.text()).toBe('9b54cf1b5a5a');
   });

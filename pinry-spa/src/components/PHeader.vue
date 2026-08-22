@@ -3,8 +3,9 @@
     <nav class="navbar" role="navigation" aria-label="main navigation">
       <div class="container">
         <div class="navbar-brand">
-          <a class="navbar-item" href="/">
-            <img src="../assets/logo-dark.png" height="28">
+          <a class="navbar-item brand-lockup" data-test="brand-lockup" href="/">
+            <img src="../assets/svrx-pinry-light-ui.png" alt="SVRx Pinry" height="32">
+            <span class="brand-name" data-test="brand-name">SVRx Pinry</span>
           </a>
           <a role="button" class="navbar-burger burger"
              aria-label="menu" aria-expanded="false"
@@ -237,5 +238,11 @@ export default {
 </script>
 
 <style scoped>
+.brand-lockup {
+  gap: .5rem;
+}
 
+.brand-name {
+  white-space: nowrap;
+}
 </style>

@@ -48,6 +48,7 @@ const EXPECTED_LOCALE_KEYS = [
   'boardsUserProfileCardLink',
   'bookmarkletLink',
   'browserExtensionsLink',
+  'buildBrandLabel',
   'buildInfoTitle',
   'buildVersionLabel',
   'bulkPinAddToBoard',
@@ -166,7 +167,8 @@ const REQUIRED_KOREAN_TEXT = {
   browserExtensionsLink: '브라우저 확장 프로그램',
   chromeLink: 'Chrome — 기존 단건용',
   firefoxLink: 'Firefox — 기존 단건용',
-  customExtensionPendingLink: 'Pinry Custom 전체선택 확장 — 준비 중',
+  customExtensionPendingLink: 'SVRx Pinry 전체선택 확장 — 준비 중',
+  buildBrandLabel: '제품',
   buildInfoTitle: '빌드 정보',
   buildVersionLabel: '실행 버전',
   bulkPinDeleteConfirm: '선택한 Pin {count}개를 삭제하시겠습니까?',
@@ -302,7 +304,7 @@ describe('Header locale and extension menus', () => {
       target: '_blank',
       rel: 'noopener noreferrer',
     });
-    expect(custom.text()).toBe('Pinry Custom 전체선택 확장 — 준비 중');
+    expect(custom.text()).toBe('SVRx Pinry 전체선택 확장 — 준비 중');
     expect(custom.attributes('href')).toBeUndefined();
     expect(custom.attributes('aria-disabled')).toBe('true');
     expect(custom.classes()).toContain('is-disabled');
