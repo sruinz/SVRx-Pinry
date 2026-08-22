@@ -6,9 +6,11 @@ import PHeader from '@/components/PHeader.vue';
 import localeUtils, {
   DEFAULT_LOCALE,
   SUPPORTED_LOCALES,
+  loadAndSyncStoredLocale,
   loadStoredLocale,
   persistLocale,
   resolveLocale,
+  syncDocumentLocale,
 } from '@/components/utils/i18n';
 import en from '@/components/utils/i18n/locales/en.json';
 import fr from '@/components/utils/i18n/locales/fr.json';
@@ -230,6 +232,23 @@ describe('Korean-first locale contract', () => {
     expect(() => persistLocale(storage, 'en')).not.toThrow();
     expect(persistLocale(storage, 'en')).toBe('en');
   });
+
+  it('synchronizes the resolved locale to the document language', () => {
+    document.documentElement.lang = 'en';
+
+    expect(syncDocumentLocale(document, 'zh')).toBe('zh');
+    expect(document.documentElement.lang).toBe('zh');
+    expect(syncDocumentLocale(document, 'unsupported')).toBe('ko');
+    expect(document.documentElement.lang).toBe('ko');
+  });
+
+  it('loads and synchronizes the stored locale for application startup', () => {
+    const storage = { getItem: () => 'fr' };
+    document.documentElement.lang = 'ko';
+
+    expect(loadAndSyncStoredLocale(storage, document)).toBe('fr');
+    expect(document.documentElement.lang).toBe('fr');
+  });
 });
 
 
@@ -238,6 +257,7 @@ describe('Header locale and extension menus', () => {
 
   beforeEach(() => {
     localStorage.clear();
+    document.documentElement.lang = 'ko';
     initializeUser = jest.spyOn(PHeader.methods, 'initializeUser')
       .mockImplementation(() => {});
   });
@@ -271,6 +291,7 @@ describe('Header locale and extension menus', () => {
     await options.at(1).trigger('click');
     expect(i18n.locale).toBe('en');
     expect(localStorage.getItem('localeCode')).toBe('en');
+    expect(document.documentElement.lang).toBe('en');
   });
 
   it('still applies a locale when local storage rejects the write', async () => {

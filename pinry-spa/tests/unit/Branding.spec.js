@@ -133,7 +133,7 @@ describe('SVRx Pinry branding', () => {
     const lockup = wrapper.find('[data-test="brand-lockup"]');
     expect(lockup.attributes('href')).toBe('/');
     expect(lockup.find('img').attributes()).toMatchObject({
-      alt: 'SVRx Pinry',
+      alt: '',
       height: '32',
     });
     expect(lockup.find('picture').exists()).toBe(false);

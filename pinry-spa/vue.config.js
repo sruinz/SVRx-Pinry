@@ -25,10 +25,23 @@ module.exports = {
     iconPaths: {
       favicon32: 'favicon.png',
       favicon16: 'favicon.png',
-      appleTouchIcon: 'favicon.png',
-      // FIXME(winkidney): Add svg file for safari
-      // maskIcon: 'img/icons/safari-pinned-tab.svg',
-      msTileImage: 'favicon.png',
+      appleTouchIcon: 'img/icons/android-chrome-192x192.png',
+      maskIcon: null,
+      msTileImage: 'img/icons/android-chrome-192x192.png',
+    },
+    manifestOptions: {
+      icons: [
+        {
+          src: './img/icons/android-chrome-192x192.png',
+          sizes: '192x192',
+          type: 'image/png',
+        },
+        {
+          src: './img/icons/android-chrome-512x512.png',
+          sizes: '512x512',
+          type: 'image/png',
+        },
+      ],
     },
   },
 };

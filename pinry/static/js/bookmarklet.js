@@ -65,7 +65,7 @@
             textAlign: 'center',
             fontSize: '22px'
         });
-        pinryBar.textContent = 'Pinry Bookmarklet';
+        pinryBar.textContent = 'SVRx Pinry \uBD81\uB9C8\uD074\uB9BF';
         pinryBar.onclick = closePinry;
         pinryImages.appendChild(pinryBar);
         var pinrySort = document.createElement('div');
@@ -76,7 +76,7 @@
             right: '1em',
             cursor: 'pointer'
         });
-        pinrySort.textContent = '\u21D5 Size';
+        pinrySort.textContent = '\u21D5 \uD06C\uAE30';
         pinryBar.appendChild(pinrySort);
         document.body.appendChild(pinryImages);
         document.onkeyup = function (e) {

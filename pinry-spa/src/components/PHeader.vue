@@ -4,7 +4,7 @@
       <div class="container">
         <div class="navbar-brand">
           <a class="navbar-item brand-lockup" data-test="brand-lockup" href="/">
-            <img src="../assets/svrx-pinry-light-ui.png" alt="SVRx Pinry" height="32">
+            <img src="../assets/svrx-pinry-light-ui.png" alt="" height="32">
             <span class="brand-name" data-test="brand-name">SVRx Pinry</span>
           </a>
           <a role="button" class="navbar-burger burger"
@@ -157,6 +157,7 @@
 import localeUtils, {
   SUPPORTED_LOCALES,
   persistLocale,
+  syncDocumentLocale,
 } from '@/components/utils/i18n';
 import api from './api';
 import modals from './modals';
@@ -183,7 +184,8 @@ export default {
   },
   methods: {
     setLocale(locale) {
-      this.$i18n.locale = persistLocale(localStorage, locale);
+      const persisted = persistLocale(localStorage, locale);
+      this.$i18n.locale = syncDocumentLocale(document, persisted);
     },
     toggleMenu() {
       this.active = !this.active;

@@ -20,6 +20,17 @@ export function loadStoredLocale(storage) {
   }
 }
 
+export function syncDocumentLocale(documentRef, locale) {
+  const resolved = resolveLocale(locale);
+  const rootElement = documentRef.documentElement;
+  rootElement.lang = resolved;
+  return resolved;
+}
+
+export function loadAndSyncStoredLocale(storage, documentRef) {
+  return syncDocumentLocale(documentRef, loadStoredLocale(storage));
+}
+
 export function persistLocale(storage, locale) {
   const resolved = resolveLocale(locale);
   try {
@@ -47,9 +58,11 @@ const langCode2Name = {
 export default {
   DEFAULT_LOCALE,
   SUPPORTED_LOCALES,
+  loadAndSyncStoredLocale,
   loadStoredLocale,
   persistLocale,
   resolveLocale,
+  syncDocumentLocale,
   messages,
   langCode2Name,
 };

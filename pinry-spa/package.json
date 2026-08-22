@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "serve": "NODE_OPTIONS=--openssl-legacy-provider vue-cli-service serve",
-    "build": "NODE_OPTIONS=--openssl-legacy-provider vue-cli-service build",
+    "build": "NODE_OPTIONS=--openssl-legacy-provider vue-cli-service build && node scripts/verify-branding-build.js dist",
     "lint": "NODE_OPTIONS=--openssl-legacy-provider vue-cli-service lint",
     "test:unit": "NODE_OPTIONS=--openssl-legacy-provider sh -c 'if [ \"${1:-}\" = \"--\" ]; then shift; fi; vue-cli-service test:unit \"$@\"' --"
   },
