@@ -431,6 +431,10 @@ class PinMediaLifecycleTest(
         "SQLite file database write serialization observation",
     )
     def test_conditional_delete_serializes_competing_board_add(self):
+        if connection.creation.is_in_memory_db(
+            connection.settings_dict["NAME"]
+        ):
+            self.skipTest("This concurrency contract requires file SQLite.")
         image = create_image()
         pin = create_pin(self.owner, image, [])
         pin_id = pin.pk
