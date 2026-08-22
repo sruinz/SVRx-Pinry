@@ -25,6 +25,15 @@ function validateBuildArtifacts(buildDirectory) {
   if (!/<html\b[^>]*\blang=["']ko["']/i.test(html)) {
     throw new Error('html_language_not_korean');
   }
+  const noScriptMatch = html.match(/<noscript\b[^>]*>([\s\S]*?)<\/noscript>/i);
+  const noScriptText = noScriptMatch
+    ? noScriptMatch[1].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+    : '';
+  if (!noScriptText.includes('SVRx Pinry')
+    || !noScriptText.includes('JavaScript')
+    || !/[가-힣]/.test(noScriptText)) {
+    throw new Error('noscript_message_not_korean');
+  }
 
   const visibleHtml = html.replace(/<!--[\s\S]*?-->/g, '');
   ['favicon-light.png', 'favicon-dark.png'].forEach((filename) => {
