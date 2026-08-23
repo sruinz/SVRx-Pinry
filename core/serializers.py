@@ -337,6 +337,7 @@ class BoardSerializer(serializers.HyperlinkedModelSerializer):
             "private",
             "total_pins",
             "cover",
+            "cover_pin_id",
             "published",
             "submitter",
             "pins_to_add",
@@ -352,6 +353,9 @@ class BoardSerializer(serializers.HyperlinkedModelSerializer):
         read_only=True,
     )
     cover = serializers.SerializerMethodField(
+        read_only=True,
+    )
+    cover_pin_id = serializers.SerializerMethodField(
         read_only=True,
     )
     pins_to_add = PinIdListField(
@@ -375,12 +379,26 @@ class BoardSerializer(serializers.HyperlinkedModelSerializer):
         query = filter_private_pin(request, query)
         return query.count()
 
+    def _cover_resolution(self, instance):
+        cache_name = "_serialized_cover_resolution"
+        if not hasattr(instance, cache_name):
+            service = self.context["board_cover_service"]
+            setattr(
+                instance,
+                cache_name,
+                service.resolve(instance, self.context["request"]),
+            )
+        return getattr(instance, cache_name)
+
     def get_cover(self, instance: Board) -> dict or None:
-        request = self.context['request']
-        pin = filter_private_pin(request, instance.pins.all()).first()
+        pin, _manual_id = self._cover_resolution(instance)
         if pin is None:
             return None
         return PinSerializer(pin, context=self.context).data
+
+    def get_cover_pin_id(self, instance):
+        _pin, manual_id = self._cover_resolution(instance)
+        return manual_id
 
     def update(self, instance: Board, validated_data):
         pins_to_add = validated_data.pop("pins_to_add", [])

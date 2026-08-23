@@ -86,6 +86,13 @@ class Board(models.Model):
     name = models.CharField(max_length=128, blank=False, null=False)
     private = models.BooleanField(default=False, blank=False)
     pins = models.ManyToManyField("Pin", related_name="pins", blank=True)
+    cover_pin = models.ForeignKey(
+        "Pin",
+        null=True,
+        blank=True,
+        related_name="covering_boards",
+        on_delete=models.SET_NULL,
+    )
 
     published = models.DateTimeField(auto_now_add=True)
 

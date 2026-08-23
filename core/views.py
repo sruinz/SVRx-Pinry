@@ -29,6 +29,7 @@ from core.pin_sorting import PinSortFilter
 from core.permissions import IsOwnerOrReadOnly, OwnerOnlyIfPrivate
 from core.serializers import filter_private_pin, filter_private_board
 from core.services.batch_import import BatchImportService
+from core.services.board_cover import BoardCoverService
 from core.services.bulk_pin_management import (
     BulkOperationError,
     BulkPinManagementService,
@@ -439,6 +440,7 @@ class BoardViewSet(viewsets.ModelViewSet):
 
     def get_serializer_context(self):
         context = super(BoardViewSet, self).get_serializer_context()
+        context["board_cover_service"] = BoardCoverService()
         context["pin_membership_service"] = (
             self.pin_membership_service_class()
         )
