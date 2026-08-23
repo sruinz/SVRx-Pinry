@@ -364,8 +364,12 @@ def _lock_registered_asset(registry, using):
     )
 
 
-def _lock_registered_pin_boards(pin_id, using):
-    board_ids = list(
+class _RegisteredPinBoardSetChanged(Exception):
+    pass
+
+
+def _registered_pin_board_ids(pin_id, using):
+    return list(
         Board.objects.using(using)
         .filter(
             models.Q(pins__pk=pin_id)
@@ -375,14 +379,19 @@ def _lock_registered_pin_boards(pin_id, using):
         .values_list("pk", flat=True)
         .distinct()
     )
+
+
+def _lock_registered_pin_boards(pin_id, using):
+    board_ids = _registered_pin_board_ids(pin_id, using)
     if not board_ids:
-        return []
-    return list(
+        return board_ids
+    list(
         Board.objects.select_for_update()
         .using(using)
         .filter(pk__in=board_ids)
         .order_by("pk")
     )
+    return board_ids
 
 
 def _delete_locked_registered_pin(
@@ -404,7 +413,7 @@ def _delete_locked_registered_pin(
         current_registry = _lock_registered_asset(registry, using)
     else:
         current_registry = _lock_registered_asset(registry, using)
-        _lock_registered_pin_boards(pin.pk, using)
+        locked_board_ids = _lock_registered_pin_boards(pin.pk, using)
         current_pin = (
             Pin.objects.select_for_update()
             .using(using)
@@ -412,6 +421,11 @@ def _delete_locked_registered_pin(
             .order_by("pk")
             .first()
         )
+        if (
+            _registered_pin_board_ids(pin.pk, using)
+            != locked_board_ids
+        ):
+            raise _RegisteredPinBoardSetChanged()
     image = (
         BaseImage.objects.select_for_update()
         .using(using)
@@ -446,6 +460,43 @@ def _delete_locked_registered_pin(
     if exclusive_condition is not None:
         return ("deleted", None), True
     return delete_result, True
+
+
+def _delete_registered_pin_with_board_retry(
+    pin,
+    registry,
+    media_manifest,
+    using,
+    keep_parents,
+    exclusive_condition,
+    commit_marker,
+    deadline,
+    clock,
+):
+    while True:
+        if exclusive_condition is None and clock() >= deadline:
+            raise RuntimeError(
+                "registered_pin_delete_board_retry_timeout"
+            )
+        try:
+            with transaction.atomic(using=using):
+                transaction.on_commit(
+                    lambda: commit_marker.__setitem__(0, True),
+                    using=using,
+                )
+                return _delete_locked_registered_pin(
+                    pin,
+                    registry,
+                    media_manifest,
+                    using,
+                    keep_parents,
+                    exclusive_condition,
+                )
+        except _RegisteredPinBoardSetChanged:
+            if clock() >= deadline:
+                raise RuntimeError(
+                    "registered_pin_delete_board_retry_timeout"
+                )
 
 
 def _delete_pin_with_registry_lock(
@@ -513,19 +564,17 @@ def _delete_pin_with_registry_lock(
             deadline=deadline,
             clock=clock,
         ):
-            with transaction.atomic(using=database_alias):
-                transaction.on_commit(
-                    lambda: commit_marker.__setitem__(0, True),
-                    using=database_alias,
-                )
-                result, deleted = _delete_locked_registered_pin(
-                    pin,
-                    registry,
-                    media_manifest,
-                    database_alias,
-                    keep_parents,
-                    exclusive_condition,
-                )
+            result, deleted = _delete_registered_pin_with_board_retry(
+                pin,
+                registry,
+                media_manifest,
+                database_alias,
+                keep_parents,
+                exclusive_condition,
+                commit_marker,
+                deadline,
+                clock,
+            )
     except BaseException as error:
         try:
             root_directory.close()

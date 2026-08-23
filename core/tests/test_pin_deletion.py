@@ -14,6 +14,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.db import close_old_connections, connection, connections
 from django.db import OperationalError, transaction
+from django.db.models.deletion import Collector
 from django.db.models.query import QuerySet
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
@@ -942,6 +943,164 @@ class PinMediaLifecycleTest(
         self.assertFalse(Image.objects.filter(pk=image.pk).exists())
         self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
         self.assertTrue(all(not path.exists() for path in directories))
+
+    def test_registered_delete_retries_after_related_board_set_changes(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        pin_id = pin.pk
+        self._register_asset(image)
+        first_board = Board.objects.create(
+            submitter=self.owner,
+            name="registered-delete-retry-first",
+        )
+        second_board = Board.objects.create(
+            submitter=self.owner,
+            name="registered-delete-retry-second",
+        )
+        first_board.pins.add(pin)
+        first_board.cover_pin = pin
+        first_board.save(update_fields=("cover_pin",))
+        probe_count = [0]
+        rollback_observed = []
+        events = []
+        original_fetch_all = QuerySet._fetch_all
+        original_collector_delete = Collector.delete
+
+        def observe_fetch(queryset):
+            is_related_probe = (
+                queryset._result_cache is None
+                and queryset.model is Board
+                and not queryset.query.select_for_update
+                and queryset._fields == ("pk",)
+            )
+            is_locked_query = (
+                queryset._result_cache is None
+                and queryset.query.select_for_update
+                and queryset.model in (Board, Pin)
+            )
+            original_fetch_all(queryset)
+            if is_related_probe:
+                probe_count[0] += 1
+                if probe_count[0] == 2:
+                    Board.objects.filter(pk=second_board.pk).update(
+                        name="transient-name",
+                    )
+                elif probe_count[0] == 3:
+                    rollback_observed.append(
+                        Board.objects.get(pk=second_board.pk).name
+                        == "registered-delete-retry-second"
+                    )
+                queryset._result_cache = (
+                    [first_board.pk]
+                    if probe_count[0] == 1
+                    else [first_board.pk, second_board.pk]
+                )
+            elif is_locked_query:
+                events.append((
+                    "board" if queryset.model is Board else "pin",
+                    tuple(row.pk for row in queryset._result_cache),
+                ))
+
+        def observe_collector_delete(collector):
+            if Pin in collector.data:
+                events.append(("collector", (pin_id,)))
+            return original_collector_delete(collector)
+
+        with mock.patch.object(
+            QuerySet,
+            "_fetch_all",
+            autospec=True,
+            side_effect=observe_fetch,
+        ), mock.patch.object(
+            Collector,
+            "delete",
+            autospec=True,
+            side_effect=observe_collector_delete,
+        ):
+            pin.delete()
+
+        self.assertEqual(probe_count, [4])
+        self.assertEqual(rollback_observed, [True])
+        self.assertEqual(events, [
+            ("board", (first_board.pk,)),
+            ("pin", (pin_id,)),
+            ("board", (first_board.pk, second_board.pk)),
+            ("pin", (pin_id,)),
+            ("collector", (pin_id,)),
+        ])
+        self.assertFalse(Pin.objects.filter(pk=pin_id).exists())
+
+    def test_registered_delete_related_board_retry_stops_at_deadline(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        pin_id = pin.pk
+        asset = self._register_asset(image)
+        first_board = Board.objects.create(
+            submitter=self.owner,
+            name="registered-delete-timeout-first",
+        )
+        second_board = Board.objects.create(
+            submitter=self.owner,
+            name="registered-delete-timeout-second",
+        )
+        first_board.pins.add(pin)
+        probe_count = [0]
+        collector_calls = []
+        original_fetch_all = QuerySet._fetch_all
+        original_collector_delete = Collector.delete
+
+        def alternate_related_boards(queryset):
+            is_related_probe = (
+                queryset._result_cache is None
+                and queryset.model is Board
+                and not queryset.query.select_for_update
+                and queryset._fields == ("pk",)
+            )
+            original_fetch_all(queryset)
+            if is_related_probe:
+                probe_count[0] += 1
+                queryset._result_cache = (
+                    [first_board.pk]
+                    if probe_count[0] % 2
+                    else [first_board.pk, second_board.pk]
+                )
+
+        def observe_collector_delete(collector):
+            if Pin in collector.data:
+                collector_calls.append(pin_id)
+            return original_collector_delete(collector)
+
+        stripe = mock.MagicMock()
+        stripe.__enter__.return_value = stripe
+        stripe.__exit__.return_value = False
+        with mock.patch.object(
+            QuerySet,
+            "_fetch_all",
+            autospec=True,
+            side_effect=alternate_related_boards,
+        ), mock.patch.object(
+            Collector,
+            "delete",
+            autospec=True,
+            side_effect=observe_collector_delete,
+        ), mock.patch(
+            "core.models.media_dedup_lock",
+            return_value=stripe,
+        ), mock.patch(
+            "core.models.time.monotonic",
+            side_effect=(0.0, 1.0, 12.0),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "registered_pin_delete_board_retry_timeout",
+            ):
+                pin.delete()
+
+        self.assertEqual(probe_count, [2])
+        self.assertEqual(collector_calls, [])
+        self.assertTrue(Pin.objects.filter(pk=pin_id).exists())
+        self.assertTrue(Image.objects.filter(pk=image.pk).exists())
+        self.assertTrue(MediaAsset.objects.filter(pk=asset.pk).exists())
 
     def test_registered_delete_rejects_existing_database_transaction(self):
         image = create_image()
