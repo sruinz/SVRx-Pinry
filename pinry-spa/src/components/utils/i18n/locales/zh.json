@@ -143,5 +143,11 @@
   "bulkPinTagAdd": "添加标签",
   "bulkPinTagRemove": "移除标签",
   "bulkPinTagReplace": "替换标签",
-  "bulkPinTargetBoard": "目标画板"
+  "bulkPinTargetBoard": "目标画板",
+  "pinSortLabel": "排序",
+  "pinSortLatest": "最新优先",
+  "pinSortOldest": "最早优先",
+  "pinSortRandom": "随机",
+  "pinSortReshuffled": "已重新打乱随机顺序。",
+  "pinSortDisabled": "选择 Pin 或执行批量操作时无法更改排序。"
 }

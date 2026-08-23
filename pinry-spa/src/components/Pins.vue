@@ -28,6 +28,14 @@
         @edit="openBulkEdit"
         @delete="confirmBulkDelete"
       />
+      <PinSortControls
+        v-if="!pinFilters.idFilter"
+        :mode="sortState.mode"
+        :disabled="selection.active || selection.operationInFlight"
+        :busy="status.loading"
+        :announcement="sortAnnouncement"
+        @select="applySortMode"
+      />
       <div
         v-if="selection.result && selection.result.code === 'selection_too_large'"
         class="notification is-warning"
@@ -170,6 +178,14 @@ import PinBulkToolbar from './bulk/PinBulkToolbar.vue';
 import PinSelection from './bulk/PinSelection';
 import { executeBulk, intersectRemaining } from './bulk/bulkExecutor';
 import { openPinBulkBoard, openPinBulkEdit } from './modals';
+import PinSortControls from './sorting/PinSortControls.vue';
+import {
+  generateRandomSeed,
+  pinSortStorageKey,
+  readPinSortState,
+  transitionPinSortState,
+  writePinSortState,
+} from './sorting/pinSortState';
 
 const MAX_SELECTION_IDS = 50000;
 const SELECTION_FIELDS = ['count', 'results'];
@@ -270,6 +286,11 @@ function initialData() {
     bulkDeleteDialogOpen: false,
     bulkModalOpen: false,
     bulkModalStarted: false,
+    sortState: { version: 1, mode: 'latest', randomSeed: 0 },
+    sortStorageKey: null,
+    sortAnnouncement: '',
+    sortLegacyFallback: false,
+    sortFallbackAttempted: false,
   };
 }
 
@@ -282,12 +303,14 @@ export default {
     this.bulkOperationToken = 0;
     this.bulkModalHandle = null;
     this.isDestroyed = false;
+    this.seedFactory = generateRandomSeed;
   },
   components: {
     loadingSpinner,
     noMore,
     EditorUI,
     PinBulkToolbar,
+    PinSortControls,
   },
   data() {
     return initialData();
@@ -305,8 +328,13 @@ export default {
     },
   },
   watch: {
-    pinFilters() {
-      this.reset();
+    pinFilters: {
+      deep: true,
+      handler() {
+        this.activateSortContext();
+        this.reset();
+        this.$nextTick(() => window.scrollTo(0, 0));
+      },
     },
   },
   computed: {
@@ -353,6 +381,31 @@ export default {
     },
   },
   methods: {
+    activateSortContext() {
+      this.sortStorageKey = pinSortStorageKey(this.pinFilters);
+      this.sortState = readPinSortState(
+        window.localStorage, this.sortStorageKey, this.seedFactory,
+      );
+      this.sortLegacyFallback = this.sortStorageKey === null;
+      this.sortFallbackAttempted = false;
+      this.sortAnnouncement = '';
+    },
+    applySortMode(mode) {
+      if (this.selection.active || this.selection.operationInFlight || this.status.loading) return;
+      const leavingLegacyFallback = this.sortLegacyFallback;
+      const transition = transitionPinSortState(this.sortState, mode, this.seedFactory);
+      if (!transition.changed && !leavingLegacyFallback) return;
+      this.sortState = transition.state;
+      this.sortLegacyFallback = false;
+      this.sortFallbackAttempted = false;
+      writePinSortState(window.localStorage, this.sortStorageKey, this.sortState);
+      this.sortAnnouncement = transition.reshuffled ? this.$t('pinSortReshuffled') : '';
+      this.reset();
+      this.$nextTick(() => window.scrollTo(0, 0));
+    },
+    sortRequestState() {
+      return this.sortLegacyFallback || this.pinFilters.idFilter ? null : this.sortState;
+    },
     captureFilterSnapshot() {
       return {
         tagFilter: this.pinFilters.tagFilter,
@@ -911,6 +964,13 @@ export default {
       this.invalidateSelectionRequest();
       this.invalidateBulkOperation();
       this.requestGeneration += 1;
+      const sorting = {
+        sortState: this.sortState,
+        sortStorageKey: this.sortStorageKey,
+        sortAnnouncement: this.sortAnnouncement,
+        sortLegacyFallback: this.sortLegacyFallback,
+        sortFallbackAttempted: this.sortFallbackAttempted,
+      };
       const data = initialData();
       this.selectionModel = new PinSelection();
       Object.entries(data).forEach(
@@ -919,7 +979,27 @@ export default {
           this[key] = value;
         },
       );
+      Object.entries(sorting).forEach(
+        (kv) => {
+          const [key, value] = kv;
+          this[key] = value;
+        },
+      );
       this.initialize();
+    },
+    fallbackToLegacySort() {
+      if (this.sortFallbackAttempted) return false;
+      this.sortFallbackAttempted = true;
+      this.sortLegacyFallback = true;
+      this.sortState = { ...this.sortState, mode: 'latest' };
+      this.sortAnnouncement = '';
+      try {
+        window.localStorage.removeItem(this.sortStorageKey);
+      } catch (_ignored) {
+        // 저장소 삭제가 막혀도 메모리 대체 상태를 사용한다.
+      }
+      this.reset();
+      return true;
     },
     fetchMore(
       created,
@@ -934,9 +1014,13 @@ export default {
       let promise;
       const { offset } = this.status;
       if (filters.tagFilter) {
-        promise = API.fetchPins(offset, filters.tagFilter, null, null);
+        promise = API.fetchPins(
+          offset, filters.tagFilter, null, null, this.sortRequestState(),
+        );
       } else if (filters.userFilter) {
-        promise = API.fetchPins(offset, null, filters.userFilter, null);
+        promise = API.fetchPins(
+          offset, null, filters.userFilter, null, this.sortRequestState(),
+        );
       } else if (filters.boardFilter) {
         const prevPromise = API.Board.get(filters.boardFilter);
         promise = prevPromise.then(
@@ -944,33 +1028,38 @@ export default {
             if (!this.isRequestCurrent(generation, filters)) return null;
             this.editorMeta.currentBoard = resp.data;
             this.metaReady.board = true;
-            return API.fetchPins(offset, null, null, filters.boardFilter);
+            return API.fetchPins(
+              offset, null, null, filters.boardFilter, this.sortRequestState(),
+            );
           },
         );
       } else if (filters.idFilter) {
         promise = API.fetchPin(filters.idFilter);
       } else {
-        promise = API.fetchPins(offset);
+        promise = API.fetchPins(offset, null, null, null, this.sortRequestState());
       }
       promise.then(
         (resp) => {
           if (!resp || !this.isRequestCurrent(generation, filters)) return;
           const { results, next } = resp.data;
-          let newBlocks = this.buildBlocks(results);
+          const consumed = results.length;
+          const newBlocks = this.buildBlocks(results)
+            .filter(item => !this.blocksMap[item.id]);
           newBlocks.forEach(
             (item) => { this.blocksMap[item.id] = item; },
           );
-          newBlocks = this.blocks.concat(newBlocks);
-          this.blocks = newBlocks;
+          this.blocks = this.blocks.concat(newBlocks);
           this.syncLoadedSelection();
-          this.status.offset = newBlocks.length;
-          this.status.hasNext = !(next === null);
+          this.status.offset += consumed;
+          this.status.hasNext = next !== null;
           this.status.loading = false;
         },
-        () => {
-          if (this.isRequestCurrent(generation, filters)) {
-            this.status.loading = false;
-          }
+        (error) => {
+          if (!this.isRequestCurrent(generation, filters)) return;
+          const code = error && error.response && error.response.data
+            ? error.response.data.code : null;
+          if (code === 'pin_sort_invalid' && this.fallbackToLegacySort()) return;
+          this.status.loading = false;
         },
       );
     },
@@ -980,6 +1069,7 @@ export default {
     bus.bus.$on(bus.events.refreshPin, this.reset);
     this.registerScrollEvent();
     document.addEventListener('keydown', this.onDocumentKeydown);
+    this.activateSortContext();
     this.initialize();
   },
   beforeDestroy() {

@@ -1,0 +1,443 @@
+/* eslint-env jest */
+
+import flushPromises from 'flush-promises';
+import { createLocalVue, mount } from '@vue/test-utils';
+
+import API from '@/components/api';
+import Pins from '@/components/Pins.vue';
+import PinSortControls from '@/components/sorting/PinSortControls.vue';
+
+const HOME_KEY = 'svrx.pinSort.v1:home';
+let mountedPinWrappers = [];
+
+function deferred() {
+  const request = {};
+  request.promise = new Promise((resolve, reject) => {
+    request.resolve = resolve;
+    request.reject = reject;
+  });
+  return request;
+}
+
+function pin(id, author = 'owner') {
+  return {
+    id,
+    private: false,
+    description: `Pin ${id}`,
+    tags: [],
+    referer: '',
+    url: `https://example.test/original-${id}.jpg`,
+    submitter: {
+      id: author === 'owner' ? 1 : 2,
+      username: author,
+      gravatar: '',
+    },
+    image: {
+      image: `https://example.test/image-${id}.jpg`,
+      width: 240,
+      thumbnail: {
+        image: `https://example.test/thumb-${id}.jpg`,
+        width: 240,
+        height: 180,
+      },
+    },
+  };
+}
+
+function page(pins = [pin(30), pin(29)], next = null) {
+  return Promise.resolve({ data: { results: pins, next } });
+}
+
+function storeState(key, mode, randomSeed) {
+  localStorage.setItem(key, JSON.stringify({ version: 1, mode, randomSeed }));
+}
+
+function invalidSortError() {
+  const error = new Error('invalid sort contract');
+  error.response = { status: 400, data: { code: 'pin_sort_invalid' } };
+  return error;
+}
+
+function mountPins({
+  pinFilters = {},
+  fetchPinsImplementation = null,
+  fetchPinImplementation = null,
+  boardImplementation = null,
+} = {}) {
+  API.fetchPins.mockImplementation(
+    fetchPinsImplementation || (() => page()),
+  );
+  API.fetchPin.mockImplementation(
+    fetchPinImplementation || (() => page([pin(pinFilters.idFilter || 1)])),
+  );
+  API.Board.get.mockImplementation(
+    boardImplementation || (boardId => Promise.resolve({
+      data: { id: boardId, submitter: { username: 'owner' } },
+    })),
+  );
+
+  const localVue = createLocalVue();
+  localVue.directive('masonry', {});
+  localVue.directive('masonry-tile', {});
+  const wrapper = mount(Pins, {
+    localVue,
+    propsData: { pinFilters },
+    mocks: {
+      $buefy: { modal: { open: jest.fn() } },
+      $t: (key, values) => (values ? `${key}:${values.count}` : key),
+    },
+    stubs: {
+      EditorUI: true,
+      loadingSpinner: true,
+      noMore: true,
+      'router-link': {
+        props: ['to'],
+        template: '<a href="#"><slot /></a>',
+      },
+    },
+  });
+  mountedPinWrappers.push(wrapper);
+  return wrapper;
+}
+
+async function settle() {
+  await flushPromises();
+  await flushPromises();
+}
+
+describe('PinSortControls', () => {
+  it('presents all modes and emits the selected mode', async () => {
+    const wrapper = mount(PinSortControls, {
+      propsData: { mode: 'oldest' },
+      mocks: { $t: key => key },
+    });
+
+    expect(wrapper.find('[data-test="pin-sort-latest"]').attributes('aria-pressed'))
+      .toBe('false');
+    expect(wrapper.find('[data-test="pin-sort-oldest"]').attributes('aria-pressed'))
+      .toBe('true');
+    expect(wrapper.find('[data-test="pin-sort-random"]').attributes('aria-pressed'))
+      .toBe('false');
+
+    await wrapper.find('[data-test="pin-sort-random"]').trigger('click');
+
+    expect(wrapper.emitted('select')).toEqual([['random']]);
+  });
+
+  it.each([
+    ['selection or bulk state', { disabled: true, busy: false }],
+    ['loading state', { disabled: false, busy: true }],
+  ])('disables every mode during %s', async (_name, props) => {
+    const wrapper = mount(PinSortControls, {
+      propsData: { mode: 'latest', ...props },
+      mocks: { $t: key => key },
+    });
+
+    ['latest', 'oldest', 'random'].forEach((mode) => {
+      expect(wrapper.find(`[data-test="pin-sort-${mode}"]`).attributes('disabled'))
+        .toBe('disabled');
+    });
+  });
+});
+
+describe('Pins sorting', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mountedPinWrappers = [];
+    localStorage.clear();
+    storeState(HOME_KEY, 'latest', 5);
+    Object.defineProperty(window, 'crypto', {
+      configurable: true,
+      value: {
+        getRandomValues(values) {
+          values.set([5]);
+          return values;
+        },
+      },
+    });
+    window.scrollTo = jest.fn();
+    jest.spyOn(Pins.methods, 'initializeMeta').mockImplementation(function initializeMeta() {
+      this.editorMeta.user = { loggedIn: true, meta: { username: 'owner' } };
+      this.metaReady.user = true;
+      this.syncLoadedSelection();
+    });
+    API.fetchPins = jest.fn();
+    API.fetchPin = jest.fn();
+    API.Board.get = jest.fn();
+    API.User.fetchUserInfo = jest.fn();
+    API.Pin.fetchSelectionIds = jest.fn();
+    API.Pin.bulk = jest.fn();
+  });
+
+  afterEach(() => {
+    mountedPinWrappers.forEach(wrapper => wrapper.destroy());
+    if (Pins.methods.initializeMeta.mockRestore) {
+      Pins.methods.initializeMeta.mockRestore();
+    }
+    localStorage.clear();
+  });
+
+  it('loads one isolated sort state for each list context', async () => {
+    storeState('svrx.pinSort.v1:user:owner', 'oldest', 13);
+
+    const wrapper = mountPins({ pinFilters: { userFilter: 'owner' } });
+    await settle();
+
+    expect(API.fetchPins.mock.calls[0][4]).toEqual({
+      version: 1, mode: 'oldest', randomSeed: 13,
+    });
+    expect(wrapper.find('[data-test="pin-sort-oldest"]').attributes('aria-pressed'))
+      .toBe('true');
+  });
+
+  it('loads the stored home, user, board, and tag state after each context change', async () => {
+    storeState(HOME_KEY, 'oldest', 11);
+    storeState('svrx.pinSort.v1:user:owner', 'random', 12);
+    storeState('svrx.pinSort.v1:board:7', 'latest', 13);
+    storeState('svrx.pinSort.v1:tag:%EC%95%A0%EB%8B%88', 'oldest', 14);
+    const wrapper = mountPins();
+    await settle();
+
+    expect(API.fetchPins.mock.calls[0][4]).toEqual({
+      version: 1, mode: 'oldest', randomSeed: 11,
+    });
+
+    const expectContext = async (filters, expected) => {
+      await wrapper.setProps({ pinFilters: filters });
+      await settle();
+      const lastCall = API.fetchPins.mock.calls[API.fetchPins.mock.calls.length - 1];
+      expect(lastCall[4]).toEqual(expected);
+      expect(wrapper.find(`[data-test="pin-sort-${expected.mode}"]`)
+        .attributes('aria-pressed')).toBe('true');
+    };
+    await expectContext(
+      { userFilter: 'owner' },
+      { version: 1, mode: 'random', randomSeed: 12 },
+    );
+    await expectContext(
+      { boardFilter: 7 },
+      { version: 1, mode: 'latest', randomSeed: 13 },
+    );
+    await expectContext(
+      { tagFilter: '애니' },
+      { version: 1, mode: 'oldest', randomSeed: 14 },
+    );
+  });
+
+  it('persists a selected mode and does not reload an already active non-random mode', async () => {
+    const wrapper = mountPins();
+    await settle();
+
+    await wrapper.find('[data-test="pin-sort-oldest"]').trigger('click');
+    await settle();
+
+    expect(JSON.parse(localStorage.getItem(HOME_KEY))).toEqual({
+      version: 1, mode: 'oldest', randomSeed: 5,
+    });
+    const lastCall = API.fetchPins.mock.calls[API.fetchPins.mock.calls.length - 1];
+    expect(lastCall[0]).toBe(0);
+    expect(lastCall[4]).toEqual({ version: 1, mode: 'oldest', randomSeed: 5 });
+
+    const requestCount = API.fetchPins.mock.calls.length;
+    await wrapper.find('[data-test="pin-sort-oldest"]').trigger('click');
+    await settle();
+    expect(API.fetchPins).toHaveBeenCalledTimes(requestCount);
+  });
+
+  it('random re-click replaces seed, resets offset and scrolls to top', async () => {
+    const wrapper = mountPins();
+    await settle();
+    wrapper.vm.sortState = { version: 1, mode: 'random', randomSeed: 5 };
+    wrapper.vm.seedFactory = () => 6;
+    wrapper.vm.status.offset = 30;
+
+    await wrapper.find('[data-test="pin-sort-random"]').trigger('click');
+    await settle();
+
+    expect(wrapper.vm.sortState.randomSeed).toBe(6);
+    expect(API.fetchPins.mock.calls[API.fetchPins.mock.calls.length - 1][0]).toBe(0);
+    expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
+    expect(wrapper.find('[data-test="pin-sort-announcement"]').text())
+      .toBe('pinSortReshuffled');
+  });
+
+  it('disables all modes during selection or an operation', async () => {
+    const wrapper = mountPins();
+    await settle();
+
+    wrapper.vm.selection.active = true;
+    await wrapper.vm.$nextTick();
+    ['latest', 'oldest', 'random'].forEach((mode) => {
+      expect(wrapper.find(`[data-test="pin-sort-${mode}"]`).attributes('disabled'))
+        .toBe('disabled');
+    });
+
+    wrapper.vm.selection.active = false;
+    wrapper.vm.selection.operationInFlight = true;
+    await wrapper.vm.$nextTick();
+    ['latest', 'oldest', 'random'].forEach((mode) => {
+      expect(wrapper.find(`[data-test="pin-sort-${mode}"]`).attributes('disabled'))
+        .toBe('disabled');
+    });
+  });
+
+  it('clears list state on context change and ignores the previous deferred page', async () => {
+    storeState('svrx.pinSort.v1:user:other', 'oldest', 17);
+    const oldPage = deferred();
+    const currentPage = deferred();
+    let requestCount = 0;
+    const wrapper = mountPins({
+      fetchPinsImplementation: () => {
+        requestCount += 1;
+        if (requestCount === 1) return page([pin(41)], '/api/v2/pins/?offset=1');
+        return requestCount === 2 ? oldPage.promise : currentPage.promise;
+      },
+    });
+    await settle();
+    wrapper.vm.fetchMore();
+
+    await wrapper.setProps({ pinFilters: { userFilter: 'other' } });
+    expect(wrapper.vm.blocks).toEqual([]);
+    expect(wrapper.vm.blocksMap).toEqual({});
+    expect(wrapper.vm.status.offset).toBe(0);
+    expect(window.scrollTo).toHaveBeenCalledWith(0, 0);
+
+    currentPage.resolve({ data: { results: [pin(80, 'other')], next: null } });
+    await settle();
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([80]);
+    expect(API.fetchPins.mock.calls[2][4]).toEqual({
+      version: 1, mode: 'oldest', randomSeed: 17,
+    });
+
+    oldPage.resolve({ data: { results: [pin(40)], next: null } });
+    await settle();
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([80]);
+    expect(wrapper.vm.status.offset).toBe(1);
+  });
+
+  it('uses the same random mode and seed for every offset request', async () => {
+    storeState(HOME_KEY, 'random', 23);
+    const responses = [
+      () => page([pin(30), pin(29)], '/api/v2/pins/?offset=2'),
+      () => page([pin(28)], null),
+    ];
+    const wrapper = mountPins({ fetchPinsImplementation: () => responses.shift()() });
+    await settle();
+
+    wrapper.vm.fetchMore();
+    await settle();
+
+    expect(API.fetchPins.mock.calls.map(call => [call[0], call[4]])).toEqual([
+      [0, { version: 1, mode: 'random', randomSeed: 23 }],
+      [2, { version: 1, mode: 'random', randomSeed: 23 }],
+    ]);
+  });
+
+  it('deduplicates later rows while advancing offset by consumed rows', async () => {
+    const responses = [
+      () => page([pin(30), pin(29)], '/api/v2/pins/?offset=2'),
+      () => page([pin(29), pin(28)], null),
+    ];
+    const wrapper = mountPins({ fetchPinsImplementation: () => responses.shift()() });
+    await settle();
+
+    wrapper.vm.fetchMore();
+    await settle();
+
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([30, 29, 28]);
+    expect(Object.keys(wrapper.vm.blocksMap).map(Number).sort((a, b) => a - b))
+      .toEqual([28, 29, 30]);
+    expect(wrapper.vm.status.offset).toBe(4);
+  });
+
+  it('clears a partial sorted list before one offset-zero legacy retry', async () => {
+    storeState(HOME_KEY, 'oldest', 31);
+    const responses = [
+      () => page([pin(30), pin(29)], '/api/v2/pins/?offset=2'),
+      () => Promise.reject(invalidSortError()),
+      () => page([pin(90), pin(89)], null),
+    ];
+    const wrapper = mountPins({ fetchPinsImplementation: () => responses.shift()() });
+    await settle();
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([30, 29]);
+
+    wrapper.vm.fetchMore();
+    await settle();
+
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([90, 89]);
+    expect(wrapper.vm.blocks.map(item => item.id)).not.toContain(30);
+    const legacyCalls = API.fetchPins.mock.calls.filter(call => call[4] === null);
+    expect(legacyCalls).toHaveLength(1);
+    expect(legacyCalls[0][0]).toBe(0);
+    expect(localStorage.getItem(HOME_KEY)).toBeNull();
+    expect(wrapper.vm.sortLegacyFallback).toBe(true);
+    expect(wrapper.vm.sortFallbackAttempted).toBe(true);
+  });
+
+  it('does not loop when the legacy retry also reports an invalid sort contract', async () => {
+    const invalid = () => Promise.reject(invalidSortError());
+    const wrapper = mountPins({
+      fetchPinsImplementation: jest.fn()
+        .mockImplementationOnce(invalid)
+        .mockImplementationOnce(invalid),
+    });
+
+    await settle();
+
+    expect(API.fetchPins).toHaveBeenCalledTimes(2);
+    expect(API.fetchPins.mock.calls.filter(call => call[4] === null)).toHaveLength(1);
+    expect(wrapper.vm.sortLegacyFallback).toBe(true);
+    expect(wrapper.vm.sortFallbackAttempted).toBe(true);
+    expect(wrapper.vm.status.loading).toBe(false);
+  });
+
+  it('leaves legacy fallback when the user selects any sort, including latest', async () => {
+    const wrapper = mountPins();
+    await settle();
+    wrapper.vm.sortLegacyFallback = true;
+    wrapper.vm.sortFallbackAttempted = true;
+    wrapper.vm.sortState = { version: 1, mode: 'latest', randomSeed: 5 };
+
+    wrapper.vm.applySortMode('latest');
+    await settle();
+
+    expect(wrapper.vm.sortLegacyFallback).toBe(false);
+    expect(wrapper.vm.sortFallbackAttempted).toBe(false);
+    const lastCall = API.fetchPins.mock.calls[API.fetchPins.mock.calls.length - 1];
+    expect(lastCall[0]).toBe(0);
+    expect(lastCall[4]).toEqual({ version: 1, mode: 'latest', randomSeed: 5 });
+  });
+
+  it.each([
+    ['network error', new Error('offline')],
+    ['server error', { response: { status: 503, data: { code: 'unavailable' } } }],
+  ])('keeps sort state without fallback after a %s', async (_name, error) => {
+    storeState(HOME_KEY, 'random', 37);
+    const wrapper = mountPins({
+      fetchPinsImplementation: () => Promise.reject(error),
+    });
+
+    await settle();
+
+    expect(wrapper.vm.sortState).toEqual({ version: 1, mode: 'random', randomSeed: 37 });
+    expect(wrapper.vm.sortLegacyFallback).toBe(false);
+    expect(wrapper.vm.sortFallbackAttempted).toBe(false);
+    expect(JSON.parse(localStorage.getItem(HOME_KEY))).toEqual({
+      version: 1, mode: 'random', randomSeed: 37,
+    });
+    expect(API.fetchPins).toHaveBeenCalledTimes(1);
+    expect(API.fetchPins.mock.calls[0][4]).toEqual({
+      version: 1, mode: 'random', randomSeed: 37,
+    });
+    expect(wrapper.vm.status.loading).toBe(false);
+  });
+
+  it('hides controls for a single Pin lookup', async () => {
+    const wrapper = mountPins({ pinFilters: { idFilter: 7 } });
+    await settle();
+
+    expect(wrapper.find('[data-test="pin-sort-latest"]').exists()).toBe(false);
+    expect(API.fetchPins).not.toHaveBeenCalled();
+    expect(API.fetchPin).toHaveBeenCalledWith(7);
+  });
+});

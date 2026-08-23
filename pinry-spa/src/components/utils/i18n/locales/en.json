@@ -143,5 +143,11 @@
     "bulkPinTagAdd": "Add tags",
     "bulkPinTagRemove": "Remove tags",
     "bulkPinTagReplace": "Replace tags",
-    "bulkPinTargetBoard": "Destination board"
+    "bulkPinTargetBoard": "Destination board",
+    "pinSortLabel": "Sort",
+    "pinSortLatest": "Newest first",
+    "pinSortOldest": "Oldest first",
+    "pinSortRandom": "Random",
+    "pinSortReshuffled": "Random order reshuffled.",
+    "pinSortDisabled": "Sorting cannot be changed while selecting Pins or running a bulk action."
 }

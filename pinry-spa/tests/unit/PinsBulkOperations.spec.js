@@ -789,6 +789,16 @@ describe('bulk operation dialogs', () => {
 describe('Pins bulk operation orchestration', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    Object.defineProperty(window, 'crypto', {
+      configurable: true,
+      value: {
+        getRandomValues(values) {
+          values.set([5]);
+          return values;
+        },
+      },
+    });
+    window.scrollTo = jest.fn();
     jest.spyOn(Pins.methods, 'initializeMeta').mockImplementation(function initializeMeta() {
       this.editorMeta.user = { loggedIn: true, meta: { username: 'owner' } };
       this.metaReady.user = true;

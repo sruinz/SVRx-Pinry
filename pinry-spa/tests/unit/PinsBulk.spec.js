@@ -156,6 +156,17 @@ describe('Pins selection mode', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mountedPinWrappers = [];
+    localStorage.clear();
+    Object.defineProperty(window, 'crypto', {
+      configurable: true,
+      value: {
+        getRandomValues(values) {
+          values.set([5]);
+          return values;
+        },
+      },
+    });
+    window.scrollTo = jest.fn();
     jest.spyOn(Pins.methods, 'initializeMeta').mockImplementation(function initializeMeta() {
       this.editorMeta.user = mockAuthenticatedUsername === null
         ? { loggedIn: false, meta: {} }
@@ -178,6 +189,7 @@ describe('Pins selection mode', () => {
     if (Pins.methods.initializeMeta.mockRestore) {
       Pins.methods.initializeMeta.mockRestore();
     }
+    localStorage.clear();
   });
 
   it('shows management only for the authenticated owner route', async () => {

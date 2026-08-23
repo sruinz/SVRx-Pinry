@@ -143,5 +143,11 @@
     "bulkPinTagAdd": "Ajouter des tags",
     "bulkPinTagRemove": "Retirer des tags",
     "bulkPinTagReplace": "Remplacer les tags",
-    "bulkPinTargetBoard": "Tableau de destination"
+    "bulkPinTargetBoard": "Tableau de destination",
+    "pinSortLabel": "Tri",
+    "pinSortLatest": "Plus récent",
+    "pinSortOldest": "Plus ancien",
+    "pinSortRandom": "Aléatoire",
+    "pinSortReshuffled": "L'ordre aléatoire a été remélangé.",
+    "pinSortDisabled": "Le tri ne peut pas être modifié pendant la sélection de Pins ou une action groupée."
 }
