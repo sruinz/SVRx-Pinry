@@ -296,10 +296,40 @@ describe('Header locale and extension menus', () => {
     const wrapper = shallowMount(PHeader, {
       localVue,
       i18n,
-      stubs: ['b-icon', 'router-link'],
+      stubs: {
+        'b-icon': true,
+        'router-link': {
+          name: 'RouterLinkStub',
+          props: ['to'],
+          template: '<a><slot /></a>',
+        },
+      },
     });
     return { i18n, wrapper };
   }
+
+  it('renders My menu as Pin, boards, and profile with exact route params', async () => {
+    const { wrapper } = mountHeader();
+    await wrapper.setData({
+      user: { loggedIn: true, meta: { username: 'owner' } },
+    });
+
+    const menu = wrapper.find('[data-test="my-menu"]');
+    expect([...menu.element.children].map(item => item.dataset.test)).toEqual([
+      'my-pins-link',
+      'my-boards-link',
+      'my-profile-link',
+    ]);
+    expect(wrapper.find('[data-test="my-pins-link"]').props('to')).toEqual({
+      name: 'user', params: { user: 'owner' },
+    });
+    expect(wrapper.find('[data-test="my-boards-link"]').props('to')).toEqual({
+      name: 'boards4user', params: { username: 'owner' },
+    });
+    expect(wrapper.find('[data-test="my-profile-link"]').props('to')).toEqual({
+      name: 'profile4user', params: { username: 'owner' },
+    });
+  });
 
   it('renders and persists locale choices in the explicit product order', async () => {
     const { i18n, wrapper } = mountHeader();

@@ -46,20 +46,23 @@
               <a class="navbar-link">
                 {{ $t("myLink") }}
               </a>
-              <div class="navbar-dropdown">
-                <router-link
-                  :to="{ name: 'boards4user', params: {username: user.meta.username} }"
-                  class="navbar-item">
-                  {{ $t("boardsLink") }}
-                </router-link>
+              <div class="navbar-dropdown" data-test="my-menu">
                 <router-link
                   :to="{ name: 'user', params: {user: user.meta.username} }"
-                  class="navbar-item">
+                  class="navbar-item"
+                  data-test="my-pins-link">
                   {{ $t("pinsLink") }}
                 </router-link>
                 <router-link
+                  :to="{ name: 'boards4user', params: {username: user.meta.username} }"
+                  class="navbar-item"
+                  data-test="my-boards-link">
+                  {{ $t("boardsLink") }}
+                </router-link>
+                <router-link
                   :to="{ name: 'profile4user', params: {username: user.meta.username} }"
-                  class="navbar-item">
+                  class="navbar-item"
+                  data-test="my-profile-link">
                   {{ $t("profileLink") }}
                 </router-link>
               </div>
