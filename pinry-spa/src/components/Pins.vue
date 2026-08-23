@@ -1043,8 +1043,12 @@ export default {
           if (!resp || !this.isRequestCurrent(generation, filters)) return;
           const { results, next } = resp.data;
           const consumed = results.length;
-          const newBlocks = this.buildBlocks(results)
-            .filter(item => !this.blocksMap[item.id]);
+          const pageIds = new Set();
+          const newBlocks = this.buildBlocks(results).filter((item) => {
+            if (this.blocksMap[item.id] || pageIds.has(item.id)) return false;
+            pageIds.add(item.id);
+            return true;
+          });
           newBlocks.forEach(
             (item) => { this.blocksMap[item.id] = item; },
           );
@@ -1056,9 +1060,14 @@ export default {
         },
         (error) => {
           if (!this.isRequestCurrent(generation, filters)) return;
+          const status = error && error.response ? error.response.status : null;
           const code = error && error.response && error.response.data
             ? error.response.data.code : null;
-          if (code === 'pin_sort_invalid' && this.fallbackToLegacySort()) return;
+          if (
+            status === 400
+            && code === 'pin_sort_invalid'
+            && this.fallbackToLegacySort()
+          ) return;
           this.status.loading = false;
         },
       );

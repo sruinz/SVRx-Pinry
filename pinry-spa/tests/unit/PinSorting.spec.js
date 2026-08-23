@@ -350,6 +350,19 @@ describe('Pins sorting', () => {
     expect(wrapper.vm.status.offset).toBe(4);
   });
 
+  it('deduplicates repeated IDs within one page while consuming every row', async () => {
+    const wrapper = mountPins({
+      fetchPinsImplementation: () => page([pin(30), pin(30), pin(29)], null),
+    });
+
+    await settle();
+
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([30, 29]);
+    expect(Object.keys(wrapper.vm.blocksMap).map(Number).sort((a, b) => a - b))
+      .toEqual([29, 30]);
+    expect(wrapper.vm.status.offset).toBe(3);
+  });
+
   it('clears a partial sorted list before one offset-zero legacy retry', async () => {
     storeState(HOME_KEY, 'oldest', 31);
     const responses = [
@@ -429,6 +442,29 @@ describe('Pins sorting', () => {
     expect(API.fetchPins.mock.calls[0][4]).toEqual({
       version: 1, mode: 'random', randomSeed: 37,
     });
+    expect(wrapper.vm.status.loading).toBe(false);
+  });
+
+  it('does not fallback when a 5xx body contains pin_sort_invalid', async () => {
+    storeState(HOME_KEY, 'random', 41);
+    const error = new Error('server error');
+    error.response = {
+      status: 503,
+      data: { code: 'pin_sort_invalid' },
+    };
+    const wrapper = mountPins({
+      fetchPinsImplementation: () => Promise.reject(error),
+    });
+
+    await settle();
+
+    expect(wrapper.vm.sortState).toEqual({ version: 1, mode: 'random', randomSeed: 41 });
+    expect(wrapper.vm.sortLegacyFallback).toBe(false);
+    expect(wrapper.vm.sortFallbackAttempted).toBe(false);
+    expect(JSON.parse(localStorage.getItem(HOME_KEY))).toEqual({
+      version: 1, mode: 'random', randomSeed: 41,
+    });
+    expect(API.fetchPins).toHaveBeenCalledTimes(1);
     expect(wrapper.vm.status.loading).toBe(false);
   });
 
