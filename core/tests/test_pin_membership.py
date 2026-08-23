@@ -244,6 +244,18 @@ class PinMembershipServiceTests(TestCase):
         self.source.refresh_from_db()
         self.assertEqual(self.source.cover_pin_id, self.pin.pk)
 
+    def test_update_membership_removes_initial_non_member_in_overlap(self):
+        self.service.update_board_membership(
+            self.owner,
+            self.source.pk,
+            [self.pin.pk],
+            [self.pin.pk],
+        )
+
+        self.assertFalse(
+            self.source.pins.filter(pk=self.pin.pk).exists()
+        )
+
     def test_move_rejects_pin_outside_both_boards_without_changes(self):
         with self.assertRaises(MembershipConflict) as caught:
             self.service.move_pins(

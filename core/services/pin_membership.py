@@ -167,16 +167,17 @@ class PinMembershipService(object):
             removals = [
                 visible_pins[pin_id]
                 for pin_id in remove_ids
-                if (
-                    pin_id in visible_pins
-                    and pin_id in existing_remove_ids
-                )
+                if pin_id in visible_pins
             ]
             if additions:
                 board.pins.add(*additions)
             BoardCoverService.clear_if_removed(
                 board,
-                [pin.pk for pin in removals],
+                [
+                    pin.pk
+                    for pin in removals
+                    if pin.pk in existing_remove_ids
+                ],
             )
             if removals:
                 board.pins.remove(*removals)
