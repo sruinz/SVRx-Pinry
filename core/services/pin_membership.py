@@ -1,6 +1,7 @@
 from django.db import DEFAULT_DB_ALIAS, transaction
 
 from core.models import Board, Pin
+from core.services.board_cover import BoardCoverService
 
 
 class MembershipConflict(Exception):
@@ -118,6 +119,10 @@ class PinMembershipService(object):
                 for pin_id in requested_ids
                 if pin_id not in target_ids
             ]
+            BoardCoverService.clear_if_removed(
+                source,
+                [pin.pk for pin in pins_to_remove],
+            )
             if pins_to_remove:
                 source.pins.remove(*pins_to_remove)
             if pins_to_add:
@@ -150,6 +155,10 @@ class PinMembershipService(object):
                 for pin in pins
                 if not pin.private or pin.submitter_id == user.pk
             }
+            existing_remove_ids = set(
+                board.pins.filter(pk__in=remove_ids)
+                .values_list("pk", flat=True)
+            )
             additions = [
                 visible_pins[pin_id]
                 for pin_id in add_ids
@@ -158,10 +167,17 @@ class PinMembershipService(object):
             removals = [
                 visible_pins[pin_id]
                 for pin_id in remove_ids
-                if pin_id in visible_pins
+                if (
+                    pin_id in visible_pins
+                    and pin_id in existing_remove_ids
+                )
             ]
             if additions:
                 board.pins.add(*additions)
+            BoardCoverService.clear_if_removed(
+                board,
+                [pin.pk for pin in removals],
+            )
             if removals:
                 board.pins.remove(*removals)
             return board

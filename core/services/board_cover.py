@@ -12,6 +12,14 @@ class BoardCoverError(Exception):
 
 class BoardCoverService(object):
     @staticmethod
+    def clear_if_removed(board, removed_pin_ids):
+        if board.cover_pin_id not in set(removed_pin_ids):
+            return False
+        board.cover_pin = None
+        board.save(update_fields=("cover_pin",))
+        return True
+
+    @staticmethod
     def eligible_pins(board, request):
         query = board.pins.select_related("image", "submitter")
         if not board.private:

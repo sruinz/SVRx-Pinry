@@ -21,6 +21,7 @@ from rest_framework.test import APIClient, APITestCase, APITransactionTestCase
 
 from core.bulk_serializers import BulkPinRequestSerializer
 from core.models import Board, Image, MediaAsset, Pin
+from core.services.board_cover import BoardCoverService
 from core.services.bulk_pin_management import BulkOperationError
 from core.services.pin_membership import PinMembershipService
 from core.tests.helpers import create_image, create_user
@@ -400,6 +401,27 @@ class BulkPinWriteAPITests(
         })
         self.assertNotIn("private", str(response.data))
         self.assertNotIn("busy", str(response.data))
+
+    def test_bulk_delete_clears_manual_cover_and_uses_auto_fallback(self):
+        self.source.pins.add(self.second)
+        self.source.cover_pin = self.first
+        self.source.save(update_fields=("cover_pin",))
+
+        response = self.client.post(
+            self._url(),
+            {"operation": "delete", "pin_ids": [self.first.pk]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.source.refresh_from_db()
+        self.assertIsNone(self.source.cover_pin_id)
+        fallback, manual_id = BoardCoverService().resolve(
+            self.source,
+            None,
+        )
+        self.assertEqual(fallback.pk, self.second.pk)
+        self.assertIsNone(manual_id)
 
     def test_delete_maps_database_busy_without_raw_message(self):
         with mock.patch.object(
@@ -1013,6 +1035,31 @@ class BulkPinWriteAPITests(
         self.assertTrue(Pin.objects.filter(
             pk=missing_membership.pk
         ).exists())
+
+    def test_conditional_delete_clears_cover_and_uses_auto_fallback(self):
+        self.source.pins.add(self.second)
+        self.source.cover_pin = self.first
+        self.source.save(update_fields=("cover_pin",))
+
+        response = self.client.post(
+            self._url(),
+            {
+                "operation": "delete_if_exclusive_to_board",
+                "pin_ids": [self.first.pk],
+                "source_board_id": self.source.pk,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.source.refresh_from_db()
+        self.assertIsNone(self.source.cover_pin_id)
+        fallback, manual_id = BoardCoverService().resolve(
+            self.source,
+            None,
+        )
+        self.assertEqual(fallback.pk, self.second.pk)
+        self.assertIsNone(manual_id)
 
     def test_conditional_delete_registered_media_uses_hydrated_pin(self):
         image = create_image()

@@ -23,6 +23,7 @@ from rest_framework.test import APIClient, APITransactionTestCase
 
 from core.admin import PinAdmin
 from core.models import BatchImportItem, Board, Image, MediaAsset, Pin
+from core.services.board_cover import BoardCoverService
 from core.services.idempotency import IdempotencyStore, StoredError
 from core.services.media_storage import MediaStorage
 from core.services.pin_membership import PinMembershipService
@@ -62,6 +63,27 @@ class PinDeletionAPITest(TemporaryMediaMixin, APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Pin.objects.filter(pk=self.pin.pk).exists())
+
+    def test_instance_delete_clears_manual_cover_and_uses_auto_fallback(self):
+        board = Board.objects.create(
+            submitter=self.owner,
+            name="instance-delete-cover",
+        )
+        fallback_pin = Pin.objects.create(
+            submitter=self.owner,
+            image=create_image(),
+        )
+        board.pins.add(self.pin, fallback_pin)
+        board.cover_pin = self.pin
+        board.save(update_fields=("cover_pin",))
+
+        self.pin.delete()
+
+        board.refresh_from_db()
+        self.assertIsNone(board.cover_pin_id)
+        fallback, manual_id = BoardCoverService().resolve(board, None)
+        self.assertEqual(fallback.pk, fallback_pin.pk)
+        self.assertIsNone(manual_id)
 
     def test_removed_trash_routes_return_404(self):
         detail = reverse("pin-detail", args=[self.pin.pk])
@@ -1300,6 +1322,25 @@ class PinMediaLifecycleTest(
         self.assertEqual(
             media_snapshot(self.temporary_media.name), files_before
         )
+
+    def test_queryset_delete_clears_manual_cover_and_uses_auto_fallback(self):
+        board = Board.objects.create(
+            submitter=self.owner,
+            name="queryset-delete-cover",
+        )
+        cover_pin = create_pin(self.owner, create_image(), [])
+        fallback_pin = create_pin(self.owner, create_image(), [])
+        board.pins.add(cover_pin, fallback_pin)
+        board.cover_pin = cover_pin
+        board.save(update_fields=("cover_pin",))
+
+        Pin.objects.filter(pk=cover_pin.pk).delete()
+
+        board.refresh_from_db()
+        self.assertIsNone(board.cover_pin_id)
+        fallback, manual_id = BoardCoverService().resolve(board, None)
+        self.assertEqual(fallback.pk, fallback_pin.pk)
+        self.assertIsNone(manual_id)
 
     def test_registered_queryset_delete_locks_before_pin_row_mutation(self):
         image = create_image()

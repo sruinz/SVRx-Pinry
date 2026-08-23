@@ -5,6 +5,7 @@ from django.test import TestCase, TransactionTestCase
 import mock
 
 from core.models import Board, Pin
+from core.services.board_cover import BoardCoverService
 from core.services.pin_membership import (
     MembershipConflict,
     PinMembershipService,
@@ -162,6 +163,86 @@ class PinMembershipServiceTests(TestCase):
                     self.target.pins.filter(pk=self.pin.pk).exists(),
                     final_target,
                 )
+
+    def test_move_clears_source_cover_and_preserves_target_cover(self):
+        source_fallback = self._create_pin(self.owner)
+        target_cover = self._create_pin(self.owner)
+        self.source.pins.add(self.pin, source_fallback)
+        self.target.pins.add(target_cover)
+        self.source.cover_pin = self.pin
+        self.target.cover_pin = target_cover
+        self.source.save(update_fields=("cover_pin",))
+        self.target.save(update_fields=("cover_pin",))
+
+        self.service.move_pins(
+            self.owner,
+            self.source.pk,
+            self.target.pk,
+            [self.pin.pk],
+        )
+
+        self.source.refresh_from_db()
+        self.target.refresh_from_db()
+        self.assertIsNone(self.source.cover_pin_id)
+        self.assertEqual(self.target.cover_pin_id, target_cover.pk)
+        fallback, manual_id = BoardCoverService().resolve(
+            self.source,
+            None,
+        )
+        self.assertEqual(fallback.pk, source_fallback.pk)
+        self.assertIsNone(manual_id)
+
+    def test_update_membership_clears_removed_manual_cover(self):
+        fallback_pin = self._create_pin(self.owner)
+        self.source.pins.add(self.pin, fallback_pin)
+        self.source.cover_pin = self.pin
+        self.source.save(update_fields=("cover_pin",))
+
+        self.service.update_board_membership(
+            self.owner,
+            self.source.pk,
+            [],
+            [self.pin.pk],
+        )
+
+        self.source.refresh_from_db()
+        self.assertIsNone(self.source.cover_pin_id)
+        fallback, manual_id = BoardCoverService().resolve(
+            self.source,
+            None,
+        )
+        self.assertEqual(fallback.pk, fallback_pin.pk)
+        self.assertIsNone(manual_id)
+
+    def test_update_membership_preserves_cover_when_non_cover_is_removed(self):
+        removed_pin = self._create_pin(self.owner)
+        self.source.pins.add(self.pin, removed_pin)
+        self.source.cover_pin = self.pin
+        self.source.save(update_fields=("cover_pin",))
+
+        self.service.update_board_membership(
+            self.owner,
+            self.source.pk,
+            [],
+            [removed_pin.pk],
+        )
+
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.cover_pin_id, self.pin.pk)
+
+    def test_update_membership_preserves_cover_for_requested_non_member(self):
+        self.source.cover_pin = self.pin
+        self.source.save(update_fields=("cover_pin",))
+
+        self.service.update_board_membership(
+            self.owner,
+            self.source.pk,
+            [],
+            [self.pin.pk],
+        )
+
+        self.source.refresh_from_db()
+        self.assertEqual(self.source.cover_pin_id, self.pin.pk)
 
     def test_move_rejects_pin_outside_both_boards_without_changes(self):
         with self.assertRaises(MembershipConflict) as caught:
