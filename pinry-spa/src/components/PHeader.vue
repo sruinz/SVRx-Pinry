@@ -68,29 +68,45 @@
               <a class="navbar-link">
                 {{ $t("browserExtensionsLink") }}
               </a>
-              <div class="navbar-dropdown">
+              <div
+                class="navbar-dropdown"
+                data-test="browser-extension-menu">
                 <a
                   class="navbar-item"
-                  data-test="chrome-extension-link"
-                  href="https://chrome.google.com/webstore/detail/jmhdcnmfkglikfjafdmdikoonedgijpa/"
+                  data-test="custom-extension-github"
+                  href="https://github.com/sruinz/SVRx-Pinry-Extention"
                   target="_blank"
                   rel="noopener noreferrer">
-                  {{ $t("chromeLink") }}
-                </a>
-                <a
-                  class="navbar-item"
-                  data-test="firefox-extension-link"
-                  href="https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/"
-                  target="_blank"
-                  rel="noopener noreferrer">
-                  {{ $t("firefoxLink") }}
+                  {{ $t("customExtensionGitHubLink") }}
                 </a>
                 <span
                   class="navbar-item is-disabled"
-                  data-test="custom-extension-pending"
+                  data-test="custom-extension-chrome-pending"
                   aria-disabled="true">
-                  {{ $t("customExtensionPendingLink") }}
+                  {{ $t("customExtensionChromePendingLink") }}
                 </span>
+                <span
+                  class="navbar-item is-disabled"
+                  data-test="custom-extension-edge-pending"
+                  aria-disabled="true">
+                  {{ $t("customExtensionEdgePendingLink") }}
+                </span>
+                <a
+                  class="navbar-item"
+                  data-test="legacy-chrome-link"
+                  href="https://chrome.google.com/webstore/detail/jmhdcnmfkglikfjafdmdikoonedgijpa/"
+                  target="_blank"
+                  rel="noopener noreferrer">
+                  {{ $t("legacyChromeLink") }}
+                </a>
+                <a
+                  class="navbar-item"
+                  data-test="legacy-firefox-link"
+                  href="https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/"
+                  target="_blank"
+                  rel="noopener noreferrer">
+                  {{ $t("legacyFirefoxLink") }}
+                </a>
               </div>
             </div>
           </div>

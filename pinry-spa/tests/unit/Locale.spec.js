@@ -18,6 +18,9 @@ import ko from '@/components/utils/i18n/locales/ko.json';
 import zh from '@/components/utils/i18n/locales/zh.json';
 
 
+const CHROME_URL = 'https://chrome.google.com/webstore/detail/jmhdcnmfkglikfjafdmdikoonedgijpa/';
+const FIREFOX_URL = 'https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/';
+
 const EXPECTED_LOCALE_KEYS = [
   'Add2BoardModalCardButton',
   'Add2BoardModalCardTitle',
@@ -86,11 +89,12 @@ const EXPECTED_LOCALE_KEYS = [
   'bulkPinTagReplace',
   'bulkPinTargetBoard',
   'chooseFilterPlaceholder',
-  'chromeLink',
   'closeButton',
   'createBoardButton',
   'createLink',
-  'customExtensionPendingLink',
+  'customExtensionChromePendingLink',
+  'customExtensionEdgePendingLink',
+  'customExtensionGitHubLink',
   'descriptionLabel',
   'drfApiDocumentationLink',
   'emailLabel',
@@ -99,11 +103,12 @@ const EXPECTED_LOCALE_KEYS = [
   'error404',
   'filterSelectCreateNewBoardButton',
   'filterSelectSelectBoardPlaceholder',
-  'firefoxLink',
   'forMoreDetailsParagraph',
   'imageSourceLabel',
   'imageUrlLabel',
   'isPrivateCheckbox',
+  'legacyChromeLink',
+  'legacyFirefoxLink',
   'logInLink',
   'logOutLink',
   'loginButton',
@@ -170,9 +175,11 @@ const REQUIRED_KOREAN_TEXT = {
   pinDeleteError: 'Pin을 삭제하지 못했습니다',
   pinCreateError: 'Pin을 만들지 못했습니다',
   browserExtensionsLink: '브라우저 확장 프로그램',
-  chromeLink: 'Chrome — 기존 단건용',
-  firefoxLink: 'Firefox — 기존 단건용',
-  customExtensionPendingLink: 'SVRx Pinry 전체선택 확장 — 준비 중',
+  customExtensionGitHubLink: 'SVRx Pinry - GitHub',
+  customExtensionChromePendingLink: 'SVRx Pinry - Chrome 웹 스토어 (준비 중)',
+  customExtensionEdgePendingLink: 'SVRx Pinry - Microsoft Edge Add-ons (준비 중)',
+  legacyChromeLink: 'Pinry 레거시 - Chrome',
+  legacyFirefoxLink: 'Pinry 레거시 - Firefox',
   buildBrandLabel: '제품',
   buildInfoTitle: '빌드 정보',
   buildVersionLabel: '실행 버전',
@@ -313,27 +320,38 @@ describe('Header locale and extension menus', () => {
     setItem.mockRestore();
   });
 
-  it('separates legacy single-image stores from the disabled custom item', () => {
+  it('renders the custom and legacy extension items in the release order', () => {
     const { wrapper } = mountHeader();
-    const chrome = wrapper.find('[data-test="chrome-extension-link"]');
-    const firefox = wrapper.find('[data-test="firefox-extension-link"]');
-    const custom = wrapper.find('[data-test="custom-extension-pending"]');
+    const menu = wrapper.find('[data-test="browser-extension-menu"]');
 
-    expect(chrome.text()).toBe('Chrome — 기존 단건용');
-    expect(chrome.attributes()).toMatchObject({
-      href: 'https://chrome.google.com/webstore/detail/jmhdcnmfkglikfjafdmdikoonedgijpa/',
-      target: '_blank',
-      rel: 'noopener noreferrer',
+    expect(menu.exists()).toBe(true);
+    expect([...menu.element.children].map(item => item.dataset.test)).toEqual([
+      'custom-extension-github',
+      'custom-extension-chrome-pending',
+      'custom-extension-edge-pending',
+      'legacy-chrome-link',
+      'legacy-firefox-link',
+    ]);
+
+    const items = wrapper.findAll(
+      '[data-test="browser-extension-menu"] > [data-test]',
+    );
+    expect(items.at(0).attributes('href'))
+      .toBe('https://github.com/sruinz/SVRx-Pinry-Extention');
+    expect(items.at(1).attributes('aria-disabled')).toBe('true');
+    expect(items.at(2).attributes('aria-disabled')).toBe('true');
+    expect(items.at(3).attributes('href')).toBe(CHROME_URL);
+    expect(items.at(4).attributes('href')).toBe(FIREFOX_URL);
+
+    [0, 3, 4].forEach((index) => {
+      expect(items.at(index).attributes()).toMatchObject({
+        target: '_blank',
+        rel: 'noopener noreferrer',
+      });
     });
-    expect(firefox.text()).toBe('Firefox — 기존 단건용');
-    expect(firefox.attributes()).toMatchObject({
-      href: 'https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/',
-      target: '_blank',
-      rel: 'noopener noreferrer',
+    [1, 2].forEach((index) => {
+      expect(items.at(index).attributes('href')).toBeUndefined();
+      expect(items.at(index).classes()).toContain('is-disabled');
     });
-    expect(custom.text()).toBe('SVRx Pinry 전체선택 확장 — 준비 중');
-    expect(custom.attributes('href')).toBeUndefined();
-    expect(custom.attributes('aria-disabled')).toBe('true');
-    expect(custom.classes()).toContain('is-disabled');
   });
 });
