@@ -1,8 +1,16 @@
-# SVRx Pinry Server
+<p align="center">
+  <img src="docs/src/imgs/svrx-pinry-logo.png" width="128" height="128"
+    alt="SVRx Pinry 로고">
+</p>
 
-SVRx Pinry Server는 한국어 환경과 대량 이미지 관리를 중심으로 Pinry를
-확장한 셀프 호스팅 이미지 보드 서버입니다. 개인 서버나 NAS에 설치해
-이미지를 보드와 태그로 정리하고, SVRx Pinry 브라우저 확장 프로그램으로
+<h1 align="center">SVRx Pinry Server</h1>
+
+<p align="center">
+  한국어와 대량 이미지 관리에 맞춘 셀프 호스팅 이미지 보드
+</p>
+
+SVRx Pinry Server는 개인 서버나 NAS에 설치해 이미지를 보드와 태그로
+정리하는 서버입니다. SVRx Pinry 브라우저 확장 프로그램을 사용하면
 웹페이지의 여러 이미지를 한 번에 저장할 수 있습니다.
 
 이 프로젝트는 Pinry를 기반으로 만든 비공식 수정 배포판입니다.
