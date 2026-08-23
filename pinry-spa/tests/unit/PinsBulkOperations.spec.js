@@ -4,6 +4,7 @@ import flushPromises from 'flush-promises';
 import { createLocalVue, mount, shallowMount } from '@vue/test-utils';
 
 import API from '@/components/api';
+import bus from '@/components/utils/bus';
 import PinBulkBoardDialog from '@/components/bulk/PinBulkBoardDialog.vue';
 import PinBulkEdit, { buildChanges } from '@/components/bulk/PinBulkEdit.vue';
 import { openPinBulkBoard, openPinBulkEdit } from '@/components/modals';
@@ -212,6 +213,7 @@ function dispatchKey(target, key, options = {}) {
 describe('bulk operation dialogs', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    API.Board.create = jest.fn();
     API.Board.fetchFullList = jest.fn().mockResolvedValue({
       data: [
         { id: 3, name: 'Source' },
@@ -255,6 +257,140 @@ describe('bulk operation dialogs', () => {
     expect(API.Board.fetchFullList).toHaveBeenCalledWith('owner');
     expect(wrapper.vm.boardOptions).toEqual([{ id: 7, name: 'Target' }]);
     expect(wrapper.find('[data-test="bulk-board-target"]').text()).not.toContain('Source');
+  });
+
+  it('shows board creation only for add mode with labelled accessible controls', async () => {
+    const add = mountBoardDialog({ mode: 'add' });
+    const move = mountBoardDialog({ mode: 'move', sourceBoardId: 3 });
+    await settle();
+
+    expect(add.find('[data-test="bulk-board-create-form"]').exists()).toBe(true);
+    expect(move.find('[data-test="bulk-board-create-form"]').exists()).toBe(false);
+    expect(add.find('label[for="pin-bulk-new-board-name"]').exists()).toBe(true);
+    expect(add.find('label[for="pin-bulk-new-board-private"]').exists()).toBe(true);
+    expect(add.find('[data-test="bulk-board-create-status"]')
+      .attributes('aria-live')).toBe('polite');
+  });
+
+  it('creates a private board once, selects it, then applies the existing bulk add', async () => {
+    const creation = deferred();
+    API.Board.create.mockReturnValueOnce(creation.promise);
+    const refreshBoards = jest.spyOn(bus.bus, '$emit');
+    const wrapper = mountBoardDialog({ mode: 'add' });
+    await settle();
+    const target = wrapper.find('[data-test="bulk-board-target"]');
+    const focus = jest.spyOn(target.element, 'focus');
+
+    await wrapper.find('[data-test="bulk-board-new-name"]').setValue('  New Board  ');
+    await wrapper.find('[data-test="bulk-board-new-private"]').setChecked(true);
+    await wrapper.find('[data-test="bulk-board-create-form"]').trigger('submit');
+    await wrapper.find('[data-test="bulk-board-create-form"]').trigger('submit');
+
+    expect(API.Board.create).toHaveBeenCalledTimes(1);
+    expect(API.Board.create).toHaveBeenCalledWith('New Board', true);
+    expect(wrapper.find('[data-test="bulk-board-target"]').attributes('disabled'))
+      .toBe('disabled');
+    expect(wrapper.find('[data-test="bulk-board-submit"]').attributes('disabled'))
+      .toBe('disabled');
+    expect(wrapper.find('[data-test="bulk-board-close"]').attributes('disabled'))
+      .toBe('disabled');
+
+    creation.resolve({ id: 11, name: 'New Board', private: true });
+    await settle();
+
+    expect(wrapper.vm.boardOptions).toEqual([
+      { id: 11, name: 'New Board' },
+      { id: 3, name: 'Source' },
+      { id: 7, name: 'Target' },
+    ]);
+    expect(wrapper.vm.targetBoardId).toBe(11);
+    expect(refreshBoards).toHaveBeenCalledWith(bus.events.refreshBoards);
+    expect(focus).toHaveBeenCalled();
+    expect(API.Pin.bulk).not.toHaveBeenCalled();
+
+    await wrapper.find('[data-test="bulk-board-submit"]').trigger('click');
+    await settle();
+    expect(API.Pin.bulk).toHaveBeenCalledWith({
+      operation: 'add_to_board', board_id: 11, pin_ids: [41, 42],
+    });
+    refreshBoards.mockRestore();
+  });
+
+  it('blocks a blank board name locally and preserves the current target', async () => {
+    const wrapper = mountBoardDialog({ mode: 'add' });
+    await settle();
+    await wrapper.find('[data-test="bulk-board-target"]').setValue('7');
+    await wrapper.find('[data-test="bulk-board-new-name"]').setValue('   ');
+    await wrapper.find('[data-test="bulk-board-create-form"]').trigger('submit');
+
+    expect(API.Board.create).not.toHaveBeenCalled();
+    expect(wrapper.vm.targetBoardId).toBe(7);
+    expect(wrapper.find('[data-test="bulk-board-create-error"]').text())
+      .toBe('bulkPinBoardNameRequired');
+  });
+
+  it('keeps create fields and target after failure and allows an explicit retry', async () => {
+    API.Board.create
+      .mockRejectedValueOnce(undefined)
+      .mockResolvedValueOnce({ id: 12, name: 'Retry Board', private: true });
+    const wrapper = mountBoardDialog({ mode: 'add' });
+    await settle();
+    await wrapper.find('[data-test="bulk-board-target"]').setValue('7');
+    await wrapper.find('[data-test="bulk-board-new-name"]').setValue('Retry Board');
+    await wrapper.find('[data-test="bulk-board-new-private"]').setChecked(true);
+
+    await wrapper.find('[data-test="bulk-board-create-form"]').trigger('submit');
+    await settle();
+    expect(wrapper.find('[data-test="bulk-board-create-error"]').text())
+      .toBe('bulkPinBoardCreateError');
+    expect(wrapper.find('[data-test="bulk-board-new-name"]').element.value)
+      .toBe('Retry Board');
+    expect(wrapper.find('[data-test="bulk-board-new-private"]').element.checked).toBe(true);
+    expect(wrapper.vm.targetBoardId).toBe(7);
+
+    await wrapper.find('[data-test="bulk-board-create-form"]').trigger('submit');
+    await settle();
+    expect(API.Board.create).toHaveBeenCalledTimes(2);
+    expect(wrapper.vm.targetBoardId).toBe(12);
+  });
+
+  it('ignores a board creation response after destruction', async () => {
+    const creation = deferred();
+    API.Board.create.mockReturnValueOnce(creation.promise);
+    const wrapper = mountBoardDialog({ mode: 'add' });
+    await settle();
+    await wrapper.find('[data-test="bulk-board-new-name"]').setValue('Late Board');
+    const request = wrapper.vm.createBoard();
+    wrapper.destroy();
+    creation.resolve({ id: 13, name: 'Late Board', private: false });
+    await request;
+
+    expect(wrapper.vm.targetBoardId).toBeNull();
+    expect(wrapper.vm.boardOptions.some(board => board.id === 13)).toBe(false);
+    expect(wrapper.emitted('started')).toBeUndefined();
+    expect(wrapper.emitted('completed')).toBeUndefined();
+  });
+
+  it('does not create a board while list loading or bulk retry state owns the modal', async () => {
+    const boards = deferred();
+    API.Board.fetchFullList.mockReturnValueOnce(boards.promise);
+    const loading = mountBoardDialog({ mode: 'add' });
+    expect(loading.find('[data-test="bulk-board-create"]').attributes('disabled'))
+      .toBe('disabled');
+    await expect(loading.vm.createBoard()).resolves.toBeNull();
+
+    boards.resolve({ data: [{ id: 7, name: 'Target' }] });
+    await settle();
+    API.Pin.bulk.mockRejectedValueOnce(new Error('network'));
+    await loading.find('[data-test="bulk-board-target"]').setValue('7');
+    await loading.find('[data-test="bulk-board-submit"]').trigger('click');
+    await settle();
+
+    expect(loading.vm.result.retryable).toBe(true);
+    expect(loading.find('[data-test="bulk-board-create"]').attributes('disabled'))
+      .toBe('disabled');
+    await expect(loading.vm.createBoard()).resolves.toBeNull();
+    expect(API.Board.create).not.toHaveBeenCalled();
   });
 
   it('ignores late board-list and operation callbacks after destruction', async () => {

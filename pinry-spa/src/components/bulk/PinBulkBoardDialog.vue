@@ -13,9 +13,10 @@
         <div class="select is-fullwidth">
           <select
             id="pin-bulk-board-target"
+            ref="targetBoard"
             v-model.number="targetBoardId"
             data-test="bulk-board-target"
-            :disabled="loadingBoards || operationInFlight || result !== null"
+            :disabled="loadingBoards || boardCreateInFlight || operationInFlight || result !== null"
           >
             <option :value="null">{{ $t('bulkPinChooseBoard') }}</option>
             <option v-for="board in boardOptions" :key="board.id" :value="board.id">
@@ -23,6 +24,63 @@
             </option>
           </select>
         </div>
+        <form
+          v-if="mode === 'add'"
+          class="pin-bulk-board-create"
+          data-test="bulk-board-create-form"
+          novalidate
+          @submit.prevent="createBoard"
+        >
+          <h3 class="title is-6">{{ $t('BoardCreateTitle') }}</h3>
+          <label class="label" for="pin-bulk-new-board-name">{{ $t('nameLabel') }}</label>
+          <input
+            id="pin-bulk-new-board-name"
+            v-model="newBoardName"
+            class="input"
+            type="text"
+            maxlength="128"
+            data-test="bulk-board-new-name"
+            :disabled="!canCreateBoard"
+            :aria-invalid="boardCreateError ? 'true' : null"
+            :aria-describedby="boardCreateError ? 'pin-bulk-new-board-error' : null"
+            @input="boardCreateError = null"
+          >
+          <p
+            v-if="boardCreateError"
+            id="pin-bulk-new-board-error"
+            class="help is-danger"
+            data-test="bulk-board-create-error"
+            role="alert"
+          >
+            {{ $t(boardCreateError) }}
+          </p>
+          <label class="checkbox" for="pin-bulk-new-board-private">
+            <input
+              id="pin-bulk-new-board-private"
+              v-model="newBoardPrivate"
+              type="checkbox"
+              data-test="bulk-board-new-private"
+              :disabled="!canCreateBoard"
+            >
+            {{ $t('isPrivateCheckbox') }}
+          </label>
+          <button
+            class="button"
+            type="submit"
+            data-test="bulk-board-create"
+            :disabled="!canCreateBoard"
+          >
+            {{ $t('createBoardButton') }}
+          </button>
+          <p
+            class="is-sr-only"
+            data-test="bulk-board-create-status"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {{ boardCreateAnnouncement ? $t(boardCreateAnnouncement) : '' }}
+          </p>
+        </form>
         <p v-if="progress" data-test="bulk-board-progress" aria-live="polite">
           {{ $t('bulkPinProgress', progress) }}
         </p>
@@ -33,7 +91,13 @@
         </p>
       </section>
       <footer class="modal-card-foot">
-        <button class="button" type="button" :disabled="operationInFlight" @click="close">
+        <button
+          class="button"
+          type="button"
+          data-test="bulk-board-close"
+          :disabled="boardCreateInFlight || operationInFlight"
+          @click="close"
+        >
           {{ $t('closeButton') }}
         </button>
         <button
@@ -61,6 +125,7 @@
 
 <script>
 import API from '../api';
+import bus from '../utils/bus';
 import { executeBulk } from './bulkExecutor';
 
 export default {
@@ -68,6 +133,7 @@ export default {
   beforeCreate() {
     this.disposed = false;
     this.boardRequestToken = 0;
+    this.boardCreateToken = 0;
     this.operationToken = 0;
     this.operationSnapshot = null;
     this.operationFieldsSnapshot = null;
@@ -101,6 +167,11 @@ export default {
       boardOptions: [],
       targetBoardId: null,
       loadingBoards: false,
+      newBoardName: '',
+      newBoardPrivate: false,
+      boardCreateInFlight: false,
+      boardCreateError: null,
+      boardCreateAnnouncement: null,
       operationInFlight: false,
       operationCompleted: false,
       progress: null,
@@ -109,8 +180,17 @@ export default {
     };
   },
   computed: {
+    canCreateBoard() {
+      return this.mode === 'add'
+        && !this.loadingBoards
+        && !this.boardCreateInFlight
+        && !this.operationInFlight
+        && !this.operationCompleted
+        && this.result === null;
+    },
     canSubmit() {
       return !this.loadingBoards
+        && !this.boardCreateInFlight
         && !this.operationInFlight
         && !this.operationCompleted
         && this.result === null
@@ -131,11 +211,12 @@ export default {
   beforeDestroy() {
     this.disposed = true;
     this.boardRequestToken += 1;
+    this.boardCreateToken += 1;
     this.operationToken += 1;
   },
   methods: {
     close() {
-      if (this.operationInFlight || this.closeConsumed) return;
+      if (this.boardCreateInFlight || this.operationInFlight || this.closeConsumed) return;
       this.closeConsumed = true;
       this.$emit('closed');
       if (this.$parent && typeof this.$parent.close === 'function') this.$parent.close();
@@ -163,6 +244,56 @@ export default {
           this.loadingBoards = false;
         }
       });
+    },
+    async createBoard() {
+      if (!this.canCreateBoard || this.canStartOperation() !== true) return null;
+      const name = this.newBoardName.trim();
+      if (name === '') {
+        this.boardCreateError = 'bulkPinBoardNameRequired';
+        this.boardCreateAnnouncement = null;
+        return null;
+      }
+
+      const privateBoard = Boolean(this.newBoardPrivate);
+      const token = this.boardCreateToken + 1;
+      this.boardCreateToken = token;
+      this.boardCreateInFlight = true;
+      this.boardCreateError = null;
+      this.boardCreateAnnouncement = null;
+      try {
+        const created = await API.Board.create(name, privateBoard);
+        if (this.disposed || this.boardCreateToken !== token) return created;
+        const boardId = Number(created && created.id);
+        if (!Number.isSafeInteger(boardId) || boardId <= 0
+          || !created || typeof created.name !== 'string' || created.name === '') {
+          throw new Error('invalid_board_response');
+        }
+        if (!this.boardOptions.some(board => Number(board.id) === boardId)) {
+          this.boardOptions = [{ id: boardId, name: created.name }, ...this.boardOptions];
+        }
+        this.targetBoardId = boardId;
+        this.newBoardName = '';
+        this.newBoardPrivate = false;
+        this.boardCreateAnnouncement = 'bulkPinBoardCreated';
+        bus.bus.$emit(bus.events.refreshBoards);
+        this.$nextTick(() => {
+          if (!this.disposed && this.boardCreateToken === token
+            && this.$refs.targetBoard && typeof this.$refs.targetBoard.focus === 'function') {
+            this.$refs.targetBoard.focus();
+          }
+        });
+        return created;
+      } catch (_error) {
+        if (!this.disposed && this.boardCreateToken === token) {
+          this.boardCreateError = 'bulkPinBoardCreateError';
+          this.boardCreateAnnouncement = null;
+        }
+        return null;
+      } finally {
+        if (!this.disposed && this.boardCreateToken === token) {
+          this.boardCreateInFlight = false;
+        }
+      }
     },
     operationFields() {
       const targetBoardId = Number(this.targetBoardId);
