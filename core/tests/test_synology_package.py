@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import re
@@ -11,6 +12,7 @@ import unittest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 TASK_PRODUCTION_PATHS = (
+    ".github/workflows/node.js.yml",
     ".gitignore",
     ".dockerignore",
     "Dockerfile.autobuild",
@@ -18,6 +20,8 @@ TASK_PRODUCTION_PATHS = (
     "NOTICE.md",
     "UPSTREAM.md",
     "docker/scripts/start.sh",
+    "pinry-spa/package.json",
+    "pinry-spa/pnpm-lock.yaml",
     "scripts/create_synology_output.sh",
     "deploy/synology/build-image.sh",
     "deploy/synology/docker-compose.synology.yml",
@@ -1004,6 +1008,26 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertNotIn("libtiff5-dev", source)
         self.assertNotIn("--install-option", source)
         self.assertNotIn("rcssmin==1.0.6", source)
+
+    def test_frontend_build_declares_async_runtime_and_pins_pnpm(self):
+        package = json.loads(
+            (self.repository_root / "pinry-spa/package.json").read_text()
+        )
+        dockerfile = (
+            self.repository_root / "Dockerfile.autobuild"
+        ).read_text()
+        workflow = (
+            self.repository_root / ".github/workflows/node.js.yml"
+        ).read_text()
+
+        self.assertEqual(
+            package["dependencies"]["regenerator-runtime"], "^0.13.9"
+        )
+        self.assertEqual(package["packageManager"], "pnpm@9.15.9")
+        self.assertIn("RUN npm install -g pnpm@9.15.9", dockerfile)
+        self.assertIn("RUN pnpm install --frozen-lockfile", dockerfile)
+        self.assertIn("run: npm install -g pnpm@9.15.9", workflow)
+        self.assertIn("run: pnpm install --frozen-lockfile", workflow)
 
     def test_final_image_exposes_exact_source_commit_build_contract(self):
         source = (

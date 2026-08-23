@@ -23,8 +23,8 @@ jobs:
         uses: actions/setup-node@v1
         with:
           node-version: ${{ matrix.node-version }}
-      - run: npm install -g pnpm
-      - run: pnpm install
+      - run: npm install -g pnpm@9.15.9
+      - run: pnpm install --frozen-lockfile
         working-directory: ./pinry-spa
       - run: pnpm build
         working-directory: ./pinry-spa

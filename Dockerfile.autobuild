@@ -15,8 +15,8 @@ FROM node:18-bookworm as pnpm-build
 
 WORKDIR pinry-spa
 COPY pinry-spa/package.json pinry-spa/pnpm-lock.yaml ./
-RUN npm install -g pnpm
-RUN pnpm install
+RUN npm install -g pnpm@9.15.9
+RUN pnpm install --frozen-lockfile
 COPY pinry-spa .
 RUN pnpm build
 

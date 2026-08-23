@@ -2,6 +2,7 @@
   "name": "pinry-spa",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@9.15.9",
   "scripts": {
     "serve": "NODE_OPTIONS=--openssl-legacy-provider vue-cli-service serve",
     "build": "NODE_OPTIONS=--openssl-legacy-provider vue-cli-service build && node scripts/verify-branding-build.js dist",
@@ -13,6 +14,7 @@
     "buefy": "^0.8.20",
     "bulma": "0.7.5",
     "core-js": "^3.3.2",
+    "regenerator-runtime": "^0.13.9",
     "register-service-worker": "^1.6.2",
     "vue": "^2.6.10",
     "vue-i18n": "8",

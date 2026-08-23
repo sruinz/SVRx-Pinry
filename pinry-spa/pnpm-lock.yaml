@@ -20,6 +20,9 @@ importers:
       core-js:
         specifier: ^3.3.2
         version: 3.22.2
+      regenerator-runtime:
+        specifier: ^0.13.9
+        version: 0.13.9
       register-service-worker:
         specifier: ^1.6.2
         version: 1.7.2
