@@ -12,7 +12,8 @@ script_directory="$(
     pwd -P
 )"
 repository_root="$(cd "${script_directory}/.." && pwd -P)"
-output_root="${1:-${repository_root}/output/synology}"
+output_root="${1:-}"
+default_output=0
 
 cd "${repository_root}"
 source_commit="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -40,8 +41,27 @@ then
     exit 1
 fi
 short_commit="${source_commit:0:12}"
+if [ -z "${output_root}" ]; then
+    default_output=1
+    common_git_directory="$(
+        cd "$(git rev-parse --git-common-dir)" >/dev/null 2>&1
+        pwd -P
+    )"
+    canonical_checkout="$(cd "${common_git_directory}/.." && pwd -P)"
+    workspace_root="$(cd "${canonical_checkout}/.." && pwd -P)"
+    output_root="${workspace_root}/output/svrx-pinry-server-${short_commit}"
+fi
 
-mkdir -p "${output_root}"
+if [ "${default_output}" -eq 1 ]; then
+    if [ -e "${output_root}" ] || [ -L "${output_root}" ]; then
+        echo "output_already_exists=${output_root}" >&2
+        exit 1
+    fi
+    mkdir -p "$(dirname "${output_root}")"
+    mkdir "${output_root}"
+else
+    mkdir -p "${output_root}"
+fi
 output_root="$(cd "${output_root}" && pwd -P)"
 
 package_name="pinry-custom"
@@ -67,6 +87,10 @@ cleanup_temporary_files() {
     fi
     if [ -f "${temporary_archive}" ]; then
         rm -f -- "${temporary_archive}"
+    fi
+    if [ "${default_output}" -eq 1 ] && [ ! -e "${package_directory}" ] \
+        && [ ! -e "${archive_path}" ]; then
+        rmdir -- "${output_root}" 2>/dev/null || :
     fi
 }
 trap cleanup_temporary_files EXIT

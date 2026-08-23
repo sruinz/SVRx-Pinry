@@ -11,6 +11,7 @@ import unittest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 TASK_PRODUCTION_PATHS = (
+    ".gitignore",
     ".dockerignore",
     "Dockerfile.autobuild",
     "LICENSE.md",
@@ -479,17 +480,103 @@ class SynologyPackageTests(unittest.TestCase):
         )
         return repository
 
-    def _run_packager_in(self, repository, output_root, environment):
+    def _run_packager_in(self, repository, output_root=None, environment=None):
+        command = [
+            "bash",
+            str(repository / "scripts/create_synology_output.sh"),
+        ]
+        if output_root is not None:
+            command.append(str(output_root))
         return subprocess.run(
-            [
-                "bash",
-                str(repository / "scripts/create_synology_output.sh"),
-                str(output_root),
-            ],
+            command,
             cwd=str(repository),
-            env=environment,
+            env=environment or os.environ.copy(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+        )
+
+    def test_default_output_is_shared_by_canonical_and_linked_worktree(self):
+        """기본 산출물은 같은 커밋의 모든 checkout에서 하나여야 한다."""
+        default_output = (
+            self.repository_root.parent
+            / "output"
+            / "svrx-pinry-server-{}".format(self.short_sha)
+        )
+        self.addCleanup(shutil.rmtree, default_output, ignore_errors=True)
+        expected_package = default_output / self.package_name
+        expected_archive = default_output / "{}-{}.tar.gz".format(
+            self.package_name, self.short_sha
+        )
+
+        canonical = self._run_packager_in(self.repository_root)
+
+        self.assertEqual(canonical.returncode, 0, canonical.stderr.decode("utf-8"))
+        self.assertTrue(expected_package.is_dir())
+        self.assertTrue(expected_archive.is_file())
+
+        linked_worktree = self.temporary_root / "linked-worktree"
+        completed = subprocess.run(
+            [
+                "git",
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                str(linked_worktree),
+                self.full_sha,
+            ],
+            cwd=str(self.repository_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        self.addCleanup(
+            subprocess.run,
+            ["git", "worktree", "remove", "--force", str(linked_worktree)],
+            cwd=str(self.repository_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        collision = self._run_packager_in(linked_worktree)
+
+        self.assertNotEqual(collision.returncode, 0)
+        self.assertIn(b"output_already_exists=", collision.stderr)
+        self.assertTrue(expected_package.is_dir())
+        self.assertTrue(expected_archive.is_file())
+
+    def test_default_output_refuses_existing_commit_destination(self):
+        default_output = (
+            self.repository_root.parent
+            / "output"
+            / "svrx-pinry-server-{}".format(self.short_sha)
+        )
+        default_output.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, default_output, ignore_errors=True)
+        sentinel = default_output / "keep-user-file"
+        sentinel.write_text("preserve")
+
+        completed = self._run_packager_in(self.repository_root)
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"output_already_exists=", completed.stderr)
+        self.assertEqual(sentinel.read_text(), "preserve")
+        self.assertFalse((default_output / self.package_name).exists())
+
+    def test_explicit_output_directory_overrides_shared_default(self):
+        explicit_output = self.temporary_root / "explicit-output"
+
+        completed = self._run_packager_in(
+            self.repository_root, explicit_output
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        self.assertTrue((explicit_output / self.package_name).is_dir())
+        self.assertTrue(
+            (
+                explicit_output
+                / "{}-{}.tar.gz".format(self.package_name, self.short_sha)
+            ).is_file()
         )
 
     def test_packager_creates_minimal_build_context_from_head(self):
@@ -1387,7 +1474,7 @@ class SynologyPackageTests(unittest.TestCase):
                 "git",
                 "check-ignore",
                 "--quiet",
-                "output/synology/probe",
+                "output/probe",
             ],
             cwd=str(self.repository_root),
         )
