@@ -317,6 +317,24 @@ class PinIdListField(serializers.ListField):
     )
 
 
+class BoardCoverUpdateSerializer(serializers.Serializer):
+    pin_id = serializers.IntegerField(
+        min_value=1,
+        allow_null=True,
+        required=True,
+    )
+
+    def validate(self, attrs):
+        if set(self.initial_data.keys()) != {"pin_id"}:
+            raise ValidationError({"code": "board_cover_invalid"})
+        raw_pin_id = self.initial_data["pin_id"]
+        if raw_pin_id is not None and (
+            type(raw_pin_id) is not int or raw_pin_id <= 0
+        ):
+            raise ValidationError({"code": "board_cover_invalid"})
+        return attrs
+
+
 class BoardAutoCompleteSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = Board

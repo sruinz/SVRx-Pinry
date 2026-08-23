@@ -29,7 +29,7 @@ from core.pin_sorting import PinSortFilter
 from core.permissions import IsOwnerOrReadOnly, OwnerOnlyIfPrivate
 from core.serializers import filter_private_pin, filter_private_board
 from core.services.batch_import import BatchImportService
-from core.services.board_cover import BoardCoverService
+from core.services.board_cover import BoardCoverError, BoardCoverService
 from core.services.bulk_pin_management import (
     BulkOperationError,
     BulkPinManagementService,
@@ -436,11 +436,12 @@ class BoardViewSet(viewsets.ModelViewSet):
         OwnerOnlyIfPrivate("submitter"),
     ]
     bulk_pin_management_service_class = BulkPinManagementService
+    board_cover_service_class = BoardCoverService
     pin_membership_service_class = PinMembershipService
 
     def get_serializer_context(self):
         context = super(BoardViewSet, self).get_serializer_context()
-        context["board_cover_service"] = BoardCoverService()
+        context["board_cover_service"] = self.board_cover_service_class()
         context["pin_membership_service"] = (
             self.pin_membership_service_class()
         )
@@ -448,6 +449,31 @@ class BoardViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return filter_private_board(self.request, Board.objects.all())
+
+    @action(detail=True, methods=["patch"], url_path="cover")
+    def cover(self, request, pk=None):
+        board = self.get_object()
+        payload = api.BoardCoverUpdateSerializer(data=request.data)
+        if not payload.is_valid():
+            return Response(
+                {"code": "board_cover_invalid"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            board = self.board_cover_service_class().set_cover(
+                request.user,
+                board.pk,
+                payload.validated_data["pin_id"],
+            )
+        except BoardCoverError as error:
+            if error.code == "board_not_found":
+                raise NotFound()
+            return Response(
+                {"code": error.code},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = self.get_serializer(board)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(
         detail=True,
