@@ -111,14 +111,19 @@ const Pin = {
 };
 
 
-function fetchPins(offset, tagFilter, userFilter, boardFilter) {
+function fetchPins(offset, tagFilter, userFilter, boardFilter, sortState = null) {
   const url = `${API_PREFIX}pins/`;
   const queryArgs = {
     format: 'json',
-    ordering: '-id',
     limit: 30,
     offset,
   };
+  if (sortState) {
+    queryArgs.sort = sortState.mode;
+    if (sortState.mode === 'random') queryArgs.random_seed = sortState.randomSeed;
+  } else {
+    queryArgs.ordering = '-id';
+  }
   if (tagFilter) queryArgs.tags__name = tagFilter;
   if (userFilter) queryArgs.submitter__username = userFilter;
   if (boardFilter) queryArgs.pins__id = boardFilter;
