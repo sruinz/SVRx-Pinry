@@ -5,6 +5,7 @@
       type="button"
       class="button is-primary"
       data-test="pin-selection-enter"
+      :disabled="enterDisabled"
       @click="$emit('enter')"
     >
       {{ $t('bulkPinSelectStart') }}
@@ -122,6 +123,7 @@ export default {
     showDelete: { type: Boolean, required: true },
     canDelete: { type: Boolean, required: true },
     operationInFlight: { type: Boolean, required: true },
+    enterDisabled: { type: Boolean, default: false },
     announcement: { type: String, default: '' },
   },
 };

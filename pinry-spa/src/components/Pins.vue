@@ -1,6 +1,18 @@
 <template>
   <div class="pins">
     <section class="section">
+      <BoardCoverToolbar
+        v-if="isOwnedBoardRoute"
+        ref="boardCoverToolbar"
+        :active="interactionMode === 'cover-selection'"
+        :selected-id="coverSelection.candidateId"
+        :current-cover-id="currentBoardCoverId"
+        :busy="coverSelection.inFlight"
+        :can-reset="currentBoardCoverId !== null"
+        :disabled="interactionMode !== 'browse'"
+        @enter="enterCoverSelection"
+        @cancel="cancelCoverSelection"
+      />
       <PinBulkToolbar
         v-if="canManagePins"
         :active="selection.active"
@@ -17,6 +29,7 @@
         :show-delete="true"
         :can-delete="canUseOwnedPinActions"
         :operation-in-flight="selection.operationInFlight"
+        :enter-disabled="interactionMode !== 'browse' || coverSelection.inFlight"
         :announcement="selectionAnnouncement"
         @enter="enterSelection"
         @exit="exitSelection"
@@ -31,7 +44,9 @@
       <PinSortControls
         v-if="!pinFilters.idFilter"
         :mode="sortState.mode"
-        :disabled="selection.active || selection.operationInFlight"
+        :disabled="interactionMode !== 'browse'
+          || selection.active
+          || selection.operationInFlight"
         :busy="status.loading"
         :announcement="sortAnnouncement"
         @select="applySortMode"
@@ -88,11 +103,19 @@
               <div class="gutter-sizer"></div>
               <div
                 class="pin-card grid-item"
-                :class="{ 'is-selected': isPinSelected(item.id) }"
+                :class="{
+                  'is-selected': isPinSelected(item.id) || isCoverCandidate(item.id),
+                  'is-cover-disabled': isCoverCandidateDisabled(item),
+                }"
                 :data-test="`pin-card-${item.id}`"
-                :role="selection.active ? 'button' : null"
-                :tabindex="selection.active ? 0 : null"
+                :role="interactionMode !== 'browse' ? 'button' : null"
+                :tabindex="interactionMode !== 'browse' ? 0 : null"
                 :aria-selected="selection.active ? String(isPinSelected(item.id)) : null"
+                :aria-pressed="interactionMode === 'cover-selection'
+                  ? String(isCoverCandidate(item.id)) : null"
+                :aria-disabled="isCoverCandidateDisabled(item) ? 'true' : null"
+                :aria-label="isCoverCandidateDisabled(item)
+                  ? $t('boardCoverPrivateUnavailable') : null"
                 @click="onPinCardClick(item, $event)"
                 @keydown="onPinCardKeydown(item, $event)"
               >
@@ -100,7 +123,7 @@
                      @mouseleave="hideEditButtons(item.id)"
                 >
                   <EditorUI
-                    v-show="!selection.active && shouldShowEdit(item.id)"
+                    v-show="interactionMode === 'browse' && shouldShowEdit(item.id)"
                     :pin="item"
                     :currentUsername="editorMeta.user.meta.username"
                     :currentBoard="editorMeta.currentBoard"
@@ -116,6 +139,11 @@
                     :aria-label="$t('bulkPinSelectOne')"
                     @click.stop="togglePinSelection(item.id, $event)"
                   >
+                  <span
+                    v-if="interactionMode === 'cover-selection' && isCoverCandidate(item.id)"
+                    class="pin-selection-check"
+                    aria-hidden="true"
+                  >✓</span>
                   <img :src="item.url"
                      @load="onPinImageLoaded(item.id)"
                      @click.stop="onPinImageClick(item, $event)"
@@ -175,6 +203,7 @@ import bus from './utils/bus';
 import EditorUI from './editors/PinEditorUI.vue';
 import niceLinks from './utils/niceLinks';
 import PinBulkToolbar from './bulk/PinBulkToolbar.vue';
+import BoardCoverToolbar from './board_cover/BoardCoverToolbar.vue';
 import PinSelection from './bulk/PinSelection';
 import { executeBulk, intersectRemaining } from './bulk/bulkExecutor';
 import { openPinBulkBoard, openPinBulkEdit } from './modals';
@@ -283,6 +312,13 @@ function initialData() {
       progress: null,
       result: null,
     },
+    interactionMode: 'browse',
+    coverSelection: {
+      candidateId: null,
+      inFlight: false,
+      error: null,
+      requestToken: 0,
+    },
     bulkDeleteDialogOpen: false,
     bulkModalOpen: false,
     bulkModalStarted: false,
@@ -310,6 +346,7 @@ export default {
     noMore,
     EditorUI,
     PinBulkToolbar,
+    BoardCoverToolbar,
     PinSortControls,
   },
   data() {
@@ -357,6 +394,10 @@ export default {
         && submitter.username === username,
       );
     },
+    currentBoardCoverId() {
+      const id = this.editorMeta.currentBoard.cover_pin_id;
+      return Number.isInteger(id) ? id : null;
+    },
     canManagePins() {
       return this.isMyPinsRoute || this.isOwnedBoardRoute;
     },
@@ -391,7 +432,12 @@ export default {
       this.sortAnnouncement = '';
     },
     applySortMode(mode) {
-      if (this.selection.active || this.selection.operationInFlight || this.status.loading) return;
+      if (
+        this.interactionMode !== 'browse'
+        || this.selection.active
+        || this.selection.operationInFlight
+        || this.status.loading
+      ) return;
       const leavingLegacyFallback = this.sortLegacyFallback;
       const transition = transitionPinSortState(this.sortState, mode, this.seedFactory);
       if (!transition.changed && !leavingLegacyFallback) return;
@@ -484,7 +530,12 @@ export default {
       this.updateSelection(this.selectionModel.setLoadedRows(rows));
     },
     enterSelection() {
-      if (!this.canManagePins || this.selection.bulkOperationInFlight) return;
+      if (
+        !this.canManagePins
+        || this.interactionMode !== 'browse'
+        || this.selection.bulkOperationInFlight
+      ) return;
+      this.interactionMode = 'bulk-selection';
       this.updateSelection(this.selectionModel.selectLoaded([]), {
         active: true,
         allCount: 0,
@@ -500,6 +551,50 @@ export default {
         operationInFlight: false,
         result: null,
       });
+      this.interactionMode = 'browse';
+    },
+    enterCoverSelection() {
+      if (
+        !this.isOwnedBoardRoute
+        || this.interactionMode !== 'browse'
+        || this.selection.active
+        || this.coverSelection.inFlight
+      ) return;
+      this.interactionMode = 'cover-selection';
+      this.coverSelection.candidateId = this.currentBoardCoverId;
+      this.coverSelection.error = null;
+    },
+    invalidateCoverSelection() {
+      this.interactionMode = 'browse';
+      this.coverSelection.candidateId = null;
+      this.coverSelection.inFlight = false;
+      this.coverSelection.error = null;
+      this.coverSelection.requestToken += 1;
+    },
+    cancelCoverSelection() {
+      if (this.interactionMode !== 'cover-selection' || this.coverSelection.inFlight) return;
+      this.invalidateCoverSelection();
+      this.$nextTick(() => {
+        if (this.$refs.boardCoverToolbar) this.$refs.boardCoverToolbar.focusEnter();
+      });
+    },
+    isCoverCandidate(id) {
+      return this.interactionMode === 'cover-selection'
+        && this.coverSelection.candidateId === id;
+    },
+    isCoverCandidateDisabled(item) {
+      return this.interactionMode === 'cover-selection'
+        && !this.editorMeta.currentBoard.private
+        && item.private === true;
+    },
+    selectCoverCandidate(item) {
+      if (
+        this.interactionMode !== 'cover-selection'
+        || this.coverSelection.inFlight
+        || this.isCoverCandidateDisabled(item)
+      ) return;
+      this.coverSelection.candidateId = item.id;
+      this.coverSelection.error = null;
     },
     clearPinSelection() {
       this.updateSelection(this.selectionModel.selectLoaded([]), {
@@ -821,10 +916,20 @@ export default {
       }), { result: null });
     },
     onPinCardClick(item, event) {
+      if (this.interactionMode === 'cover-selection') {
+        if (event) event.preventDefault();
+        this.selectCoverCandidate(item);
+        return;
+      }
       if (!this.selection.active) return;
       this.togglePinSelection(item.id, event);
     },
     onPinImageClick(item, event) {
+      if (this.interactionMode === 'cover-selection') {
+        if (event) event.preventDefault();
+        this.selectCoverCandidate(item);
+        return;
+      }
       if (this.selection.active) {
         this.togglePinSelection(item.id, event);
         return;
@@ -832,7 +937,13 @@ export default {
       this.openPreview(item);
     },
     onPinCardKeydown(item, event) {
-      if (!this.selection.active || (event.key !== 'Enter' && event.key !== ' ')) return;
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      if (this.interactionMode === 'cover-selection') {
+        event.preventDefault();
+        this.selectCoverCandidate(item);
+        return;
+      }
+      if (!this.selection.active) return;
       event.preventDefault();
       this.togglePinSelection(item.id, event);
     },
@@ -847,6 +958,13 @@ export default {
       );
     },
     onDocumentKeydown(event) {
+      if (this.interactionMode === 'cover-selection') {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          this.cancelCoverSelection();
+        }
+        return;
+      }
       if (!this.selection.active) return;
       if (event.key === 'Escape') {
         event.preventDefault();
@@ -967,6 +1085,8 @@ export default {
     reset() {
       this.invalidateSelectionRequest();
       this.invalidateBulkOperation();
+      this.invalidateCoverSelection();
+      const coverRequestToken = this.coverSelection.requestToken;
       this.requestGeneration += 1;
       const sorting = {
         sortState: this.sortState,
@@ -989,6 +1109,7 @@ export default {
           this[key] = value;
         },
       );
+      this.coverSelection.requestToken = coverRequestToken;
       this.initialize();
     },
     fallbackToLegacySort() {
@@ -1088,6 +1209,7 @@ export default {
   beforeDestroy() {
     this.invalidateSelectionRequest();
     this.invalidateBulkOperation();
+    this.invalidateCoverSelection();
     this.updateSelection(this.selectionModel.selectLoaded([]), {
       active: false,
       allCount: 0,
@@ -1136,6 +1258,18 @@ $avatar-height: 30px;
   &.is-selected {
     outline: 3px solid #3273dc;
     outline-offset: 2px;
+  }
+
+  &[role="button"] .pin-preview-image {
+    cursor: pointer;
+  }
+
+  &.is-cover-disabled {
+    opacity: .6;
+
+    .pin-preview-image {
+      cursor: not-allowed;
+    }
   }
 
   .pin-selection-check {

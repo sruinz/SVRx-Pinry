@@ -61,6 +61,12 @@ const Board = {
       { pins_to_remove: pinIds },
     );
   },
+  setCover(boardId, pinId) {
+    return axios.patch(
+      `${API_PREFIX}boards/${boardId}/cover/`,
+      { pin_id: pinId },
+    );
+  },
   delete(boardId) {
     const url = `${API_PREFIX}boards/${boardId}/`;
     return axios.delete(url);
