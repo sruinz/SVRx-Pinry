@@ -118,3 +118,14 @@ class PinSortAPITests(TemporaryMediaMixin, APITestCase):
             [row["id"] for row in response.data["results"]],
             [PRIME - 1, PRIME, PRIME + 1],
         )
+
+    def test_random_sort_casts_pin_id_to_bigint_before_arithmetic(self):
+        from django.db.backends.postgresql.base import DatabaseWrapper
+
+        from core.pin_sorting import PinSort, apply_pin_sort
+
+        query = apply_pin_sort(Pin.objects.all(), PinSort("random", 1)).query
+        postgres = DatabaseWrapper({"NAME": "pinry"}, "postgresql")
+        sql = query.get_compiler(connection=postgres).as_sql()[0]
+
+        self.assertIn('(\"core_pin\".\"id\")::bigint', sql)

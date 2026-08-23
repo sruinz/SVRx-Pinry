@@ -2,6 +2,7 @@ import re
 from collections import namedtuple
 
 from django.db.models import BigIntegerField, ExpressionWrapper, F, Value
+from django.db.models.functions import Cast
 from rest_framework.exceptions import ValidationError
 from rest_framework.filters import OrderingFilter
 
@@ -56,7 +57,10 @@ def apply_pin_sort(queryset, pin_sort):
         return queryset.order_by("published", "id")
     multiplier, increment = random_coefficients(pin_sort.random_seed)
     output = BigIntegerField()
-    id_mod = ExpressionWrapper(F("id") % Value(PRIME), output_field=output)
+    id_mod = ExpressionWrapper(
+        Cast(F("id"), output_field=output) % Value(PRIME),
+        output_field=output,
+    )
     key = ExpressionWrapper(
         ((id_mod * Value(multiplier)) + Value(increment)) % Value(PRIME),
         output_field=output,
