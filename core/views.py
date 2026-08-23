@@ -25,6 +25,7 @@ from core.batch_serializers import BatchImportRequestSerializer
 from core.bulk_serializers import BulkPinRequestSerializer
 from core.models import Image, Pin, Board
 from core.parsers import LimitedJSONParser
+from core.pin_sorting import PinSortFilter
 from core.permissions import IsOwnerOrReadOnly, OwnerOnlyIfPrivate
 from core.serializers import filter_private_pin, filter_private_board
 from core.services.batch_import import BatchImportService
@@ -72,7 +73,7 @@ class PinViewSet(viewsets.ModelViewSet):
         "internal_error": status.HTTP_500_INTERNAL_SERVER_ERROR,
     }
     serializer_class = api.PinSerializer
-    filter_backends = (DjangoFilterBackend, SearchFilter, OrderingFilter)
+    filter_backends = (DjangoFilterBackend, SearchFilter, PinSortFilter)
     filter_fields = ("submitter__username", 'tags__name', "pins__id")
     ordering_fields = ('-id', )
     ordering = ('-id', )
