@@ -54,20 +54,20 @@ PC에서 Synology용 산출물을 만든 뒤 NAS에 업로드해 이미지를 �
 
 ```text
 <작업공간>/
-├── pinry-custom/
+├── <서버 저장소>/
 └── output/
     └── svrx-pinry-server-<커밋 앞 12자리>/
-        ├── pinry-custom/
-        └── pinry-custom-<커밋 앞 12자리>.tar.gz
+        ├── svrx-pinry/
+        └── svrx-pinry-<커밋 앞 12자리>.tar.gz
 ```
 
-생성된 압축 파일 또는 `pinry-custom/` 폴더를 NAS에 업로드합니다. 이미지
-빌드, `.env` 작성, Compose 실행 및 데이터 백업 방법은
+생성된 압축 파일 또는 `svrx-pinry/` 폴더를 NAS에 업로드합니다. 이미지
+빌드, Compose 실행 및 데이터 백업 방법은
 [Synology 이미지 빌드 및 실행 안내](deploy/synology/README_KO.md)를
 따르세요.
 
 산출물에는 이미지 빌드와 실행에 필요한 파일만 들어갑니다. 데이터베이스,
-업로드 이미지, 비밀키와 실제 `.env` 파일은 포함하지 않습니다.
+업로드 이미지와 비밀키는 포함하지 않습니다.
 
 ## 실행 버전 확인
 
@@ -83,12 +83,12 @@ curl -s http://NAS주소:2048/api/v2/version/
 강제로 다시 생성해야 새 이미지가 실행됩니다.
 
 ```sh
-docker compose --env-file .env up -d --force-recreate
+docker compose up -d --force-recreate
 ```
 
 ## 데이터 보존
 
-기본 Compose 설정은 `/volume1/docker/pinry-custom/data`를 영구 데이터
+기본 Compose 설정은 `/volume1/docker/svrx-pinry/data`를 영구 데이터
 경로로 사용합니다. 이 폴더에는 데이터베이스, 업로드 이미지와 서버 설정이
 저장됩니다. 컨테이너나 이미지를 교체하기 전에 해당 폴더를 백업하고 직접
 삭제하지 마세요.

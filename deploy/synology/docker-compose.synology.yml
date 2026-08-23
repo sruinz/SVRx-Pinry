@@ -1,11 +1,11 @@
 version: "3.8"
 
 services:
-  pinry:
-    image: ${PINRY_IMAGE}
-    container_name: ${PINRY_CONTAINER_NAME}
+  svrx-pinry:
+    image: svrx-pinry:latest
+    container_name: svrx-pinry
     ports:
-      - "${PINRY_HTTP_PORT}:80"
+      - "2048:80"
     volumes:
-      - "${PINRY_DATA_PATH}:/data"
+      - "/volume1/docker/svrx-pinry/data:/data"
     restart: unless-stopped

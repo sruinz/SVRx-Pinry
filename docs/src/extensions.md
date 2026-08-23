@@ -10,5 +10,9 @@
 이 기존 확장은 batch API, 토큰 기반 worker 또는 이미지 전체선택 기능을
 제공하지 않습니다.
 
-Pinry Custom의 이미지 전체선택 확장은 준비 중입니다. 실제 저장소와 배포
-경로가 마련되기 전까지 다운로드 링크를 제공하지 않습니다.
+## SVRx Pinry Extension
+
+[SVRx Pinry Extension](https://github.com/sruinz/SVRx-Pinry-Extention)은
+현재 페이지에서 여러 이미지를 선택한 뒤 공통 보드·태그·공개 범위를
+지정해 한 번에 Pin으로 만드는 전용 확장 프로그램입니다. 서버 주소와 API
+토큰은 확장 프로그램의 설정 화면에서 저장합니다.

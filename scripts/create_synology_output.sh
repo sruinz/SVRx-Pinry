@@ -31,7 +31,6 @@ package_control_paths=(
     scripts/create_synology_output.sh
     deploy/synology/build-image.sh
     deploy/synology/docker-compose.synology.yml
-    deploy/synology/.env.example
 )
 if ! git diff --quiet "${source_commit}" -- "${package_control_paths[@]}" \
     || ! git diff --cached --quiet "${source_commit}" -- \
@@ -64,7 +63,7 @@ else
 fi
 output_root="$(cd "${output_root}" && pwd -P)"
 
-package_name="pinry-custom"
+package_name="svrx-pinry"
 package_directory="${output_root}/${package_name}"
 archive_path="${output_root}/${package_name}-${short_commit}.tar.gz"
 
@@ -104,7 +103,6 @@ mkdir "${control_directory}"
 git archive --format=tar "${source_commit}" -- \
     deploy/synology/build-image.sh \
     deploy/synology/docker-compose.synology.yml \
-    deploy/synology/.env.example \
     | tar -xf - -C "${control_directory}"
 git archive --format=tar "${source_commit}" -- \
     Dockerfile.autobuild \
@@ -150,10 +148,7 @@ install -m 0755 \
 install -m 0644 \
     "${control_directory}/deploy/synology/docker-compose.synology.yml" \
     "${temporary_directory}/docker-compose.yml"
-install -m 0644 \
-    "${control_directory}/deploy/synology/.env.example" \
-    "${temporary_directory}/.env.example"
-printf 'source_commit=%s\ndefault_image=pinry-custom:latest\n' \
+printf 'source_commit=%s\ndefault_image=svrx-pinry:latest\n' \
     "${source_commit}" \
     > "${temporary_directory}/BUILD_INFO"
 

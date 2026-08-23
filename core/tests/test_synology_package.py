@@ -20,13 +20,13 @@ TASK_PRODUCTION_PATHS = (
     "docker/scripts/start.sh",
     "scripts/create_synology_output.sh",
     "deploy/synology/build-image.sh",
+    "deploy/synology/docker-compose.synology.yml",
     "deploy/synology/README_KO.md",
 )
 PACKAGE_CONTROL_PATHS = (
     "scripts/create_synology_output.sh",
     "deploy/synology/build-image.sh",
     "deploy/synology/docker-compose.synology.yml",
-    "deploy/synology/.env.example",
 )
 
 
@@ -133,7 +133,7 @@ def _write_archive_publish_failure_wrapper(path):
         "set -eu\n"
         "for argument in \"$@\"; do\n"
         "    case \"$argument\" in\n"
-        "        */.pinry-custom.archive.*)\n"
+        "        */.svrx-pinry.archive.*)\n"
         "            exit 43\n"
         "            ;;\n"
         "    esac\n"
@@ -261,21 +261,6 @@ def _final_stage_copy_sources(dockerfile):
     return sources
 
 
-def _environment_values(source):
-    values = {}
-    for line in source.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if "=" not in stripped:
-            raise AssertionError("invalid environment assignment")
-        name, value = stripped.split("=", 1)
-        if not name or name in values:
-            raise AssertionError("invalid environment variable name")
-        values[name] = value
-    return values
-
-
 class SynologyPackageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -351,7 +336,7 @@ class SynologyPackageTests(unittest.TestCase):
         self.short_sha = _git_output(
             self.repository_root, "rev-parse", "--short=12", "HEAD"
         )
-        self.package_name = "pinry-custom"
+        self.package_name = "svrx-pinry"
         self.package_directory = self.output_root / self.package_name
         self.context_directory = self.package_directory / "context"
         self.archive_path = self.output_root / "{}-{}.tar.gz".format(
@@ -616,7 +601,7 @@ class SynologyPackageTests(unittest.TestCase):
             )
         )
         leaked_output = default_output.exists()
-        leaked_temporary_paths = tuple(default_output.glob(".pinry-custom.*"))
+        leaked_temporary_paths = tuple(default_output.glob(".svrx-pinry.*"))
         retry = self._run_packager_in(self.repository_root)
 
         self.assertEqual(failed.returncode, 73)
@@ -658,7 +643,6 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertEqual(
             {path.name for path in self.package_directory.iterdir()},
             {
-                ".env.example",
                 "BUILD_INFO",
                 "build-image.sh",
                 "context",
@@ -697,20 +681,10 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertEqual(
             (self.package_directory / "BUILD_INFO").read_text(),
             "source_commit={}\n"
-            "default_image=pinry-custom:latest\n".format(self.full_sha),
+            "default_image=svrx-pinry:latest\n".format(self.full_sha),
         )
         self.assertFalse((self.package_directory / ".env").exists())
-        self.assertEqual(
-            _environment_values(
-                (self.package_directory / ".env.example").read_text()
-            ),
-            {
-                "PINRY_IMAGE": "pinry-custom:latest",
-                "PINRY_CONTAINER_NAME": "pinry-custom",
-                "PINRY_HTTP_PORT": "2048",
-                "PINRY_DATA_PATH": "/volume1/docker/pinry-custom/data",
-            },
-        )
+        self.assertFalse((self.package_directory / ".env.example").exists())
         compose = (
             self.package_directory / "docker-compose.yml"
         ).read_text()
@@ -719,13 +693,13 @@ class SynologyPackageTests(unittest.TestCase):
             [
                 'version: "3.8"',
                 "services:",
-                "pinry:",
-                "image: ${PINRY_IMAGE}",
-                "container_name: ${PINRY_CONTAINER_NAME}",
+                "svrx-pinry:",
+                "image: svrx-pinry:latest",
+                "container_name: svrx-pinry",
                 "ports:",
-                '- "${PINRY_HTTP_PORT}:80"',
+                '- "2048:80"',
                 "volumes:",
-                '- "${PINRY_DATA_PATH}:/data"',
+                '- "/volume1/docker/svrx-pinry/data:/data"',
                 "restart: unless-stopped",
             ],
         )
@@ -803,7 +777,7 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertIn(
             "{}/build-image.sh".format(self.package_name), names
         )
-        self.assertIn(
+        self.assertNotIn(
             "{}/.env.example".format(self.package_name), names
         )
         self.assertIn(
@@ -862,7 +836,7 @@ class SynologyPackageTests(unittest.TestCase):
             (context / "pinry-spa/src/package._sentinel.txt").is_file()
         )
         self.assertTrue((context / "pinry-spa/src/package-sentinel.txt").is_file())
-        archive_path = output_root / "pinry-custom-{}.tar.gz".format(
+        archive_path = output_root / "svrx-pinry-{}.tar.gz".format(
             subprocess.check_output(
                 ["git", "rev-parse", "--short=12", "HEAD"],
                 cwd=str(repository),
@@ -884,25 +858,25 @@ class SynologyPackageTests(unittest.TestCase):
                 for key in member.pax_headers
             )
         )
-        self.assertIn("pinry-custom/.DS_Store.backup", names)
+        self.assertIn("svrx-pinry/.DS_Store.backup", names)
         self.assertIn(
-            "pinry-custom/context/pinry-spa/src/.DS_Store.backup", names
+            "svrx-pinry/context/pinry-spa/src/.DS_Store.backup", names
         )
         self.assertIn(
-            "pinry-custom/context/pinry-spa/src/race/.DS_Store.backup",
+            "svrx-pinry/context/pinry-spa/src/race/.DS_Store.backup",
             names,
         )
-        self.assertIn("pinry-custom/BUILD_INFO._backup", names)
+        self.assertIn("svrx-pinry/BUILD_INFO._backup", names)
         self.assertIn(
-            "pinry-custom/context/pinry-spa/src/race/asset._preview.js",
-            names,
-        )
-        self.assertIn(
-            "pinry-custom/context/pinry-spa/src/package._sentinel.txt",
+            "svrx-pinry/context/pinry-spa/src/race/asset._preview.js",
             names,
         )
         self.assertIn(
-            "pinry-custom/context/pinry-spa/src/package-sentinel.txt", names
+            "svrx-pinry/context/pinry-spa/src/package._sentinel.txt",
+            names,
+        )
+        self.assertIn(
+            "svrx-pinry/context/pinry-spa/src/package-sentinel.txt", names
         )
 
     def test_packager_cleans_failed_publish_and_allows_immediate_retry(self):
@@ -924,8 +898,8 @@ class SynologyPackageTests(unittest.TestCase):
             {
                 path.name
                 for path in self.output_root.iterdir()
-                if path.name.startswith(".pinry-custom.tmp.")
-                or path.name.startswith(".pinry-custom.archive.")
+                if path.name.startswith(".svrx-pinry.tmp.")
+                or path.name.startswith(".svrx-pinry.archive.")
             },
             set(),
         )
@@ -935,7 +909,7 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertEqual(
             (self.package_directory / "BUILD_INFO").read_text(),
             "source_commit={}\n"
-            "default_image=pinry-custom:latest\n".format(self.full_sha),
+            "default_image=svrx-pinry:latest\n".format(self.full_sha),
         )
         self.assertTrue((self.context_directory / "core/models.py").is_file())
         self.assertTrue(self.archive_path.is_file())
@@ -944,8 +918,8 @@ class SynologyPackageTests(unittest.TestCase):
             {
                 path.name
                 for path in self.output_root.iterdir()
-                if path.name.startswith(".pinry-custom.tmp.")
-                or path.name.startswith(".pinry-custom.archive.")
+                if path.name.startswith(".svrx-pinry.tmp.")
+                or path.name.startswith(".svrx-pinry.archive.")
             },
             set(),
         )
@@ -969,8 +943,8 @@ class SynologyPackageTests(unittest.TestCase):
             {
                 path.name
                 for path in self.output_root.iterdir()
-                if path.name.startswith(".pinry-custom.tmp.")
-                or path.name.startswith(".pinry-custom.archive.")
+                if path.name.startswith(".svrx-pinry.tmp.")
+                or path.name.startswith(".svrx-pinry.archive.")
             },
             set(),
         )
@@ -1073,7 +1047,6 @@ class SynologyPackageTests(unittest.TestCase):
             "docker-compose.yml": (
                 "deploy/synology/docker-compose.synology.yml"
             ),
-            ".env.example": "deploy/synology/.env.example",
         }
 
         for packaged_name, tracked_path in packaged_controls.items():
@@ -1195,7 +1168,6 @@ class SynologyPackageTests(unittest.TestCase):
         changed_controls = (
             "deploy/synology/build-image.sh",
             "deploy/synology/docker-compose.synology.yml",
-            "deploy/synology/.env.example",
         )
         for relative_path in changed_controls:
             changed_control = repository / relative_path
@@ -1281,7 +1253,7 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertEqual(
             (package_directory / "BUILD_INFO").read_text(),
             "source_commit={}\n"
-            "default_image=pinry-custom:latest\n".format(source_commit),
+            "default_image=svrx-pinry:latest\n".format(source_commit),
         )
         self.assertEqual(
             (package_directory / "context/core/models.py").read_bytes(),
@@ -1292,7 +1264,6 @@ class SynologyPackageTests(unittest.TestCase):
             "docker-compose.yml": (
                 "deploy/synology/docker-compose.synology.yml"
             ),
-            ".env.example": "deploy/synology/.env.example",
         }
         for packaged_name, relative_path in packaged_controls.items():
             self.assertEqual(
@@ -1302,7 +1273,7 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertTrue(
             (
                 output_root
-                / "pinry-custom-{}.tar.gz".format(source_commit[:12])
+                / "svrx-pinry-{}.tar.gz".format(source_commit[:12])
             ).is_file()
         )
 
@@ -1337,7 +1308,7 @@ class SynologyPackageTests(unittest.TestCase):
                     self.full_sha
                 ),
                 "--tag",
-                "pinry-custom:latest",
+                "svrx-pinry:latest",
                 ".",
             ],
         )
@@ -1357,7 +1328,7 @@ class SynologyPackageTests(unittest.TestCase):
             [
                 "sh",
                 str(self.package_directory / "build-image.sh"),
-                "registry.local/pinry-custom:nas",
+                "registry.local/svrx-pinry:nas",
             ],
             env=environment,
             stdout=subprocess.PIPE,
@@ -1371,7 +1342,7 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertEqual(_docker_call_count(capture), 1)
         self.assertEqual(
             arguments[arguments.index("--tag") + 1],
-            "registry.local/pinry-custom:nas",
+            "registry.local/svrx-pinry:nas",
         )
 
     def test_build_rejects_every_malformed_build_info_without_docker(self):
@@ -1381,7 +1352,7 @@ class SynologyPackageTests(unittest.TestCase):
         )
         build_info = self.package_directory / "BUILD_INFO"
         sentinel = self.temporary_root / "shell-payload-ran"
-        valid_default = "default_image=pinry-custom:latest\n"
+        valid_default = "default_image=svrx-pinry:latest\n"
         invalid_sources = {
             "missing": valid_default,
             "duplicate-valid": (
@@ -1433,12 +1404,12 @@ class SynologyPackageTests(unittest.TestCase):
             ),
             "duplicate-default-image": (
                 "source_commit={}\n"
-                "default_image=pinry-custom:latest\n"
-                "default_image=pinry-custom:other\n".format(self.full_sha)
+                "default_image=svrx-pinry:latest\n"
+                "default_image=svrx-pinry:other\n".format(self.full_sha)
             ),
             "duplicate-empty-default-image": (
                 "source_commit={}\n"
-                "default_image=pinry-custom:latest\n"
+                "default_image=svrx-pinry:latest\n"
                 "default_image=\n".format(self.full_sha)
             ),
         }
@@ -1478,7 +1449,7 @@ class SynologyPackageTests(unittest.TestCase):
         build_info = self.package_directory / "BUILD_INFO"
         build_info.write_text(
             "source_commit={}\n"
-            "default_image=pinry-custom:latest\n".format("\u00e9" * 40)
+            "default_image=svrx-pinry:latest\n".format("\u00e9" * 40)
         )
 
         completed = subprocess.run(
