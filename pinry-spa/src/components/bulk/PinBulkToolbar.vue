@@ -1,5 +1,5 @@
 <template>
-  <div class="pin-bulk-toolbar">
+  <div class="pin-bulk-toolbar" :class="{ 'is-active': active }">
     <button
       v-if="!active"
       type="button"
@@ -131,7 +131,7 @@ export default {
 
 <style lang="scss" scoped>
 .pin-bulk-toolbar {
-  margin-bottom: 1rem;
+  width: 100%;
 }
 
 .pin-bulk-toolbar__summary {
@@ -142,5 +142,23 @@ export default {
   display: flex;
   flex-wrap: wrap;
   gap: .5rem;
+}
+
+@media screen and (min-width: 769px) {
+  .pin-bulk-toolbar {
+    width: auto;
+  }
+
+  .pin-bulk-toolbar.is-active {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: .5rem;
+    width: 100%;
+  }
+
+  .pin-bulk-toolbar__summary {
+    margin-bottom: 0;
+  }
 }
 </style>

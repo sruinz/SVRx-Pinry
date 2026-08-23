@@ -1,59 +1,107 @@
 <template>
   <div class="pins">
     <section class="section">
-      <BoardCoverToolbar
-        v-if="isOwnedBoardRoute"
-        ref="boardCoverToolbar"
-        :active="interactionMode === 'cover-selection'"
-        :selected-id="coverSelection.candidateId"
-        :current-cover-id="currentBoardCoverId"
-        :busy="coverSelection.inFlight"
-        :can-reset="currentBoardCoverId !== null"
-        :disabled="interactionMode !== 'browse'"
-        :error="coverSelection.error"
-        @enter="enterCoverSelection"
-        @apply="applyCoverPin(coverSelection.candidateId)"
-        @cancel="cancelCoverSelection"
-        @reset="confirmCoverReset"
-      />
-      <PinBulkToolbar
-        v-if="canManagePins"
-        :active="selection.active"
-        :selected-count="selection.selectedIds.length"
-        :loaded-count="blocks.length"
-        :scope="selection.scope"
-        :all-count="selection.allCount"
-        :show-add-to-board="isMyPinsRoute"
-        :can-add-to-board="canUseOwnedPinActions"
-        :show-move="isOwnedBoardRoute"
-        :can-move="isOwnedBoardRoute"
-        :show-edit="true"
-        :can-edit="canUseOwnedPinActions"
-        :show-delete="true"
-        :can-delete="canUseOwnedPinActions"
-        :operation-in-flight="selection.operationInFlight"
-        :enter-disabled="interactionMode !== 'browse' || coverSelection.inFlight"
-        :announcement="selectionAnnouncement"
-        @enter="enterSelection"
-        @exit="exitSelection"
-        @select-loaded="selectLoadedPins"
-        @clear="clearPinSelection"
-        @select-all="selectAllPins"
-        @add-to-board="openBulkBoard('add')"
-        @move="openBulkBoard('move')"
-        @edit="openBulkEdit"
-        @delete="confirmBulkDelete"
-      />
-      <PinSortControls
+      <div
         v-if="!pinFilters.idFilter"
-        :mode="sortState.mode"
-        :disabled="interactionMode !== 'browse'
-          || selection.active
-          || selection.operationInFlight"
-        :busy="status.loading"
-        :announcement="sortAnnouncement"
-        @select="applySortMode"
-      />
+        class="container pin-tools"
+        data-test="pin-tools"
+      >
+        <div class="pin-tools__primary" data-test="pin-tools-primary">
+          <PinSortControls
+            :mode="sortState.mode"
+            :disabled="interactionMode !== 'browse'
+              || selection.active
+              || selection.operationInFlight"
+            :busy="status.loading"
+            :announcement="sortAnnouncement"
+            @select="applySortMode"
+          />
+          <div v-if="canManagePins" class="pin-tools__management">
+            <PinBulkToolbar
+              :active="false"
+              :selected-count="selection.selectedIds.length"
+              :loaded-count="blocks.length"
+              :scope="selection.scope"
+              :all-count="selection.allCount"
+              :show-add-to-board="isMyPinsRoute"
+              :can-add-to-board="canUseOwnedPinActions"
+              :show-move="isOwnedBoardRoute"
+              :can-move="isOwnedBoardRoute"
+              :show-edit="true"
+              :can-edit="canUseOwnedPinActions"
+              :show-delete="true"
+              :can-delete="canUseOwnedPinActions"
+              :operation-in-flight="selection.operationInFlight"
+              :enter-disabled="interactionMode !== 'browse' || coverSelection.inFlight"
+              :announcement="selectionAnnouncement"
+              @enter="enterSelection"
+            />
+            <BoardCoverToolbar
+              v-if="isOwnedBoardRoute"
+              ref="boardCoverToolbar"
+              :active="false"
+              :selected-id="coverSelection.candidateId"
+              :current-cover-id="currentBoardCoverId"
+              :busy="coverSelection.inFlight"
+              :can-reset="currentBoardCoverId !== null"
+              :disabled="interactionMode !== 'browse'"
+              @enter="enterCoverSelection"
+            />
+          </div>
+        </div>
+        <div
+          v-if="selection.active || interactionMode === 'cover-selection'"
+          class="pin-tools__active"
+          data-test="pin-tools-active"
+        >
+          <PinBulkToolbar
+            v-if="selection.active"
+            :active="true"
+            :selected-count="selection.selectedIds.length"
+            :loaded-count="blocks.length"
+            :scope="selection.scope"
+            :all-count="selection.allCount"
+            :show-add-to-board="isMyPinsRoute"
+            :can-add-to-board="canUseOwnedPinActions"
+            :show-move="isOwnedBoardRoute"
+            :can-move="isOwnedBoardRoute"
+            :show-edit="true"
+            :can-edit="canUseOwnedPinActions"
+            :show-delete="true"
+            :can-delete="canUseOwnedPinActions"
+            :operation-in-flight="selection.operationInFlight"
+            :announcement="selectionAnnouncement"
+            @exit="exitSelection"
+            @select-loaded="selectLoadedPins"
+            @clear="clearPinSelection"
+            @select-all="selectAllPins"
+            @add-to-board="openBulkBoard('add')"
+            @move="openBulkBoard('move')"
+            @edit="openBulkEdit"
+            @delete="confirmBulkDelete"
+          />
+          <template v-else>
+            <p class="pin-tools__status" data-test="board-cover-status">
+              {{ $t('boardCoverEnter') }} ·
+              {{ $t('bulkPinSelectedCount', {
+                count: coverSelection.candidateId === null ? 0 : 1,
+              }) }}
+            </p>
+            <BoardCoverToolbar
+              :active="true"
+              :selected-id="coverSelection.candidateId"
+              :current-cover-id="currentBoardCoverId"
+              :busy="coverSelection.inFlight"
+              :can-reset="currentBoardCoverId !== null"
+              :disabled="interactionMode !== 'browse'"
+              :error="coverSelection.error"
+              @apply="applyCoverPin(coverSelection.candidateId)"
+              @cancel="cancelCoverSelection"
+              @reset="confirmCoverReset"
+            />
+          </template>
+        </div>
+      </div>
       <div
         v-if="selection.result && selection.result.code === 'selection_too_large'"
         class="notification is-warning"
@@ -1347,6 +1395,50 @@ $avatar-width: 30px;
 $avatar-height: 30px;
 @import './utils/fonts';
 @import './utils/loader.scss';
+
+.pin-tools {
+  margin-bottom: 1rem;
+}
+
+.pin-tools__primary,
+.pin-tools__management,
+.pin-tools__active {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+}
+
+.pin-tools__primary,
+.pin-tools__active {
+  justify-content: space-between;
+}
+
+.pin-tools__management {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.pin-tools__active {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid #dbdbdb;
+}
+
+.pin-tools__status {
+  margin: 0;
+}
+
+@media screen and (max-width: 768px) {
+  .pin-tools__primary,
+  .pin-tools__active {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pin-tools__management {
+    justify-content: flex-start;
+  }
+}
 
 .pin-card{
   position: relative;

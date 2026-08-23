@@ -73,7 +73,7 @@ export default {
 
 <style lang="scss" scoped>
 .board-cover-toolbar {
-  margin-bottom: 1rem;
+  width: 100%;
 }
 
 .board-cover-toolbar__buttons {
@@ -84,5 +84,11 @@ export default {
 
 .board-cover-toolbar__error {
   margin-top: .75rem;
+}
+
+@media screen and (min-width: 769px) {
+  .board-cover-toolbar {
+    width: auto;
+  }
 }
 </style>

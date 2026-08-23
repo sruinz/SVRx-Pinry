@@ -1,7 +1,7 @@
 <template>
   <div class="pin-sort" aria-labelledby="pin-sort-label">
     <span id="pin-sort-label" class="pin-sort__label">{{ $t('pinSortLabel') }}</span>
-    <div class="pin-sort__buttons">
+    <div class="pin-sort__buttons buttons has-addons">
       <button
         v-for="option in options"
         :key="option.mode"
@@ -46,5 +46,6 @@ export default {
 
 <style scoped lang="scss">
 .pin-sort { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
-.pin-sort__buttons { display: flex; flex-wrap: wrap; gap: .5rem; }
+.pin-sort__buttons { margin-bottom: 0; }
+.pin-sort__buttons .button { margin-bottom: 0; }
 </style>
