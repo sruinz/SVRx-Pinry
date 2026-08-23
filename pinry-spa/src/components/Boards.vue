@@ -76,6 +76,8 @@ function createBoardItem(board) {
   boardItem.id = board.id;
   boardItem.name = board.name;
   boardItem.private = board.private;
+  boardItem.cover = board.cover;
+  boardItem.cover_pin_id = board.cover_pin_id;
   boardItem.total_pins = board.total_pins;
   if (previewImage.image.thumbnail.image !== null) {
     boardItem.preview_image_url = pinHandler.escapeUrl(

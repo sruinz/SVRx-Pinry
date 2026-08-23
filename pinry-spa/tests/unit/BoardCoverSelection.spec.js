@@ -431,6 +431,80 @@ describe('Pins board-cover selection mode', () => {
     expect(wrapper.vm.interactionMode).toBe('browse');
   });
 
+  it('keeps the candidate after an HTTP 5xx response and allows a retry', async () => {
+    API.Board.setCover
+      .mockRejectedValueOnce({
+        response: { status: 503, data: { code: 'temporary_failure' } },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          id: 7,
+          private: false,
+          cover_pin_id: 40,
+          submitter: { username: 'owner' },
+        },
+      });
+    const wrapper = mountPins();
+    await settle();
+    wrapper.vm.enterCoverSelection();
+    wrapper.vm.selectCoverCandidate(wrapper.vm.blocks[1]);
+
+    await wrapper.vm.applyCoverPin(40);
+    await settle();
+
+    expect(wrapper.vm.interactionMode).toBe('cover-selection');
+    expect(wrapper.vm.coverSelection).toMatchObject({
+      candidateId: 40,
+      inFlight: false,
+      error: 'boardCoverSaveFailed',
+    });
+    expect(wrapper.text()).not.toContain('temporary_failure');
+
+    await wrapper.vm.applyCoverPin(40);
+    await settle();
+    expect(API.Board.setCover).toHaveBeenCalledTimes(2);
+    expect(wrapper.vm.interactionMode).toBe('browse');
+  });
+
+  it.each(['resolve', 'reject'])(
+    'ignores a late %s after the component is destroyed',
+    async (outcome) => {
+      const request = deferred();
+      API.Board.setCover.mockReturnValue(request.promise);
+      const wrapper = mountPins();
+      await settle();
+      wrapper.vm.enterCoverSelection();
+      wrapper.vm.selectCoverCandidate(wrapper.vm.blocks[1]);
+      const originalBoard = wrapper.vm.editorMeta.currentBoard;
+      const applyPromise = wrapper.vm.applyCoverPin(40);
+
+      wrapper.destroy();
+      if (outcome === 'resolve') {
+        request.resolve({
+          data: {
+            id: 7,
+            private: false,
+            cover_pin_id: 40,
+            submitter: { username: 'owner' },
+          },
+        });
+      } else {
+        request.reject({ response: { status: 503, data: { code: 'late_failure' } } });
+      }
+      await applyPromise;
+      await settle();
+
+      expect(wrapper.vm.editorMeta.currentBoard).toBe(originalBoard);
+      expect(wrapper.vm.interactionMode).toBe('browse');
+      expect(wrapper.vm.coverSelection).toMatchObject({
+        candidateId: null,
+        inFlight: false,
+        error: null,
+      });
+      expect(wrapper.vm.$buefy.toast.open).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     [400, 'board_cover_invalid'],
     [400, 'board_cover_private_pin'],
