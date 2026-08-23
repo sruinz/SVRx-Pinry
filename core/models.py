@@ -364,6 +364,27 @@ def _lock_registered_asset(registry, using):
     )
 
 
+def _lock_registered_pin_boards(pin_id, using):
+    board_ids = list(
+        Board.objects.using(using)
+        .filter(
+            models.Q(pins__pk=pin_id)
+            | models.Q(cover_pin_id=pin_id)
+        )
+        .order_by("pk")
+        .values_list("pk", flat=True)
+        .distinct()
+    )
+    if not board_ids:
+        return []
+    return list(
+        Board.objects.select_for_update()
+        .using(using)
+        .filter(pk__in=board_ids)
+        .order_by("pk")
+    )
+
+
 def _delete_locked_registered_pin(
     pin,
     registry,
@@ -383,10 +404,12 @@ def _delete_locked_registered_pin(
         current_registry = _lock_registered_asset(registry, using)
     else:
         current_registry = _lock_registered_asset(registry, using)
+        _lock_registered_pin_boards(pin.pk, using)
         current_pin = (
             Pin.objects.select_for_update()
             .using(using)
             .filter(pk=pin.pk, image_id=registry["image_id"])
+            .order_by("pk")
             .first()
         )
     image = (

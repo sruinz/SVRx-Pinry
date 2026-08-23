@@ -872,6 +872,77 @@ class PinMediaLifecycleTest(
         self.assertEqual(media_snapshot(self.temporary_media.name), {})
         self.assertTrue(all(not path.exists() for path in directories))
 
+    def test_registered_delete_locks_all_related_boards_before_pin(self):
+        image = create_image()
+        pin = create_pin(self.owner, image, [])
+        pin_id = pin.pk
+        asset = self._register_asset(image)
+        self._assert_four_image_files(image)
+        directories = self._asset_directories(image)
+        member_board = Board.objects.create(
+            submitter=self.owner,
+            name="registered-delete-member-cover",
+        )
+        cover_only_board = Board.objects.create(
+            submitter=self.owner,
+            name="registered-delete-cover-only",
+        )
+        fallback_pin = create_pin(self.owner, create_image(), [])
+        member_board.pins.add(pin, fallback_pin)
+        member_board.cover_pin = pin
+        member_board.save(update_fields=("cover_pin",))
+        cover_only_board.cover_pin = pin
+        cover_only_board.save(update_fields=("cover_pin",))
+        locked_queries = []
+        original_fetch_all = QuerySet._fetch_all
+
+        def record_locked_query(queryset):
+            should_record = (
+                queryset._result_cache is None
+                and queryset.query.select_for_update
+                and queryset.model in (Board, Pin)
+            )
+            original_fetch_all(queryset)
+            if should_record:
+                locked_queries.append((
+                    queryset.model,
+                    tuple(queryset.query.order_by),
+                    [row.pk for row in queryset._result_cache],
+                ))
+
+        with mock.patch.object(
+            QuerySet,
+            "_fetch_all",
+            autospec=True,
+            side_effect=record_locked_query,
+        ):
+            pin.delete()
+
+        self.assertGreaterEqual(len(locked_queries), 2)
+        self.assertEqual(locked_queries[0], (
+            Board,
+            ("pk",),
+            sorted((member_board.pk, cover_only_board.pk)),
+        ))
+        self.assertEqual(locked_queries[1], (
+            Pin,
+            ("pk",),
+            [pin_id],
+        ))
+        member_board.refresh_from_db()
+        cover_only_board.refresh_from_db()
+        fallback, manual_id = BoardCoverService().resolve(
+            member_board,
+            None,
+        )
+        self.assertIsNone(member_board.cover_pin_id)
+        self.assertIsNone(cover_only_board.cover_pin_id)
+        self.assertEqual(fallback.pk, fallback_pin.pk)
+        self.assertIsNone(manual_id)
+        self.assertFalse(Image.objects.filter(pk=image.pk).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertTrue(all(not path.exists() for path in directories))
+
     def test_registered_delete_rejects_existing_database_transaction(self):
         image = create_image()
         pin = create_pin(self.owner, image, [])

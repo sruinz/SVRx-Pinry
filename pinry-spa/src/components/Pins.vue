@@ -119,6 +119,7 @@
                 :aria-disabled="isCoverCandidateDisabled(item) ? 'true' : null"
                 :aria-label="isCoverCandidateDisabled(item)
                   ? $t('boardCoverPrivateUnavailable') : null"
+                @click.capture="onPinCardClickCapture($event)"
                 @click="onPinCardClick(item, $event)"
                 @keydown="onPinCardKeydown(item, $event)"
               >
@@ -998,6 +999,11 @@ export default {
         ctrlKey: Boolean(event && event.ctrlKey),
         metaKey: Boolean(event && event.metaKey),
       }), { result: null });
+    },
+    onPinCardClickCapture(event) {
+      if (this.interactionMode === 'cover-selection' || this.selection.active) {
+        event.preventDefault();
+      }
     },
     onPinCardClick(item, event) {
       if (this.interactionMode === 'cover-selection') {

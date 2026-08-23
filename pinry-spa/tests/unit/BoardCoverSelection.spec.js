@@ -47,6 +47,18 @@ function pin(id, { author = 'owner', private_ = false } = {}) {
   };
 }
 
+function guardedRouterLink(navigate) {
+  return {
+    props: ['to'],
+    methods: {
+      follow(event) {
+        if (!event.defaultPrevented) navigate(this.to);
+      },
+    },
+    template: '<a href="#" @click="follow"><slot /></a>',
+  };
+}
+
 function page(pins) {
   return Promise.resolve({ data: { results: pins, next: null } });
 }
@@ -61,6 +73,10 @@ function mountPins({
     submitter: { username: 'owner' },
   },
   pins = [pin(41), pin(40), pin(39, { private_: true })],
+  routerLink = {
+    props: ['to'],
+    template: '<a href="#"><slot /></a>',
+  },
 } = {}) {
   API.fetchPins.mockImplementation(() => page(pins));
   API.Board.get.mockResolvedValue({ data: board });
@@ -84,10 +100,7 @@ function mountPins({
       EditorUI: true,
       loadingSpinner: true,
       noMore: true,
-      'router-link': {
-        props: ['to'],
-        template: '<a href="#"><slot /></a>',
-      },
+      'router-link': routerLink,
     },
   });
   wrapper.vm.editorMeta.user = authenticatedUsername === null
@@ -253,6 +266,37 @@ describe('Pins board-cover selection mode', () => {
     await wrapper.find('[data-test="pin-image-41"]').trigger('click');
     expect(wrapper.vm.coverSelection.candidateId).toBe(41);
     expect(wrapper.vm.$buefy.modal.open).not.toHaveBeenCalled();
+  });
+
+  it('prevents inner router-link navigation before selecting the card', async () => {
+    const navigate = jest.fn();
+    const taggedPin = pin(40);
+    taggedPin.tags = ['photo'];
+    const wrapper = mountPins({
+      board: {
+        id: 7,
+        private: false,
+        cover_pin_id: null,
+        submitter: { username: 'owner' },
+      },
+      pins: [taggedPin],
+      routerLink: guardedRouterLink(navigate),
+    });
+    await settle();
+    await wrapper.find('[data-test="board-cover-enter"]').trigger('click');
+    const links = wrapper.findAll('.pin-info a');
+
+    await links.at(0).trigger('click');
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(wrapper.vm.coverSelection.candidateId).toBe(40);
+
+    wrapper.vm.cancelCoverSelection();
+    wrapper.vm.enterSelection();
+    await links.at(1).trigger('click');
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(wrapper.vm.selection.selectedIds).toEqual([40]);
   });
 
   it('disables a private candidate on a public board', async () => {
