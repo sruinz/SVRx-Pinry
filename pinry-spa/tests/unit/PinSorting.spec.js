@@ -261,6 +261,38 @@ describe('Pins sorting', () => {
       .toBe('pinSortReshuffled');
   });
 
+  it('mutates the live region for every consecutive random reshuffle', async () => {
+    storeState(HOME_KEY, 'random', 5);
+    const wrapper = mountPins();
+    await settle();
+    let nextSeed = 5;
+    wrapper.vm.seedFactory = () => {
+      nextSeed += 1;
+      return nextSeed;
+    };
+    const liveRegion = wrapper.find('[data-test="pin-sort-announcement"]').element;
+    let mutationCount = 0;
+    const observer = new MutationObserver(() => {
+      mutationCount += 1;
+    });
+    observer.observe(liveRegion, { childList: true, characterData: true, subtree: true });
+
+    try {
+      await wrapper.find('[data-test="pin-sort-random"]').trigger('click');
+      await settle();
+      expect(liveRegion.textContent.trim()).toBe('pinSortReshuffled');
+      expect(mutationCount).toBeGreaterThan(0);
+      const firstMutationCount = mutationCount;
+
+      await wrapper.find('[data-test="pin-sort-random"]').trigger('click');
+      await settle();
+      expect(liveRegion.textContent.trim()).toBe('pinSortReshuffled');
+      expect(mutationCount).toBeGreaterThan(firstMutationCount);
+    } finally {
+      observer.disconnect();
+    }
+  });
+
   it('disables all modes during selection or an operation', async () => {
     const wrapper = mountPins();
     await settle();

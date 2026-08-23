@@ -399,9 +399,13 @@ export default {
       this.sortLegacyFallback = false;
       this.sortFallbackAttempted = false;
       writePinSortState(window.localStorage, this.sortStorageKey, this.sortState);
-      this.sortAnnouncement = transition.reshuffled ? this.$t('pinSortReshuffled') : '';
+      const announcement = transition.reshuffled ? this.$t('pinSortReshuffled') : '';
+      this.sortAnnouncement = '';
       this.reset();
-      this.$nextTick(() => window.scrollTo(0, 0));
+      this.$nextTick(() => {
+        this.sortAnnouncement = announcement;
+        window.scrollTo(0, 0);
+      });
     },
     sortRequestState() {
       return this.sortLegacyFallback || this.pinFilters.idFilter ? null : this.sortState;
