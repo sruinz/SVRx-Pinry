@@ -74,6 +74,7 @@ COPY pinry ./pinry
 COPY pinry_plugins ./pinry_plugins
 COPY users ./users
 COPY docker/scripts ./docker/scripts
+COPY LICENSE.md NOTICE.md UPSTREAM.md /usr/share/licenses/svrx-pinry/
 
 # Load in all of our config files.
 ADD docker/nginx/nginx.conf /etc/nginx/nginx.conf

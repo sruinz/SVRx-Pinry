@@ -62,6 +62,21 @@ describe('Profile build version', () => {
     expect(version.text()).toBe('9b54cf1b5a5a');
   });
 
+  it('renders local open-source attribution without repository links', () => {
+    const wrapper = mountProfile();
+    const notice = wrapper.find('[data-test="open-source-license"]');
+
+    expect(notice.exists()).toBe(true);
+    expect(notice.text()).toContain('오픈소스 라이선스');
+    expect(notice.text()).toContain(
+      '이 제품에는 BSD 2-Clause 라이선스로 제공되는 Pinry 구성 요소가 포함되어 있습니다.',
+    );
+    expect(notice.text()).toContain(
+      "Copyright (c) 2019, Pinry's Contributors",
+    );
+    expect(notice.find('a').exists()).toBe(false);
+  });
+
   it('does not render a fabricated version when the request fails', async () => {
     axios.get.mockRejectedValue(new Error('/private/build/path'));
 

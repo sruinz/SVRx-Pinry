@@ -11,7 +11,11 @@ import unittest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 TASK_PRODUCTION_PATHS = (
+    ".dockerignore",
     "Dockerfile.autobuild",
+    "LICENSE.md",
+    "NOTICE.md",
+    "UPSTREAM.md",
     "docker/scripts/start.sh",
     "scripts/create_synology_output.sh",
     "deploy/synology/build-image.sh",
@@ -504,6 +508,9 @@ class SynologyPackageTests(unittest.TestCase):
         required_context = (
             "Dockerfile.autobuild",
             ".dockerignore",
+            "LICENSE.md",
+            "NOTICE.md",
+            "UPSTREAM.md",
             "requirements.txt",
             "manage.py",
             "core/models.py",
@@ -577,6 +584,9 @@ class SynologyPackageTests(unittest.TestCase):
             {
                 ".dockerignore",
                 "Dockerfile.autobuild",
+                "LICENSE.md",
+                "NOTICE.md",
+                "UPSTREAM.md",
                 "requirements.txt",
                 "manage.py",
                 "core",
@@ -601,7 +611,12 @@ class SynologyPackageTests(unittest.TestCase):
                 self.assertNotIn("tests", relative.parts)
                 self.assertFalse(path.name == "tests.py")
                 self.assertFalse(path.name.startswith("test_"))
-                self.assertNotIn(path.suffix.lower(), (".md", ".rst"))
+                if path.name not in {
+                    "LICENSE.md",
+                    "NOTICE.md",
+                    "UPSTREAM.md",
+                }:
+                    self.assertNotIn(path.suffix.lower(), (".md", ".rst"))
                 self.assertNotEqual(path.name, ".DS_Store")
         self.assertEqual(
             (self.context_directory / ".dockerignore").read_text(),
@@ -643,7 +658,11 @@ class SynologyPackageTests(unittest.TestCase):
                 ".." not in Path(name).parts
                 and ".git" not in Path(name).parts
                 and ".DS_Store" not in Path(name).parts
-                and Path(name).suffix.lower() not in (".md", ".rst")
+                and (
+                    Path(name).name
+                    in {"LICENSE.md", "NOTICE.md", "UPSTREAM.md"}
+                    or Path(name).suffix.lower() not in (".md", ".rst")
+                )
                 for name in names
             )
         )
@@ -818,7 +837,23 @@ class SynologyPackageTests(unittest.TestCase):
                 "pinry_plugins",
                 "users",
                 "docker/scripts",
+                "LICENSE.md",
+                "NOTICE.md",
+                "UPSTREAM.md",
             ],
+        )
+
+    def test_root_docker_context_keeps_required_license_files(self):
+        ignored = {
+            line.strip()
+            for line in (REPOSITORY_ROOT / ".dockerignore")
+            .read_text()
+            .splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+
+        self.assertTrue(
+            {"LICENSE.md", "NOTICE.md", "UPSTREAM.md"}.isdisjoint(ignored)
         )
 
     def test_synology_dockerfile_uses_supported_bookworm_inputs(self):

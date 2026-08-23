@@ -36,6 +36,21 @@
         </div>
       </div>
     </div>
+    <div
+      class="card open-source-card"
+      data-test="open-source-license">
+      <header class="card-header">
+        <p class="card-header-title">
+          {{ $t("openSourceLicenseTitle") }}
+        </p>
+      </header>
+      <div class="card-content">
+        <div class="content">
+          <p>{{ $t("openSourceLicenseDescription") }}</p>
+          <p>{{ $t("openSourceLicenseCopyright") }}</p>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -85,7 +100,8 @@ export default {
   box-shadow: 5px 5px 2px 1px rgba(0, 0, 255, .1);
 }
 
-.build-info-card {
+.build-info-card,
+.open-source-card {
   margin-top: 1rem;
 }
 

@@ -82,6 +82,9 @@ git archive --format=tar "${source_commit}" -- \
     | tar -xf - -C "${control_directory}"
 git archive --format=tar "${source_commit}" -- \
     Dockerfile.autobuild \
+    LICENSE.md \
+    NOTICE.md \
+    UPSTREAM.md \
     requirements.txt \
     manage.py \
     core \
