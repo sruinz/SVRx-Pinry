@@ -354,6 +354,60 @@ describe('Pins board-cover selection mode', () => {
     expect(wrapper.vm.sortState).toEqual({ version: 1, mode: 'oldest', randomSeed: 23 });
   });
 
+  it('loads Board metadata once while later pages preserve a saved cover', async () => {
+    const initialBoard = {
+      id: 7,
+      private: false,
+      cover_pin_id: 41,
+      submitter: { username: 'owner' },
+    };
+    const savedBoard = { ...initialBoard, cover_pin_id: 40 };
+    const staleBoardRequest = deferred();
+    const nextPageRequest = deferred();
+    const wrapper = mountPins({
+      board: initialBoard,
+      pins: [pin(41), pin(40)],
+    });
+    await settle();
+    wrapper.vm.status.hasNext = true;
+    API.Board.get.mockReturnValueOnce(staleBoardRequest.promise);
+    API.fetchPins.mockReturnValueOnce(nextPageRequest.promise);
+    API.Board.setCover.mockResolvedValue({ data: savedBoard });
+
+    wrapper.vm.fetchMore();
+    wrapper.vm.enterCoverSelection();
+    wrapper.vm.selectCoverCandidate(wrapper.vm.blocks[1]);
+    await wrapper.vm.applyCoverPin(40);
+    await settle();
+    expect(wrapper.vm.editorMeta.currentBoard.cover_pin_id).toBe(40);
+
+    staleBoardRequest.resolve({ data: initialBoard });
+    await settle();
+    nextPageRequest.resolve({
+      data: { results: [pin(39)], next: null },
+    });
+    await settle();
+
+    expect(wrapper.vm.editorMeta.currentBoard.cover_pin_id).toBe(40);
+    expect(API.Board.get).toHaveBeenCalledTimes(1);
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([41, 40, 39]);
+    expect(wrapper.vm.status.offset).toBe(3);
+    expect(wrapper.vm.status.hasNext).toBe(false);
+  });
+
+  it('loads Board metadata again once after reset starts a new generation', async () => {
+    const wrapper = mountPins({ pins: [pin(41)] });
+    await settle();
+    expect(API.Board.get).toHaveBeenCalledTimes(1);
+
+    wrapper.vm.reset();
+    await settle();
+
+    expect(API.Board.get).toHaveBeenCalledTimes(2);
+    expect(wrapper.vm.metaReady.board).toBe(true);
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([41]);
+  });
+
   it('applies once, refreshes board metadata, exits, and restores focus', async () => {
     const request = deferred();
     API.Board.setCover.mockReturnValue(request.promise);

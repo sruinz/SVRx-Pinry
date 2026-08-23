@@ -1237,17 +1237,23 @@ export default {
           offset, null, filters.userFilter, null, this.sortRequestState(),
         );
       } else if (filters.boardFilter) {
-        const prevPromise = API.Board.get(filters.boardFilter);
-        promise = prevPromise.then(
-          (resp) => {
-            if (!this.isRequestCurrent(generation, filters)) return null;
-            this.editorMeta.currentBoard = resp.data;
-            this.metaReady.board = true;
-            return API.fetchPins(
-              offset, null, null, filters.boardFilter, this.sortRequestState(),
-            );
-          },
-        );
+        if (this.metaReady.board) {
+          promise = API.fetchPins(
+            offset, null, null, filters.boardFilter, this.sortRequestState(),
+          );
+        } else {
+          const prevPromise = API.Board.get(filters.boardFilter);
+          promise = prevPromise.then(
+            (resp) => {
+              if (!this.isRequestCurrent(generation, filters)) return null;
+              this.editorMeta.currentBoard = resp.data;
+              this.metaReady.board = true;
+              return API.fetchPins(
+                offset, null, null, filters.boardFilter, this.sortRequestState(),
+              );
+            },
+          );
+        }
       } else if (filters.idFilter) {
         promise = API.fetchPin(filters.idFilter);
       } else {
