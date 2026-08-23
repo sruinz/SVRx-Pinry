@@ -21,7 +21,7 @@ from rest_framework.test import APIClient, APITestCase, APITransactionTestCase
 
 from core.bulk_serializers import BulkPinRequestSerializer
 from core.models import Board, Image, MediaAsset, Pin
-from core.services.board_cover import BoardCoverService
+from core.services.board_cover import BoardCoverError, BoardCoverService
 from core.services.bulk_pin_management import BulkOperationError
 from core.services.pin_membership import PinMembershipService
 from core.tests.helpers import create_image, create_user
@@ -860,6 +860,90 @@ class BulkPinWriteAPITests(
                 pin.referer,
                 "https://example.com/original",
             )
+
+    def test_update_private_clears_only_public_board_manual_covers(self):
+        second_public_board = Board.objects.create(
+            submitter=self.owner,
+            name="bulk-write-second-public",
+            cover_pin=self.second,
+        )
+        private_board = Board.objects.create(
+            submitter=self.owner,
+            name="bulk-write-private",
+            private=True,
+            cover_pin=self.first,
+        )
+        self.source.cover_pin = self.first
+        self.source.save(update_fields=("cover_pin",))
+        self.source.pins.add(self.first)
+        second_public_board.pins.add(self.second)
+        private_board.pins.add(self.first)
+
+        response = self.client.post(
+            self._url(),
+            {
+                "operation": "update",
+                "pin_ids": [self.first.pk, self.second.pk],
+                "changes": {"private": True},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.source.refresh_from_db()
+        second_public_board.refresh_from_db()
+        private_board.refresh_from_db()
+        self.assertIsNone(self.source.cover_pin_id)
+        self.assertIsNone(second_public_board.cover_pin_id)
+        self.assertEqual(private_board.cover_pin_id, self.first.pk)
+
+    def test_bulk_making_pin_public_does_not_restore_manual_cover(self):
+        self.source.cover_pin = self.first
+        self.source.save(update_fields=("cover_pin",))
+        self.source.pins.add(self.first)
+
+        private_response = self.client.post(
+            self._url(),
+            {
+                "operation": "update",
+                "pin_ids": [self.first.pk],
+                "changes": {"private": True},
+            },
+            format="json",
+        )
+        public_response = self.client.post(
+            self._url(),
+            {
+                "operation": "update",
+                "pin_ids": [self.first.pk],
+                "changes": {"private": False},
+            },
+            format="json",
+        )
+
+        self.assertEqual(private_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(public_response.status_code, status.HTTP_200_OK)
+        self.source.refresh_from_db()
+        self.assertIsNone(self.source.cover_pin_id)
+
+    def test_bulk_cover_change_conflict_is_exact_code_only_409(self):
+        with mock.patch.object(
+            BoardCoverService,
+            "pin_privacy_transition",
+            side_effect=BoardCoverError("board_cover_changed"),
+        ):
+            response = self.client.post(
+                self._url(),
+                {
+                    "operation": "update",
+                    "pin_ids": [self.first.pk],
+                    "changes": {"private": True},
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.json(), {"code": "board_cover_changed"})
 
     def test_update_failure_rolls_back_whole_chunk(self):
         real_save = Pin.save

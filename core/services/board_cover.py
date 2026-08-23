@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 from django.db import transaction
 from django.db.models import Q
 
@@ -11,6 +13,69 @@ class BoardCoverError(Exception):
 
 
 class BoardCoverService(object):
+    def reconcile_locked_board(self, board):
+        if board.cover_pin_id is None:
+            return False
+        cover = (
+            Pin.objects.select_for_update()
+            .filter(pk=board.cover_pin_id)
+            .first()
+        )
+        valid = (
+            cover is not None
+            and board.pins.filter(pk=cover.pk).exists()
+            and (board.private or not cover.private)
+        )
+        if valid:
+            return False
+        board.cover_pin = None
+        board.save(update_fields=("cover_pin",))
+        return True
+
+    @contextmanager
+    def pin_privacy_transition(self, user, pin_ids, target_private):
+        ordered_ids = sorted(set(pin_ids))
+        with transaction.atomic():
+            if target_private:
+                probed_board_ids = list(
+                    Board.objects.filter(
+                        private=False,
+                        cover_pin_id__in=ordered_ids,
+                    ).order_by("pk").values_list("pk", flat=True)
+                )
+            else:
+                probed_board_ids = []
+            list(
+                Board.objects.select_for_update()
+                .filter(pk__in=probed_board_ids)
+                .order_by("pk")
+            )
+            pins = list(
+                Pin.objects.select_for_update()
+                .filter(pk__in=ordered_ids, submitter=user)
+                .order_by("pk")
+            )
+            if len(pins) != len(ordered_ids):
+                raise BoardCoverError("pin_not_found")
+            if target_private:
+                current_board_ids = list(
+                    Board.objects.filter(
+                        private=False,
+                        cover_pin_id__in=ordered_ids,
+                    ).order_by("pk").values_list("pk", flat=True)
+                )
+            else:
+                current_board_ids = []
+            if current_board_ids != probed_board_ids:
+                raise BoardCoverError("board_cover_changed")
+            yield {pin.pk: pin for pin in pins}
+            if target_private and current_board_ids:
+                Board.objects.filter(
+                    pk__in=current_board_ids,
+                    cover_pin_id__in=ordered_ids,
+                    private=False,
+                ).update(cover_pin=None)
+
     @staticmethod
     def clear_if_removed(board, removed_pin_ids):
         if board.cover_pin_id not in set(removed_pin_ids):

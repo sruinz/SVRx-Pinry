@@ -70,6 +70,7 @@ class PinViewSet(viewsets.ModelViewSet):
         "board_not_found": status.HTTP_404_NOT_FOUND,
         "pin_not_found": status.HTTP_404_NOT_FOUND,
         "pin_membership_changed": status.HTTP_409_CONFLICT,
+        "board_cover_changed": status.HTTP_409_CONFLICT,
         "database_busy": status.HTTP_503_SERVICE_UNAVAILABLE,
         "internal_error": status.HTTP_500_INTERNAL_SERVER_ERROR,
     }
@@ -194,6 +195,7 @@ class PinViewSet(viewsets.ModelViewSet):
 
     def get_serializer_context(self):
         context = super(PinViewSet, self).get_serializer_context()
+        context["board_cover_service"] = BoardCoverService()
         service = getattr(self, "_pin_import_service", None)
         if service is not None:
             context["pin_import_service"] = service

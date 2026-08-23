@@ -11,6 +11,7 @@ from django_images.models import Thumbnail
 from django_images.paths import UnsupportedImageFormat
 from core.services.local_upload import LocalUploadError
 from core.services.media_storage import MediaStorageError
+from core.services.board_cover import BoardCoverError
 from core.services.pin_import import ImportMetadata, PinImportError
 from core.services.safe_url_fetch import SafeFetchError
 from users.serializers import UserSerializer
@@ -103,6 +104,16 @@ class URLImportConflict(APIException):
 
 class URLImportInternalError(APIException):
     status_code = 500
+
+
+class BoardCoverChanged(APIException):
+    status_code = 409
+    default_code = "board_cover_changed"
+
+    def __init__(self):
+        super(BoardCoverChanged, self).__init__({
+            "code": "board_cover_changed"
+        })
 
 
 _URL_CLIENT_ERROR_CODES = frozenset((
@@ -300,15 +311,36 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
 
     def update(self, instance, validated_data):
         tags = validated_data.pop('tag_list', None)
+        if "private" in validated_data:
+            service = self.context["board_cover_service"]
+            request = self.context["request"]
+            try:
+                with service.pin_privacy_transition(
+                    request.user,
+                    [instance.pk],
+                    validated_data["private"],
+                ) as pins:
+                    return self._update_locked_pin(
+                        pins[instance.pk],
+                        validated_data,
+                        tags,
+                    )
+            except BoardCoverError as error:
+                if error.code == "board_cover_changed":
+                    raise BoardCoverChanged() from None
+                raise
         with transaction.atomic():
-            if tags:
-                instance.tags.set(*tags)
-            else:
-                instance.tags.set()
-            # change for image-id or image is not allowed
-            validated_data.pop('image_file', None)
-            validated_data.pop('board_ids', None)
-            return super(PinSerializer, self).update(instance, validated_data)
+            return self._update_locked_pin(instance, validated_data, tags)
+
+    def _update_locked_pin(self, instance, validated_data, tags):
+        if tags:
+            instance.tags.set(*tags)
+        else:
+            instance.tags.set()
+        # change for image-id or image is not allowed
+        validated_data.pop('image_file', None)
+        validated_data.pop('board_ids', None)
+        return super(PinSerializer, self).update(instance, validated_data)
 
 
 class PinIdListField(serializers.ListField):
@@ -421,22 +453,30 @@ class BoardSerializer(serializers.HyperlinkedModelSerializer):
     def update(self, instance: Board, validated_data):
         pins_to_add = validated_data.pop("pins_to_add", [])
         pins_to_remove = validated_data.pop("pins_to_remove", [])
-        board = Board.objects.filter(
-            submitter=instance.submitter,
-            name=validated_data.get('name', None)
-        ).first()
-        if board and board.id != instance.id:
-            raise ValidationError(
-                detail={'name': "Board with this name already exists"}
+        with transaction.atomic():
+            instance = Board.objects.select_for_update().get(pk=instance.pk)
+            board = Board.objects.filter(
+                submitter=instance.submitter,
+                name=validated_data.get('name', None)
+            ).first()
+            if board and board.id != instance.id:
+                raise ValidationError(
+                    detail={'name': "Board with this name already exists"}
+                )
+            instance = super(BoardSerializer, self).update(
+                instance,
+                validated_data,
             )
-        instance = super(BoardSerializer, self).update(instance, validated_data)
-        service = self.context["pin_membership_service"]
-        return service.update_board_membership(
-            self.context["request"].user,
-            instance.pk,
-            pins_to_add,
-            pins_to_remove,
-        )
+            membership_service = self.context["pin_membership_service"]
+            instance = membership_service.update_board_membership(
+                self.context["request"].user,
+                instance.pk,
+                pins_to_add,
+                pins_to_remove,
+            )
+            cover_service = self.context["board_cover_service"]
+            cover_service.reconcile_locked_board(instance)
+            return instance
 
     def create(self, validated_data):
         validated_data.pop('pins_to_remove', None)

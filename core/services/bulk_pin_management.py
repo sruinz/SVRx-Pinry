@@ -6,6 +6,7 @@ from django.db import connection, OperationalError, transaction
 from django.db.models import BooleanField, Case, Count, IntegerField, Q, Value, When
 
 from core.models import Board, Pin
+from core.services.board_cover import BoardCoverError, BoardCoverService
 from core.services.pin_membership import (
     MembershipConflict,
     PinMembershipService,
@@ -94,9 +95,17 @@ class BulkPinManagementService(object):
         "source_membership_changed",
     ))
 
-    def __init__(self, membership_service=None, clock=time.monotonic):
+    def __init__(
+        self,
+        membership_service=None,
+        clock=time.monotonic,
+        board_cover_service=None,
+    ):
         self.membership_service = (
             membership_service or PinMembershipService()
+        )
+        self.board_cover_service = (
+            board_cover_service or BoardCoverService()
         )
         self.clock = clock
 
@@ -177,28 +186,55 @@ class BulkPinManagementService(object):
         del started_at
         pin_ids = request_data["pin_ids"]
         changes = request_data["changes"]
-        with transaction.atomic():
-            pins = self._owned_pins(user, pin_ids, lock=True)
-            for pin_id in pin_ids:
-                pin = pins[pin_id]
-                if "private" in changes:
-                    pin.private = changes["private"]
-                    pin.save(update_fields=("private",))
-                tag_changes = changes.get("tags")
-                if tag_changes is not None:
-                    mode = tag_changes["mode"]
-                    values = tag_changes["values"]
-                    if mode == "add":
-                        pin.tags.add(*values)
-                    elif mode == "remove":
-                        pin.tags.remove(*values)
-                    else:
-                        pin.tags.set(*values)
+        if "private" in changes:
+            try:
+                with self.board_cover_service.pin_privacy_transition(
+                    user,
+                    pin_ids,
+                    changes["private"],
+                ) as pins:
+                    self._apply_locked_updates(
+                        pins,
+                        pin_ids,
+                        changes,
+                    )
+            except BoardCoverError as error:
+                if error.code == "board_cover_changed":
+                    raise BulkOperationError(
+                        "board_cover_changed",
+                        409,
+                    ) from None
+                if error.code == "pin_not_found":
+                    raise BulkOperationError("pin_not_found", 404) from None
+                raise
+        else:
+            with transaction.atomic():
+                pins = self._owned_pins(user, pin_ids, lock=True)
+                self._apply_locked_updates(pins, pin_ids, changes)
         results = [
             {"id": pin_id, "status": "updated"}
             for pin_id in pin_ids
         ]
         return self._summarize("update", results)
+
+    @staticmethod
+    def _apply_locked_updates(pins, pin_ids, changes):
+        for pin_id in pin_ids:
+            pin = pins[pin_id]
+            if "private" in changes:
+                pin.private = changes["private"]
+                pin.save(update_fields=("private",))
+            tag_changes = changes.get("tags")
+            if tag_changes is None:
+                continue
+            mode = tag_changes["mode"]
+            values = tag_changes["values"]
+            if mode == "add":
+                pin.tags.add(*values)
+            elif mode == "remove":
+                pin.tags.remove(*values)
+            else:
+                pin.tags.set(*values)
 
     def _delete_if_exclusive_to_board(
         self,
