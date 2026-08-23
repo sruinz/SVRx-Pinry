@@ -200,6 +200,45 @@ describe('Pins responsive tool area', () => {
     );
   });
 
+  it('hides every active bulk control when Board management permission is lost', async () => {
+    const wrapper = mountPins({ pinFilters: { boardFilter: 7 } });
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+
+    wrapper.vm.editorMeta.currentBoard = {
+      ...wrapper.vm.editorMeta.currentBoard,
+      submitter: { username: 'other' },
+    };
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.vm.canManagePins).toBe(false);
+    expect(wrapper.find('[data-test="pin-tools-active"]').exists()).toBe(false);
+    [
+      'summary', 'select-loaded', 'clear', 'select-all', 'move', 'edit', 'delete', 'exit',
+    ].forEach((name) => {
+      expect(wrapper.find(`[data-test="pin-selection-${name}"]`).exists()).toBe(false);
+    });
+  });
+
+  it('hides every active cover control when Board ownership is lost', async () => {
+    const wrapper = mountPins({ pinFilters: { boardFilter: 7 } });
+    await settle();
+    await wrapper.find('[data-test="board-cover-enter"]').trigger('click');
+
+    wrapper.vm.editorMeta.currentBoard = {
+      ...wrapper.vm.editorMeta.currentBoard,
+      submitter: { username: 'other' },
+    };
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.vm.isOwnedBoardRoute).toBe(false);
+    expect(wrapper.find('[data-test="pin-tools-active"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="board-cover-status"]').exists()).toBe(false);
+    ['apply', 'cancel', 'reset'].forEach((name) => {
+      expect(wrapper.find(`[data-test="board-cover-${name}"]`).exists()).toBe(false);
+    });
+  });
+
   it('does not add the list tool area to a single Pin route', async () => {
     const wrapper = mountPins({ pinFilters: { idFilter: 41 } });
     await settle();

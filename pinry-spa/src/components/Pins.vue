@@ -50,12 +50,13 @@
           </div>
         </div>
         <div
-          v-if="selection.active || interactionMode === 'cover-selection'"
+          v-if="(selection.active && canManagePins)
+            || (interactionMode === 'cover-selection' && isOwnedBoardRoute)"
           class="pin-tools__active"
           data-test="pin-tools-active"
         >
           <PinBulkToolbar
-            v-if="selection.active"
+            v-if="selection.active && canManagePins"
             :active="true"
             :selected-count="selection.selectedIds.length"
             :loaded-count="blocks.length"
@@ -80,7 +81,7 @@
             @edit="openBulkEdit"
             @delete="confirmBulkDelete"
           />
-          <template v-else>
+          <template v-else-if="interactionMode === 'cover-selection' && isOwnedBoardRoute">
             <p class="pin-tools__status" data-test="board-cover-status">
               {{ $t('boardCoverEnter') }} ·
               {{ $t('bulkPinSelectedCount', {
