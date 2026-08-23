@@ -10,8 +10,11 @@
         :busy="coverSelection.inFlight"
         :can-reset="currentBoardCoverId !== null"
         :disabled="interactionMode !== 'browse'"
+        :error="coverSelection.error"
         @enter="enterCoverSelection"
+        @apply="applyCoverPin(coverSelection.candidateId)"
         @cancel="cancelCoverSelection"
+        @reset="confirmCoverReset"
       />
       <PinBulkToolbar
         v-if="canManagePins"
@@ -595,6 +598,87 @@ export default {
       ) return;
       this.coverSelection.candidateId = item.id;
       this.coverSelection.error = null;
+    },
+    async applyCoverPin(pinId) {
+      if (
+        this.coverSelection.inFlight
+        || !this.isOwnedBoardRoute
+        || this.interactionMode !== 'cover-selection'
+      ) return;
+      const token = this.coverSelection.requestToken + 1;
+      this.coverSelection.requestToken = token;
+      this.coverSelection.inFlight = true;
+      this.coverSelection.error = null;
+      try {
+        const response = await API.Board.setCover(
+          this.editorMeta.currentBoard.id,
+          pinId,
+        );
+        if (token !== this.coverSelection.requestToken) return;
+        this.editorMeta.currentBoard = response.data;
+        this.interactionMode = 'browse';
+        this.coverSelection.candidateId = null;
+        this.$buefy.toast.open({
+          message: this.$t('boardCoverSaved'),
+          type: 'is-success',
+        });
+        this.$nextTick(() => {
+          const toolbar = this.$refs.boardCoverToolbar;
+          if (toolbar && typeof toolbar.focusEnter === 'function') {
+            toolbar.focusEnter();
+          }
+        });
+      } catch (error) {
+        if (token !== this.coverSelection.requestToken) return;
+        this.handleCoverError(error);
+      } finally {
+        if (token === this.coverSelection.requestToken) {
+          this.coverSelection.inFlight = false;
+        }
+      }
+    },
+    handleCoverError(error) {
+      const response = error && error.response;
+      const status = response && response.status;
+      const code = response && response.data && response.data.code;
+      const invalidCodes = new Set([
+        'board_cover_invalid',
+        'board_cover_private_pin',
+        'board_cover_changed',
+      ]);
+
+      if ((status === 400 || status === 409) && invalidCodes.has(code)) {
+        this.coverSelection.candidateId = null;
+        this.$buefy.toast.open({
+          message: this.$t('boardCoverRefreshRequired'),
+          type: 'is-warning',
+        });
+        this.reset();
+        return;
+      }
+
+      if (status === 403 || status === 404) {
+        this.coverSelection.candidateId = null;
+        this.$buefy.toast.open({
+          message: this.$t('boardCoverSaveFailed'),
+          type: 'is-danger',
+        });
+        this.reset();
+        return;
+      }
+
+      this.coverSelection.error = this.$t('boardCoverSaveFailed');
+    },
+    confirmCoverReset() {
+      if (
+        this.coverSelection.inFlight
+        || this.interactionMode !== 'cover-selection'
+        || this.currentBoardCoverId === null
+      ) return;
+      this.$buefy.dialog.confirm({
+        message: this.$t('boardCoverResetConfirm'),
+        onConfirm: () => this.applyCoverPin(null),
+      });
     },
     clearPinSelection() {
       this.updateSelection(this.selectionModel.selectLoaded([]), {

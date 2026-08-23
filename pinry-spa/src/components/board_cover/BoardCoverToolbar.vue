@@ -40,6 +40,14 @@
         {{ $t('boardCoverReset') }}
       </button>
     </div>
+    <p
+      v-if="error"
+      class="notification is-danger board-cover-toolbar__error"
+      data-test="board-cover-error"
+      role="alert"
+    >
+      {{ error }}
+    </p>
   </div>
 </template>
 
@@ -53,6 +61,7 @@ export default {
     busy: { type: Boolean, required: true },
     canReset: { type: Boolean, required: true },
     disabled: { type: Boolean, default: false },
+    error: { type: String, default: null },
   },
   methods: {
     focusEnter() {
@@ -71,5 +80,9 @@ export default {
   display: flex;
   flex-wrap: wrap;
   gap: .5rem;
+}
+
+.board-cover-toolbar__error {
+  margin-top: .75rem;
 }
 </style>

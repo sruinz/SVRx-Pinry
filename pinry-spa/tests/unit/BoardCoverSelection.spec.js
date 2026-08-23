@@ -12,6 +12,16 @@ jest.mock('axios');
 
 let mountedPinWrappers = [];
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function pin(id, { author = 'owner', private_ = false } = {}) {
   return {
     id,
@@ -63,7 +73,11 @@ function mountPins({
     attachTo: document.body,
     propsData: { pinFilters },
     mocks: {
-      $buefy: { modal: { open: jest.fn() } },
+      $buefy: {
+        dialog: { confirm: jest.fn() },
+        modal: { open: jest.fn() },
+        toast: { open: jest.fn() },
+      },
       $t: key => key,
     },
     stubs: {
@@ -167,6 +181,7 @@ describe('Pins board-cover selection mode', () => {
     API.fetchPins = jest.fn();
     API.fetchPin = jest.fn();
     API.Board.get = jest.fn();
+    API.Board.setCover = jest.fn();
     API.User.fetchUserInfo = jest.fn();
     API.Pin.fetchSelectionIds = jest.fn();
     API.Pin.bulk = jest.fn();
@@ -293,5 +308,209 @@ describe('Pins board-cover selection mode', () => {
       requestToken: token + 1,
     });
     expect(wrapper.vm.sortState).toEqual({ version: 1, mode: 'oldest', randomSeed: 23 });
+  });
+
+  it('applies once, refreshes board metadata, exits, and restores focus', async () => {
+    const request = deferred();
+    API.Board.setCover.mockReturnValue(request.promise);
+    const wrapper = mountPins();
+    await settle();
+    await wrapper.find('[data-test="board-cover-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-card-40"]').trigger('click');
+
+    await wrapper.find('[data-test="board-cover-apply"]').trigger('click');
+    await wrapper.find('[data-test="board-cover-apply"]').trigger('click');
+
+    expect(API.Board.setCover).toHaveBeenCalledTimes(1);
+    expect(API.Board.setCover).toHaveBeenCalledWith(7, 40);
+    request.resolve({
+      data: {
+        id: 7,
+        private: false,
+        cover_pin_id: 40,
+        submitter: { username: 'owner' },
+      },
+    });
+    await settle();
+
+    expect(wrapper.vm.editorMeta.currentBoard.cover_pin_id).toBe(40);
+    expect(wrapper.vm.interactionMode).toBe('browse');
+    expect(wrapper.vm.coverSelection.candidateId).toBeNull();
+    expect(wrapper.vm.$buefy.toast.open).toHaveBeenCalledWith({
+      message: 'boardCoverSaved',
+      type: 'is-success',
+    });
+    expect(document.activeElement).toBe(
+      wrapper.find('[data-test="board-cover-enter"]').element,
+    );
+  });
+
+  it('finishes a successful save when the toolbar disappears before the response', async () => {
+    const request = deferred();
+    API.Board.setCover.mockReturnValue(request.promise);
+    const wrapper = mountPins();
+    await settle();
+    wrapper.vm.enterCoverSelection();
+    wrapper.vm.selectCoverCandidate(wrapper.vm.blocks[1]);
+    wrapper.vm.applyCoverPin(40);
+
+    wrapper.vm.editorMeta.user.meta.username = 'viewer';
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="board-cover-enter"]').exists()).toBe(false);
+    request.resolve({
+      data: {
+        id: 7,
+        private: false,
+        cover_pin_id: 40,
+        submitter: { username: 'owner' },
+      },
+    });
+    await settle();
+
+    expect(wrapper.vm.interactionMode).toBe('browse');
+    expect(wrapper.vm.coverSelection.inFlight).toBe(false);
+  });
+
+  it('ignores a late apply result after the route filter changes', async () => {
+    const request = deferred();
+    API.Board.setCover.mockReturnValue(request.promise);
+    const wrapper = mountPins();
+    await settle();
+    wrapper.vm.enterCoverSelection();
+    wrapper.vm.selectCoverCandidate(wrapper.vm.blocks[1]);
+    wrapper.vm.applyCoverPin(40);
+
+    await wrapper.setProps({ pinFilters: { tagFilter: 'photo' } });
+    await settle();
+    request.resolve({
+      data: {
+        id: 7,
+        private: false,
+        cover_pin_id: 40,
+        submitter: { username: 'owner' },
+      },
+    });
+    await settle();
+
+    expect(wrapper.vm.editorMeta.currentBoard.id).not.toBe(7);
+    expect(wrapper.vm.interactionMode).toBe('browse');
+    expect(wrapper.vm.coverSelection.inFlight).toBe(false);
+  });
+
+  it('keeps the candidate after a network failure and allows a retry', async () => {
+    API.Board.setCover
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce({
+        data: {
+          id: 7,
+          private: false,
+          cover_pin_id: 40,
+          submitter: { username: 'owner' },
+        },
+      });
+    const wrapper = mountPins();
+    await settle();
+    wrapper.vm.enterCoverSelection();
+    wrapper.vm.selectCoverCandidate(wrapper.vm.blocks[1]);
+
+    await wrapper.vm.applyCoverPin(40);
+    await settle();
+
+    expect(wrapper.vm.interactionMode).toBe('cover-selection');
+    expect(wrapper.vm.coverSelection).toMatchObject({
+      candidateId: 40,
+      inFlight: false,
+      error: 'boardCoverSaveFailed',
+    });
+    expect(wrapper.find('[data-test="board-cover-error"]').text())
+      .toBe('boardCoverSaveFailed');
+
+    await wrapper.vm.applyCoverPin(40);
+    await settle();
+    expect(API.Board.setCover).toHaveBeenCalledTimes(2);
+    expect(wrapper.vm.interactionMode).toBe('browse');
+  });
+
+  it.each([
+    [400, 'board_cover_invalid'],
+    [400, 'board_cover_private_pin'],
+    [409, 'board_cover_changed'],
+  ])('refreshes after confirmed candidate error %i %s without exposing its code', async (
+    status, code,
+  ) => {
+    API.Board.setCover.mockRejectedValue({ response: { status, data: { code } } });
+    const wrapper = mountPins();
+    await settle();
+    wrapper.vm.enterCoverSelection();
+    wrapper.vm.selectCoverCandidate(wrapper.vm.blocks[1]);
+    const boardFetches = API.Board.get.mock.calls.length;
+
+    await wrapper.vm.applyCoverPin(40);
+    await settle();
+
+    expect(wrapper.vm.interactionMode).toBe('browse');
+    expect(wrapper.vm.coverSelection.candidateId).toBeNull();
+    expect(API.Board.get.mock.calls.length).toBeGreaterThan(boardFetches);
+    expect(wrapper.vm.$buefy.toast.open).toHaveBeenCalledWith({
+      message: 'boardCoverRefreshRequired',
+      type: 'is-warning',
+    });
+    expect(wrapper.text()).not.toContain(code);
+    expect(JSON.stringify(wrapper.vm.$buefy.toast.open.mock.calls)).not.toContain(code);
+  });
+
+  it.each([403, 404])('exits and refreshes after an unavailable board response %i', async (status) => {
+    API.Board.setCover.mockRejectedValue({
+      response: { status, data: { code: 'board_cover_internal_code' } },
+    });
+    const wrapper = mountPins();
+    await settle();
+    wrapper.vm.enterCoverSelection();
+    wrapper.vm.selectCoverCandidate(wrapper.vm.blocks[1]);
+    const boardFetches = API.Board.get.mock.calls.length;
+
+    await wrapper.vm.applyCoverPin(40);
+    await settle();
+
+    expect(wrapper.vm.interactionMode).toBe('browse');
+    expect(wrapper.vm.coverSelection.candidateId).toBeNull();
+    expect(API.Board.get.mock.calls.length).toBeGreaterThan(boardFetches);
+    expect(wrapper.vm.$buefy.toast.open).toHaveBeenCalledWith({
+      message: 'boardCoverSaveFailed',
+      type: 'is-danger',
+    });
+    expect(wrapper.text()).not.toContain('board_cover_internal_code');
+    expect(JSON.stringify(wrapper.vm.$buefy.toast.open.mock.calls))
+      .not.toContain('board_cover_internal_code');
+  });
+
+  it('resets to automatic selection only after confirmation and submits once', async () => {
+    const request = deferred();
+    API.Board.setCover.mockReturnValue(request.promise);
+    const wrapper = mountPins();
+    await settle();
+    await wrapper.find('[data-test="board-cover-enter"]').trigger('click');
+
+    await wrapper.find('[data-test="board-cover-reset"]').trigger('click');
+
+    expect(wrapper.vm.$buefy.dialog.confirm).toHaveBeenCalledTimes(1);
+    expect(API.Board.setCover).not.toHaveBeenCalled();
+    const { onConfirm } = wrapper.vm.$buefy.dialog.confirm.mock.calls[0][0];
+    onConfirm();
+    onConfirm();
+    expect(API.Board.setCover).toHaveBeenCalledTimes(1);
+    expect(API.Board.setCover).toHaveBeenCalledWith(7, null);
+
+    request.resolve({
+      data: {
+        id: 7,
+        private: false,
+        cover_pin_id: null,
+        submitter: { username: 'owner' },
+      },
+    });
+    await settle();
+    expect(wrapper.vm.currentBoardCoverId).toBeNull();
+    expect(wrapper.vm.interactionMode).toBe('browse');
   });
 });

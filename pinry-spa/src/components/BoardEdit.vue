@@ -41,10 +41,21 @@
             <b-field v-bind:label="$t('privacyOptionLabel')"
                        :type="editModel.form.private.type"
                        :message="editModel.form.private.error">
-                <b-checkbox v-model="editModel.form.private.value">
+                <b-checkbox
+                  v-model="editModel.form.private.value"
+                  data-test="board-private-checkbox"
+                >
                     {{ $t("isPrivateCheckbox") }}
                 </b-checkbox>
               </b-field>
+            <p
+              v-if="willResetPrivateCover"
+              class="notification is-info"
+              data-test="board-cover-publish-warning"
+              role="status"
+            >
+              {{ $t('boardCoverPublishWarning') }}
+            </p>
           </div>
         </section>
         <footer class="modal-card-foot">
@@ -104,6 +115,18 @@ export default {
     } else {
       this.createModel.form.private.value = false;
     }
+  },
+  computed: {
+    willResetPrivateCover() {
+      return Boolean(
+        this.isEdit
+        && this.board.private
+        && this.editModel.form.private.value === false
+        && this.board.cover_pin_id
+        && this.board.cover
+        && this.board.cover.private,
+      );
+    },
   },
   methods: {
     saveBoardChanges() {
