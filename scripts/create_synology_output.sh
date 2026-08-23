@@ -73,19 +73,13 @@ if [ -e "${package_directory}" ] || [ -e "${archive_path}" ]; then
     exit 1
 fi
 
-temporary_root="$(
-    mktemp -d "${output_root}/.${package_name}.tmp.XXXXXX"
-)"
-temporary_directory="${temporary_root}/${package_name}"
-temporary_archive="$(
-    mktemp "${output_root}/.${package_name}.archive.XXXXXX"
-)"
-
+temporary_root=""
+temporary_archive=""
 cleanup_temporary_files() {
-    if [ -d "${temporary_root}" ]; then
+    if [ -n "${temporary_root}" ] && [ -d "${temporary_root}" ]; then
         rm -rf -- "${temporary_root}"
     fi
-    if [ -f "${temporary_archive}" ]; then
+    if [ -n "${temporary_archive}" ] && [ -f "${temporary_archive}" ]; then
         rm -f -- "${temporary_archive}"
     fi
     if [ "${default_output}" -eq 1 ] && [ ! -e "${package_directory}" ] \
@@ -94,6 +88,14 @@ cleanup_temporary_files() {
     fi
 }
 trap cleanup_temporary_files EXIT
+
+temporary_root="$(
+    mktemp -d "${output_root}/.${package_name}.tmp.XXXXXX"
+)"
+temporary_directory="${temporary_root}/${package_name}"
+temporary_archive="$(
+    mktemp "${output_root}/.${package_name}.archive.XXXXXX"
+)"
 
 mkdir "${temporary_directory}"
 mkdir "${temporary_directory}/context"

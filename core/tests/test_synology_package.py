@@ -143,6 +143,25 @@ def _write_archive_publish_failure_wrapper(path):
     path.chmod(0o700)
 
 
+def _write_mktemp_failure_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "if [ -f \"$PINRY_MKTEMP_CAPTURE\" ]; then\n"
+        "    count=$(cat \"$PINRY_MKTEMP_CAPTURE\")\n"
+        "else\n"
+        "    count=0\n"
+        "fi\n"
+        "count=$((count + 1))\n"
+        "printf '%s' \"$count\" > \"$PINRY_MKTEMP_CAPTURE\"\n"
+        "if [ \"$count\" = \"$PINRY_MKTEMP_FAIL_ON\" ]; then\n"
+        "    exit 73\n"
+        "fi\n"
+        "exec \"$PINRY_REAL_MKTEMP\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
 def _write_head_move_git_wrapper(path):
     path.write_text(
         "#!/bin/sh\n"
@@ -398,6 +417,22 @@ class SynologyPackageTests(unittest.TestCase):
         environment["PINRY_REAL_MV"] = real_mv
         return environment
 
+    def _mktemp_environment(self, wrapper, fail_on):
+        environment = os.environ.copy()
+        real_mktemp = shutil.which("mktemp")
+        self.assertIsNotNone(real_mktemp)
+        environment["PATH"] = "{}{}{}".format(
+            wrapper.parent,
+            os.pathsep,
+            environment.get("PATH", ""),
+        )
+        environment["PINRY_MKTEMP_CAPTURE"] = str(
+            self.temporary_root / "mktemp-count"
+        )
+        environment["PINRY_MKTEMP_FAIL_ON"] = str(fail_on)
+        environment["PINRY_REAL_MKTEMP"] = real_mktemp
+        return environment
+
     def _clone_repository(self, name):
         repository = self.temporary_root / name
         completed = subprocess.run(
@@ -562,6 +597,44 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertIn(b"output_already_exists=", completed.stderr)
         self.assertEqual(sentinel.read_text(), "preserve")
         self.assertFalse((default_output / self.package_name).exists())
+
+    def _assert_default_output_recovers_from_mktemp_failure(self, fail_on):
+        default_output = (
+            self.repository_root.parent
+            / "output"
+            / "svrx-pinry-server-{}".format(self.short_sha)
+        )
+        self.addCleanup(shutil.rmtree, default_output, ignore_errors=True)
+        binary_directory = self.temporary_root / "failing-mktemp"
+        binary_directory.mkdir()
+        wrapper = binary_directory / "mktemp"
+        _write_mktemp_failure_wrapper(wrapper)
+
+        failed = self._run_packager_in(
+            self.repository_root, environment=self._mktemp_environment(
+                wrapper, fail_on
+            )
+        )
+        leaked_output = default_output.exists()
+        leaked_temporary_paths = tuple(default_output.glob(".pinry-custom.*"))
+        retry = self._run_packager_in(self.repository_root)
+
+        self.assertEqual(failed.returncode, 73)
+        self.assertFalse(
+            leaked_output,
+            "기본 목적지 누수로 재시도가 막혔습니다: {}".format(
+                retry.stderr.decode("utf-8")
+            ),
+        )
+        self.assertEqual(leaked_temporary_paths, ())
+        self.assertEqual(retry.returncode, 0, retry.stderr.decode("utf-8"))
+        self.assertTrue((default_output / self.package_name).is_dir())
+
+    def test_default_output_recovers_when_first_mktemp_fails(self):
+        self._assert_default_output_recovers_from_mktemp_failure(1)
+
+    def test_default_output_recovers_when_second_mktemp_fails(self):
+        self._assert_default_output_recovers_from_mktemp_failure(2)
 
     def test_explicit_output_directory_overrides_shared_default(self):
         explicit_output = self.temporary_root / "explicit-output"

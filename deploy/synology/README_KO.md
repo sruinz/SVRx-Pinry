@@ -10,7 +10,7 @@
 ./scripts/create_synology_output.sh
 ```
 
-`output/svrx-pinry-server-<커밋 앞 12자리 SHA>/` 아래에 업로드 가능한 `pinry-custom/` 폴더와 `pinry-custom-<커밋 앞 12자리 SHA>.tar.gz` 파일이 생성된다. 이 경로는 canonical checkout과 linked worktree가 공통으로 사용하므로 같은 커밋의 산출물이 이미 있으면 덮어쓰지 않고 중단한다. 다른 위치가 필요하면 `./scripts/create_synology_output.sh /원하는/산출물/경로`처럼 경로를 명시한다. 패키지는 시작 시점의 Git `HEAD` 커밋 하나에서만 만든다. 생성기, `build-image.sh`, Compose 파일 또는 `.env.example`에 tracked 미커밋 변경이 있으면 서로 다른 revision이 섞이지 않도록 산출물을 만들기 전에 중단한다. 테스트, 일반 Markdown·문서 파일, GitHub 설정과 개발용 파일은 포함하지 않는다. 단, 법적 고지 파일인 `LICENSE.md`, `NOTICE.md`, `UPSTREAM.md`는 예외로 포함한다. 기존 산출물이 있으면 덮어쓰지 않고 중단한다.
+기본 산출물 경로는 canonical checkout의 저장소 루트 기준 `../output/svrx-pinry-server-<커밋 앞 12자리 SHA>/`이다. 즉 저장소 바깥의 workspace 공통 `output/` 아래에 업로드 가능한 `pinry-custom/` 폴더와 `pinry-custom-<커밋 앞 12자리 SHA>.tar.gz` 파일이 생성된다. linked worktree에서 실행해도 canonical checkout과 같은 이 경로를 사용하므로, 같은 커밋의 산출물이 이미 있으면 덮어쓰지 않고 중단한다. 다른 위치가 필요하면 `./scripts/create_synology_output.sh /원하는/산출물/경로`처럼 경로를 명시한다. 패키지는 시작 시점의 Git `HEAD` 커밋 하나에서만 만든다. 생성기, `build-image.sh`, Compose 파일 또는 `.env.example`에 tracked 미커밋 변경이 있으면 서로 다른 revision이 섞이지 않도록 산출물을 만들기 전에 중단한다. 테스트, 일반 Markdown·문서 파일, GitHub 설정과 개발용 파일은 포함하지 않는다. 단, 법적 고지 파일인 `LICENSE.md`, `NOTICE.md`, `UPSTREAM.md`는 예외로 포함한다. 기존 산출물이 있으면 덮어쓰지 않고 중단한다.
 
 산출물 구조는 다음과 같다.
 
