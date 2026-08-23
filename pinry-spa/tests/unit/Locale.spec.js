@@ -350,6 +350,7 @@ describe('Header locale and extension menus', () => {
       });
     });
     [1, 2].forEach((index) => {
+      expect(items.at(index).element.tagName).toBe('SPAN');
       expect(items.at(index).attributes('href')).toBeUndefined();
       expect(items.at(index).classes()).toContain('is-disabled');
     });
