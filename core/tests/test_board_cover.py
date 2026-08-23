@@ -2,6 +2,7 @@ import queue
 import threading
 
 from django.db import close_old_connections, connection, OperationalError
+from django.db.models.query import QuerySet
 from django.urls import reverse
 from django_images.test_helpers import TemporaryMediaMixin
 import mock
@@ -9,7 +10,6 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase, APITransactionTestCase
 
 from core.models import Board, Pin
-from core.services.board_cover import BoardCoverError, BoardCoverService
 from core.services.bulk_pin_management import normalize_bulk_exception
 from core.tests.helpers import create_image, create_user
 from core.tests.test_pin_import_atomicity import _SQLiteConcurrencyHarness
@@ -433,11 +433,82 @@ class BoardCoverPrivacyTransitionTests(TemporaryMediaMixin, APITestCase):
         self.assertEqual(self.public_pin.description, "changed")
         self.assertEqual(set(self.public_pin.tags.names()), {"new"})
 
-    def test_pin_cover_change_conflict_is_exact_code_only_409(self):
+    def test_board_update_prelocks_cover_and_membership_union_in_pk_order(self):
+        removed_pin = self._create_pin(private=False)
+        added_pin = self._create_pin(private=False)
+        self.board.cover_pin = self.public_pin
+        self.board.save(update_fields=("cover_pin",))
+        self.board.pins.add(self.public_pin, removed_pin)
+        locked_queries = []
+        original_fetch_all = QuerySet._fetch_all
+
+        def record_locked_query(queryset):
+            should_record = (
+                queryset._result_cache is None
+                and queryset.query.select_for_update
+                and queryset.model in (Board, Pin)
+            )
+            original_fetch_all(queryset)
+            if should_record:
+                locked_queries.append((
+                    queryset.model,
+                    tuple(queryset.query.order_by),
+                    [row.pk for row in queryset._result_cache],
+                ))
+
         with mock.patch.object(
-            BoardCoverService,
-            "pin_privacy_transition",
-            side_effect=BoardCoverError("board_cover_changed"),
+            QuerySet,
+            "_fetch_all",
+            autospec=True,
+            side_effect=record_locked_query,
+        ):
+            response = self.client.patch(
+                self.board_url,
+                {
+                    "pins_to_add": [added_pin.pk],
+                    "pins_to_remove": [removed_pin.pk],
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(locked_queries), 2)
+        self.assertEqual(locked_queries[0][0], Board)
+        self.assertEqual(locked_queries[1], (
+            Pin,
+            ("pk",),
+            [self.public_pin.pk, removed_pin.pk, added_pin.pk],
+        ))
+        self.assertTrue(self.board.pins.filter(pk=added_pin.pk).exists())
+        self.assertFalse(self.board.pins.filter(pk=removed_pin.pk).exists())
+
+    def test_real_probe_recheck_change_is_exact_code_only_409(self):
+        self.board.pins.add(self.public_pin)
+        original_values_list = QuerySet.values_list
+        probe_count = [0]
+
+        def add_cover_before_recheck(queryset, *fields, **expressions):
+            if (
+                queryset.model is Board
+                and fields == ("pk",)
+                and expressions.get("flat") is True
+            ):
+                probe_count[0] += 1
+                if probe_count[0] == 2:
+                    Board.objects.filter(pk=self.board.pk).update(
+                        cover_pin=self.public_pin,
+                    )
+            return original_values_list(
+                queryset,
+                *fields,
+                **expressions
+            )
+
+        with mock.patch.object(
+            QuerySet,
+            "values_list",
+            autospec=True,
+            side_effect=add_cover_before_recheck,
         ):
             response = self.client.patch(
                 self.pin_url,
@@ -447,6 +518,11 @@ class BoardCoverPrivacyTransitionTests(TemporaryMediaMixin, APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
         self.assertEqual(response.json(), {"code": "board_cover_changed"})
+        self.assertEqual(probe_count, [2])
+        self.board.refresh_from_db()
+        self.public_pin.refresh_from_db()
+        self.assertIsNone(self.board.cover_pin_id)
+        self.assertFalse(self.public_pin.private)
 
 
 class BoardCoverConcurrencyTests(
@@ -477,7 +553,7 @@ class BoardCoverConcurrencyTests(
             kwargs={"pk": self.pin.pk},
         )
 
-    def _run_two_workers(self, requests):
+    def _run_two_workers(self, requests, expected_bad_request):
         if connection.vendor != "sqlite":
             self.skipTest("This concurrency contract requires SQLite.")
         if connection.creation.is_in_memory_db(
@@ -500,9 +576,17 @@ class BoardCoverConcurrencyTests(
                     code, retryable = normalize_bulk_exception(error)
                     if code != "database_busy" or not retryable:
                         raise
-                    outcomes.put((name, status.HTTP_503_SERVICE_UNAVAILABLE))
+                    outcomes.put((
+                        name,
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        {"code": "database_busy"},
+                    ))
                 else:
-                    outcomes.put((name, response.status_code))
+                    outcomes.put((
+                        name,
+                        response.status_code,
+                        response.data,
+                    ))
             except BaseException as error:
                 outcomes.put(("error", name, error))
             finally:
@@ -520,13 +604,33 @@ class BoardCoverConcurrencyTests(
         collected = harness.join_and_collect(outcomes, len(workers))
         errors = [item for item in collected if item[0] == "error"]
         self.assertEqual(errors, [])
-        allowed = {
+        self.assertIn(
             status.HTTP_200_OK,
-            status.HTTP_400_BAD_REQUEST,
-            status.HTTP_409_CONFLICT,
-            status.HTTP_503_SERVICE_UNAVAILABLE,
+            [item[1] for item in collected],
+        )
+        expected_errors = {
+            status.HTTP_400_BAD_REQUEST: (
+                {"code": expected_bad_request},
+            ),
+            status.HTTP_409_CONFLICT: (
+                {"code": "board_cover_changed"},
+            ),
+            status.HTTP_503_SERVICE_UNAVAILABLE: (
+                {"code": "database_busy"},
+            ),
         }
-        self.assertTrue(all(item[1] in allowed for item in collected))
+        for name, response_status, body in collected:
+            if response_status == status.HTTP_200_OK:
+                continue
+            self.assertIn(
+                response_status,
+                expected_errors,
+                "unexpected worker response: {}".format(
+                    (name, response_status, body)
+                ),
+            )
+            self.assertIn(body, expected_errors[response_status])
+        return collected
 
     def assert_public_cover_invariant(self):
         self.board.refresh_from_db()
@@ -538,46 +642,113 @@ class BoardCoverConcurrencyTests(
         self.assertTrue(self.board.pins.filter(pk=cover.pk).exists())
 
     def test_set_cover_racing_pin_private_never_commits_private_public_cover(self):
-        self._run_two_workers((
-            (
-                "cover",
-                lambda client: client.patch(
+        privacy_probe_ready = threading.Event()
+        cover_finished = threading.Event()
+        original_values_list = QuerySet.values_list
+        paused = [False]
+
+        def pause_privacy_after_probe(queryset, *fields, **expressions):
+            result = original_values_list(
+                queryset,
+                *fields,
+                **expressions
+            )
+            if (
+                threading.current_thread().name == "privacy-worker"
+                and queryset.model is Board
+                and fields == ("pk",)
+                and expressions.get("flat") is True
+                and not paused[0]
+            ):
+                paused[0] = True
+                result = list(result)
+                privacy_probe_ready.set()
+                if not cover_finished.wait(5):
+                    raise AssertionError("cover request did not finish")
+            return result
+
+        def set_cover_after_privacy_probe(client):
+            if not privacy_probe_ready.wait(5):
+                raise AssertionError("privacy probe was not reached")
+            try:
+                return client.patch(
                     self.cover_url,
                     {"pin_id": self.pin.pk},
                     format="json",
+                )
+            finally:
+                cover_finished.set()
+
+        with mock.patch.object(
+            QuerySet,
+            "values_list",
+            autospec=True,
+            side_effect=pause_privacy_after_probe,
+        ):
+            self._run_two_workers((
+                ("cover", set_cover_after_privacy_probe),
+                (
+                    "privacy",
+                    lambda client: client.patch(
+                        self.pin_url,
+                        {"private": True},
+                        format="json",
+                    ),
                 ),
-            ),
-            (
-                "privacy",
-                lambda client: client.patch(
-                    self.pin_url,
-                    {"private": True},
-                    format="json",
-                ),
-            ),
-        ))
+            ), "board_cover_private_pin")
 
         self.assert_public_cover_invariant()
 
     def test_set_cover_racing_membership_remove_never_commits_non_member_cover(self):
-        self._run_two_workers((
-            (
-                "cover",
-                lambda client: client.patch(
+        membership_board_ready = threading.Event()
+        cover_finished = threading.Event()
+        original_fetch_all = QuerySet._fetch_all
+        paused = [False]
+
+        def pause_membership_after_board_lock(queryset):
+            should_pause = (
+                threading.current_thread().name == "membership-worker"
+                and queryset._result_cache is None
+                and queryset.model is Board
+                and queryset.query.select_for_update
+                and not paused[0]
+            )
+            original_fetch_all(queryset)
+            if should_pause:
+                paused[0] = True
+                membership_board_ready.set()
+                if not cover_finished.wait(5):
+                    raise AssertionError("cover request did not finish")
+
+        def set_cover_after_membership_board_lock(client):
+            if not membership_board_ready.wait(5):
+                raise AssertionError("membership Board lock was not reached")
+            try:
+                return client.patch(
                     self.cover_url,
                     {"pin_id": self.pin.pk},
                     format="json",
+                )
+            finally:
+                cover_finished.set()
+
+        with mock.patch.object(
+            QuerySet,
+            "_fetch_all",
+            autospec=True,
+            side_effect=pause_membership_after_board_lock,
+        ):
+            self._run_two_workers((
+                ("cover", set_cover_after_membership_board_lock),
+                (
+                    "membership",
+                    lambda client: client.patch(
+                        self.board_url,
+                        {"pins_to_remove": [self.pin.pk]},
+                        format="json",
+                    ),
                 ),
-            ),
-            (
-                "membership",
-                lambda client: client.patch(
-                    self.board_url,
-                    {"pins_to_remove": [self.pin.pk]},
-                    format="json",
-                ),
-            ),
-        ))
+            ), "board_cover_invalid")
 
         self.board.refresh_from_db()
         if self.board.cover_pin_id is not None:

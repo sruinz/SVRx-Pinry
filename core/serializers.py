@@ -455,6 +455,14 @@ class BoardSerializer(serializers.HyperlinkedModelSerializer):
         pins_to_remove = validated_data.pop("pins_to_remove", [])
         with transaction.atomic():
             instance = Board.objects.select_for_update().get(pk=instance.pk)
+            pin_ids = set(pins_to_add) | set(pins_to_remove)
+            if instance.cover_pin_id is not None:
+                pin_ids.add(instance.cover_pin_id)
+            list(
+                Pin.objects.select_for_update()
+                .filter(pk__in=sorted(pin_ids))
+                .order_by("pk")
+            )
             board = Board.objects.filter(
                 submitter=instance.submitter,
                 name=validated_data.get('name', None)
