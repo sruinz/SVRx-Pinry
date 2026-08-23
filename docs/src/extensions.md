@@ -1,8 +1,8 @@
 # 브라우저 확장 프로그램
 
-기존 Pinry용 Chrome 및 Firefox 확장은 웹 페이지에서 이미지 한 개를
+기존 Pinry용 Chrome·Firefox 레거시 확장은 웹 페이지에서 이미지 한 개를
 `/pin-creation/from-url` 화면으로 전달하는 단건 UI 흐름에 한해 사용할 수
-있습니다.
+있는 단건 Pin 생성용입니다.
 
 - [Chrome — 기존 단건용](https://chrome.google.com/webstore/detail/jmhdcnmfkglikfjafdmdikoonedgijpa/)
 - [Firefox — 기존 단건용](https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/)
@@ -16,3 +16,7 @@
 현재 페이지에서 여러 이미지를 선택한 뒤 공통 보드·태그·공개 범위를
 지정해 한 번에 Pin으로 만드는 전용 확장 프로그램입니다. 서버 주소와 API
 토큰은 확장 프로그램의 설정 화면에서 저장합니다.
+
+GitHub에서 수동 설치할 수 있으며 Chrome 웹 스토어와 Edge Add-ons
+배포는 준비 중입니다. Chrome·Edge를 공식 지원하며 Firefox는 공식
+지원 대상이 아닙니다.
