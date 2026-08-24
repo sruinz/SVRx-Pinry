@@ -180,6 +180,63 @@ describe('Board sorting query and controls', () => {
     wrapper.destroy();
   });
 
+  it('keeps the user Board screen working when the localStorage getter throws', async () => {
+    API.User.fetchUserInfo = jest.fn(() => Promise.resolve(null));
+    API.fetchBoardForUser = jest.fn(() => page([]));
+    const descriptor = Object.getOwnPropertyDescriptor(window, 'localStorage');
+    let wrapper;
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      get() { throw new DOMException('blocked', 'SecurityError'); },
+    });
+
+    try {
+      wrapper = mountBoards({ boardUsername: 'alice' });
+      await settle();
+      expect(wrapper.vm.sortState).toEqual({
+        version: 1, mode: 'custom', randomSeed: 17,
+      });
+
+      wrapper.vm.applySortMode('latest');
+      await settle();
+      expect(wrapper.vm.sortState).toEqual({
+        version: 1, mode: 'latest', randomSeed: 17,
+      });
+      expect(API.fetchBoardForUser.mock.calls[1][3]).toEqual(wrapper.vm.sortState);
+    } finally {
+      if (wrapper) wrapper.destroy();
+      Object.defineProperty(window, 'localStorage', descriptor);
+    }
+  });
+
+  it('keeps in-memory sorting when the same user context is reapplied after write failure', async () => {
+    API.User.fetchUserInfo = jest.fn(() => Promise.resolve(null));
+    API.fetchBoardForUser = jest.fn(() => page([]));
+    const wrapper = mountBoards({ boardUsername: 'alice' });
+    await settle();
+    const setItem = jest.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('write failed');
+    });
+
+    try {
+      wrapper.vm.applySortMode('latest');
+      await settle();
+      expect(wrapper.vm.sortState).toEqual({
+        version: 1, mode: 'latest', randomSeed: 17,
+      });
+
+      await wrapper.setProps({ filters: { boardUsername: 'alice' } });
+      await settle();
+      expect(wrapper.vm.sortState).toEqual({
+        version: 1, mode: 'latest', randomSeed: 17,
+      });
+      expect(API.fetchBoardForUser.mock.calls[2][3]).toEqual(wrapper.vm.sortState);
+    } finally {
+      setItem.mockRestore();
+      wrapper.destroy();
+    }
+  });
+
   it('uses the same random mode and seed for every offset request', async () => {
     localStorage.setItem(boardSortStorageKey('alice'), JSON.stringify({
       version: 1, mode: 'random', randomSeed: 23,
@@ -198,6 +255,29 @@ describe('Board sorting query and controls', () => {
       [0, { version: 1, mode: 'random', randomSeed: 23 }],
       [1, { version: 1, mode: 'random', randomSeed: 23 }],
     ]);
+    wrapper.destroy();
+  });
+
+  it('deduplicates Board pages while advancing offset by consumed rows', async () => {
+    API.User.fetchUserInfo = jest.fn(() => Promise.resolve(null));
+    const responses = [
+      () => page([board(1), board(2), board(2)], '/api/v2/boards/?offset=3'),
+      () => page([board(2), board(3), board(3)], '/api/v2/boards/?offset=6'),
+      () => page([], null),
+    ];
+    API.fetchBoardForUser = jest.fn(() => responses.shift()());
+    const wrapper = mountBoards({ boardUsername: 'alice' });
+    await settle();
+
+    wrapper.vm.fetchMore();
+    await settle();
+    wrapper.vm.fetchMore();
+    await settle();
+
+    expect(API.fetchBoardForUser.mock.calls.map(call => call[1])).toEqual([0, 3, 6]);
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual([1, 2, 3]);
+    expect(Object.keys(wrapper.vm.blocksMap).map(Number).sort()).toEqual([1, 2, 3]);
+    expect(wrapper.vm.status.offset).toBe(6);
     wrapper.destroy();
   });
 

@@ -83,6 +83,14 @@ import {
   writeBoardSortState,
 } from './board_ordering/boardSortState';
 
+function getBoardSortStorage() {
+  try {
+    return window.localStorage;
+  } catch (_error) {
+    return null;
+  }
+}
+
 function createBoardItem(board) {
   const defaultPreviewImage = placeholder;
   const boardItem = {};
@@ -174,9 +182,11 @@ export default {
         && this.filters.boardNameContains === filters.boardNameContains;
     },
     activateSortContext() {
-      this.sortStorageKey = boardSortStorageKey(this.filters.boardUsername);
+      const sortStorageKey = boardSortStorageKey(this.filters.boardUsername);
+      if (sortStorageKey === this.sortStorageKey) return;
+      this.sortStorageKey = sortStorageKey;
       this.sortState = readBoardSortState(
-        window.localStorage, this.sortStorageKey, this.seedFactory,
+        getBoardSortStorage(), this.sortStorageKey, this.seedFactory,
       );
     },
     applySortMode(mode) {
@@ -184,7 +194,7 @@ export default {
       const transition = transitionBoardSortState(this.sortState, mode, this.seedFactory);
       if (!transition.changed) return;
       this.sortState = transition.state;
-      writeBoardSortState(window.localStorage, this.sortStorageKey, this.sortState);
+      writeBoardSortState(getBoardSortStorage(), this.sortStorageKey, this.sortState);
       this.reset();
       this.$nextTick(() => window.scrollTo(0, 0));
     },
@@ -309,13 +319,18 @@ export default {
         (resp) => {
           if (!this.isRequestCurrent(generation, filters)) return;
           const { results, next } = resp.data;
-          let newBlocks = this.buildBlocks(results);
+          const consumed = results.length;
+          const pageIds = new Set();
+          const newBlocks = this.buildBlocks(results).filter((item) => {
+            if (this.blocksMap[item.id] || pageIds.has(item.id)) return false;
+            pageIds.add(item.id);
+            return true;
+          });
           newBlocks.forEach(
             (item) => { this.blocksMap[item.id] = item; },
           );
-          newBlocks = this.blocks.concat(newBlocks);
-          this.blocks = newBlocks;
-          this.status.offset = newBlocks.length;
+          this.blocks = this.blocks.concat(newBlocks);
+          this.status.offset += consumed;
           this.status.hasNext = !(next === null);
           this.status.loading = false;
         },
