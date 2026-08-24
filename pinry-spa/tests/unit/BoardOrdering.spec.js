@@ -239,6 +239,19 @@ describe('accessible Board custom ordering', () => {
     expect(wrapper.vm.$redrawVueMasonry).toHaveBeenCalledTimes(2);
   });
 
+  it('redraws Masonry after a remounted ordering image finishes loading', async () => {
+    const wrapper = mountBoards();
+    await settle();
+    await enterOrdering(wrapper);
+    wrapper.vm.$redrawVueMasonry.mockClear();
+
+    await wrapper.find('.board-order-static-image .preview-image').trigger('load');
+    await wrapper.vm.$nextTick();
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.vm.$redrawVueMasonry).toHaveBeenCalledTimes(1);
+  });
+
   it('supports pick, arrow move, release, and Escape on the native handle', async () => {
     const wrapper = mountBoards();
     await settle();

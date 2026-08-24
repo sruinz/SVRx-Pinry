@@ -385,6 +385,9 @@ export default {
         'image-loaded': true,
       };
       this.blocksMap[itemId].style.height = 'auto';
+      if (this.ordering.editing) {
+        this.redrawBoardMasonry();
+      }
     },
     registerScrollEvent() {
       const self = this;
