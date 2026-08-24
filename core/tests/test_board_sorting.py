@@ -44,6 +44,21 @@ class BoardSortAPITests(APITestCase):
         response = self.client.get(self.url, {"search": "board"})
         self.assertEqual([item["id"] for item in response.json()["results"]], [self.second.pk, self.first.pk])
 
+    def test_duplicate_username_without_sort_keeps_legacy_filtering(self):
+        response = self.client.get(
+            "{}?submitter__username={}&submitter__username={}".format(
+                self.url,
+                self.owner.username,
+                self.owner.username,
+            )
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [item["id"] for item in response.json()["results"]],
+            [self.second.pk, self.first.pk],
+        )
+
     def test_date_modes_use_id_as_the_tie_breaker(self):
         published = timezone.now() - timedelta(days=1)
         Board.objects.filter(pk__in=(self.first.pk, self.second.pk)).update(
@@ -134,15 +149,15 @@ class BoardDisplayOrderMigrationTests(TransactionTestCase):
             list(
                 Board.objects.filter(submitter_id=self.owner.pk)
                 .order_by("display_order")
-                .values_list("id", flat=True)
+                .values_list("id", "display_order")
             ),
-            [12, 11],
+            [(12, 1), (11, 2)],
         )
         self.assertEqual(
             list(
                 Board.objects.filter(submitter_id=self.other.pk)
                 .order_by("display_order")
-                .values_list("id", flat=True)
+                .values_list("id", "display_order")
             ),
-            [21],
+            [(21, 1)],
         )

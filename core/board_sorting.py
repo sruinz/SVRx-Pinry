@@ -22,13 +22,15 @@ def parse_board_sort(query_params):
     sorts = query_params.getlist("sort")
     seeds = query_params.getlist("random_seed")
     usernames = query_params.getlist("submitter__username")
-    if len(sorts) > 1 or len(seeds) > 1 or len(usernames) > 1:
+    if len(sorts) > 1 or len(seeds) > 1:
         _invalid()
     if not sorts:
         if seeds:
             _invalid()
         return None
     if query_params.getlist("ordering"):
+        _invalid()
+    if len(usernames) > 1:
         _invalid()
     if len(usernames) != 1 or not usernames[0]:
         _invalid()
