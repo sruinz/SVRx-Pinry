@@ -153,15 +153,22 @@ def canonical_original_path(asset_uuid, original_filename, extension):
     return "{}{}".format(prefix, leaf)
 
 
-def _derivative_upload_path(instance, extension):
-    if instance.size not in DERIVATIVE_NAMES:
+def canonical_derivative_path(asset_uuid, size, extension):
+    asset_uuid_text, _asset_uuid_hex = _asset_uuid_parts(asset_uuid)
+    if size not in DERIVATIVE_NAMES:
         raise ValueError(
-            "Unsupported derivative size: {}".format(instance.size)
+            "Unsupported derivative size: {}".format(size)
         )
+    if extension not in _CANONICAL_EXTENSIONS:
+        raise ValueError("invalid_derivative_extension")
     return "derivatives/{}/{}{}".format(
-        instance.original.asset_uuid,
-        instance.size,
-        extension,
+        asset_uuid_text, size, extension
+    )
+
+
+def _derivative_upload_path(instance, extension):
+    return canonical_derivative_path(
+        instance.original.asset_uuid, instance.size, extension
     )
 
 

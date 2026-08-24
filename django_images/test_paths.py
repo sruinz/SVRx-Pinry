@@ -13,6 +13,7 @@ from core.serializers import ImageSerializer
 from django_images.models import Image, Thumbnail
 from django_images.paths import (
     canonical_extension,
+    canonical_derivative_path,
     canonical_original_path,
     is_valid_original_leaf,
     sanitize_original_filename,
@@ -168,6 +169,42 @@ class CanonicalOriginalPathTest(SimpleTestCase):
         self.assertTrue(
             is_valid_original_leaf(self.asset_uuid, nfd_leaf)
         )
+
+
+class CanonicalDerivativePathTest(SimpleTestCase):
+    asset_uuid = uuid.UUID(
+        "8dbc3cf8-0348-43ff-8e72-dc1c4774012a"
+    )
+
+    def test_canonical_derivative_path_uses_uuid_size_and_real_extension(self):
+        for size, extension in (
+            ("thumbnail", ".png"),
+            ("standard", ".jpg"),
+            ("square", ".webp"),
+        ):
+            with self.subTest(size=size, extension=extension):
+                self.assertEqual(
+                    canonical_derivative_path(
+                        self.asset_uuid, size, extension
+                    ),
+                    "derivatives/{}/{}{}".format(
+                        self.asset_uuid, size, extension
+                    ),
+                )
+
+    def test_canonical_derivative_path_rejects_invalid_uuid(self):
+        with self.assertRaisesRegex(ValueError, "invalid_asset_uuid"):
+            canonical_derivative_path("not-a-uuid", "thumbnail", ".png")
+
+    def test_canonical_derivative_path_rejects_unknown_size(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported derivative size"):
+            canonical_derivative_path(self.asset_uuid, "preview", ".png")
+
+    def test_canonical_derivative_path_rejects_invalid_extension(self):
+        with self.assertRaisesRegex(
+            ValueError, "invalid_derivative_extension"
+        ):
+            canonical_derivative_path(self.asset_uuid, "thumbnail", ".PNG")
 
 
 class AssetStoragePathTest(TemporaryMediaMixin, TransactionTestCase):
