@@ -1680,25 +1680,6 @@ class AutoV2MediaMigrator(object):
             publish_intent[:2],
         )
 
-    def _restore_failed_atomic_publish(
-        self,
-        staging_directory,
-        staging_name,
-        destination_directory,
-        destination_name,
-    ):
-        try:
-            rename_media_noreplace(
-                destination_directory,
-                destination_name,
-                staging_directory,
-                staging_name,
-            )
-            destination_directory.fsync_publish()
-            staging_directory.fsync_publish()
-        except BaseException:
-            pass
-
     def _verify_atomic_publish_identity(
         self,
         staging_directory,
@@ -1774,7 +1755,6 @@ class AutoV2MediaMigrator(object):
         else:
             raise _command_error("destination_collision")
 
-        renamed = False
         try:
             self._inject_fault("before_atomic_publish")
             rename_media_noreplace(
@@ -1783,7 +1763,6 @@ class AutoV2MediaMigrator(object):
                 destination_directory,
                 destination_name,
             )
-            renamed = True
             destination_stat = self._verify_atomic_publish_identity(
                 staging_directory,
                 staging_name,
@@ -1801,15 +1780,6 @@ class AutoV2MediaMigrator(object):
             return destination_stat
         except FileExistsError as error:
             raise _command_error("destination_collision", error)
-        except Exception:
-            if renamed:
-                self._restore_failed_atomic_publish(
-                    staging_directory,
-                    staging_name,
-                    destination_directory,
-                    destination_name,
-                )
-            raise
 
     def _resume_publish_intent(
         self,

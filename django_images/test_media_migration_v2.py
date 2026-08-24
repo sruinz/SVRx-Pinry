@@ -17,6 +17,7 @@ from django_images.file_ops import (
     MediaPathError,
     open_verified_media_file,
     open_verified_media_root,
+    rename_media_noreplace as real_rename_media_noreplace,
 )
 from django_images.models import Image, Thumbnail
 from django_images.paths import (
@@ -215,6 +216,53 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 os.close(directory_descriptor)
 
         return swap_before_atomic_publish, swapped_names, replacement_bytes
+
+    def destination_replacement_after_atomic_publish(self):
+        replacement_bytes = b"external-destination-replacement"
+        replacement_identity = []
+
+        def rename_then_replace(
+            source_directory,
+            source_name,
+            destination_directory,
+            destination_name,
+        ):
+            real_rename_media_noreplace(
+                source_directory,
+                source_name,
+                destination_directory,
+                destination_name,
+            )
+            if replacement_identity:
+                return
+            replacement_name = "external-{}.part".format(uuid.uuid4())
+            descriptor = os.open(
+                replacement_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=destination_directory.descriptor,
+            )
+            try:
+                os.write(descriptor, replacement_bytes)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(
+                replacement_name,
+                destination_name,
+                src_dir_fd=destination_directory.descriptor,
+                dst_dir_fd=destination_directory.descriptor,
+            )
+            destination_stat = os.stat(
+                destination_name,
+                dir_fd=destination_directory.descriptor,
+                follow_symlinks=False,
+            )
+            replacement_identity.append(
+                (destination_stat.st_dev, destination_stat.st_ino)
+            )
+
+        return rename_then_replace, replacement_identity, replacement_bytes
 
     def test_md5_closure_plans_named_targets_from_database_name_and_real_format(self):
         image = self.make_image()
@@ -860,10 +908,9 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         staging = Path(
             self.temporary_media.name, ".staging", intent["staging_name"]
         )
-        self.assertEqual(staging.read_bytes(), replacement_bytes)
-        self.assertFalse(
-            Path(self.temporary_media.name, destination_relative).exists()
-        )
+        destination = Path(self.temporary_media.name, destination_relative)
+        self.assertFalse(staging.exists())
+        self.assertEqual(destination.read_bytes(), replacement_bytes)
         image.refresh_from_db()
         self.assertEqual(image.image.name, old_path)
         events = {event["event"] for event in self.manifest_events()}
@@ -911,13 +958,132 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         self.assertEqual(len(swapped), 1)
         staging = staging_directory / intent["staging_name"]
-        self.assertEqual(staging.read_bytes(), replacement_bytes)
-        self.assertFalse(destination.exists())
+        self.assertFalse(staging.exists())
+        self.assertEqual(destination.read_bytes(), replacement_bytes)
         image.refresh_from_db()
         self.assertEqual(image.image.name, old_path)
         events = {event["event"] for event in self.manifest_events()}
         self.assertNotIn("published", events)
         self.assertNotIn("committed", events)
+
+    def test_initial_publish_does_not_reverse_external_destination_replacement(self):
+        image = self.make_image(sizes=())
+        old_path = image.image.name
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        destination = Path(self.temporary_media.name, destination_relative)
+        rename, replacement_identity, replacement_bytes = (
+            self.destination_replacement_after_atomic_publish()
+        )
+
+        with mock.patch(
+            "django_images.services.media_migration_v2."
+            "rename_media_noreplace",
+            side_effect=rename,
+        ):
+            with self.assertRaisesRegex(
+                CommandError, "^media_verification_failed$"
+            ):
+                self.migrator().run(execute=True)
+
+        self.assertTrue(destination.exists())
+        self.assertEqual(destination.read_bytes(), replacement_bytes)
+        destination_stat = os.stat(str(destination))
+        self.assertEqual(
+            (destination_stat.st_dev, destination_stat.st_ino),
+            replacement_identity[0],
+        )
+        intent = next(
+            event
+            for event in self.manifest_events()
+            if event["event"] == "publish_intent"
+        )
+        self.assertFalse(
+            Path(
+                self.temporary_media.name,
+                ".staging",
+                intent["staging_name"],
+            ).exists()
+        )
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, old_path)
+        events = {event["event"] for event in self.manifest_events()}
+        self.assertNotIn("published", events)
+        self.assertNotIn("committed", events)
+
+        with self.assertRaisesRegex(CommandError, "^destination_collision$"):
+            self.migrator().run(execute=True)
+        self.assertEqual(destination.read_bytes(), replacement_bytes)
+        destination_stat = os.stat(str(destination))
+        self.assertEqual(
+            (destination_stat.st_dev, destination_stat.st_ino),
+            replacement_identity[0],
+        )
+
+    def test_resume_publish_does_not_reverse_external_destination_replacement(self):
+        image = self.make_image(sizes=())
+        old_path = image.image.name
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        destination = Path(self.temporary_media.name, destination_relative)
+
+        def crash_after_intent(point):
+            if point == "after_publish_intent":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(
+                fault_injector=crash_after_intent
+            ).run(execute=True)
+
+        rename, replacement_identity, replacement_bytes = (
+            self.destination_replacement_after_atomic_publish()
+        )
+        with mock.patch(
+            "django_images.services.media_migration_v2."
+            "rename_media_noreplace",
+            side_effect=rename,
+        ):
+            with self.assertRaisesRegex(
+                CommandError, "^media_verification_failed$"
+            ):
+                self.migrator().run(execute=True)
+
+        self.assertTrue(destination.exists())
+        self.assertEqual(destination.read_bytes(), replacement_bytes)
+        destination_stat = os.stat(str(destination))
+        self.assertEqual(
+            (destination_stat.st_dev, destination_stat.st_ino),
+            replacement_identity[0],
+        )
+        intent = next(
+            event
+            for event in self.manifest_events()
+            if event["event"] == "publish_intent"
+        )
+        self.assertFalse(
+            Path(
+                self.temporary_media.name,
+                ".staging",
+                intent["staging_name"],
+            ).exists()
+        )
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, old_path)
+        events = {event["event"] for event in self.manifest_events()}
+        self.assertNotIn("published", events)
+        self.assertNotIn("committed", events)
+
+        with self.assertRaisesRegex(CommandError, "^destination_collision$"):
+            self.migrator().run(execute=True)
+        self.assertEqual(destination.read_bytes(), replacement_bytes)
+        destination_stat = os.stat(str(destination))
+        self.assertEqual(
+            (destination_stat.st_dev, destination_stat.st_ino),
+            replacement_identity[0],
+        )
 
     def test_initial_publish_fails_closed_without_atomic_rename_support(self):
         image = self.make_image(sizes=())
