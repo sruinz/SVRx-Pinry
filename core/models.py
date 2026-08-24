@@ -80,11 +80,15 @@ class MediaAsset(models.Model):
 class Board(models.Model):
     class Meta:
         unique_together = ("submitter", "name")
-        index_together = ("submitter", "name")
+        index_together = (
+            ("submitter", "name"),
+            ("submitter", "display_order", "id"),
+        )
 
     submitter = models.ForeignKey(User, on_delete=models.CASCADE)
     name = models.CharField(max_length=128, blank=False, null=False)
     private = models.BooleanField(default=False, blank=False)
+    display_order = models.PositiveIntegerField(default=0)
     pins = models.ManyToManyField("Pin", related_name="pins", blank=True)
     cover_pin = models.ForeignKey(
         "Pin",

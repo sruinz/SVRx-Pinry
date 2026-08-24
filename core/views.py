@@ -24,6 +24,7 @@ from core import serializers as api
 from core.batch_serializers import BatchImportRequestSerializer
 from core.bulk_serializers import BulkPinRequestSerializer
 from core.models import Image, Pin, Board
+from core.board_sorting import BoardSortFilter
 from core.parsers import LimitedJSONParser
 from core.pin_sorting import PinSortFilter
 from core.permissions import IsOwnerOrReadOnly, OwnerOnlyIfPrivate
@@ -428,7 +429,12 @@ class PinViewSet(viewsets.ModelViewSet):
 
 class BoardViewSet(viewsets.ModelViewSet):
     serializer_class = api.BoardSerializer
-    filter_backends = (DjangoFilterBackend, OrderingFilter, SearchFilter)
+    filter_backends = (
+        DjangoFilterBackend,
+        OrderingFilter,
+        SearchFilter,
+        BoardSortFilter,
+    )
     search_fields = ("name", )
     filter_fields = ("submitter__username", )
     ordering_fields = ('-id', )
