@@ -369,7 +369,10 @@ class BoardCoverUpdateSerializer(serializers.Serializer):
 
 
 class BoardOrderRequestSerializer(serializers.Serializer):
-    version = serializers.RegexField(r"\A[0-9a-f]{64}\Z")
+    version = serializers.RegexField(
+        r"\A[0-9a-f]{64}\Z",
+        trim_whitespace=False,
+    )
     board_ids = serializers.ListField(
         child=serializers.IntegerField(min_value=1),
         allow_empty=True,

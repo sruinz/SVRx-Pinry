@@ -1,7 +1,8 @@
 import hashlib
 
+from django.contrib import admin
 from django.db import connection
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 import mock
 from rest_framework import status
@@ -182,6 +183,26 @@ class BoardOrderAPITests(APITestCase):
                 )
                 self.assertEqual(self._positions(), original_positions)
 
+    def test_put_rejects_version_with_surrounding_whitespace(self):
+        snapshot = self.client.get(self.order_url).json()
+        original_positions = self._positions()
+
+        for version in (
+            " " + snapshot["version"],
+            snapshot["version"] + " ",
+        ):
+            with self.subTest(version=version):
+                response = self._put(version, snapshot["board_ids"])
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_400_BAD_REQUEST,
+                )
+                self.assertEqual(
+                    response.json(),
+                    {"code": "board_order_invalid"},
+                )
+                self.assertEqual(self._positions(), original_positions)
+
     def test_put_rejects_missing_and_foreign_ids_without_changes(self):
         snapshot = self.client.get(self.order_url).json()
         original_positions = self._positions()
@@ -349,3 +370,44 @@ class BoardMutationLockingTests(TestCase):
             service.delete_board(self.owner, self.first.pk)
 
         self.assertEqual(events, ["user", "boards", "pins"])
+
+
+class BoardAdminCreationTests(TransactionTestCase):
+    def setUp(self):
+        super(BoardAdminCreationTests, self).setUp()
+        self.owner = create_user("board-admin-create-owner")
+
+    def test_admin_create_locks_user_before_board_insert_in_transaction(self):
+        board_admin = admin.site._registry[Board]
+        board = Board(submitter=self.owner, name="admin-created-board")
+        events = []
+        real_user_lock = User.objects.select_for_update
+        real_board_save = Board.save
+
+        def record_user_lock(*args, **kwargs):
+            events.append(("user", connection.in_atomic_block))
+            return real_user_lock(*args, **kwargs)
+
+        def record_board_save(instance, *args, **kwargs):
+            events.append(("board", connection.in_atomic_block))
+            return real_board_save(instance, *args, **kwargs)
+
+        with mock.patch.object(
+            User.objects,
+            "select_for_update",
+            side_effect=record_user_lock,
+        ), mock.patch.object(
+            Board,
+            "save",
+            autospec=True,
+            side_effect=record_board_save,
+        ):
+            board_admin.save_model(None, board, None, False)
+
+        self.assertEqual(events, [("user", True), ("board", True)])
+        self.assertTrue(
+            Board.objects.filter(
+                submitter=self.owner,
+                name="admin-created-board",
+            ).exists()
+        )
