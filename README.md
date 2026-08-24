@@ -36,8 +36,9 @@ SVRx Pinry Server는 개인 서버나 NAS에 설치해 이미지를 보드와 �
 지정해 한 번에 Pin으로 만드는 브라우저 확장 프로그램입니다.
 
 서버 주소와 API 토큰은 확장 프로그램의 설정 화면에서 저장합니다.
-GitHub에서 수동 설치할 수 있으며 Chrome 웹 스토어와 Edge Add-ons
-배포는 준비 중입니다. SVRx Pinry 확장은 Chrome·Edge를 공식
+[Chrome 웹 스토어](https://chromewebstore.google.com/detail/svrx-pinry/kgncmldoobdakadnojepmalpbmacoonh?authuser=0&hl=ko)와
+[Microsoft Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/svrx-pinry/gmbgeiddpdblpjdbceoofclpeiikobjj)에서
+설치하거나 GitHub에서 수동 설치할 수 있습니다. SVRx Pinry 확장은 Chrome·Edge를 공식
 지원하고 Firefox는 공식 지원 대상이 아닙니다. 기존 Pinry용 Chrome·Firefox
 레거시 확장은 단건 Pin 생성용입니다.
 

@@ -82,18 +82,22 @@
                   rel="noopener noreferrer">
                   {{ $t("customExtensionGitHubLink") }}
                 </a>
-                <span
-                  class="navbar-item is-disabled"
-                  data-test="custom-extension-chrome-pending"
-                  aria-disabled="true">
-                  {{ $t("customExtensionChromePendingLink") }}
-                </span>
-                <span
-                  class="navbar-item is-disabled"
-                  data-test="custom-extension-edge-pending"
-                  aria-disabled="true">
-                  {{ $t("customExtensionEdgePendingLink") }}
-                </span>
+                <a
+                  class="navbar-item"
+                  data-test="custom-extension-chrome"
+                  href="https://chromewebstore.google.com/detail/svrx-pinry/kgncmldoobdakadnojepmalpbmacoonh?authuser=0&amp;hl=ko"
+                  target="_blank"
+                  rel="noopener noreferrer">
+                  {{ $t("customExtensionChromeLink") }}
+                </a>
+                <a
+                  class="navbar-item"
+                  data-test="custom-extension-edge"
+                  href="https://microsoftedge.microsoft.com/addons/detail/svrx-pinry/gmbgeiddpdblpjdbceoofclpeiikobjj"
+                  target="_blank"
+                  rel="noopener noreferrer">
+                  {{ $t("customExtensionEdgeLink") }}
+                </a>
                 <a
                   class="navbar-item"
                   data-test="legacy-chrome-link"

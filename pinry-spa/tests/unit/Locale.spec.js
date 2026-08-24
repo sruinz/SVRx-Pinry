@@ -18,7 +18,9 @@ import ko from '@/components/utils/i18n/locales/ko.json';
 import zh from '@/components/utils/i18n/locales/zh.json';
 
 
-const CHROME_URL = 'https://chrome.google.com/webstore/detail/jmhdcnmfkglikfjafdmdikoonedgijpa/';
+const CUSTOM_CHROME_URL = 'https://chromewebstore.google.com/detail/svrx-pinry/kgncmldoobdakadnojepmalpbmacoonh?authuser=0&hl=ko';
+const CUSTOM_EDGE_URL = 'https://microsoftedge.microsoft.com/addons/detail/svrx-pinry/gmbgeiddpdblpjdbceoofclpeiikobjj';
+const LEGACY_CHROME_URL = 'https://chrome.google.com/webstore/detail/jmhdcnmfkglikfjafdmdikoonedgijpa/';
 const FIREFOX_URL = 'https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/';
 
 const EXPECTED_LOCALE_KEYS = [
@@ -127,8 +129,8 @@ const EXPECTED_LOCALE_KEYS = [
   'closeButton',
   'createBoardButton',
   'createLink',
-  'customExtensionChromePendingLink',
-  'customExtensionEdgePendingLink',
+  'customExtensionChromeLink',
+  'customExtensionEdgeLink',
   'customExtensionGitHubLink',
   'descriptionLabel',
   'drfApiDocumentationLink',
@@ -235,8 +237,8 @@ const REQUIRED_KOREAN_TEXT = {
   boardOrderSaveFailed: 'Board 순서를 저장하지 못했습니다. 변경한 순서를 유지했습니다.',
   browserExtensionsLink: '브라우저 확장 프로그램',
   customExtensionGitHubLink: 'SVRx Pinry - GitHub',
-  customExtensionChromePendingLink: 'SVRx Pinry - Chrome 웹 스토어 (준비 중)',
-  customExtensionEdgePendingLink: 'SVRx Pinry - Microsoft Edge Add-ons (준비 중)',
+  customExtensionChromeLink: 'SVRx Pinry - Chrome 웹 스토어',
+  customExtensionEdgeLink: 'SVRx Pinry - Microsoft Edge Add-ons',
   legacyChromeLink: 'Pinry 레거시 - Chrome',
   legacyFirefoxLink: 'Pinry 레거시 - Firefox',
   buildBrandLabel: '제품',
@@ -277,6 +279,18 @@ describe('Korean-first locale contract', () => {
 
   it('uses the approved Korean product copy', () => {
     expect(ko).toMatchObject(REQUIRED_KOREAN_TEXT);
+  });
+
+  it.each([
+    ['en', en, 'SVRx Pinry - Chrome Web Store', 'SVRx Pinry - Microsoft Edge Add-ons'],
+    ['ko', ko, 'SVRx Pinry - Chrome 웹 스토어', 'SVRx Pinry - Microsoft Edge Add-ons'],
+    ['zh', zh, 'SVRx Pinry - Chrome 网上应用店', 'SVRx Pinry - Microsoft Edge 加载项'],
+    ['fr', fr, 'SVRx Pinry - Chrome Web Store', 'SVRx Pinry - Microsoft Edge Add-ons'],
+  ])('uses published extension labels for %s', (
+    _name, locale, chromeLabel, edgeLabel,
+  ) => {
+    expect(locale.customExtensionChromeLink).toBe(chromeLabel);
+    expect(locale.customExtensionEdgeLink).toBe(edgeLabel);
   });
 
   it('resolves only persisted supported locales and otherwise uses Korean', () => {
@@ -422,39 +436,43 @@ describe('Header locale and extension menus', () => {
     setItem.mockRestore();
   });
 
-  it('renders the custom and legacy extension items in the release order', () => {
+  it('renders published custom and legacy extension links in the release order', () => {
     const { wrapper } = mountHeader();
     const menu = wrapper.find('[data-test="browser-extension-menu"]');
 
     expect(menu.exists()).toBe(true);
     expect([...menu.element.children].map(item => item.dataset.test)).toEqual([
       'custom-extension-github',
-      'custom-extension-chrome-pending',
-      'custom-extension-edge-pending',
+      'custom-extension-chrome',
+      'custom-extension-edge',
       'legacy-chrome-link',
       'legacy-firefox-link',
     ]);
+  });
 
+  it('renders every extension item as a secure link to the exact published target', () => {
+    const { wrapper } = mountHeader();
     const items = wrapper.findAll(
       '[data-test="browser-extension-menu"] > [data-test]',
     );
-    expect(items.at(0).attributes('href'))
-      .toBe('https://github.com/sruinz/SVRx-Pinry-Extention');
-    expect(items.at(1).attributes('aria-disabled')).toBe('true');
-    expect(items.at(2).attributes('aria-disabled')).toBe('true');
-    expect(items.at(3).attributes('href')).toBe(CHROME_URL);
-    expect(items.at(4).attributes('href')).toBe(FIREFOX_URL);
+    expect(items.wrappers.map(item => item.attributes('href'))).toEqual([
+      'https://github.com/sruinz/SVRx-Pinry-Extention',
+      CUSTOM_CHROME_URL,
+      CUSTOM_EDGE_URL,
+      LEGACY_CHROME_URL,
+      FIREFOX_URL,
+    ]);
 
-    [0, 3, 4].forEach((index) => {
+    [0, 1, 2, 3, 4].forEach((index) => {
+      expect(items.at(index).element.tagName).toBe('A');
       expect(items.at(index).attributes()).toMatchObject({
         target: '_blank',
         rel: 'noopener noreferrer',
       });
     });
     [1, 2].forEach((index) => {
-      expect(items.at(index).element.tagName).toBe('SPAN');
-      expect(items.at(index).attributes('href')).toBeUndefined();
-      expect(items.at(index).classes()).toContain('is-disabled');
+      expect(items.at(index).attributes('aria-disabled')).toBeUndefined();
+      expect(items.at(index).classes()).not.toContain('is-disabled');
     });
   });
 });
