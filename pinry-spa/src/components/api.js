@@ -35,6 +35,12 @@ const Board = {
     const url = `${API_PREFIX}boards-auto-complete/`;
     return axios.get(url);
   },
+  fetchOrder() {
+    return axios.get('/api/v2/boards/order/');
+  },
+  saveOrder(version, boardIds) {
+    return axios.put('/api/v2/boards/order/', { version, board_ids: boardIds });
+  },
   fetchListWhichContains(text, offset = 0, limit = 50) {
     const prefix = `${API_PREFIX}boards/?search=${text}`;
     const url = `${prefix}&offset=${offset}&limit=${limit}`;
