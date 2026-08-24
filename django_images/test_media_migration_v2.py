@@ -267,6 +267,21 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertEqual(self.destination_entries(), [])
         self.assertEqual(self.database_paths(), original_database_paths)
 
+    def test_execute_rejects_image_added_after_plan_before_first_write(self):
+        planned = self.make_image(sizes=())
+        old_path = planned.image.name
+        self.migrator().run(execute=False)
+        self.make_image(sizes=())
+
+        with self.assertRaisesRegex(
+            CommandError, "media_migration_database_changed"
+        ):
+            self.migrator().run(execute=True)
+
+        planned.refresh_from_db()
+        self.assertEqual(planned.image.name, old_path)
+        self.assertEqual(self.destination_entries(), [])
+
     def test_symlink_and_hardlink_sources_fail_closed(self):
         image = self.make_image(sizes=())
         original = Path(self.temporary_media.name, image.image.name)
@@ -343,6 +358,53 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 self.service_uid,
                 self.service_gid,
             )
+
+    def test_log_loader_and_service_reject_run_outside_data_root(self):
+        self.make_image(sizes=())
+        for boundary in ("log", "loader", "service"):
+            with self.subTest(boundary=boundary):
+                with tempfile.TemporaryDirectory(
+                    dir="/private/tmp"
+                ) as external_data:
+                    external_run = Path(external_data, RUN_ID)
+                    external_run.mkdir(mode=0o700)
+                    os.chmod(str(external_run), 0o700)
+                    os.chown(
+                        str(external_run),
+                        self.service_uid,
+                        self.service_gid,
+                    )
+
+                    def cross_boundary():
+                        if boundary == "log":
+                            with AutoV2ManifestLog.open(
+                                str(external_run),
+                                MANIFEST_FILENAME,
+                                RUN_ID,
+                                self.service_uid,
+                                self.service_gid,
+                            ):
+                                return None
+                        if boundary == "loader":
+                            return load_auto_v2_plan(
+                                str(external_run),
+                                MANIFEST_FILENAME,
+                                RUN_ID,
+                                self.service_uid,
+                                self.service_gid,
+                            )
+                        return AutoV2MediaMigrator(
+                            str(external_run),
+                            MANIFEST_FILENAME,
+                            RUN_ID,
+                            self.service_uid,
+                            self.service_gid,
+                        ).run(execute=False)
+
+                    with self.assertRaisesRegex(
+                        CommandError, "unsafe_auto_v2_manifest"
+                    ):
+                        cross_boundary()
 
     def test_v1_or_changed_target_manifest_is_plan_mismatch(self):
         self.manifest_path.write_text(
@@ -527,6 +589,62 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             )
         )
 
+    def test_database_commit_rejects_destination_swap_after_batch_verify(self):
+        image = self.make_image(sizes=())
+        old_path = image.image.name
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        destination = Path(
+            self.temporary_media.name, destination_relative
+        )
+        swapped = []
+
+        def replace_destination(point):
+            if point != "before_database_update" or swapped:
+                return
+            replacement = destination.with_name("replacement.png")
+            replacement.write_bytes(destination.read_bytes())
+            os.replace(str(replacement), str(destination))
+            swapped.append(True)
+
+        with self.assertRaisesRegex(
+            CommandError, "media_verification_failed"
+        ):
+            self.migrator(
+                fault_injector=replace_destination
+            ).run(execute=True)
+
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, old_path)
+        self.assertNotIn(
+            "committed",
+            {event["event"] for event in self.manifest_events()},
+        )
+
+    def test_database_commit_rejects_image_added_during_commit(self):
+        planned = self.make_image(sizes=())
+        old_path = planned.image.name
+        added = []
+
+        def add_image(point):
+            if point != "before_database_update" or added:
+                return
+            added.append(self.make_image(sizes=()).pk)
+
+        with self.assertRaisesRegex(
+            CommandError, "media_migration_database_changed"
+        ):
+            self.migrator(fault_injector=add_image).run(execute=True)
+
+        planned.refresh_from_db()
+        self.assertEqual(planned.image.name, old_path)
+        self.assertFalse(Image.objects.filter(pk=added[0]).exists())
+        self.assertNotIn(
+            "committed",
+            {event["event"] for event in self.manifest_events()},
+        )
+
     def test_publish_and_database_commit_crashes_resume_same_plan(self):
         for crash_point in ("after_publish", "after_database_commit"):
             with self.subTest(crash_point=crash_point):
@@ -559,6 +677,55 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 self.assertEqual(
                     self.manifest_events()[-1]["event"], expected_event
                 )
+
+    def test_publish_before_published_event_crash_resumes_from_intent(self):
+        image = self.make_image(sizes=())
+
+        def crash(point):
+            if point == "after_publish_before_event":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+
+        events = self.manifest_events()
+        self.assertIn("publish_intent", {event["event"] for event in events})
+        self.assertNotIn("published", {event["event"] for event in events})
+
+        self.migrator().run(execute=True)
+
+        image.refresh_from_db()
+        self.assertEqual(
+            image.image.name,
+            canonical_original_path(
+                image.asset_uuid, image.original_filename, ".png"
+            ),
+        )
+        self.assertEqual(self.manifest_events()[-1]["event"], "committed")
+
+    def test_publish_intent_does_not_adopt_external_destination(self):
+        image = self.make_image(sizes=())
+        source = Path(self.temporary_media.name, image.image.name)
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        destination = Path(
+            self.temporary_media.name, destination_relative
+        )
+
+        def create_external_destination(point):
+            if point != "after_publish_intent":
+                return
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+
+        with self.assertRaisesRegex(CommandError, "destination_collision"):
+            self.migrator(
+                fault_injector=create_external_destination
+            ).run(execute=True)
+
+        image.refresh_from_db()
+        self.assertNotEqual(image.image.name, destination_relative)
 
     def test_recovered_commit_rejects_destination_identity_swap(self):
         image = self.make_image(sizes=())

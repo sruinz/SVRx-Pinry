@@ -19,7 +19,6 @@ from django_images.file_ops import (
     open_or_create_media_directory_from,
     open_verified_media_file,
     open_verified_media_root,
-    publish_noreplace,
     sha256_file_descriptor,
 )
 from django_images.models import Image, Thumbnail
@@ -676,6 +675,7 @@ class _AutoV2ManifestState(object):
         self.plans = []
         self.plan_by_image = {}
         self.latest_by_image = {}
+        self.publish_intents_by_image = {}
         self.published_by_image = {}
         self.plan_complete = False
         self.plan_end_offset = None
@@ -684,9 +684,38 @@ class _AutoV2ManifestState(object):
         self.raw_bytes = b""
 
 
+def _verify_contained_run_directory(data_directory, run_directory):
+    try:
+        data_directory.verify_current()
+        run_directory.verify_current()
+        data_names = tuple(data_directory.names)
+        run_names = tuple(run_directory.names)
+        if (
+            len(run_names) <= len(data_names)
+            or run_names[:len(data_names)] != data_names
+        ):
+            raise _command_error("unsafe_auto_v2_manifest")
+        data_stat = os.fstat(data_directory.descriptor)
+        contained_stat = os.fstat(
+            run_directory.descriptors[len(data_names)]
+        )
+    except (IndexError, OSError, MediaPathError) as error:
+        raise _command_error("unsafe_auto_v2_manifest", error)
+    if (
+        data_stat.st_dev,
+        data_stat.st_ino,
+    ) != (
+        contained_stat.st_dev,
+        contained_stat.st_ino,
+    ):
+        raise _command_error("unsafe_auto_v2_manifest")
+    return True
+
+
 class AutoV2ManifestLog(object):
     def __init__(
         self,
+        data_directory,
         run_directory,
         filename,
         run_id,
@@ -695,6 +724,7 @@ class AutoV2ManifestLog(object):
         descriptor,
         file_stat,
     ):
+        self.data_directory = data_directory
         self.run_directory = run_directory
         self.filename = filename
         self.run_id = run_id
@@ -722,10 +752,15 @@ class AutoV2ManifestLog(object):
             raise _command_error("unsafe_auto_v2_manifest")
         if os.path.basename(run_directory) != run_id:
             raise _command_error("manifest_run_id_mismatch")
+        data_directory = None
         directory = None
         descriptor = None
         try:
+            data_directory = open_verified_media_root(
+                settings.PINRY_DATA_ROOT
+            )
             directory = open_verified_media_root(run_directory)
+            _verify_contained_run_directory(data_directory, directory)
             directory_stat = os.fstat(directory.descriptor)
             if (
                 directory_stat.st_uid != service_uid
@@ -770,6 +805,7 @@ class AutoV2ManifestLog(object):
             ):
                 raise _command_error("unsafe_auto_v2_manifest")
             opened = cls(
+                data_directory,
                 directory,
                 filename,
                 run_id,
@@ -779,6 +815,7 @@ class AutoV2ManifestLog(object):
                 file_stat,
             )
             descriptor = None
+            data_directory = None
             directory = None
             return opened
         except BaseException as error:
@@ -790,6 +827,11 @@ class AutoV2ManifestLog(object):
             if directory is not None:
                 try:
                     directory.close()
+                except BaseException:
+                    pass
+            if data_directory is not None:
+                try:
+                    data_directory.close()
                 except BaseException:
                     pass
             if isinstance(error, CommandError):
@@ -826,12 +868,19 @@ class AutoV2ManifestLog(object):
         except BaseException as error:
             if first_error is None:
                 first_error = error
+        try:
+            self.data_directory.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         if first_error is not None:
             raise first_error
 
     def _verify_current(self):
         try:
-            self.run_directory.verify_current()
+            _verify_contained_run_directory(
+                self.data_directory, self.run_directory
+            )
             directory_stat = os.fstat(self.run_directory.descriptor)
             descriptor_stat = os.fstat(self.descriptor)
             named_stat = os.stat(
@@ -918,7 +967,35 @@ class AutoV2ManifestLog(object):
                 previous = state.latest_by_image.get(image_id)
                 if previous in ("committed", "recovered_commit", "already_current"):
                     raise _command_error("invalid_auto_v2_manifest")
-                if event_name == "published":
+                if event_name == "publish_intent":
+                    plan = state.plan_by_image[image_id]
+                    file_by_key = {
+                        file_plan.kind_key: file_plan
+                        for file_plan in plan.files
+                    }
+                    file_key = event.get("file_key")
+                    identity = (
+                        event.get("staging_device"),
+                        event.get("staging_inode"),
+                        event.get("destination_parent_device"),
+                        event.get("destination_parent_inode"),
+                    )
+                    intents = state.publish_intents_by_image.setdefault(
+                        image_id, {}
+                    )
+                    if (
+                        file_key not in file_by_key
+                        or file_by_key[file_key].operation != "copy"
+                        or file_key in intents
+                        or any(type(value) is not int for value in identity)
+                        or identity[0] < 0
+                        or identity[1] <= 0
+                        or identity[2] < 0
+                        or identity[3] <= 0
+                    ):
+                        raise _command_error("invalid_auto_v2_manifest")
+                    intents[file_key] = identity
+                elif event_name == "published":
                     plan = state.plan_by_image[image_id]
                     file_by_key = {
                         file_plan.kind_key: file_plan
@@ -940,6 +1017,14 @@ class AutoV2ManifestLog(object):
                         or destination_inode <= 0
                     ):
                         raise _command_error("invalid_auto_v2_manifest")
+                    intent = state.publish_intents_by_image.get(
+                        image_id, {}
+                    ).get(file_key)
+                    if intent is not None and (
+                        destination_device,
+                        destination_inode,
+                    ) != intent[:2]:
+                        raise _command_error("manifest_plan_mismatch")
                     published[file_key] = (
                         destination_device,
                         destination_inode,
@@ -1015,6 +1100,30 @@ class AutoV2ManifestLog(object):
                 "file_key": file_key,
                 "destination_device": destination_identity[0],
                 "destination_inode": destination_identity[1],
+                "plan_sha256": self.summary().plan_sha256,
+            }
+        )
+
+    def record_publish_intent(
+        self,
+        image_id,
+        file_key,
+        staging_identity,
+        destination_parent_identity,
+    ):
+        self.append(
+            {
+                "event": "publish_intent",
+                "image_id": image_id,
+                "file_key": file_key,
+                "staging_device": staging_identity[0],
+                "staging_inode": staging_identity[1],
+                "destination_parent_device": (
+                    destination_parent_identity[0]
+                ),
+                "destination_parent_inode": (
+                    destination_parent_identity[1]
+                ),
                 "plan_sha256": self.summary().plan_sha256,
             }
         )
@@ -1107,6 +1216,7 @@ def _validate_manifest_event(event, run_id):
     if event.get("event") not in (
         "planned",
         "plan_complete",
+        "publish_intent",
         "published",
         "committed",
         "recovered_commit",
@@ -1233,6 +1343,7 @@ class AutoV2MediaMigrator(object):
     def _execute(self, manifest, plans, plan_sha256):
         if manifest.summary().plan_sha256 != plan_sha256:
             raise _command_error("manifest_plan_mismatch")
+        self._validate_image_plan_closure(plans)
         pending = []
         source_verifications = []
         destination_verifications = []
@@ -1266,7 +1377,7 @@ class AutoV2MediaMigrator(object):
                 continue
             if state != "old":
                 raise _command_error("media_migration_database_changed")
-            if latest not in (None, "published"):
+            if latest not in (None, "publish_intent", "published"):
                 raise _command_error("manifest_plan_mismatch")
             pending.append(plan)
 
@@ -1296,6 +1407,9 @@ class AutoV2MediaMigrator(object):
                         .published_by_image.get(plan.image_id, {}).items()
                     }
                 )
+                publish_intents = manifest.state.publish_intents_by_image.get(
+                    plan.image_id, {}
+                )
                 for file_plan in plan.files:
                     self._prepare_file(
                         root_directory,
@@ -1306,6 +1420,7 @@ class AutoV2MediaMigrator(object):
                             file_plan.new_path,
                             reusable_destinations.get(file_plan.kind_key),
                         ),
+                        publish_intents.get(file_plan.kind_key),
                     )
             if root_directory is not None:
                 root_directory.verify_current()
@@ -1332,6 +1447,7 @@ class AutoV2MediaMigrator(object):
         image_id,
         file_plan,
         reusable_destination_identity,
+        publish_intent,
     ):
         source = None
         try:
@@ -1359,6 +1475,38 @@ class AutoV2MediaMigrator(object):
             )
             if existing is not None:
                 try:
+                    if (
+                        reusable_destination_identity is None
+                        and publish_intent is not None
+                    ):
+                        parent_stat = os.fstat(
+                            existing.parent_directory.descriptor
+                        )
+                        if (
+                            existing.file_stat.st_dev,
+                            existing.file_stat.st_ino,
+                        ) != publish_intent[:2] or (
+                            parent_stat.st_dev,
+                            parent_stat.st_ino,
+                        ) != publish_intent[2:]:
+                            raise _command_error("destination_collision")
+                        _verify_receipt_details(
+                            existing,
+                            file_plan.size,
+                            file_plan.sha256,
+                            file_plan.image_format,
+                            file_plan.width,
+                            file_plan.height,
+                            "destination_collision",
+                            expected_identity=publish_intent[:2],
+                        )
+                        manifest.record_published(
+                            image_id,
+                            file_plan.kind_key,
+                            publish_intent[:2],
+                        )
+                        self._inject_fault("after_publish")
+                        return
                     if reusable_destination_identity is None:
                         raise _command_error("destination_collision")
                     _verify_receipt_details(
@@ -1376,9 +1524,16 @@ class AutoV2MediaMigrator(object):
                     existing.close()
             if reusable_destination_identity is not None:
                 raise _command_error("destination_collision")
+            if publish_intent is not None:
+                raise _command_error("media_verification_failed")
             destination_identity = self._copy_source(
-                root_directory, source, file_plan
+                root_directory,
+                manifest,
+                image_id,
+                source,
+                file_plan,
             )
+            self._inject_fault("after_publish_before_event")
             manifest.record_published(
                 image_id, file_plan.kind_key, destination_identity
             )
@@ -1391,7 +1546,9 @@ class AutoV2MediaMigrator(object):
             if source is not None:
                 source.close()
 
-    def _copy_source(self, root_directory, source, file_plan):
+    def _copy_source(
+        self, root_directory, manifest, image_id, source, file_plan
+    ):
         staging_directory = None
         destination_directory = None
         staging = None
@@ -1421,17 +1578,54 @@ class AutoV2MediaMigrator(object):
             destination_directory = open_or_create_media_directory_from(
                 root_directory, relative_directory
             )
-            publish_result = publish_noreplace(
-                staging.name,
-                destination_name,
-                file_plan.sha256,
-                part_descriptor=staging.descriptor,
-                part_directory_descriptor=staging_directory.descriptor,
-                destination_directory=destination_directory,
+            existing = open_verified_media_file(
+                root_directory, file_plan.new_path, missing_ok=True
             )
-            published = True
-            if publish_result.reused:
+            if existing is not None:
+                existing.close()
                 raise _command_error("destination_collision")
+            staging_stat = os.fstat(staging.descriptor)
+            destination_parent_stat = os.fstat(
+                destination_directory.descriptor
+            )
+            manifest.record_publish_intent(
+                image_id,
+                file_plan.kind_key,
+                (staging_stat.st_dev, staging_stat.st_ino),
+                (
+                    destination_parent_stat.st_dev,
+                    destination_parent_stat.st_ino,
+                ),
+            )
+            self._inject_fault("after_publish_intent")
+            try:
+                os.link(
+                    staging.name,
+                    destination_name,
+                    src_dir_fd=staging_directory.descriptor,
+                    dst_dir_fd=destination_directory.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as error:
+                raise _command_error("destination_collision", error)
+            named_destination_stat = os.stat(
+                destination_name,
+                dir_fd=destination_directory.descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(named_destination_stat.st_mode)
+                or (
+                    named_destination_stat.st_dev,
+                    named_destination_stat.st_ino,
+                )
+                != (staging_stat.st_dev, staging_stat.st_ino)
+            ):
+                raise _command_error("media_verification_failed")
+            os.fsync(staging.descriptor)
+            destination_directory.fsync_publish()
+            staging.cleanup()
+            published = True
             destination = open_verified_media_file(
                 root_directory, file_plan.new_path
             )
@@ -1532,6 +1726,59 @@ class AutoV2MediaMigrator(object):
                 receipt.close()
         root.verify_current()
 
+    def _open_plan_destination_receipts(
+        self, root, plan, destination_identities
+    ):
+        receipt_records = []
+        try:
+            for file_plan in plan.files:
+                receipt = open_verified_media_file(
+                    root, file_plan.new_path
+                )
+                receipt_records.append(
+                    (
+                        receipt,
+                        file_plan,
+                        destination_identities[file_plan.kind_key],
+                    )
+                )
+            self._verify_destination_receipts(root, receipt_records)
+            return receipt_records
+        except BaseException:
+            self._close_destination_receipts(
+                receipt_records, suppress_errors=True
+            )
+            raise
+
+    def _verify_destination_receipts(self, root, receipt_records):
+        for receipt, file_plan, expected_identity in receipt_records:
+            _verify_receipt_details(
+                receipt,
+                file_plan.size,
+                file_plan.sha256,
+                file_plan.image_format,
+                file_plan.width,
+                file_plan.height,
+                "media_verification_failed",
+                expected_identity=expected_identity,
+            )
+        root.verify_current()
+
+    def _close_destination_receipts(
+        self, receipt_records, suppress_errors=False
+    ):
+        first_error = None
+        for receipt, _file_plan, _expected_identity in reversed(
+            receipt_records
+        ):
+            try:
+                receipt.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None and not suppress_errors:
+            raise first_error
+
     def _database_state(self, plan, lock=False):
         queryset = Image.objects
         if lock:
@@ -1588,50 +1835,85 @@ class AutoV2MediaMigrator(object):
             return "new"
         return "changed"
 
+    def _validate_image_plan_closure(self, plans, lock=False):
+        queryset = Image.objects.order_by("pk")
+        if lock:
+            queryset = queryset.select_for_update()
+        current_image_ids = tuple(
+            queryset.values_list("pk", flat=True)
+        )
+        planned_image_ids = tuple(plan.image_id for plan in plans)
+        if current_image_ids != planned_image_ids:
+            raise _command_error("media_migration_database_changed")
+
     def _commit_batches(self, manifest, plans):
         root = None
         try:
             root = open_verified_media_root(settings.MEDIA_ROOT)
+            all_plans = list(manifest.state.plans)
+            self._validate_image_plan_closure(all_plans)
             for start in range(0, len(plans), self.batch_size):
                 batch = plans[start:start + self.batch_size]
-                for plan in batch:
-                    self._verify_plan_destinations_from(
-                        root,
-                        plan,
-                        self._destination_identities(manifest, plan),
-                    )
-                root.verify_current()
-                with transaction.atomic():
-                    self._inject_fault("before_database_update")
-                    root.verify_current()
+                receipt_records = []
+                try:
                     for plan in batch:
-                        if self._database_state(plan, lock=True) != "old":
-                            raise _command_error(
-                                "media_migration_database_changed"
+                        receipt_records.extend(
+                            self._open_plan_destination_receipts(
+                                root,
+                                plan,
+                                self._destination_identities(
+                                    manifest, plan
+                                ),
                             )
-                        original = plan.files[0]
-                        if original.old_path != original.new_path:
-                            updated = Image.objects.filter(
-                                pk=plan.image_id,
-                                image=original.old_path,
-                            ).update(image=original.new_path)
-                            if updated != 1:
+                        )
+                    with transaction.atomic():
+                        self._inject_fault("before_database_update")
+                        self._validate_image_plan_closure(
+                            all_plans, lock=True
+                        )
+                        self._verify_destination_receipts(
+                            root, receipt_records
+                        )
+                        for plan in batch:
+                            if self._database_state(plan, lock=True) != "old":
                                 raise _command_error(
                                     "media_migration_database_changed"
                                 )
-                        for file_plan in plan.files[1:]:
-                            if file_plan.old_path == file_plan.new_path:
-                                continue
-                            updated = Thumbnail.objects.filter(
-                                pk=file_plan.thumbnail_id,
-                                original_id=plan.image_id,
-                                image=file_plan.old_path,
-                            ).update(image=file_plan.new_path)
-                            if updated != 1:
-                                raise _command_error(
-                                    "media_migration_database_changed"
-                                )
-                    root.verify_current()
+                            original = plan.files[0]
+                            if original.old_path != original.new_path:
+                                updated = Image.objects.filter(
+                                    pk=plan.image_id,
+                                    image=original.old_path,
+                                ).update(image=original.new_path)
+                                if updated != 1:
+                                    raise _command_error(
+                                        "media_migration_database_changed"
+                                    )
+                            for file_plan in plan.files[1:]:
+                                if file_plan.old_path == file_plan.new_path:
+                                    continue
+                                updated = Thumbnail.objects.filter(
+                                    pk=file_plan.thumbnail_id,
+                                    original_id=plan.image_id,
+                                    image=file_plan.old_path,
+                                ).update(image=file_plan.new_path)
+                                if updated != 1:
+                                    raise _command_error(
+                                        "media_migration_database_changed"
+                                    )
+                        self._verify_destination_receipts(
+                            root, receipt_records
+                        )
+                        self._validate_image_plan_closure(
+                            all_plans, lock=True
+                        )
+                except BaseException:
+                    self._close_destination_receipts(
+                        receipt_records, suppress_errors=True
+                    )
+                    raise
+                else:
+                    self._close_destination_receipts(receipt_records)
                 self._inject_fault("after_database_commit")
                 for plan in batch:
                     manifest.record_result(
