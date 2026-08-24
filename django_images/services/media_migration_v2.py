@@ -15,6 +15,7 @@ from PIL import Image as PILImage
 
 from django_images.file_ops import (
     MediaPathError,
+    OwnedStagingFile,
     create_owned_staging_file,
     open_or_create_media_directory_from,
     open_verified_media_file,
@@ -40,7 +41,7 @@ _RUN_ID_PATTERN = re.compile(
 _STAGING_NAME_PATTERN = re.compile(
     r"^auto-v2-"
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-    r"[0-9a-f]{4}-[0-9a-f]{12})\.part$"
+    r"[0-9a-f]{4}-[0-9a-f]{12})\.part\Z"
 )
 
 
@@ -1604,7 +1605,7 @@ class AutoV2MediaMigrator(object):
                 flags,
                 dir_fd=staging_directory.descriptor,
             )
-            self._verify_intent_staging_identity(
+            file_stat = self._verify_intent_staging_identity(
                 staging_directory,
                 publish_intent[4],
                 descriptor,
@@ -1619,7 +1620,15 @@ class AutoV2MediaMigrator(object):
                 publish_intent,
                 expected_link_count,
             )
-            return descriptor
+            return OwnedStagingFile(
+                staging_directory,
+                publish_intent[4],
+                descriptor,
+                file_stat,
+                publish_intent[4],
+                owns_directory=False,
+                idempotent_cleanup=True,
+            )
         except BaseException:
             if descriptor is not None:
                 try:
@@ -1676,7 +1685,7 @@ class AutoV2MediaMigrator(object):
     ):
         staging_directory = None
         destination_directory = None
-        staging_descriptor = None
+        staging_file = None
         try:
             staging_directory = open_or_create_media_directory_from(
                 root_directory, ".staging"
@@ -1707,7 +1716,7 @@ class AutoV2MediaMigrator(object):
                 destination_stat = None
 
             if destination_stat is None:
-                staging_descriptor = self._open_intent_staging(
+                staging_file = self._open_intent_staging(
                     staging_directory,
                     publish_intent,
                     file_plan,
@@ -1755,7 +1764,7 @@ class AutoV2MediaMigrator(object):
                     return
                 raise _command_error("destination_collision")
             elif destination_stat.st_nlink == 2:
-                staging_descriptor = self._open_intent_staging(
+                staging_file = self._open_intent_staging(
                     staging_directory,
                     publish_intent,
                     file_plan,
@@ -1767,7 +1776,7 @@ class AutoV2MediaMigrator(object):
             self._verify_intent_staging_identity(
                 staging_directory,
                 publish_intent[4],
-                staging_descriptor,
+                staging_file.descriptor,
                 publish_intent,
                 2,
             )
@@ -1785,17 +1794,15 @@ class AutoV2MediaMigrator(object):
                 or destination_stat.st_nlink != 2
             ):
                 raise _command_error("destination_collision")
-            os.fsync(staging_descriptor)
+            os.fsync(staging_file.descriptor)
             destination_directory.fsync_publish()
             self._inject_fault(
                 "after_publish_fsync_before_staging_unlink"
             )
             destination_directory.verify_current()
-            os.unlink(
-                publish_intent[4],
-                dir_fd=staging_directory.descriptor,
-            )
-            os.fsync(staging_directory.descriptor)
+            if not staging_file.cleanup():
+                raise _command_error("media_verification_failed")
+            staging_stat = os.fstat(staging_file.descriptor)
             destination_stat = os.stat(
                 destination_name,
                 dir_fd=destination_directory.descriptor,
@@ -1808,7 +1815,11 @@ class AutoV2MediaMigrator(object):
                     destination_stat.st_ino,
                 ) != publish_intent[:2]
                 or destination_stat.st_nlink != 1
-                or os.fstat(staging_descriptor).st_nlink != 1
+                or (
+                    staging_stat.st_dev,
+                    staging_stat.st_ino,
+                ) != publish_intent[:2]
+                or staging_stat.st_nlink != 1
             ):
                 raise _command_error("media_verification_failed")
             self._record_intent_destination(
@@ -1819,8 +1830,8 @@ class AutoV2MediaMigrator(object):
                 publish_intent,
             )
         finally:
-            if staging_descriptor is not None:
-                os.close(staging_descriptor)
+            if staging_file is not None:
+                staging_file.close()
             if destination_directory is not None:
                 destination_directory.close()
             if staging_directory is not None:
@@ -1910,7 +1921,16 @@ class AutoV2MediaMigrator(object):
             self._inject_fault(
                 "after_publish_fsync_before_staging_unlink"
             )
-            staging.cleanup()
+            if not staging.cleanup():
+                raise _command_error("media_verification_failed")
+            cleaned_staging_stat = os.fstat(staging.descriptor)
+            if (
+                cleaned_staging_stat.st_dev,
+                cleaned_staging_stat.st_ino,
+            ) != (staging_stat.st_dev, staging_stat.st_ino) or (
+                cleaned_staging_stat.st_nlink != 1
+            ):
+                raise _command_error("media_verification_failed")
             published = True
             destination = open_verified_media_file(
                 root_directory, file_plan.new_path

@@ -27,6 +27,7 @@ from django_images.services.media_migration_v2 import (
     AutoV2MediaMigrator,
     AutoV2MigrationPlan,
     AutoV2PlanSummary,
+    _valid_staging_name,
     load_auto_v2_plan,
 )
 
@@ -358,6 +359,18 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 self.service_uid,
                 self.service_gid,
             )
+
+    def test_staging_name_validation_requires_exact_canonical_basename(self):
+        canonical = "auto-v2-12345678-1234-5678-1234-567812345678.part"
+
+        self.assertTrue(_valid_staging_name(canonical))
+        for invalid in (
+            canonical + "\n",
+            canonical + "/child",
+            canonical + ".other",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(_valid_staging_name(invalid))
 
     def test_log_loader_and_service_reject_run_outside_data_root(self):
         self.make_image(sizes=())
@@ -796,6 +809,80 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertEqual(image.image.name, destination_relative)
         self.assertEqual(os.stat(str(destination)).st_nlink, 1)
         self.assertEqual(self.manifest_events()[-1]["event"], "committed")
+
+    def test_resume_rejects_staging_name_swap_before_unlink(self):
+        image = self.make_image(sizes=())
+        old_path = image.image.name
+
+        def crash(point):
+            if point == "after_publish_fsync_before_staging_unlink":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+
+        swapped = []
+
+        def swap_staging_name(point):
+            if (
+                point != "after_publish_fsync_before_staging_unlink"
+                or swapped
+            ):
+                return
+            staging_directory = Path(
+                self.temporary_media.name, ".staging"
+            )
+            staging = next(staging_directory.glob("auto-v2-*.part"))
+            replacement = staging_directory / "replacement.part"
+            replacement.write_bytes(b"replacement")
+            os.replace(str(replacement), str(staging))
+            swapped.append(True)
+
+        with self.assertRaisesRegex(
+            CommandError, "media_verification_failed"
+        ):
+            self.migrator(
+                fault_injector=swap_staging_name
+            ).run(execute=True)
+
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, old_path)
+        events = {event["event"] for event in self.manifest_events()}
+        self.assertNotIn("published", events)
+        self.assertNotIn("committed", events)
+
+    def test_initial_publish_rejects_staging_name_swap_before_cleanup(self):
+        image = self.make_image(sizes=())
+        old_path = image.image.name
+        swapped = []
+
+        def swap_staging_name(point):
+            if (
+                point != "after_publish_fsync_before_staging_unlink"
+                or swapped
+            ):
+                return
+            staging_directory = Path(
+                self.temporary_media.name, ".staging"
+            )
+            staging = next(staging_directory.glob("auto-v2-*.part"))
+            replacement = staging_directory / "replacement.part"
+            replacement.write_bytes(b"replacement")
+            os.replace(str(replacement), str(staging))
+            swapped.append(True)
+
+        with self.assertRaisesRegex(
+            CommandError, "media_verification_failed"
+        ):
+            self.migrator(
+                fault_injector=swap_staging_name
+            ).run(execute=True)
+
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, old_path)
+        events = {event["event"] for event in self.manifest_events()}
+        self.assertNotIn("published", events)
+        self.assertNotIn("committed", events)
 
     def test_publish_intent_does_not_adopt_external_destination(self):
         image = self.make_image(sizes=())
