@@ -159,5 +159,10 @@
     "pinSortOldest": "Plus ancien",
     "pinSortRandom": "Aléatoire",
     "pinSortReshuffled": "L'ordre aléatoire a été remélangé.",
-    "pinSortDisabled": "Le tri ne peut pas être modifié pendant la sélection de Pins ou une action groupée."
+    "pinSortDisabled": "Le tri ne peut pas être modifié pendant la sélection de Pins ou une action groupée.",
+    "boardSortLabel": "Tri",
+    "boardSortCustom": "Personnalisé",
+    "boardSortLatest": "Plus récent",
+    "boardSortOldest": "Plus ancien",
+    "boardSortRandom": "Aléatoire"
 }

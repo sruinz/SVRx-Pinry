@@ -161,10 +161,19 @@ function fetchPin(pinId) {
   );
 }
 
-function fetchBoardForUser(username, offset = 0, limit = 50) {
-  const prefix = `${API_PREFIX}boards/?submitter__username=${username}`;
-  const url = `${prefix}&offset=${offset}&limit=${limit}`;
-  return axios.get(url);
+function fetchBoardForUser(username, offset = 0, limit = 50, sortState = null) {
+  const params = {
+    submitter__username: username,
+    offset,
+    limit,
+  };
+  if (sortState) {
+    params.sort = sortState.mode;
+    if (sortState.mode === 'random') params.random_seed = sortState.randomSeed;
+  } else {
+    params.ordering = '-id';
+  }
+  return axios.get(`${API_PREFIX}boards/`, { params });
 }
 
 const User = {

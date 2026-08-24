@@ -159,5 +159,10 @@
   "pinSortOldest": "오래된순",
   "pinSortRandom": "랜덤",
   "pinSortReshuffled": "랜덤 순서를 새로 섞었습니다.",
-  "pinSortDisabled": "Pin 선택 또는 일괄 작업 중에는 정렬을 변경할 수 없습니다."
+  "pinSortDisabled": "Pin 선택 또는 일괄 작업 중에는 정렬을 변경할 수 없습니다.",
+  "boardSortLabel": "정렬",
+  "boardSortCustom": "사용자 지정",
+  "boardSortLatest": "최신순",
+  "boardSortOldest": "오래된순",
+  "boardSortRandom": "랜덤"
 }

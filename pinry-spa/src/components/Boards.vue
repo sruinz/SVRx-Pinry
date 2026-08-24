@@ -1,6 +1,17 @@
 <template>
   <div class="boards">
     <section class="section">
+      <div
+        v-if="isUserBoardList"
+        class="container board-tools"
+        data-test="board-tools"
+      >
+        <BoardSortControls
+          :mode="sortState.mode"
+          :busy="status.loading"
+          @select="applySortMode"
+        />
+      </div>
       <div id="boards-container" class="container" v-if="blocks">
         <div
           v-masonry=""          transition-duration="0.3s"
@@ -63,6 +74,14 @@ import scroll from './utils/scroll';
 import placeholder from '../assets/pinry-placeholder.jpg';
 import BoardEditorUI from './editors/BoardEditUI.vue';
 import bus from './utils/bus';
+import BoardSortControls from './board_ordering/BoardSortControls.vue';
+import {
+  boardSortStorageKey,
+  generateRandomSeed,
+  readBoardSortState,
+  transitionBoardSortState,
+  writeBoardSortState,
+} from './board_ordering/boardSortState';
 
 function createBoardItem(board) {
   const defaultPreviewImage = placeholder;
@@ -108,32 +127,78 @@ function initialData() {
     editorMeta: {
       user: { loggedIn: false, meta: { username: null } },
     },
+    sortState: { version: 1, mode: 'custom', randomSeed: 0 },
+    sortStorageKey: null,
   };
 }
 
 export default {
   name: 'boards',
+  beforeCreate() {
+    this.requestGeneration = 0;
+    this.seedFactory = generateRandomSeed;
+  },
   components: {
     loadingSpinner,
     noMore,
     BoardEditorUI,
+    BoardSortControls,
   },
   data: initialData,
   props: ['filters'],
   watch: {
-    filters() {
-      this.reset();
+    filters: {
+      deep: true,
+      handler() {
+        this.activateSortContext();
+        this.reset();
+        this.$nextTick(() => window.scrollTo(0, 0));
+      },
+    },
+  },
+  computed: {
+    isUserBoardList() {
+      return Boolean(this.filters && this.filters.boardUsername);
     },
   },
   methods: {
-    initialize() {
-      this.initializeMeta();
-      this.fetchMore(true);
+    captureFilters() {
+      return {
+        boardUsername: this.filters.boardUsername,
+        boardNameContains: this.filters.boardNameContains,
+      };
     },
-    initializeMeta() {
+    isRequestCurrent(generation, filters) {
+      if (this.requestGeneration !== generation) return false;
+      return this.filters.boardUsername === filters.boardUsername
+        && this.filters.boardNameContains === filters.boardNameContains;
+    },
+    activateSortContext() {
+      this.sortStorageKey = boardSortStorageKey(this.filters.boardUsername);
+      this.sortState = readBoardSortState(
+        window.localStorage, this.sortStorageKey, this.seedFactory,
+      );
+    },
+    applySortMode(mode) {
+      if (!this.isUserBoardList || this.status.loading) return;
+      const transition = transitionBoardSortState(this.sortState, mode, this.seedFactory);
+      if (!transition.changed) return;
+      this.sortState = transition.state;
+      writeBoardSortState(window.localStorage, this.sortStorageKey, this.sortState);
+      this.reset();
+      this.$nextTick(() => window.scrollTo(0, 0));
+    },
+    initialize() {
+      const generation = this.requestGeneration;
+      const filters = this.captureFilters();
+      this.initializeMeta(generation, filters);
+      this.fetchMore(true, generation, filters);
+    },
+    initializeMeta(generation, filters) {
       const self = this;
       API.User.fetchUserInfo().then(
         (user) => {
+          if (!self.isRequestCurrent(generation, filters)) return;
           if (user === null) {
             self.editorMeta.user.loggedIn = false;
             self.editorMeta.user.meta = {};
@@ -145,8 +210,19 @@ export default {
       );
     },
     reset() {
+      this.requestGeneration += 1;
+      const sorting = {
+        sortState: this.sortState,
+        sortStorageKey: this.sortStorageKey,
+      };
       const data = initialData();
       Object.entries(data).forEach(
+        (kv) => {
+          const [key, value] = kv;
+          this[key] = value;
+        },
+      );
+      Object.entries(sorting).forEach(
         (kv) => {
           const [key, value] = kv;
           this[key] = value;
@@ -203,19 +279,26 @@ export default {
       }
       return true;
     },
-    fetchMore(created) {
+    fetchMore(
+      created,
+      generation = this.requestGeneration,
+      filters = this.captureFilters(),
+    ) {
+      if (!this.isRequestCurrent(generation, filters)) return;
       if (!this.shouldFetchMore(created)) {
         return;
       }
       let promise;
-      if (this.filters.boardUsername) {
+      if (filters.boardUsername) {
         promise = API.fetchBoardForUser(
-          this.filters.boardUsername,
+          filters.boardUsername,
           this.status.offset,
+          50,
+          this.sortState,
         );
-      } else if (this.filters.boardNameContains) {
+      } else if (filters.boardNameContains) {
         promise = API.Board.fetchListWhichContains(
-          this.filters.boardNameContains,
+          filters.boardNameContains,
           this.status.offset,
         );
       } else {
@@ -224,6 +307,7 @@ export default {
       this.status.loading = true;
       promise.then(
         (resp) => {
+          if (!this.isRequestCurrent(generation, filters)) return;
           const { results, next } = resp.data;
           let newBlocks = this.buildBlocks(results);
           newBlocks.forEach(
@@ -235,13 +319,17 @@ export default {
           this.status.hasNext = !(next === null);
           this.status.loading = false;
         },
-        () => { this.status.loading = false; },
+        () => {
+          if (!this.isRequestCurrent(generation, filters)) return;
+          this.status.loading = false;
+        },
       );
     },
   },
   created() {
     bus.bus.$on(bus.events.refreshBoards, this.reset);
     this.registerScrollEvent();
+    this.activateSortContext();
     this.initialize();
   },
 };
@@ -266,6 +354,10 @@ $avatar-width: 30px;
 $avatar-height: 30px;
 @import './utils/fonts';
 @import './utils/loader.scss';
+
+.board-tools {
+  margin-bottom: 1rem;
+}
 
 .board-card{
   .card-image > img {
