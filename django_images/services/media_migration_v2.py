@@ -37,6 +37,11 @@ _RUN_ID_PATTERN = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12})$"
 )
+_STAGING_NAME_PATTERN = re.compile(
+    r"^auto-v2-"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})\.part$"
+)
 
 
 def _command_error(code, cause=None):
@@ -54,6 +59,18 @@ def _valid_run_id(run_id):
         return False
     try:
         datetime.strptime(run_id[:16], "%Y%m%dT%H%M%SZ")
+        return str(uuid.UUID(match.group(1))) == match.group(1)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _valid_staging_name(name):
+    if not isinstance(name, str):
+        return False
+    match = _STAGING_NAME_PATTERN.match(name)
+    if match is None:
+        return False
+    try:
         return str(uuid.UUID(match.group(1))) == match.group(1)
     except (AttributeError, TypeError, ValueError):
         return False
@@ -979,6 +996,7 @@ class AutoV2ManifestLog(object):
                         event.get("staging_inode"),
                         event.get("destination_parent_device"),
                         event.get("destination_parent_inode"),
+                        event.get("staging_name"),
                     )
                     intents = state.publish_intents_by_image.setdefault(
                         image_id, {}
@@ -987,11 +1005,14 @@ class AutoV2ManifestLog(object):
                         file_key not in file_by_key
                         or file_by_key[file_key].operation != "copy"
                         or file_key in intents
-                        or any(type(value) is not int for value in identity)
+                        or any(
+                            type(value) is not int for value in identity[:4]
+                        )
                         or identity[0] < 0
                         or identity[1] <= 0
                         or identity[2] < 0
                         or identity[3] <= 0
+                        or not _valid_staging_name(identity[4])
                     ):
                         raise _command_error("invalid_auto_v2_manifest")
                     intents[file_key] = identity
@@ -1108,6 +1129,7 @@ class AutoV2ManifestLog(object):
         self,
         image_id,
         file_key,
+        staging_name,
         staging_identity,
         destination_parent_identity,
     ):
@@ -1116,6 +1138,7 @@ class AutoV2ManifestLog(object):
                 "event": "publish_intent",
                 "image_id": image_id,
                 "file_key": file_key,
+                "staging_name": staging_name,
                 "staging_device": staging_identity[0],
                 "staging_inode": staging_identity[1],
                 "destination_parent_device": (
@@ -1470,43 +1493,24 @@ class AutoV2MediaMigrator(object):
             self._inject_fault("after_source_revalidation")
             if file_plan.operation == "verify":
                 return
+            if (
+                publish_intent is not None
+                and reusable_destination_identity is None
+            ):
+                self._resume_publish_intent(
+                    root_directory,
+                    manifest,
+                    image_id,
+                    file_plan,
+                    publish_intent,
+                )
+                self._inject_fault("after_publish")
+                return
             existing = open_verified_media_file(
                 root_directory, file_plan.new_path, missing_ok=True
             )
             if existing is not None:
                 try:
-                    if (
-                        reusable_destination_identity is None
-                        and publish_intent is not None
-                    ):
-                        parent_stat = os.fstat(
-                            existing.parent_directory.descriptor
-                        )
-                        if (
-                            existing.file_stat.st_dev,
-                            existing.file_stat.st_ino,
-                        ) != publish_intent[:2] or (
-                            parent_stat.st_dev,
-                            parent_stat.st_ino,
-                        ) != publish_intent[2:]:
-                            raise _command_error("destination_collision")
-                        _verify_receipt_details(
-                            existing,
-                            file_plan.size,
-                            file_plan.sha256,
-                            file_plan.image_format,
-                            file_plan.width,
-                            file_plan.height,
-                            "destination_collision",
-                            expected_identity=publish_intent[:2],
-                        )
-                        manifest.record_published(
-                            image_id,
-                            file_plan.kind_key,
-                            publish_intent[:2],
-                        )
-                        self._inject_fault("after_publish")
-                        return
                     if reusable_destination_identity is None:
                         raise _command_error("destination_collision")
                     _verify_receipt_details(
@@ -1524,8 +1528,6 @@ class AutoV2MediaMigrator(object):
                     existing.close()
             if reusable_destination_identity is not None:
                 raise _command_error("destination_collision")
-            if publish_intent is not None:
-                raise _command_error("media_verification_failed")
             destination_identity = self._copy_source(
                 root_directory,
                 manifest,
@@ -1546,12 +1548,291 @@ class AutoV2MediaMigrator(object):
             if source is not None:
                 source.close()
 
+    def _verify_intent_staging_identity(
+        self,
+        staging_directory,
+        staging_name,
+        descriptor,
+        publish_intent,
+        expected_link_count,
+    ):
+        try:
+            staging_directory.verify_current()
+            named_stat = os.stat(
+                staging_name,
+                dir_fd=staging_directory.descriptor,
+                follow_symlinks=False,
+            )
+            descriptor_stat = os.fstat(descriptor)
+        except (MediaPathError, OSError) as error:
+            raise _command_error("media_verification_failed", error)
+        if (
+            not stat.S_ISREG(named_stat.st_mode)
+            or not stat.S_ISREG(descriptor_stat.st_mode)
+            or (
+                named_stat.st_dev,
+                named_stat.st_ino,
+            ) != publish_intent[:2]
+            or (
+                descriptor_stat.st_dev,
+                descriptor_stat.st_ino,
+            ) != publish_intent[:2]
+            or named_stat.st_nlink != expected_link_count
+            or descriptor_stat.st_nlink != expected_link_count
+            or named_stat.st_uid != self.service_uid
+            or stat.S_IMODE(named_stat.st_mode) != 0o600
+        ):
+            raise _command_error("media_verification_failed")
+        return descriptor_stat
+
+    def _open_intent_staging(
+        self,
+        staging_directory,
+        publish_intent,
+        file_plan,
+        expected_link_count,
+    ):
+        flags = os.O_RDONLY | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        descriptor = None
+        try:
+            descriptor = os.open(
+                publish_intent[4],
+                flags,
+                dir_fd=staging_directory.descriptor,
+            )
+            self._verify_intent_staging_identity(
+                staging_directory,
+                publish_intent[4],
+                descriptor,
+                publish_intent,
+                expected_link_count,
+            )
+            _verify_staging(descriptor, file_plan)
+            self._verify_intent_staging_identity(
+                staging_directory,
+                publish_intent[4],
+                descriptor,
+                publish_intent,
+                expected_link_count,
+            )
+            return descriptor
+        except BaseException:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
+            raise
+
+    def _record_intent_destination(
+        self,
+        root_directory,
+        manifest,
+        image_id,
+        file_plan,
+        publish_intent,
+    ):
+        destination = open_verified_media_file(
+            root_directory, file_plan.new_path
+        )
+        try:
+            parent_stat = os.fstat(
+                destination.parent_directory.descriptor
+            )
+            if (
+                parent_stat.st_dev,
+                parent_stat.st_ino,
+            ) != publish_intent[2:4]:
+                raise _command_error("destination_collision")
+            _verify_receipt_details(
+                destination,
+                file_plan.size,
+                file_plan.sha256,
+                file_plan.image_format,
+                file_plan.width,
+                file_plan.height,
+                "destination_collision",
+                expected_identity=publish_intent[:2],
+            )
+        finally:
+            destination.close()
+        manifest.record_published(
+            image_id,
+            file_plan.kind_key,
+            publish_intent[:2],
+        )
+
+    def _resume_publish_intent(
+        self,
+        root_directory,
+        manifest,
+        image_id,
+        file_plan,
+        publish_intent,
+    ):
+        staging_directory = None
+        destination_directory = None
+        staging_descriptor = None
+        try:
+            staging_directory = open_or_create_media_directory_from(
+                root_directory, ".staging"
+            )
+            relative_directory, destination_name = (
+                file_plan.new_path.rsplit("/", 1)
+            )
+            destination_directory = open_or_create_media_directory_from(
+                root_directory, relative_directory
+            )
+            staging_directory.verify_current()
+            destination_directory.verify_current()
+            destination_parent_stat = os.fstat(
+                destination_directory.descriptor
+            )
+            if (
+                destination_parent_stat.st_dev,
+                destination_parent_stat.st_ino,
+            ) != publish_intent[2:4]:
+                raise _command_error("destination_collision")
+            try:
+                destination_stat = os.stat(
+                    destination_name,
+                    dir_fd=destination_directory.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                destination_stat = None
+
+            if destination_stat is None:
+                staging_descriptor = self._open_intent_staging(
+                    staging_directory,
+                    publish_intent,
+                    file_plan,
+                    1,
+                )
+                destination_directory.verify_current()
+                try:
+                    os.link(
+                        publish_intent[4],
+                        destination_name,
+                        src_dir_fd=staging_directory.descriptor,
+                        dst_dir_fd=destination_directory.descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError as error:
+                    raise _command_error("destination_collision", error)
+                destination_stat = os.stat(
+                    destination_name,
+                    dir_fd=destination_directory.descriptor,
+                    follow_symlinks=False,
+                )
+            elif (
+                not stat.S_ISREG(destination_stat.st_mode)
+                or (
+                    destination_stat.st_dev,
+                    destination_stat.st_ino,
+                ) != publish_intent[:2]
+            ):
+                raise _command_error("destination_collision")
+            elif destination_stat.st_nlink == 1:
+                try:
+                    os.stat(
+                        publish_intent[4],
+                        dir_fd=staging_directory.descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    self._record_intent_destination(
+                        root_directory,
+                        manifest,
+                        image_id,
+                        file_plan,
+                        publish_intent,
+                    )
+                    return
+                raise _command_error("destination_collision")
+            elif destination_stat.st_nlink == 2:
+                staging_descriptor = self._open_intent_staging(
+                    staging_directory,
+                    publish_intent,
+                    file_plan,
+                    2,
+                )
+            else:
+                raise _command_error("destination_collision")
+
+            self._verify_intent_staging_identity(
+                staging_directory,
+                publish_intent[4],
+                staging_descriptor,
+                publish_intent,
+                2,
+            )
+            destination_stat = os.stat(
+                destination_name,
+                dir_fd=destination_directory.descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(destination_stat.st_mode)
+                or (
+                    destination_stat.st_dev,
+                    destination_stat.st_ino,
+                ) != publish_intent[:2]
+                or destination_stat.st_nlink != 2
+            ):
+                raise _command_error("destination_collision")
+            os.fsync(staging_descriptor)
+            destination_directory.fsync_publish()
+            self._inject_fault(
+                "after_publish_fsync_before_staging_unlink"
+            )
+            destination_directory.verify_current()
+            os.unlink(
+                publish_intent[4],
+                dir_fd=staging_directory.descriptor,
+            )
+            os.fsync(staging_directory.descriptor)
+            destination_stat = os.stat(
+                destination_name,
+                dir_fd=destination_directory.descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(destination_stat.st_mode)
+                or (
+                    destination_stat.st_dev,
+                    destination_stat.st_ino,
+                ) != publish_intent[:2]
+                or destination_stat.st_nlink != 1
+                or os.fstat(staging_descriptor).st_nlink != 1
+            ):
+                raise _command_error("media_verification_failed")
+            self._record_intent_destination(
+                root_directory,
+                manifest,
+                image_id,
+                file_plan,
+                publish_intent,
+            )
+        finally:
+            if staging_descriptor is not None:
+                os.close(staging_descriptor)
+            if destination_directory is not None:
+                destination_directory.close()
+            if staging_directory is not None:
+                staging_directory.close()
+
     def _copy_source(
         self, root_directory, manifest, image_id, source, file_plan
     ):
         staging_directory = None
         destination_directory = None
         staging = None
+        intent_recorded = False
         published = False
         try:
             staging_directory = open_or_create_media_directory_from(
@@ -1591,12 +1872,14 @@ class AutoV2MediaMigrator(object):
             manifest.record_publish_intent(
                 image_id,
                 file_plan.kind_key,
+                staging.name,
                 (staging_stat.st_dev, staging_stat.st_ino),
                 (
                     destination_parent_stat.st_dev,
                     destination_parent_stat.st_ino,
                 ),
             )
+            intent_recorded = True
             self._inject_fault("after_publish_intent")
             try:
                 os.link(
@@ -1624,6 +1907,9 @@ class AutoV2MediaMigrator(object):
                 raise _command_error("media_verification_failed")
             os.fsync(staging.descriptor)
             destination_directory.fsync_publish()
+            self._inject_fault(
+                "after_publish_fsync_before_staging_unlink"
+            )
             staging.cleanup()
             published = True
             destination = open_verified_media_file(
@@ -1648,7 +1934,7 @@ class AutoV2MediaMigrator(object):
             return destination_identity
         finally:
             if staging is not None:
-                if not published:
+                if not published and not intent_recorded:
                     staging.cleanup()
                 staging.close()
             if destination_directory is not None:

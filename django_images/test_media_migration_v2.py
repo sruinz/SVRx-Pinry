@@ -703,6 +703,100 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         )
         self.assertEqual(self.manifest_events()[-1]["event"], "committed")
 
+    def test_publish_intent_before_link_crash_resumes_from_staging(self):
+        image = self.make_image(sizes=())
+
+        def crash(point):
+            if point == "after_publish_intent":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        destination = Path(
+            self.temporary_media.name, destination_relative
+        )
+        self.assertFalse(destination.exists())
+        intent = next(
+            event
+            for event in self.manifest_events()
+            if event["event"] == "publish_intent"
+        )
+        staging = Path(
+            self.temporary_media.name,
+            ".staging",
+            intent["staging_name"],
+        )
+        staging_stat = os.stat(str(staging))
+        self.assertEqual(
+            (staging_stat.st_dev, staging_stat.st_ino),
+            (intent["staging_device"], intent["staging_inode"]),
+        )
+        self.assertEqual(staging_stat.st_nlink, 1)
+        self.assertEqual(staging_stat.st_uid, self.service_uid)
+        self.assertEqual(stat.S_IMODE(staging_stat.st_mode), 0o600)
+
+        self.migrator().run(execute=True)
+
+        image.refresh_from_db()
+        self.assertRegex(
+            intent["staging_name"],
+            r"^auto-v2-[0-9a-f-]{36}\.part$",
+        )
+        self.assertFalse(
+            Path(
+                self.temporary_media.name,
+                ".staging",
+                intent["staging_name"],
+            ).exists()
+        )
+        self.assertEqual(image.image.name, destination_relative)
+        self.assertEqual(os.stat(str(destination)).st_nlink, 1)
+        self.assertEqual(self.manifest_events()[-1]["event"], "committed")
+
+    def test_publish_fsync_before_staging_unlink_crash_resumes(self):
+        image = self.make_image(sizes=())
+
+        def crash(point):
+            if point == "after_publish_fsync_before_staging_unlink":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+
+        intent = next(
+            event
+            for event in self.manifest_events()
+            if event["event"] == "publish_intent"
+        )
+        staging = Path(
+            self.temporary_media.name,
+            ".staging",
+            intent["staging_name"],
+        )
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        destination = Path(
+            self.temporary_media.name, destination_relative
+        )
+        staging_stat = os.stat(str(staging))
+        destination_stat = os.stat(str(destination))
+        self.assertEqual(staging_stat.st_ino, destination_stat.st_ino)
+        self.assertEqual(staging_stat.st_dev, destination_stat.st_dev)
+        self.assertEqual(staging_stat.st_nlink, 2)
+
+        self.migrator().run(execute=True)
+
+        image.refresh_from_db()
+        self.assertFalse(staging.exists())
+        self.assertEqual(image.image.name, destination_relative)
+        self.assertEqual(os.stat(str(destination)).st_nlink, 1)
+        self.assertEqual(self.manifest_events()[-1]["event"], "committed")
+
     def test_publish_intent_does_not_adopt_external_destination(self):
         image = self.make_image(sizes=())
         source = Path(self.temporary_media.name, image.image.name)
