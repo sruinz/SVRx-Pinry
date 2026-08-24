@@ -52,17 +52,27 @@ def _log_cleanup_incomplete(
     run_uuid,
     kind,
     error_type,
+    include_identifiers=True,
 ):
     try:
-        logger.warning(
-            "media_storage_cleanup_incomplete event=%s asset_uuid=%s "
-            "run_uuid=%s kind=%s error_type=%s",
-            event,
-            str(asset_uuid),
-            str(run_uuid),
-            kind,
-            error_type,
-        )
+        if include_identifiers:
+            logger.warning(
+                "media_storage_cleanup_incomplete event=%s asset_uuid=%s "
+                "run_uuid=%s kind=%s error_type=%s",
+                event,
+                str(asset_uuid),
+                str(run_uuid),
+                kind,
+                error_type,
+            )
+        else:
+            logger.warning(
+                "media_storage_cleanup_incomplete event=%s kind=%s "
+                "error_type=%s",
+                event,
+                kind,
+                error_type,
+            )
     except BaseException:
         pass
 
@@ -103,6 +113,7 @@ class PreparedAsset(object):
         files,
         root_directory,
         staging_directory,
+        include_cleanup_identifiers=True,
     ):
         self.asset_uuid = asset_uuid
         self.original_filename = original_filename
@@ -110,7 +121,18 @@ class PreparedAsset(object):
         self.files = tuple(files)
         self.root_directory = root_directory
         self.staging_directory = staging_directory
+        self._include_cleanup_identifiers = include_cleanup_identifiers
         self._cleaned = False
+
+    def _log_cleanup(self, event, kind, error_type):
+        _log_cleanup_incomplete(
+            event,
+            self.asset_uuid,
+            self.run_uuid,
+            kind,
+            error_type,
+            include_identifiers=self._include_cleanup_identifiers,
+        )
 
     @property
     def is_open(self):
@@ -134,18 +156,14 @@ class PreparedAsset(object):
             try:
                 removed = prepared_file.owned_staging_handle.cleanup()
                 if removed is False:
-                    _log_cleanup_incomplete(
+                    self._log_cleanup(
                         "prepare_file_preserved",
-                        self.asset_uuid,
-                        self.run_uuid,
                         prepared_file.kind,
                         "IdentityMismatch",
                     )
             except BaseException as error:
-                _log_cleanup_incomplete(
+                self._log_cleanup(
                     "prepare_file_cleanup_failed",
-                    self.asset_uuid,
-                    self.run_uuid,
                     prepared_file.kind,
                     type(error).__name__,
                 )
@@ -153,48 +171,38 @@ class PreparedAsset(object):
             try:
                 prepared_file.owned_staging_handle.close()
             except BaseException as error:
-                _log_cleanup_incomplete(
+                self._log_cleanup(
                     "prepare_file_close_failed",
-                    self.asset_uuid,
-                    self.run_uuid,
                     prepared_file.kind,
                     type(error).__name__,
                 )
         try:
             reason = self.staging_directory.remove_created_suffix(1)
             if reason is not None:
-                _log_cleanup_incomplete(
+                self._log_cleanup(
                     "prepare_directory_preserved",
-                    self.asset_uuid,
-                    self.run_uuid,
                     "staging",
                     reason,
                 )
         except BaseException as error:
-            _log_cleanup_incomplete(
+            self._log_cleanup(
                 "prepare_directory_cleanup_failed",
-                self.asset_uuid,
-                self.run_uuid,
                 "staging",
                 type(error).__name__,
             )
         try:
             self.staging_directory.close()
         except BaseException as error:
-            _log_cleanup_incomplete(
+            self._log_cleanup(
                 "prepare_directory_close_failed",
-                self.asset_uuid,
-                self.run_uuid,
                 "staging",
                 type(error).__name__,
             )
         try:
             self.root_directory.close()
         except BaseException as error:
-            _log_cleanup_incomplete(
+            self._log_cleanup(
                 "prepare_directory_close_failed",
-                self.asset_uuid,
-                self.run_uuid,
                 "root",
                 type(error).__name__,
             )
@@ -301,18 +309,14 @@ class PublishedAsset(object):
                     missing_ok=True,
                 )
                 if not removed:
-                    _log_cleanup_incomplete(
+                    self.prepared._log_cleanup(
                         "compensate_file_preserved",
-                        self.asset_uuid,
-                        self.prepared.run_uuid,
                         published_file.kind,
                         "IdentityMismatch",
                     )
             except BaseException as error:
-                _log_cleanup_incomplete(
+                self.prepared._log_cleanup(
                     "compensate_file_cleanup_failed",
-                    self.asset_uuid,
-                    self.prepared.run_uuid,
                     published_file.kind,
                     type(error).__name__,
                 )
@@ -323,18 +327,14 @@ class PublishedAsset(object):
             try:
                 reason = directory.remove_created_suffix(1)
                 if reason is not None:
-                    _log_cleanup_incomplete(
+                    self.prepared._log_cleanup(
                         "compensate_directory_preserved",
-                        self.asset_uuid,
-                        self.prepared.run_uuid,
                         kind,
                         reason,
                     )
             except BaseException as error:
-                _log_cleanup_incomplete(
+                self.prepared._log_cleanup(
                     "compensate_directory_cleanup_failed",
-                    self.asset_uuid,
-                    self.prepared.run_uuid,
                     kind,
                     type(error).__name__,
                 )
@@ -351,10 +351,8 @@ class PublishedAsset(object):
         try:
             self.prepared.cleanup()
         except BaseException as error:
-            _log_cleanup_incomplete(
+            self.prepared._log_cleanup(
                 "prepared_cleanup_failed",
-                self.asset_uuid,
-                self.prepared.run_uuid,
                 "staging",
                 type(error).__name__,
             )
@@ -365,10 +363,8 @@ class PublishedAsset(object):
             try:
                 directory.close()
             except BaseException as error:
-                _log_cleanup_incomplete(
+                self.prepared._log_cleanup(
                     "published_directory_close_failed",
-                    self.asset_uuid,
-                    self.prepared.run_uuid,
                     kind,
                     type(error).__name__,
                 )
@@ -744,6 +740,7 @@ class MediaStorage(object):
                 fetched,
                 inputs,
                 deadline,
+                include_cleanup_identifiers=False,
             )
         except BaseException as error:
             if owned_root is not None and owned_root.descriptors:
@@ -782,6 +779,7 @@ class MediaStorage(object):
         fetched,
         inputs,
         deadline,
+        include_cleanup_identifiers=True,
     ):
         (
             asset_uuid,
@@ -862,6 +860,7 @@ class MediaStorage(object):
                 files=prepared_files,
                 root_directory=root_directory,
                 staging_directory=staging_directory,
+                include_cleanup_identifiers=include_cleanup_identifiers,
             )
         except BaseException as error:
             if isinstance(error, (MediaPathError, OSError)):
@@ -871,6 +870,7 @@ class MediaStorage(object):
                     run_uuid,
                     active_kind,
                     type(error).__name__,
+                    include_identifiers=include_cleanup_identifiers,
                 )
             self._cleanup_partial_prepare(
                 prepared_files,
@@ -878,6 +878,7 @@ class MediaStorage(object):
                 root_directory,
                 asset_uuid,
                 run_uuid,
+                include_cleanup_identifiers,
             )
             if not isinstance(error, Exception):
                 raise
@@ -1444,6 +1445,7 @@ class MediaStorage(object):
         root_directory,
         asset_uuid,
         run_uuid,
+        include_cleanup_identifiers=True,
     ):
         for prepared_file in reversed(files):
             try:
@@ -1455,6 +1457,7 @@ class MediaStorage(object):
                         run_uuid,
                         prepared_file.kind,
                         "IdentityMismatch",
+                        include_identifiers=include_cleanup_identifiers,
                     )
             except BaseException as error:
                 _log_cleanup_incomplete(
@@ -1463,6 +1466,7 @@ class MediaStorage(object):
                     run_uuid,
                     prepared_file.kind,
                     type(error).__name__,
+                    include_identifiers=include_cleanup_identifiers,
                 )
             try:
                 prepared_file.owned_staging_handle.close()
@@ -1473,6 +1477,7 @@ class MediaStorage(object):
                     run_uuid,
                     prepared_file.kind,
                     type(error).__name__,
+                    include_identifiers=include_cleanup_identifiers,
                 )
         if staging_directory is not None:
             try:
@@ -1484,6 +1489,7 @@ class MediaStorage(object):
                         run_uuid,
                         "staging",
                         reason,
+                        include_identifiers=include_cleanup_identifiers,
                     )
             except BaseException as error:
                 _log_cleanup_incomplete(
@@ -1492,6 +1498,7 @@ class MediaStorage(object):
                     run_uuid,
                     "staging",
                     type(error).__name__,
+                    include_identifiers=include_cleanup_identifiers,
                 )
             try:
                 staging_directory.close()
@@ -1502,6 +1509,7 @@ class MediaStorage(object):
                     run_uuid,
                     "staging",
                     type(error).__name__,
+                    include_identifiers=include_cleanup_identifiers,
                 )
         if root_directory is not None:
             try:
@@ -1513,6 +1521,7 @@ class MediaStorage(object):
                     run_uuid,
                     "root",
                     type(error).__name__,
+                    include_identifiers=include_cleanup_identifiers,
                 )
 
     @staticmethod

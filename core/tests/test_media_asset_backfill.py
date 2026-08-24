@@ -10,11 +10,13 @@ import uuid
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db.models.signals import post_save
 from django.test import TransactionTestCase, override_settings
 import mock
 from PIL import Image as PILImage
 
 from core.models import MediaAsset, Pin
+from core.services import media_asset_backfill
 from core.services.idempotency import IdempotencyStore
 from core.services.media_asset_backfill import (
     BackfillSummary,
@@ -451,6 +453,93 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
 
         self.assertFalse(MediaAsset.objects.exists())
 
+    def test_precommit_fence_rejects_image_added_during_registry_insert(self):
+        self._create_candidate()
+        service = self._service()
+        service.run()
+        injected = {"value": False}
+
+        def add_image(event):
+            if event == "before_registry_insert" and not injected["value"]:
+                injected["value"] = True
+                self._create_candidate(
+                    owners=(self.other_owner,),
+                    content=_png_bytes("navy"),
+                )
+
+        service.fault_injector = add_image
+        with self.assertRaisesRegex(
+            CommandError,
+            "^registry_plan_identity_changed$",
+        ):
+            service.run(execute=True)
+
+        self.assertFalse(MediaAsset.objects.exists())
+        self.assertEqual(Image.objects.count(), 1)
+
+    def test_precommit_fence_rejects_other_planned_row_mutation(self):
+        self._create_candidate(content=_png_bytes("red"))
+        other = self._create_candidate(
+            owners=(self.other_owner,),
+            content=_png_bytes("navy"),
+        )
+        original_width = other["image"].width
+        service = self._service()
+        service.run()
+        injected = {"value": False}
+
+        def mutate_other(event):
+            if event == "before_registry_insert" and not injected["value"]:
+                injected["value"] = True
+                Image.objects.filter(pk=other["image"].pk).update(
+                    width=original_width + 1,
+                )
+
+        service.fault_injector = mutate_other
+        with self.assertRaisesRegex(
+            CommandError,
+            "^registry_plan_identity_changed$",
+        ):
+            service.run(execute=True)
+
+        self.assertFalse(MediaAsset.objects.exists())
+        self.assertEqual(
+            Image.objects.values_list("width", flat=True).get(
+                pk=other["image"].pk
+            ),
+            original_width,
+        )
+
+    def test_precommit_fence_rechecks_owner_after_registry_insert(self):
+        candidate = self._create_candidate()
+        service = self._service()
+        service.run()
+
+        def mutate_owner(sender, instance, created, **kwargs):
+            del sender, instance, kwargs
+            if created:
+                Pin.objects.filter(pk=candidate["pins"][0].pk).update(
+                    submitter=self.other_owner,
+                )
+
+        post_save.connect(mutate_owner, sender=MediaAsset, weak=False)
+        try:
+            with self.assertRaisesRegex(
+                CommandError,
+                "^registry_plan_identity_changed$",
+            ):
+                service.run(execute=True)
+        finally:
+            post_save.disconnect(mutate_owner, sender=MediaAsset)
+
+        self.assertFalse(MediaAsset.objects.exists())
+        self.assertEqual(
+            Pin.objects.values_list("submitter_id", flat=True).get(
+                pk=candidate["pins"][0].pk
+            ),
+            self.owner.pk,
+        )
+
     def test_manifest_terminal_event_must_match_frozen_group_decision(self):
         candidate = self._create_candidate()
         service = self._service()
@@ -634,6 +723,63 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             event["event"] for event in events
         })
 
+    def test_recovery_rechecks_registry_at_terminal_event_boundary(self):
+        self._create_candidate()
+        crashed = {"value": False}
+
+        def crash_once(event):
+            if event == "after_registry_commit" and not crashed["value"]:
+                crashed["value"] = True
+                raise RuntimeError("simulated crash")
+
+        service = self._service(fault_injector=crash_once)
+        service.run()
+        with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+            service.run(execute=True)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+        service.fault_injector = None
+        original_record = media_asset_backfill._BackfillManifestLog.record_result
+
+        def delete_then_record(
+            manifest,
+            event_name,
+            image_id,
+            reason_code=None,
+            **kwargs
+        ):
+            if event_name == "recovered_registered":
+                MediaAsset.objects.all().delete()
+            return original_record(
+                manifest,
+                event_name,
+                image_id,
+                reason_code=reason_code,
+                **kwargs
+            )
+
+        with mock.patch.object(
+            media_asset_backfill._BackfillManifestLog,
+            "record_result",
+            new=delete_then_record,
+        ):
+            with self.assertRaisesRegex(
+                CommandError,
+                "^registry_plan_identity_changed$",
+            ):
+                service.run(execute=True)
+
+        events = [
+            json.loads(line)
+            for line in Path(
+                service.run_directory,
+                MANIFEST_FILENAME,
+            ).read_text().splitlines()
+        ]
+        self.assertFalse(MediaAsset.objects.exists())
+        self.assertNotIn("recovered_registered", {
+            event["event"] for event in events
+        })
+
     def test_manifest_rejects_symlink_hardlink_bad_mode_and_bad_owner(self):
         mutators = (
             self._manifest_symlink,
@@ -757,6 +903,37 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         with self.assertRaises(KeyboardInterrupt):
             self._service(fault_injector=interrupt).run()
         self.assertEqual(self._staging_files(), [])
+
+    def test_owned_root_cleanup_warnings_are_sanitized(self):
+        candidate = self._create_candidate(
+            original_filename="sentinel-private-original.png"
+        )
+        service = self._service()
+
+        with mock.patch(
+            "django_images.file_ops.OwnedStagingFile.cleanup",
+            side_effect=OSError("sentinel-private-cleanup-error"),
+        ), mock.patch(
+            "core.services.media_storage.logger.warning",
+        ) as warning:
+            service.run()
+
+        rendered = "\n".join(
+            call.args[0] % call.args[1:]
+            for call in warning.call_args_list
+        )
+        self.assertEqual(warning.call_count, 5)
+        forbidden = (
+            str(candidate["image"].asset_uuid),
+            candidate["image"].original_filename,
+            candidate["paths"]["original"],
+            str(self.owner.pk),
+            "sentinel-private-cleanup-error",
+        )
+        for value in forbidden:
+            self.assertNotIn(value, rendered)
+        self.assertIn("media_storage_cleanup_incomplete", rendered)
+        self.assertIn("prepare_file_cleanup_failed", rendered)
 
     def _staging_files(self):
         staging = Path(self.temporary_media.name, ".staging")
