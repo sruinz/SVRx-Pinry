@@ -1447,6 +1447,142 @@ def _link_descriptor_empty_path(
     raise OSError(error_number, os.strerror(error_number))
 
 
+def _raise_atomic_rename_error(error_number):
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number))
+    if error_number == errno.ENOENT:
+        raise FileNotFoundError(error_number, os.strerror(error_number))
+    if error_number in (
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+        errno.EXDEV,
+    ):
+        raise MediaPathError("atomic_rename_unsupported")
+    raise OSError(error_number, os.strerror(error_number))
+
+
+def _linux_rename_noreplace(
+    source_directory_descriptor,
+    source_name,
+    destination_directory_descriptor,
+    destination_name,
+):
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source_name)
+    destination_bytes = os.fsencode(destination_name)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is not None:
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            source_directory_descriptor,
+            source_bytes,
+            destination_directory_descriptor,
+            destination_bytes,
+            1,
+        )
+    else:
+        machine = os.uname().machine.lower()
+        syscall_number = {
+            "aarch64": 276,
+            "arm64": 276,
+            "armv7l": 382,
+            "i386": 353,
+            "i686": 353,
+            "ppc64": 357,
+            "ppc64le": 357,
+            "riscv64": 276,
+            "s390x": 347,
+            "x86_64": 316,
+        }.get(machine)
+        syscall = getattr(libc, "syscall", None)
+        if syscall_number is None or syscall is None:
+            raise MediaPathError("atomic_rename_unsupported")
+        syscall.restype = ctypes.c_long
+        result = syscall(
+            ctypes.c_long(syscall_number),
+            ctypes.c_int(source_directory_descriptor),
+            ctypes.c_char_p(source_bytes),
+            ctypes.c_int(destination_directory_descriptor),
+            ctypes.c_char_p(destination_bytes),
+            ctypes.c_uint(1),
+        )
+    if result != 0:
+        _raise_atomic_rename_error(ctypes.get_errno())
+
+
+def _darwin_rename_noreplace(
+    source_directory_descriptor,
+    source_name,
+    destination_directory_descriptor,
+    destination_name,
+):
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameatx_np = getattr(libc, "renameatx_np", None)
+    if renameatx_np is None:
+        raise MediaPathError("atomic_rename_unsupported")
+    renameatx_np.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameatx_np.restype = ctypes.c_int
+    result = renameatx_np(
+        source_directory_descriptor,
+        os.fsencode(source_name),
+        destination_directory_descriptor,
+        os.fsencode(destination_name),
+        0x00000004,
+    )
+    if result != 0:
+        _raise_atomic_rename_error(ctypes.get_errno())
+
+
+def rename_media_noreplace(
+    source_directory,
+    source_name,
+    destination_directory,
+    destination_name,
+):
+    if not isinstance(source_directory, MediaDirectory):
+        raise TypeError("source_directory must be a MediaDirectory")
+    if not isinstance(destination_directory, MediaDirectory):
+        raise TypeError("destination_directory must be a MediaDirectory")
+    if (
+        len(_relative_components(source_name)) != 1
+        or len(_relative_components(destination_name)) != 1
+    ):
+        raise MediaPathError("media_path_escape")
+    source_directory.verify_current()
+    destination_directory.verify_current()
+    if sys.platform.startswith("linux"):
+        _linux_rename_noreplace(
+            source_directory.descriptor,
+            source_name,
+            destination_directory.descriptor,
+            destination_name,
+        )
+    elif sys.platform == "darwin":
+        _darwin_rename_noreplace(
+            source_directory.descriptor,
+            source_name,
+            destination_directory.descriptor,
+            destination_name,
+        )
+    else:
+        raise MediaPathError("atomic_rename_unsupported")
+
+
 def _link_descriptor_proc(
     file_descriptor, directory_descriptor, destination_name
 ):

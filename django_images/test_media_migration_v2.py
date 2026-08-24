@@ -1,4 +1,5 @@
 from io import BytesIO, StringIO
+import errno
 import json
 import os
 from pathlib import Path
@@ -170,6 +171,50 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
     def manifest_events(self):
         with self.manifest_path.open(encoding="utf-8") as manifest:
             return [json.loads(line) for line in manifest]
+
+    def primitive_window_staging_swap(self):
+        swapped_names = []
+        replacement_bytes = b"primitive-window-replacement"
+        staging_directory = Path(self.temporary_media.name, ".staging")
+
+        def swap_before_atomic_publish(point):
+            if point != "before_atomic_publish" or swapped_names:
+                return
+            directory_descriptor = os.open(
+                str(staging_directory),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                staging_names = [
+                    name
+                    for name in os.listdir(str(staging_directory))
+                    if _valid_staging_name(name)
+                ]
+                self.assertEqual(len(staging_names), 1)
+                name = staging_names[0]
+                replacement_name = "swap-{}.part".format(uuid.uuid4())
+                descriptor = os.open(
+                    replacement_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                try:
+                    os.write(descriptor, replacement_bytes)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                os.replace(
+                    replacement_name,
+                    name,
+                    src_dir_fd=directory_descriptor,
+                    dst_dir_fd=directory_descriptor,
+                )
+                swapped_names.append(name)
+            finally:
+                os.close(directory_descriptor)
+
+        return swap_before_atomic_publish, swapped_names, replacement_bytes
 
     def test_md5_closure_plans_named_targets_from_database_name_and_real_format(self):
         image = self.make_image()
@@ -704,6 +749,27 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         events = self.manifest_events()
         self.assertIn("publish_intent", {event["event"] for event in events})
         self.assertNotIn("published", {event["event"] for event in events})
+        intent = next(
+            event for event in events if event["event"] == "publish_intent"
+        )
+        staging = Path(
+            self.temporary_media.name,
+            ".staging",
+            intent["staging_name"],
+        )
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        destination = Path(
+            self.temporary_media.name, destination_relative
+        )
+        self.assertFalse(staging.exists())
+        destination_stat = os.stat(str(destination))
+        self.assertEqual(
+            (destination_stat.st_dev, destination_stat.st_ino),
+            (intent["staging_device"], intent["staging_inode"]),
+        )
+        self.assertEqual(destination_stat.st_nlink, 1)
 
         self.migrator().run(execute=True)
 
@@ -716,7 +782,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         )
         self.assertEqual(self.manifest_events()[-1]["event"], "committed")
 
-    def test_publish_intent_before_link_crash_resumes_from_staging(self):
+    def test_publish_intent_before_atomic_publish_resumes_from_staging(self):
         image = self.make_image(sizes=())
 
         def crash(point):
@@ -770,116 +836,137 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertEqual(os.stat(str(destination)).st_nlink, 1)
         self.assertEqual(self.manifest_events()[-1]["event"], "committed")
 
-    def test_publish_fsync_before_staging_unlink_crash_resumes(self):
+    def test_initial_publish_rejects_swap_in_exact_detach_primitive_window(self):
         image = self.make_image(sizes=())
+        old_path = image.image.name
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        fault, swapped, replacement_bytes = (
+            self.primitive_window_staging_swap()
+        )
 
-        def crash(point):
-            if point == "after_publish_fsync_before_staging_unlink":
-                raise SimulatedProcessCrash()
+        with self.assertRaisesRegex(
+            CommandError, "media_verification_failed"
+        ):
+            self.migrator(fault_injector=fault).run(execute=True)
 
-        with self.assertRaises(SimulatedProcessCrash):
-            self.migrator(fault_injector=crash).run(execute=True)
-
+        self.assertEqual(len(swapped), 1)
         intent = next(
             event
             for event in self.manifest_events()
             if event["event"] == "publish_intent"
         )
         staging = Path(
-            self.temporary_media.name,
-            ".staging",
-            intent["staging_name"],
+            self.temporary_media.name, ".staging", intent["staging_name"]
         )
-        destination_relative = canonical_original_path(
-            image.asset_uuid, image.original_filename, ".png"
+        self.assertEqual(staging.read_bytes(), replacement_bytes)
+        self.assertFalse(
+            Path(self.temporary_media.name, destination_relative).exists()
         )
-        destination = Path(
-            self.temporary_media.name, destination_relative
-        )
-        staging_stat = os.stat(str(staging))
-        destination_stat = os.stat(str(destination))
-        self.assertEqual(staging_stat.st_ino, destination_stat.st_ino)
-        self.assertEqual(staging_stat.st_dev, destination_stat.st_dev)
-        self.assertEqual(staging_stat.st_nlink, 2)
-
-        self.migrator().run(execute=True)
-
-        image.refresh_from_db()
-        self.assertFalse(staging.exists())
-        self.assertEqual(image.image.name, destination_relative)
-        self.assertEqual(os.stat(str(destination)).st_nlink, 1)
-        self.assertEqual(self.manifest_events()[-1]["event"], "committed")
-
-    def test_resume_rejects_staging_name_swap_before_unlink(self):
-        image = self.make_image(sizes=())
-        old_path = image.image.name
-
-        def crash(point):
-            if point == "after_publish_fsync_before_staging_unlink":
-                raise SimulatedProcessCrash()
-
-        with self.assertRaises(SimulatedProcessCrash):
-            self.migrator(fault_injector=crash).run(execute=True)
-
-        swapped = []
-
-        def swap_staging_name(point):
-            if (
-                point != "after_publish_fsync_before_staging_unlink"
-                or swapped
-            ):
-                return
-            staging_directory = Path(
-                self.temporary_media.name, ".staging"
-            )
-            staging = next(staging_directory.glob("auto-v2-*.part"))
-            replacement = staging_directory / "replacement.part"
-            replacement.write_bytes(b"replacement")
-            os.replace(str(replacement), str(staging))
-            swapped.append(True)
-
-        with self.assertRaisesRegex(
-            CommandError, "media_verification_failed"
-        ):
-            self.migrator(
-                fault_injector=swap_staging_name
-            ).run(execute=True)
-
         image.refresh_from_db()
         self.assertEqual(image.image.name, old_path)
         events = {event["event"] for event in self.manifest_events()}
         self.assertNotIn("published", events)
         self.assertNotIn("committed", events)
 
-    def test_initial_publish_rejects_staging_name_swap_before_cleanup(self):
+    def test_resume_rejects_swap_in_exact_detach_primitive_window(self):
         image = self.make_image(sizes=())
         old_path = image.image.name
-        swapped = []
 
-        def swap_staging_name(point):
-            if (
-                point != "after_publish_fsync_before_staging_unlink"
-                or swapped
-            ):
-                return
-            staging_directory = Path(
-                self.temporary_media.name, ".staging"
-            )
-            staging = next(staging_directory.glob("auto-v2-*.part"))
-            replacement = staging_directory / "replacement.part"
-            replacement.write_bytes(b"replacement")
-            os.replace(str(replacement), str(staging))
-            swapped.append(True)
+        def crash_after_intent(point):
+            if point == "after_publish_intent":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(
+                fault_injector=crash_after_intent
+            ).run(execute=True)
+
+        intent = next(
+            event
+            for event in self.manifest_events()
+            if event["event"] == "publish_intent"
+        )
+        staging_directory = Path(self.temporary_media.name, ".staging")
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        destination = Path(self.temporary_media.name, destination_relative)
+        self.assertFalse(destination.exists())
+        self.assertEqual(
+            os.stat(
+                str(staging_directory / intent["staging_name"])
+            ).st_nlink,
+            1,
+        )
+        fault, swapped, replacement_bytes = (
+            self.primitive_window_staging_swap()
+        )
 
         with self.assertRaisesRegex(
             CommandError, "media_verification_failed"
         ):
-            self.migrator(
-                fault_injector=swap_staging_name
-            ).run(execute=True)
+            self.migrator(fault_injector=fault).run(execute=True)
+
+        self.assertEqual(len(swapped), 1)
+        staging = staging_directory / intent["staging_name"]
+        self.assertEqual(staging.read_bytes(), replacement_bytes)
+        self.assertFalse(destination.exists())
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, old_path)
+        events = {event["event"] for event in self.manifest_events()}
+        self.assertNotIn("published", events)
+        self.assertNotIn("committed", events)
+
+    def test_initial_publish_fails_closed_without_atomic_rename_support(self):
+        image = self.make_image(sizes=())
+        old_path = image.image.name
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+
+        with mock.patch(
+            "django_images.services.media_migration_v2."
+            "rename_media_noreplace",
+            side_effect=MediaPathError("atomic_rename_unsupported"),
+        ):
+            with self.assertRaisesRegex(
+                CommandError, "media_verification_failed"
+            ):
+                self.migrator().run(execute=True)
 
         image.refresh_from_db()
         self.assertEqual(image.image.name, old_path)
+        self.assertFalse(
+            Path(self.temporary_media.name, destination_relative).exists()
+        )
+        events = {event["event"] for event in self.manifest_events()}
+        self.assertNotIn("published", events)
+        self.assertNotIn("committed", events)
+
+    def test_initial_publish_fails_closed_across_filesystems(self):
+        image = self.make_image(sizes=())
+        old_path = image.image.name
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+
+        with mock.patch(
+            "django_images.services.media_migration_v2."
+            "rename_media_noreplace",
+            side_effect=OSError(errno.EXDEV, os.strerror(errno.EXDEV)),
+        ):
+            with self.assertRaisesRegex(
+                CommandError, "media_verification_failed"
+            ):
+                self.migrator().run(execute=True)
+
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, old_path)
+        self.assertFalse(
+            Path(self.temporary_media.name, destination_relative).exists()
+        )
         events = {event["event"] for event in self.manifest_events()}
         self.assertNotIn("published", events)
         self.assertNotIn("committed", events)
