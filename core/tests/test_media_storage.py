@@ -2213,3 +2213,129 @@ class DescriptorPublishReceiptTests(
                 )
 
         self.assertEqual(destination.read_bytes(), b"foreign")
+
+
+class MediaStorageOwnedRootTests(TemporaryMediaMixin, SimpleTestCase):
+    def setUp(self):
+        super(MediaStorageOwnedRootTests, self).setUp()
+        self.strict_media = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.addCleanup(self.strict_media.cleanup)
+        self.temporary_media = self.strict_media
+        self.strict_media_override = override_settings(
+            MEDIA_ROOT=self.temporary_media.name,
+        )
+        self.strict_media_override.enable()
+        self.addCleanup(self.strict_media_override.disable)
+
+    def test_verified_root_duplicate_is_independently_owned(self):
+        root = file_ops.open_verified_media_root(self.temporary_media.name)
+        duplicate = root.duplicate_owned()
+        try:
+            root_identity = os.fstat(root.descriptor)
+            duplicate_identity = os.fstat(duplicate.descriptor)
+            self.assertIsNot(root, duplicate)
+            self.assertNotEqual(root.descriptor, duplicate.descriptor)
+            self.assertEqual(
+                (root_identity.st_dev, root_identity.st_ino),
+                (duplicate_identity.st_dev, duplicate_identity.st_ino),
+            )
+
+            duplicate.close()
+
+            self.assertFalse(duplicate.descriptors)
+            self.assertTrue(root.verify_current())
+        finally:
+            duplicate.close()
+            root.close()
+
+    def test_prepare_from_root_uses_duplicate_and_keeps_shared_root_open(self):
+        root = file_ops.open_verified_media_root(self.temporary_media.name)
+        prepared = None
+        storage = MediaStorage(media_root=self.temporary_media.name)
+        try:
+            with mock.patch(
+                "core.services.media_storage.open_media_root",
+                side_effect=AssertionError("pathname root reopen"),
+            ) as legacy_open:
+                prepared = storage.prepare_from_root(
+                    root,
+                    make_fetched_image(),
+                    ASSET_UUID,
+                    "owned-root.png",
+                )
+
+            legacy_open.assert_not_called()
+            self.assertIsNot(prepared.root_directory, root)
+            root_stat = os.fstat(root.descriptor)
+            prepared_stat = os.fstat(prepared.root_directory.descriptor)
+            self.assertEqual(
+                (root_stat.st_dev, root_stat.st_ino),
+                (prepared_stat.st_dev, prepared_stat.st_ino),
+            )
+
+            prepared.cleanup()
+
+            self.assertFalse(prepared.root_directory.descriptors)
+            self.assertTrue(root.verify_current())
+        finally:
+            if prepared is not None:
+                prepared.cleanup()
+            root.close()
+
+    def test_two_preparations_cleanup_only_their_owned_root(self):
+        root = file_ops.open_verified_media_root(self.temporary_media.name)
+        storage = MediaStorage(media_root=self.temporary_media.name)
+        first = None
+        second = None
+        try:
+            first = storage.prepare_from_root(
+                root,
+                make_fetched_image(),
+                ASSET_UUID,
+                "first.png",
+            )
+            second = storage.prepare_from_root(
+                root,
+                make_fetched_image(size=(320, 240)),
+                uuid.uuid4(),
+                "second.png",
+            )
+
+            first.cleanup()
+
+            self.assertFalse(first.root_directory.descriptors)
+            self.assertTrue(root.verify_current())
+            self.assertTrue(second.is_open)
+            self.assertTrue(second.root_directory.verify_current())
+        finally:
+            if first is not None:
+                first.cleanup()
+            if second is not None:
+                second.cleanup()
+            root.close()
+
+    def test_prepare_from_root_rejects_path_swap_without_external_writes(self):
+        root = file_ops.open_verified_media_root(self.temporary_media.name)
+        media_root = Path(self.temporary_media.name)
+        retained = media_root.with_name(media_root.name + "-retained")
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        media_root.rename(retained)
+        media_root.symlink_to(outside.name, target_is_directory=True)
+        try:
+            with self.assertRaises(MediaStorageError) as caught:
+                MediaStorage(
+                    media_root=self.temporary_media.name,
+                ).prepare_from_root(
+                    root,
+                    make_fetched_image(),
+                    ASSET_UUID,
+                    "swapped.png",
+                )
+
+            self.assertEqual(caught.exception.code, "media_path_conflict")
+            self.assertEqual(list(Path(outside.name).rglob("*")), [])
+        finally:
+            root.close()
+            media_root.unlink()
+            retained.rename(media_root)

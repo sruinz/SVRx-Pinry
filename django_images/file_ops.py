@@ -274,6 +274,47 @@ class MediaDirectory(object):
         for descriptor in reversed(self.descriptors):
             os.fsync(descriptor)
 
+    def duplicate_owned(self):
+        if not self.verified_root:
+            raise MediaPathError("unsafe_media_directory")
+        self.verify_current()
+        descriptor = None
+        try:
+            expected = os.fstat(self.descriptor)
+            descriptor = os.dup(self.descriptor)
+            duplicated = os.fstat(descriptor)
+            self.verify_current()
+            if (
+                not stat.S_ISDIR(expected.st_mode)
+                or not stat.S_ISDIR(duplicated.st_mode)
+                or _identity(expected) != _identity(duplicated)
+                or (
+                    self.root_stat is not None
+                    and _identity(duplicated) != _identity(self.root_stat)
+                )
+            ):
+                raise MediaPathError("unsafe_media_directory")
+            owned = MediaDirectory(
+                [descriptor],
+                root_path=self.root_path,
+                root_stat=self.root_stat,
+                verified_root=True,
+            )
+            owned.verify_current()
+            descriptor = None
+            return owned
+        except BaseException as error:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
+            if isinstance(error, MediaPathError):
+                raise
+            if not isinstance(error, Exception):
+                raise
+            raise MediaPathError("unsafe_media_directory") from error
+
     def verify_current(self):
         if self.anchor_directory is not None:
             self.anchor_directory.verify_current()

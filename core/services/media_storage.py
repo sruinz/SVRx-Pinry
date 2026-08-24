@@ -698,27 +698,103 @@ class MediaStorage(object):
     ):
         try:
             self._validate_storage_configuration()
-            asset_uuid = self._asset_uuid(asset_uuid)
-            image_format = self._image_format(fetched)
-            derivative_options = self._derivative_options()
-            if not isinstance(original_filename, str):
-                raise _processing_failed()
-            original_filename = sanitize_original_filename(
-                original_filename
+            inputs = self._prepare_inputs(
+                fetched,
+                asset_uuid,
+                original_filename,
+                deadline,
             )
-            self._check_deadline(deadline)
         except MediaStorageError:
             raise
         except Exception:
             raise _processing_failed() from None
+        try:
+            root_directory = open_media_root(self.media_root)
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                raise
+            raise self._map_error(error) from None
+        return self._prepare_with_root(
+            root_directory,
+            fetched,
+            inputs,
+            deadline,
+        )
 
+    def prepare_from_root(
+        self,
+        root_directory,
+        fetched,
+        asset_uuid,
+        original_filename,
+        deadline=None,
+    ):
+        owned_root = None
+        try:
+            self._validate_storage_configuration_from_root(root_directory)
+            inputs = self._prepare_inputs(
+                fetched,
+                asset_uuid,
+                original_filename,
+                deadline,
+            )
+            owned_root = root_directory.duplicate_owned()
+            return self._prepare_with_root(
+                owned_root,
+                fetched,
+                inputs,
+                deadline,
+            )
+        except BaseException as error:
+            if owned_root is not None and owned_root.descriptors:
+                try:
+                    owned_root.close()
+                except BaseException:
+                    pass
+            if not isinstance(error, Exception):
+                raise
+            raise self._map_error(error) from None
+
+    def _prepare_inputs(
+        self,
+        fetched,
+        asset_uuid,
+        original_filename,
+        deadline,
+    ):
+        asset_uuid = self._asset_uuid(asset_uuid)
+        image_format = self._image_format(fetched)
+        derivative_options = self._derivative_options()
+        if not isinstance(original_filename, str):
+            raise _processing_failed()
+        original_filename = sanitize_original_filename(original_filename)
+        self._check_deadline(deadline)
+        return (
+            asset_uuid,
+            image_format,
+            derivative_options,
+            original_filename,
+        )
+
+    def _prepare_with_root(
+        self,
+        root_directory,
+        fetched,
+        inputs,
+        deadline,
+    ):
+        (
+            asset_uuid,
+            image_format,
+            derivative_options,
+            original_filename,
+        ) = inputs
         run_uuid = uuid.uuid4()
-        root_directory = None
         staging_directory = None
         prepared_files = []
         active_kind = "staging"
         try:
-            root_directory = open_media_root(self.media_root)
+            root_directory.verify_current()
             staging_directory = open_or_create_media_directory_from(
                 root_directory,
                 ".staging/{}/{}".format(run_uuid, asset_uuid),
@@ -930,6 +1006,36 @@ class MediaStorage(object):
                     raise _configuration_error()
         except MediaStorageError:
             raise
+        except Exception:
+            raise _configuration_error() from None
+
+    def _validate_storage_configuration_from_root(self, root_directory):
+        try:
+            if (
+                not isinstance(root_directory, MediaDirectory)
+                or not root_directory.verified_root
+            ):
+                raise _configuration_error()
+            root_directory.verify_current()
+            configured_root = os.path.abspath(settings.MEDIA_ROOT)
+            if (
+                os.path.abspath(self.media_root) != configured_root
+                or os.path.abspath(root_directory.root_path)
+                != configured_root
+            ):
+                raise _configuration_error()
+            for model in (Image, Thumbnail):
+                storage = model._meta.get_field("image").storage
+                if (
+                    storage.__class__ is not FileSystemStorage
+                    or os.path.abspath(storage.location)
+                    != configured_root
+                ):
+                    raise _configuration_error()
+        except MediaStorageError:
+            raise
+        except (AttributeError, MediaPathError, OSError):
+            raise _media_conflict() from None
         except Exception:
             raise _configuration_error() from None
 
