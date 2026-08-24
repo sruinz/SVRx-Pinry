@@ -273,6 +273,14 @@ const MAX_SELECTION_IDS = 50000;
 const SELECTION_FIELDS = ['count', 'results'];
 const SELECTION_ROW_FIELDS = ['id', 'owned'];
 
+function getPinSortStorage() {
+  try {
+    return window.localStorage;
+  } catch (_error) {
+    return null;
+  }
+}
+
 function hasExactFields(value, fields) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const keys = Object.keys(value).sort();
@@ -494,7 +502,7 @@ export default {
     activateSortContext() {
       this.sortStorageKey = pinSortStorageKey(this.pinFilters);
       this.sortState = readPinSortState(
-        window.localStorage, this.sortStorageKey, this.seedFactory,
+        getPinSortStorage(), this.sortStorageKey, this.seedFactory,
       );
       this.sortLegacyFallback = this.sortStorageKey === null;
       this.sortFallbackAttempted = false;
@@ -513,7 +521,7 @@ export default {
       this.sortState = transition.state;
       this.sortLegacyFallback = false;
       this.sortFallbackAttempted = false;
-      writePinSortState(window.localStorage, this.sortStorageKey, this.sortState);
+      writePinSortState(getPinSortStorage(), this.sortStorageKey, this.sortState);
       const announcement = transition.reshuffled ? this.$t('pinSortReshuffled') : '';
       this.sortAnnouncement = '';
       this.reset();
@@ -1274,7 +1282,8 @@ export default {
       this.sortState = { ...this.sortState, mode: 'latest' };
       this.sortAnnouncement = '';
       try {
-        window.localStorage.removeItem(this.sortStorageKey);
+        const storage = getPinSortStorage();
+        if (storage) storage.removeItem(this.sortStorageKey);
       } catch (_ignored) {
         // 저장소 삭제가 막혀도 메모리 대체 상태를 사용한다.
       }

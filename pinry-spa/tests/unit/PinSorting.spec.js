@@ -177,6 +177,38 @@ describe('Pins sorting', () => {
     localStorage.clear();
   });
 
+  it('keeps loading and changing sort modes when the localStorage getter is blocked', async () => {
+    const storageDescriptor = Object.getOwnPropertyDescriptor(window, 'localStorage');
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      get() {
+        throw new DOMException('storage blocked', 'SecurityError');
+      },
+    });
+
+    try {
+      const wrapper = mountPins();
+      await settle();
+
+      expect(API.fetchPins).toHaveBeenCalledTimes(1);
+      expect(API.fetchPins.mock.calls[0][4]).toEqual({
+        version: 1, mode: 'latest', randomSeed: 5,
+      });
+
+      wrapper.vm.applySortMode('oldest');
+      await settle();
+      expect(wrapper.vm.sortState.mode).toBe('oldest');
+      expect(API.fetchPins).toHaveBeenCalledTimes(2);
+
+      expect(wrapper.vm.fallbackToLegacySort()).toBe(true);
+      await settle();
+      expect(wrapper.vm.sortLegacyFallback).toBe(true);
+      expect(API.fetchPins).toHaveBeenCalledTimes(3);
+    } finally {
+      Object.defineProperty(window, 'localStorage', storageDescriptor);
+    }
+  });
+
   it('loads one isolated sort state for each list context', async () => {
     storeState('svrx.pinSort.v1:user:owner', 'oldest', 13);
 

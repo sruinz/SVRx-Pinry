@@ -12,7 +12,7 @@ class AssetMetadataMigrationTests(TransactionTestCase):
     migrate_from = ("django_images", "0002_auto_20180826_0814")
     migrate_to = ("django_images", "0005_enforce_image_asset_metadata")
     migrate_latest = [
-        ("core", "0015_board_cover_pin"),
+        ("core", "0016_board_display_order"),
         ("django_images", "0006_pending_media_deletion"),
     ]
 
