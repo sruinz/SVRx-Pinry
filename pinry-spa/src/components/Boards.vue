@@ -12,6 +12,7 @@
           @select="applySortMode"
         />
         <BoardOrderToolbar
+          ref="boardOrderToolbar"
           :can-enter="canEnterBoardOrdering"
           :editing="ordering.editing"
           :loading="ordering.loading"
@@ -234,6 +235,7 @@ export default {
   beforeCreate() {
     this.requestGeneration = 0;
     this.orderRequestToken = 0;
+    this.scrollDisposer = null;
     this.seedFactory = generateRandomSeed;
   },
   components: {
@@ -386,7 +388,7 @@ export default {
     },
     registerScrollEvent() {
       const self = this;
-      scroll.bindScroll2Bottom(
+      this.scrollDisposer = scroll.bindScroll2Bottom(
         () => {
           if (self.status.loading || !self.status.hasNext
               || self.ordering.loading || self.ordering.editing) {
@@ -670,6 +672,12 @@ export default {
       const blockById = new Map(this.blocks.map(board => [board.id, board]));
       this.blocks = boardIds.map(boardId => blockById.get(boardId)).filter(Boolean);
     },
+    focusBoardOrderEnter() {
+      this.$nextTick(() => {
+        const toolbar = this.$refs.boardOrderToolbar;
+        if (toolbar) toolbar.focusEnter();
+      });
+    },
     cancelBoardOrdering() {
       if (!this.ordering.editing || this.ordering.loading) return;
       this.restoreBoardOrder(this.ordering.originalBoardIds);
@@ -678,6 +686,7 @@ export default {
       this.ordering.draggedBoardId = null;
       this.ordering.error = '';
       this.ordering.announcement = this.$t('boardOrderCancelled');
+      this.focusBoardOrderEnter();
       this.redrawBoardMasonry();
     },
     async saveBoardOrdering() {
@@ -703,6 +712,7 @@ export default {
         this.ordering.pickedBoardId = null;
         this.ordering.draggedBoardId = null;
         this.ordering.announcement = this.$t('boardOrderSaved');
+        this.focusBoardOrderEnter();
         this.redrawBoardMasonry();
       } catch (error) {
         if (!this.isOrderRequestCurrent(token, generation, filters)) return;
@@ -720,6 +730,13 @@ export default {
     this.registerScrollEvent();
     this.activateSortContext();
     this.initialize();
+  },
+  beforeDestroy() {
+    this.requestGeneration += 1;
+    this.orderRequestToken += 1;
+    bus.bus.$off(bus.events.refreshBoards, this.reset);
+    if (typeof this.scrollDisposer === 'function') this.scrollDisposer();
+    this.scrollDisposer = null;
   },
 };
 </script>

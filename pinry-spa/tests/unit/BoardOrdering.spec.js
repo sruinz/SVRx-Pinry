@@ -8,6 +8,7 @@ import API from '@/components/api';
 import Boards from '@/components/Boards.vue';
 import bus from '@/components/utils/bus';
 import ko from '@/components/utils/i18n/locales/ko.json';
+import scroll from '@/components/utils/scroll';
 
 jest.mock('axios');
 jest.mock('@/components/utils/scroll', () => ({ bindScroll2Bottom: jest.fn() }));
@@ -51,6 +52,7 @@ function translate(key, values = {}) {
 }
 
 const wrappers = [];
+let scrollDisposer;
 
 function mountBoards(filters = { boardUsername: 'alice' }) {
   const localVue = createLocalVue();
@@ -113,6 +115,8 @@ describe('accessible Board custom ordering', () => {
     jest.clearAllMocks();
     localStorage.clear();
     window.scrollTo = jest.fn();
+    scrollDisposer = jest.fn();
+    scroll.bindScroll2Bottom.mockReturnValue(scrollDisposer);
     API.User.fetchUserInfo = jest.fn().mockResolvedValue({ username: 'alice' });
     API.fetchBoardForUser = jest.fn(() => response([board(1), board(2), board(3)]));
     API.Board.fetchListWhichContains = jest.fn(() => response([board(1), board(2)]));
@@ -289,12 +293,15 @@ describe('accessible Board custom ordering', () => {
     await wrapper.find('[data-test="board-order-next-1"]').trigger('click');
     expect(wrapper.vm.blocks.map(item => item.id)).toEqual([2, 1, 3]);
 
-    await wrapper.find('[data-test="board-order-cancel"]').trigger('click');
-    await wrapper.vm.$nextTick();
+    const cancel = wrapper.find('[data-test="board-order-cancel"]');
+    cancel.element.focus();
+    await cancel.trigger('click');
+    await settle();
 
     expect(wrapper.vm.blocks.map(item => item.id)).toEqual([1, 2, 3]);
     expect(wrapper.vm.ordering.editing).toBe(false);
     expect(API.Board.saveOrder).not.toHaveBeenCalled();
+    expect(document.activeElement.getAttribute('data-test')).toBe('board-order-enter');
   });
 
   it('saves one full versioned permutation and locks controls while busy', async () => {
@@ -305,7 +312,9 @@ describe('accessible Board custom ordering', () => {
     await enterOrdering(wrapper);
     await wrapper.find('[data-test="board-order-next-1"]').trigger('click');
 
-    await wrapper.find('[data-test="board-order-save"]').trigger('click');
+    const saveButton = wrapper.find('[data-test="board-order-save"]');
+    saveButton.element.focus();
+    await saveButton.trigger('click');
     await wrapper.find('[data-test="board-order-save"]').trigger('click');
 
     expect(API.Board.saveOrder).toHaveBeenCalledTimes(1);
@@ -320,6 +329,7 @@ describe('accessible Board custom ordering', () => {
 
     expect(wrapper.vm.ordering.editing).toBe(false);
     expect(wrapper.vm.blocks.map(item => item.id)).toEqual([2, 1, 3]);
+    expect(document.activeElement.getAttribute('data-test')).toBe('board-order-enter');
   });
 
   it('keeps the draft and version on 409 and asks for a refresh', async () => {
@@ -381,5 +391,64 @@ describe('accessible Board custom ordering', () => {
     expect(wrapper.vm.ordering.editing).toBe(false);
     expect(wrapper.vm.blocks.map(item => item.id)).toEqual([90, 91]);
     expect(wrapper.vm.sortStorageKey).toContain('bob');
+  });
+
+  it('invalidates a pending full-page entry response when destroyed', async () => {
+    const latePage = deferred();
+    API.fetchBoardForUser
+      .mockImplementationOnce(
+        () => response([board(1), board(2)], '/api/v2/boards/?offset=2'),
+      )
+      .mockImplementationOnce(() => latePage.promise);
+    API.Board.fetchOrder.mockImplementation(() => orderResponse(7, [1, 2, 3]));
+    const wrapper = mountBoards();
+    await settle();
+
+    await wrapper.find('[data-test="board-order-enter"]').trigger('click');
+    await settle();
+    const blocksBeforeDestroy = wrapper.vm.blocks.map(item => item.id);
+    const orderingBeforeDestroy = JSON.parse(JSON.stringify(wrapper.vm.ordering));
+    wrapper.destroy();
+
+    latePage.resolve({ data: { results: [board(3)], next: null } });
+    await settle();
+
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual(blocksBeforeDestroy);
+    expect(wrapper.vm.ordering).toEqual(orderingBeforeDestroy);
+    expect(API.fetchBoardForUser).toHaveBeenCalledTimes(2);
+  });
+
+  it('invalidates a pending save response when destroyed', async () => {
+    const save = deferred();
+    API.Board.saveOrder.mockImplementation(() => save.promise);
+    const wrapper = mountBoards();
+    await settle();
+    await enterOrdering(wrapper);
+    await wrapper.find('[data-test="board-order-next-1"]').trigger('click');
+    await wrapper.find('[data-test="board-order-save"]').trigger('click');
+    const blocksBeforeDestroy = wrapper.vm.blocks.map(item => item.id);
+    const orderingBeforeDestroy = JSON.parse(JSON.stringify(wrapper.vm.ordering));
+    wrapper.destroy();
+
+    save.resolve({ data: { version: 8, board_ids: [2, 1, 3] } });
+    await settle();
+
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual(blocksBeforeDestroy);
+    expect(wrapper.vm.ordering).toEqual(orderingBeforeDestroy);
+  });
+
+  it('removes the bus and scroll listeners when destroyed', async () => {
+    const wrapper = mountBoards();
+    await settle();
+    wrapper.destroy();
+    API.User.fetchUserInfo.mockClear();
+    API.fetchBoardForUser.mockClear();
+
+    bus.bus.$emit(bus.events.refreshBoards);
+    await settle();
+
+    expect(scrollDisposer).toHaveBeenCalledTimes(1);
+    expect(API.User.fetchUserInfo).not.toHaveBeenCalled();
+    expect(API.fetchBoardForUser).not.toHaveBeenCalled();
   });
 });

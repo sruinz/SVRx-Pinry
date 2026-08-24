@@ -6,6 +6,7 @@
   >
     <button
       v-if="!editing"
+      ref="enterButton"
       type="button"
       class="button is-light board-order-toolbar__enter"
       :class="{ 'is-loading': loading }"
@@ -70,6 +71,11 @@ export default {
     changed: { type: Boolean, default: false },
     error: { type: String, default: '' },
     announcement: { type: String, default: '' },
+  },
+  methods: {
+    focusEnter() {
+      if (this.$refs.enterButton) this.$refs.enterButton.focus();
+    },
   },
 };
 </script>
