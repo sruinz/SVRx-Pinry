@@ -212,7 +212,13 @@ describe('Pins responsive tool area', () => {
     await wrapper.vm.$nextTick();
 
     expect(wrapper.vm.canManagePins).toBe(false);
+    expect(wrapper.vm.selection.active).toBe(false);
+    expect(wrapper.vm.interactionMode).toBe('browse');
     expect(wrapper.find('[data-test="pin-tools-active"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="pin-selection-check-41"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="pin-card-41"]').attributes('role')).toBeUndefined();
+    expect(wrapper.find('[data-test="pin-card-41"]').attributes('tabindex')).toBeUndefined();
+    expect(wrapper.find('[data-test="pin-sort-latest"]').attributes('disabled')).toBeUndefined();
     [
       'summary', 'select-loaded', 'clear', 'select-all', 'move', 'edit', 'delete', 'exit',
     ].forEach((name) => {
@@ -232,11 +238,28 @@ describe('Pins responsive tool area', () => {
     await wrapper.vm.$nextTick();
 
     expect(wrapper.vm.isOwnedBoardRoute).toBe(false);
+    expect(wrapper.vm.interactionMode).toBe('browse');
+    expect(wrapper.vm.coverSelection.candidateId).toBeNull();
     expect(wrapper.find('[data-test="pin-tools-active"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="board-cover-status"]').exists()).toBe(false);
     ['apply', 'cancel', 'reset'].forEach((name) => {
       expect(wrapper.find(`[data-test="board-cover-${name}"]`).exists()).toBe(false);
     });
+  });
+
+  it('exits bulk selection when the My Pins session is lost', async () => {
+    const wrapper = mountPins({ pinFilters: { userFilter: 'owner' } });
+    await settle();
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+
+    wrapper.vm.editorMeta.user = { loggedIn: false, meta: {} };
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.vm.canManagePins).toBe(false);
+    expect(wrapper.vm.selection.active).toBe(false);
+    expect(wrapper.vm.interactionMode).toBe('browse');
+    expect(wrapper.find('[data-test="pin-selection-check-41"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="pin-sort-latest"]').attributes('disabled')).toBeUndefined();
   });
 
   it('does not add the list tool area to a single Pin route', async () => {

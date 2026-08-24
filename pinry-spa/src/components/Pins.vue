@@ -426,6 +426,22 @@ export default {
         this.$nextTick(() => window.scrollTo(0, 0));
       },
     },
+    canManagePins(canManage) {
+      if (canManage || !this.selection.active) return;
+      this.invalidateSelectionRequest();
+      this.invalidateBulkOperation();
+      this.updateSelection(this.selectionModel.selectLoaded([]), {
+        active: false,
+        allCount: 0,
+        operationInFlight: false,
+        result: null,
+      });
+      this.interactionMode = 'browse';
+    },
+    isOwnedBoardRoute(isOwned) {
+      if (isOwned || this.interactionMode !== 'cover-selection') return;
+      this.invalidateCoverSelection();
+    },
   },
   computed: {
     isMyPinsRoute() {
