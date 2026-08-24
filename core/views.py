@@ -31,6 +31,10 @@ from core.permissions import IsOwnerOrReadOnly, OwnerOnlyIfPrivate
 from core.serializers import filter_private_pin, filter_private_board
 from core.services.batch_import import BatchImportService
 from core.services.board_cover import BoardCoverError, BoardCoverService
+from core.services.board_ordering import (
+    BoardOrderChanged,
+    BoardOrderService,
+)
 from core.services.bulk_pin_management import (
     BulkOperationError,
     BulkPinManagementService,
@@ -446,6 +450,7 @@ class BoardViewSet(viewsets.ModelViewSet):
     bulk_pin_management_service_class = BulkPinManagementService
     board_cover_service_class = BoardCoverService
     pin_membership_service_class = PinMembershipService
+    board_order_service_class = BoardOrderService
 
     def get_serializer_context(self):
         context = super(BoardViewSet, self).get_serializer_context()
@@ -457,6 +462,36 @@ class BoardViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return filter_private_board(self.request, Board.objects.all())
+
+    @action(
+        detail=False,
+        methods=["get", "put"],
+        permission_classes=[IsAuthenticated],
+        url_path="order",
+    )
+    def order(self, request):
+        service = self.board_order_service_class()
+        if request.method == "GET":
+            return Response(service.snapshot(request.user))
+
+        payload = api.BoardOrderRequestSerializer(data=request.data)
+        if not payload.is_valid():
+            return Response(
+                {"code": "board_order_invalid"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = service.save(
+                request.user,
+                payload.validated_data["version"],
+                payload.validated_data["board_ids"],
+            )
+        except BoardOrderChanged:
+            return Response(
+                {"code": "board_order_changed"},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(result, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["patch"], url_path="cover")
     def cover(self, request, pk=None):

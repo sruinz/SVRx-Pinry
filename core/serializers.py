@@ -14,6 +14,7 @@ from core.services.media_storage import MediaStorageError
 from core.services.board_cover import BoardCoverError
 from core.services.pin_import import ImportMetadata, PinImportError
 from core.services.safe_url_fetch import SafeFetchError
+from users.models import User
 from users.serializers import UserSerializer
 
 
@@ -367,6 +368,33 @@ class BoardCoverUpdateSerializer(serializers.Serializer):
         return attrs
 
 
+class BoardOrderRequestSerializer(serializers.Serializer):
+    version = serializers.RegexField(r"\A[0-9a-f]{64}\Z")
+    board_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        allow_empty=True,
+    )
+
+    def validate(self, attrs):
+        if set(self.initial_data.keys()) != {"version", "board_ids"}:
+            raise ValidationError({"code": "board_order_invalid"})
+        raw_version = self.initial_data["version"]
+        raw_board_ids = self.initial_data["board_ids"]
+        if type(raw_version) is not str or not isinstance(
+            raw_board_ids,
+            list,
+        ):
+            raise ValidationError({"code": "board_order_invalid"})
+        if any(
+            type(board_id) is not int or board_id <= 0
+            for board_id in raw_board_ids
+        ):
+            raise ValidationError({"code": "board_order_invalid"})
+        if len(raw_board_ids) != len(set(raw_board_ids)):
+            raise ValidationError({"code": "board_order_invalid"})
+        return attrs
+
+
 class BoardAutoCompleteSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = Board
@@ -490,12 +518,21 @@ class BoardSerializer(serializers.HyperlinkedModelSerializer):
         validated_data.pop('pins_to_remove', None)
         validated_data.pop('pins_to_add', None)
         user = self.context['request'].user
-        if Board.objects.filter(name=validated_data['name'], submitter=user).exists():
-            raise ValidationError(
-                detail={"name": "board with this name already exists."}
+        with transaction.atomic():
+            locked_user = (
+                User.objects.select_for_update().get(pk=user.pk)
             )
-        validated_data['submitter'] = user
-        return super(BoardSerializer, self).create(validated_data)
+            if Board.objects.filter(
+                name=validated_data['name'],
+                submitter=locked_user,
+            ).exists():
+                raise ValidationError(
+                    detail={
+                        "name": "board with this name already exists."
+                    }
+                )
+            validated_data['submitter'] = locked_user
+            return super(BoardSerializer, self).create(validated_data)
 
 
 class TagAutoCompleteSerializer(serializers.ModelSerializer):

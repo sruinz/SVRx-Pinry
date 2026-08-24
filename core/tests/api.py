@@ -35,6 +35,7 @@ from core.services.safe_url_fetch import (
     SafeUrlFetcher,
 )
 from core.views import PinViewSet
+from users.models import User
 from django_images.test_helpers import TemporaryMediaMixin
 from django_images.models import Thumbnail
 from django_images import file_ops
@@ -238,6 +239,42 @@ class BoardPrivacyTests(TemporaryMediaMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertEqual(calls, [(self.owner.pk, self.private_board.pk)])
         self.assertTrue(Pin.objects.filter(pk=pin.pk).exists())
+
+    def test_create_locks_user_before_board_insert_and_keeps_response(self):
+        self.client.login(username=self.owner.username, password="password")
+        events = []
+        real_user_lock = User.objects.select_for_update
+        real_board_create = Board.objects.create
+
+        def record_user_lock(*args, **kwargs):
+            events.append(("user", connection.in_atomic_block))
+            return real_user_lock(*args, **kwargs)
+
+        def record_board_create(*args, **kwargs):
+            events.append(("board", connection.in_atomic_block))
+            return real_board_create(*args, **kwargs)
+
+        with mock.patch.object(
+            User.objects,
+            "select_for_update",
+            side_effect=record_user_lock,
+        ), mock.patch.object(
+            Board.objects,
+            "create",
+            side_effect=record_board_create,
+        ):
+            response = self.client.post(
+                "/api/v2/boards/",
+                {"name": "created-with-user-lock", "private": False},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(events, [("user", True), ("board", True)])
+        self.assertNotIn("display_order", response.json())
+        created = Board.objects.get(name="created-with-user-lock")
+        self.assertEqual(created.submitter_id, self.owner.pk)
+        self.assertEqual(created.display_order, 0)
 
     def test_delete_hides_private_board_from_non_owner_and_anonymous(self):
         cases = (

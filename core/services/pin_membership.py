@@ -2,6 +2,7 @@ from django.db import DEFAULT_DB_ALIAS, transaction
 
 from core.models import Board, Pin
 from core.services.board_cover import BoardCoverService
+from users.models import User
 
 
 class MembershipConflict(Exception):
@@ -11,6 +12,11 @@ class MembershipConflict(Exception):
 
 
 class PinMembershipService(object):
+    def _lock_user(self, user, using=DEFAULT_DB_ALIAS):
+        return (
+            User.objects.using(using).select_for_update().get(pk=user.pk)
+        )
+
     def _lock_owned_boards(
         self,
         user,
@@ -205,8 +211,9 @@ class PinMembershipService(object):
         using = DEFAULT_DB_ALIAS
         through = Board.pins.through
         with transaction.atomic(using=using):
+            locked_user = self._lock_user(user, using=using)
             board = self._lock_owned_boards(
-                user,
+                locked_user,
                 [board_id],
                 using=using,
             )[0]
