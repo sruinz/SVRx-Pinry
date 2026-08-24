@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 from dataclasses import dataclass
 from io import BytesIO
 import hashlib
@@ -9,7 +10,7 @@ import uuid
 
 from django.conf import settings
 from django.core.management.base import CommandError
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from PIL import Image as PILImage
 
 from core.models import MediaAsset, Pin
@@ -17,6 +18,8 @@ from core.services.media_storage import MediaStorage, MediaStorageError
 from core.services.safe_url_fetch import FetchedImage
 from django_images.file_ops import (
     MediaPathError,
+    media_dedup_lock,
+    media_lifecycle_lock,
     open_verified_media_file,
     open_verified_media_root,
     sha256_file_descriptor,
@@ -78,6 +81,45 @@ def _tupleize(value):
     if isinstance(value, list):
         return tuple(_tupleize(entry) for entry in value)
     return value
+
+
+def _acquire_database_write_fence(database_connection):
+    table_models = (MediaAsset, Pin, Image, Thumbnail)
+    try:
+        with database_connection.cursor() as cursor:
+            if database_connection.vendor == "sqlite":
+                table_name = database_connection.ops.quote_name(
+                    MediaAsset._meta.db_table
+                )
+                primary_key = database_connection.ops.quote_name(
+                    MediaAsset._meta.pk.column
+                )
+                cursor.execute(
+                    "UPDATE {table} SET {pk} = {pk} WHERE 0 = 1".format(
+                        table=table_name,
+                        pk=primary_key,
+                    )
+                )
+                return
+            if database_connection.vendor == "postgresql":
+                for model in table_models:
+                    table_name = database_connection.ops.quote_name(
+                        model._meta.db_table
+                    )
+                    cursor.execute(
+                        "LOCK TABLE {} IN EXCLUSIVE MODE".format(
+                            table_name
+                        )
+                    )
+                return
+    except CommandError:
+        raise
+    except Exception as error:
+        raise _command_error(
+            "registry_plan_identity_changed",
+            error,
+        )
+    raise _command_error("unsupported_media_asset_backfill_database")
 
 
 @dataclass(frozen=True)
@@ -1364,29 +1406,96 @@ class MediaAssetBackfiller(object):
             if manifest.plan_sha256() != plan_sha256:
                 raise _command_error("manifest_plan_mismatch")
 
-            for plan in plans:
-                if plan.image_id in manifest.state.latest_by_image:
-                    continue
-                decision = decisions[plan.image_id]
-                if decision == "already_registered":
-                    manifest.record_result(
-                        "already_registered",
-                        plan.image_id,
+            with ExitStack() as file_locks:
+                dedup_keys = {}
+                for plan in plans:
+                    if (
+                        plan.submitter_id is None
+                        or plan.content_sha256 is None
+                    ):
+                        continue
+                    key = "{}:{}".format(
+                        plan.submitter_id,
+                        plan.content_sha256,
+                    ).encode("ascii")
+                    stripe = hashlib.sha256(key).digest()[0]
+                    dedup_keys.setdefault(
+                        stripe,
+                        (plan.submitter_id, plan.content_sha256),
                     )
-                elif decision != "register":
-                    manifest.record_result(
-                        "skipped",
-                        plan.image_id,
-                        reason_code=decision,
-                    )
-                else:
-                    self._execute_candidate(
-                        plan,
-                        plans,
+                for stripe in sorted(dedup_keys):
+                    submitter_id, content_sha256 = dedup_keys[stripe]
+                    file_locks.enter_context(media_dedup_lock(
                         root_directory,
+                        submitter_id,
+                        content_sha256,
+                    ))
+                file_locks.enter_context(
+                    media_lifecycle_lock(root_directory)
+                )
+
+                registry_events = {}
+                with transaction.atomic():
+                    _acquire_database_write_fence(connection)
+                    self._verify_current_plans(
                         manifest,
+                        plans,
+                        decisions,
+                        root_directory,
                     )
-                root_directory.verify_current()
+                    for plan in plans:
+                        if decisions[plan.image_id] != "register":
+                            continue
+                        registry_events[plan.image_id] = (
+                            "recovered_registered"
+                            if self._execute_candidate(
+                                plan,
+                                root_directory,
+                            )
+                            else "registered"
+                        )
+                        root_directory.verify_current()
+                    self._verify_current_plans(
+                        manifest,
+                        plans,
+                        decisions,
+                        root_directory,
+                    )
+
+                self._fault("after_registry_commit")
+
+                with transaction.atomic():
+                    _acquire_database_write_fence(connection)
+                    self._verify_current_plans(
+                        manifest,
+                        plans,
+                        decisions,
+                        root_directory,
+                    )
+                    for plan in plans:
+                        if plan.image_id in manifest.state.latest_by_image:
+                            continue
+                        decision = decisions[plan.image_id]
+                        if decision == "already_registered":
+                            manifest.record_result(
+                                "already_registered",
+                                plan.image_id,
+                            )
+                        elif decision != "register":
+                            manifest.record_result(
+                                "skipped",
+                                plan.image_id,
+                                reason_code=decision,
+                            )
+                        else:
+                            self._record_registry_event(
+                                manifest,
+                                plan,
+                                plans,
+                                root_directory,
+                                registry_events[plan.image_id],
+                            )
+                        root_directory.verify_current()
         except CommandError:
             raise
         except (MediaPathError, OSError) as error:
@@ -1397,6 +1506,32 @@ class MediaAssetBackfiller(object):
         finally:
             if root_directory is not None:
                 root_directory.close()
+
+    def _verify_current_plans(
+        self,
+        manifest,
+        plans,
+        decisions,
+        root_directory,
+    ):
+        self._verify_database_plan_closure(plans)
+        for plan in plans:
+            image = Image.objects.filter(pk=plan.image_id).first()
+            if image is None:
+                raise _command_error("registry_plan_identity_changed")
+            current = self._freeze_plan(
+                image,
+                root_directory,
+                "execute_verify",
+            )
+            self._verify_plan_equivalence(
+                plan,
+                current,
+                decisions[plan.image_id],
+                manifest.state.latest_by_image.get(plan.image_id),
+            )
+            root_directory.verify_current()
+        return True
 
     @staticmethod
     def _verify_plan_equivalence(
@@ -1464,9 +1599,7 @@ class MediaAssetBackfiller(object):
     def _execute_candidate(
         self,
         plan,
-        all_plans,
         root_directory,
-        manifest,
     ):
         image = Image.objects.filter(pk=plan.image_id).first()
         if image is None:
@@ -1489,150 +1622,107 @@ class MediaAssetBackfiller(object):
             if resources.closure.file_identities != plan.file_identities:
                 raise _command_error("registry_plan_identity_changed")
             self._verify_owned_root_identity(root_directory, resources)
-            with self.media_storage.dedup_lock(
-                resources.prepared,
-                plan.submitter_id,
-                plan.content_sha256,
+            current_registry = (
+                MediaAsset.objects.filter(image_id=plan.image_id)
+                .values(
+                    "pk",
+                    "image_id",
+                    "submitter_id",
+                    "content_sha256",
+                )
+                .first()
+            )
+            if current_registry is not None:
+                signature = self._registry_signature(current_registry)
+                if signature[1:] != (
+                    plan.image_id,
+                    plan.submitter_id,
+                    plan.content_sha256,
+                ):
+                    raise _command_error("invalid_existing_registry")
+                resources.verify_current(refresh_prepared=True)
+                self._verify_owned_root_identity(
+                    root_directory,
+                    resources,
+                )
+                return True
+
+            resources.verify_current(refresh_prepared=True)
+            self._verify_owned_root_identity(root_directory, resources)
+            self._fault("before_registry_insert")
+            if (
+                self._database_signature_for_id(plan.image_id)
+                != plan.database_signature
+                or tuple(
+                    Pin.objects.filter(image_id=plan.image_id)
+                    .order_by("submitter_id")
+                    .values_list("submitter_id", flat=True)
+                    .distinct()[:2]
+                ) != plan.owner_ids
             ):
-                with self.media_storage.lifecycle_lock(resources.prepared):
-                    recovered = False
-                    with transaction.atomic():
-                        self._verify_database_plan_closure(
-                            all_plans,
-                            lock=True,
-                        )
-                        locked_image = (
-                            Image.objects.select_for_update()
-                            .filter(pk=plan.image_id)
-                            .first()
-                        )
-                        if locked_image is None:
-                            raise _command_error(
-                                "registry_plan_identity_changed"
-                            )
-                        locked_thumbnails = list(
-                            Thumbnail.objects.select_for_update()
-                            .filter(original_id=plan.image_id)
-                            .order_by("size", "pk")
-                        )
-                        owner_ids = tuple(
-                            Pin.objects.filter(image_id=plan.image_id)
-                            .order_by("submitter_id")
-                            .values_list("submitter_id", flat=True)
-                            .distinct()[:2]
-                        )
-                        if (
-                            self._database_signature_for_id(
-                                plan.image_id
-                            ) != plan.database_signature
-                            or owner_ids != plan.owner_ids
-                        ):
-                            raise _command_error(
-                                "registry_plan_identity_changed"
-                            )
-                        list(
-                            MediaAsset.objects.select_for_update().filter(
-                                submitter_id=plan.submitter_id,
-                                content_sha256=plan.content_sha256,
-                            )
-                        )
-                        current_registry = (
-                            MediaAsset.objects.select_for_update()
-                            .filter(image_id=plan.image_id)
-                            .values(
-                                "pk",
-                                "image_id",
-                                "submitter_id",
-                                "content_sha256",
-                            )
-                            .first()
-                        )
-                        if current_registry is not None:
-                            signature = self._registry_signature(
-                                current_registry
-                            )
-                            if signature[1:] != (
-                                plan.image_id,
-                                plan.submitter_id,
-                                plan.content_sha256,
-                            ):
-                                raise _command_error(
-                                    "invalid_existing_registry"
-                                )
-                            recovered = True
-                        else:
-                            resources.verify_current(
-                                refresh_prepared=True
-                            )
-                            self._verify_owned_root_identity(
-                                root_directory,
-                                resources,
-                            )
-                            self._fault("before_registry_insert")
-                            if (
-                                self._database_signature_for_id(
-                                    plan.image_id
-                                ) != plan.database_signature
-                                or tuple(
-                                    Pin.objects.filter(
-                                        image_id=plan.image_id
-                                    )
-                                    .order_by("submitter_id")
-                                    .values_list(
-                                        "submitter_id", flat=True
-                                    )
-                                    .distinct()[:2]
-                                ) != plan.owner_ids
-                            ):
-                                raise _command_error(
-                                    "registry_plan_identity_changed"
-                                )
-                            resources.verify_current()
-                            self._verify_owned_root_identity(
-                                root_directory,
-                                resources,
-                            )
-                            try:
-                                MediaAsset.objects.create(
-                                    submitter_id=plan.submitter_id,
-                                    image_id=plan.image_id,
-                                    content_sha256=plan.content_sha256,
-                                )
-                            except IntegrityError as error:
-                                raise _command_error(
-                                    "registry_plan_identity_changed",
-                                    error,
-                                )
-                            resources.verify_current()
-                            root_directory.verify_current()
-                        if recovered:
-                            resources.verify_current(
-                                refresh_prepared=True
-                            )
-                            self._verify_owned_root_identity(
-                                root_directory,
-                                resources,
-                            )
-                        self._verify_database_plan_closure(
-                            all_plans,
-                            lock=True,
-                        )
-                    self._fault("after_registry_commit")
-                    manifest.record_result(
-                        (
-                            "recovered_registered"
-                            if recovered
-                            else "registered"
-                        ),
-                        plan.image_id,
-                        before_append=lambda: self._verify_registry_event(
-                            plan,
-                            all_plans,
-                            root_directory,
-                            resources,
-                        ),
-                    )
-                    return recovered
+                raise _command_error("registry_plan_identity_changed")
+            resources.verify_current()
+            self._verify_owned_root_identity(root_directory, resources)
+            try:
+                MediaAsset.objects.create(
+                    submitter_id=plan.submitter_id,
+                    image_id=plan.image_id,
+                    content_sha256=plan.content_sha256,
+                )
+            except IntegrityError as error:
+                raise _command_error(
+                    "registry_plan_identity_changed",
+                    error,
+                )
+            resources.verify_current()
+            root_directory.verify_current()
+            return False
+        except _CandidateSkip as error:
+            raise _command_error(
+                "registry_plan_identity_changed",
+                error,
+            )
+        finally:
+            if resources is not None:
+                self._close_resources(resources)
+
+    def _record_registry_event(
+        self,
+        manifest,
+        plan,
+        all_plans,
+        root_directory,
+        event_name,
+    ):
+        image = Image.objects.filter(pk=plan.image_id).first()
+        if image is None:
+            raise _command_error("registry_plan_identity_changed")
+        thumbnails = list(
+            Thumbnail.objects.filter(original_id=image.pk).order_by(
+                "size", "pk"
+            )
+        )
+        resources = None
+        try:
+            resources = self._open_candidate_resources(
+                image,
+                thumbnails,
+                plan.submitter_id,
+                root_directory,
+                plan.database_signature,
+                "execute",
+            )
+            if resources.closure.file_identities != plan.file_identities:
+                raise _command_error("registry_plan_identity_changed")
+            self._verify_owned_root_identity(root_directory, resources)
+            return self._verify_registry_event(
+                plan,
+                all_plans,
+                root_directory,
+                resources,
+                manifest,
+                event_name,
+            )
         except _CandidateSkip as error:
             raise _command_error(
                 "registry_plan_identity_changed",
@@ -1648,12 +1738,13 @@ class MediaAssetBackfiller(object):
         all_plans,
         root_directory,
         resources,
+        manifest,
+        event_name,
     ):
-        with transaction.atomic():
-            self._verify_database_plan_closure(all_plans, lock=True)
+        def verify_before_append():
+            self._verify_database_plan_closure(all_plans)
             key_registries = list(
-                MediaAsset.objects.select_for_update()
-                .filter(
+                MediaAsset.objects.filter(
                     submitter_id=plan.submitter_id,
                     content_sha256=plan.content_sha256,
                 )
@@ -1665,8 +1756,7 @@ class MediaAssetBackfiller(object):
                 )
             )
             image_registry = (
-                MediaAsset.objects.select_for_update()
-                .filter(image_id=plan.image_id)
+                MediaAsset.objects.filter(image_id=plan.image_id)
                 .values(
                     "pk",
                     "image_id",
@@ -1693,31 +1783,22 @@ class MediaAssetBackfiller(object):
                 raise _command_error("registry_plan_identity_changed")
             resources.verify_current(refresh_prepared=True)
             self._verify_owned_root_identity(root_directory, resources)
+            return True
+
+        manifest.record_result(
+            event_name,
+            plan.image_id,
+            before_append=verify_before_append,
+        )
         return True
 
-    def _verify_database_plan_closure(self, plans, lock=False):
-        image_queryset = Image.objects.order_by("pk")
-        if lock:
-            image_queryset = image_queryset.select_for_update()
+    def _verify_database_plan_closure(self, plans):
         image_ids = tuple(
-            image_queryset.values_list("pk", flat=True)
+            Image.objects.order_by("pk").values_list("pk", flat=True)
         )
         planned_image_ids = tuple(plan.image_id for plan in plans)
         if image_ids != planned_image_ids:
             raise _command_error("registry_plan_identity_changed")
-        if lock:
-            list(
-                Thumbnail.objects.select_for_update()
-                .filter(original_id__in=planned_image_ids)
-                .order_by("pk")
-                .values_list("pk", flat=True)
-            )
-            list(
-                Pin.objects.select_for_update()
-                .filter(image_id__in=planned_image_ids)
-                .order_by("pk")
-                .values_list("pk", flat=True)
-            )
         for plan in plans:
             owner_ids = tuple(
                 Pin.objects.filter(image_id=plan.image_id)

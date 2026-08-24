@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 import tempfile
 import uuid
@@ -10,6 +11,7 @@ import uuid
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import connection, transaction
 from django.db.models.signals import post_save
 from django.test import TransactionTestCase, override_settings
 import mock
@@ -510,6 +512,156 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             original_width,
         )
 
+    def test_registry_phase_rolls_back_first_candidate_on_later_change(self):
+        self._create_candidate(content=_png_bytes("red"))
+        other = self._create_candidate(
+            owners=(self.other_owner,),
+            content=_png_bytes("navy"),
+        )
+        original_width = other["image"].width
+        service = self._service()
+        service.run()
+        inserts = {"count": 0}
+
+        def mutate_on_second_insert(event):
+            if event != "before_registry_insert":
+                return
+            inserts["count"] += 1
+            if inserts["count"] == 2:
+                Image.objects.filter(pk=other["image"].pk).update(
+                    width=original_width + 1,
+                )
+
+        service.fault_injector = mutate_on_second_insert
+        with self.assertRaisesRegex(
+            CommandError,
+            "^registry_plan_identity_changed$",
+        ):
+            service.run(execute=True)
+
+        self.assertFalse(MediaAsset.objects.exists())
+        self.assertEqual(
+            Image.objects.values_list("width", flat=True).get(
+                pk=other["image"].pk
+            ),
+            original_width,
+        )
+
+    def test_sqlite_database_fence_reserves_the_writer_slot(self):
+        if connection.vendor != "sqlite":
+            self.skipTest("SQLite writer reservation contract")
+        acquire_fence = getattr(
+            media_asset_backfill,
+            "_acquire_database_write_fence",
+            None,
+        )
+        self.assertIsNotNone(acquire_fence)
+        database_name = connection.settings_dict["NAME"]
+        probe = sqlite3.connect(
+            database_name,
+            timeout=0,
+            isolation_level=None,
+            uri=str(database_name).startswith("file:"),
+        )
+        try:
+            with transaction.atomic():
+                acquire_fence(connection)
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError,
+                    "locked",
+                ):
+                    probe.execute("BEGIN IMMEDIATE")
+        finally:
+            probe.close()
+
+    def test_postgresql_fence_uses_delete_order_before_row_work(self):
+        acquire_fence = getattr(
+            media_asset_backfill,
+            "_acquire_database_write_fence",
+            None,
+        )
+        self.assertIsNotNone(acquire_fence)
+        statements = []
+
+        class Operations(object):
+            @staticmethod
+            def quote_name(name):
+                return '"{}"'.format(name)
+
+        class Cursor(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, error_type, error, traceback):
+                del error_type, error, traceback
+                return False
+
+            @staticmethod
+            def execute(statement):
+                statements.append(statement)
+
+        class PostgreSQLConnection(object):
+            vendor = "postgresql"
+            ops = Operations()
+
+            @staticmethod
+            def cursor():
+                return Cursor()
+
+        acquire_fence(PostgreSQLConnection())
+
+        table_names = (
+            MediaAsset._meta.db_table,
+            Pin._meta.db_table,
+            Image._meta.db_table,
+            Thumbnail._meta.db_table,
+        )
+        self.assertEqual(statements, [
+            'LOCK TABLE "{}" IN EXCLUSIVE MODE'.format(table_name)
+            for table_name in table_names
+        ])
+
+    def test_database_fence_precedes_plan_closure_without_row_locks(self):
+        self._create_candidate()
+        service = self._service()
+        service.run()
+        acquire_fence = getattr(
+            media_asset_backfill,
+            "_acquire_database_write_fence",
+            None,
+        )
+        self.assertIsNotNone(acquire_fence)
+        original_verify = service._verify_database_plan_closure
+        events = []
+        fence_active = {"value": False}
+
+        def record_fence(database_connection):
+            acquire_fence(database_connection)
+            events.append("fence")
+            fence_active["value"] = True
+
+        def record_closure(plans, *args, **kwargs):
+            if fence_active["value"]:
+                events.append(("closure", kwargs.get("lock", False)))
+            return original_verify(plans, *args, **kwargs)
+
+        with mock.patch.object(
+            media_asset_backfill,
+            "_acquire_database_write_fence",
+            side_effect=record_fence,
+        ), mock.patch.object(
+            service,
+            "_verify_database_plan_closure",
+            side_effect=record_closure,
+        ):
+            service.run(execute=True)
+
+        self.assertEqual(events[0], "fence")
+        self.assertTrue(any(event[0] == "closure" for event in events[1:]))
+        self.assertFalse(any(
+            event == ("closure", True) for event in events
+        ))
+
     def test_precommit_fence_rechecks_owner_after_registry_insert(self):
         candidate = self._create_candidate()
         service = self._service()
@@ -775,10 +927,123 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
                 MANIFEST_FILENAME,
             ).read_text().splitlines()
         ]
-        self.assertFalse(MediaAsset.objects.exists())
+        self.assertTrue(MediaAsset.objects.exists())
         self.assertNotIn("recovered_registered", {
             event["event"] for event in events
         })
+
+    def test_registry_event_is_fsynced_before_verifier_returns(self):
+        self._create_candidate()
+        crashed = {"value": False}
+
+        def crash_once(event):
+            if event == "after_registry_commit" and not crashed["value"]:
+                crashed["value"] = True
+                raise RuntimeError("simulated crash")
+
+        service = self._service(fault_injector=crash_once)
+        service.run()
+        with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+            service.run(execute=True)
+        service.fault_injector = None
+        manifest_path = Path(
+            service.run_directory,
+            MANIFEST_FILENAME,
+        )
+        original_verify = service._verify_registry_event
+        observed = {"terminal_before_delete": None}
+
+        def verify_then_delete(*args, **kwargs):
+            result = original_verify(*args, **kwargs)
+            events = [
+                json.loads(line)
+                for line in manifest_path.read_text().splitlines()
+            ]
+            observed["terminal_before_delete"] = any(
+                event["event"] == "recovered_registered"
+                for event in events
+            )
+            MediaAsset.objects.all().delete()
+            return result
+
+        with mock.patch.object(
+            service,
+            "_verify_registry_event",
+            side_effect=verify_then_delete,
+        ):
+            service.run(execute=True)
+
+        self.assertTrue(observed["terminal_before_delete"])
+
+    def test_partial_terminal_crash_resumes_after_all_registry_commits(self):
+        self._create_candidate(content=_png_bytes("red"))
+        self._create_candidate(
+            owners=(self.other_owner,),
+            content=_png_bytes("navy"),
+        )
+        service = self._service()
+        service.run()
+        original_record = media_asset_backfill._BackfillManifestLog.record_result
+        crashed = {"value": False}
+
+        def record_then_crash(
+            manifest,
+            event_name,
+            image_id,
+            reason_code=None,
+            **kwargs
+        ):
+            result = original_record(
+                manifest,
+                event_name,
+                image_id,
+                reason_code=reason_code,
+                **kwargs
+            )
+            if (
+                event_name in ("registered", "recovered_registered")
+                and not crashed["value"]
+            ):
+                crashed["value"] = True
+                raise RuntimeError("partial terminal crash")
+            return result
+
+        with mock.patch.object(
+            media_asset_backfill._BackfillManifestLog,
+            "record_result",
+            new=record_then_crash,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "partial terminal crash",
+            ):
+                service.run(execute=True)
+
+        self.assertEqual(MediaAsset.objects.count(), 2)
+        manifest_path = Path(service.run_directory, MANIFEST_FILENAME)
+        terminal_events = [
+            json.loads(line)
+            for line in manifest_path.read_text().splitlines()
+            if json.loads(line)["event"] in (
+                "registered",
+                "recovered_registered",
+            )
+        ]
+        self.assertEqual(len(terminal_events), 1)
+
+        summary = service.run(execute=True)
+
+        self.assertEqual(summary.registered, 2)
+        self.assertEqual(MediaAsset.objects.count(), 2)
+        terminal_events = [
+            json.loads(line)
+            for line in manifest_path.read_text().splitlines()
+            if json.loads(line)["event"] in (
+                "registered",
+                "recovered_registered",
+            )
+        ]
+        self.assertEqual(len(terminal_events), 2)
 
     def test_manifest_rejects_symlink_hardlink_bad_mode_and_bad_owner(self):
         mutators = (
