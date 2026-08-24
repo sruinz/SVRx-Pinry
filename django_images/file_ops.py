@@ -253,6 +253,8 @@ class MediaDirectory(object):
         created=None,
         root_path=None,
         root_stat=None,
+        verified_root=False,
+        anchor_directory=None,
     ):
         self.descriptors = descriptors
         self.names = list(names or [])
@@ -260,6 +262,8 @@ class MediaDirectory(object):
         self.created = list(created or [])
         self.root_path = root_path
         self.root_stat = root_stat
+        self.verified_root = verified_root
+        self.anchor_directory = anchor_directory
         self.removed = [False for _name in self.names]
 
     @property
@@ -271,6 +275,8 @@ class MediaDirectory(object):
             os.fsync(descriptor)
 
     def verify_current(self):
+        if self.anchor_directory is not None:
+            self.anchor_directory.verify_current()
         if not self.descriptors:
             raise MediaPathError("unsafe_media_directory")
         if self.root_path is not None and self.root_stat is not None:
@@ -365,6 +371,80 @@ class MediaDirectory(object):
                 if first_error is None:
                     first_error = error
         self.descriptors.extend(reversed(retained))
+        if first_error is not None:
+            raise first_error
+
+
+class MediaFileReceipt(object):
+    def __init__(
+        self,
+        root_directory,
+        parent_directory,
+        name,
+        descriptor,
+        file_stat,
+    ):
+        self.root_directory = root_directory
+        self.parent_directory = parent_directory
+        self.name = name
+        self.descriptor = descriptor
+        self.file_stat = file_stat
+        self._closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, error_type, error, traceback):
+        del error_type, error, traceback
+        self.close()
+        return False
+
+    def verify_current(self):
+        if self._closed or self.descriptor is None:
+            raise MediaPathError("unsafe_media_file")
+        try:
+            self.root_directory.verify_current()
+            self.parent_directory.verify_current()
+            descriptor_stat = os.fstat(self.descriptor)
+            named_stat = os.stat(
+                self.name,
+                dir_fd=self.parent_directory.descriptor,
+                follow_symlinks=False,
+            )
+        except (OSError, MediaPathError) as error:
+            raise MediaPathError("unsafe_media_file") from error
+        if (
+            not stat.S_ISREG(descriptor_stat.st_mode)
+            or not stat.S_ISREG(named_stat.st_mode)
+            or descriptor_stat.st_nlink != 1
+            or named_stat.st_nlink != 1
+            or _identity(descriptor_stat) != _identity(self.file_stat)
+            or _identity(named_stat) != _identity(self.file_stat)
+            or descriptor_stat.st_size != self.file_stat.st_size
+            or named_stat.st_size != self.file_stat.st_size
+        ):
+            raise MediaPathError("unsafe_media_file")
+        return True
+
+    def close(self):
+        if self._closed:
+            if self.parent_directory.descriptors:
+                self.parent_directory.close()
+            return
+        self._closed = True
+        first_error = None
+        descriptor = self.descriptor
+        self.descriptor = None
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                first_error = error
+        try:
+            self.parent_directory.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         if first_error is not None:
             raise first_error
 
@@ -524,6 +604,218 @@ def open_media_root(media_root):
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _verified_absolute_components(path):
+    if (
+        not isinstance(path, str)
+        or not path
+        or not os.path.isabs(path)
+        or "\\" in path
+    ):
+        raise MediaPathError("unsafe_media_directory")
+    raw_components = path.split("/")
+    if raw_components[0] != "" or not raw_components[1:]:
+        raise MediaPathError("unsafe_media_directory")
+    if any(
+        component in ("", ".", "..")
+        for component in raw_components[1:]
+    ):
+        raise MediaPathError("unsafe_media_directory")
+    return tuple(raw_components[1:])
+
+
+def open_verified_media_root(media_root):
+    components = _verified_absolute_components(media_root)
+    required_flags = (
+        getattr(os, "O_DIRECTORY", None),
+        getattr(os, "O_NOFOLLOW", None),
+    )
+    if (
+        any(type(flag) is not int for flag in required_flags)
+        or os.open not in getattr(os, "supports_dir_fd", set())
+        or os.stat not in getattr(os, "supports_dir_fd", set())
+        or os.stat not in getattr(os, "supports_follow_symlinks", set())
+    ):
+        raise MediaPathError("unsafe_media_directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptors = []
+    names = []
+    directory_stats = []
+    try:
+        descriptors.append(os.open("/", flags))
+        for name in components:
+            parent_descriptor = descriptors[-1]
+            named_stat = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(named_stat.st_mode):
+                raise MediaPathError("unsafe_media_directory")
+            descriptor = os.open(
+                name,
+                flags,
+                dir_fd=parent_descriptor,
+            )
+            opened_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened_stat.st_mode)
+                or _identity(opened_stat) != _identity(named_stat)
+            ):
+                os.close(descriptor)
+                raise MediaPathError("unsafe_media_directory")
+            names.append(name)
+            directory_stats.append(opened_stat)
+            descriptors.append(descriptor)
+        root_stat = directory_stats[-1]
+        directory = MediaDirectory(
+            descriptors,
+            names=names,
+            directory_stats=directory_stats,
+            created=[False for _name in names],
+            root_path=media_root,
+            root_stat=root_stat,
+            verified_root=True,
+        )
+        directory.verify_current()
+        return directory
+    except BaseException as error:
+        while descriptors:
+            try:
+                os.close(descriptors.pop())
+            except BaseException:
+                pass
+        if isinstance(error, MediaPathError):
+            raise
+        if not isinstance(error, Exception):
+            raise
+        raise MediaPathError("unsafe_media_directory") from error
+
+
+def open_verified_media_file(
+    root_directory, relative_path, missing_ok=False
+):
+    if (
+        not isinstance(root_directory, MediaDirectory)
+        or not root_directory.verified_root
+    ):
+        raise MediaPathError("unsafe_media_file")
+    components = _relative_components(relative_path)
+    root_directory.verify_current()
+    descriptors = [os.dup(root_directory.descriptor)]
+    names = []
+    directory_stats = []
+    parent_directory = None
+    file_descriptor = None
+    receipt = None
+    try:
+        for name in components[:-1]:
+            parent_descriptor = descriptors[-1]
+            try:
+                named_stat = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if missing_ok:
+                    partial_directory = MediaDirectory(descriptors)
+                    partial_directory.close()
+                    descriptors = []
+                    return None
+                raise
+            if not stat.S_ISDIR(named_stat.st_mode):
+                raise MediaPathError("unsafe_media_file")
+            child_descriptor = _open_child_directory_nofollow(
+                parent_descriptor,
+                name,
+                named_stat,
+            )
+            names.append(name)
+            directory_stats.append(os.fstat(child_descriptor))
+            descriptors.append(child_descriptor)
+        parent_directory = MediaDirectory(
+            descriptors,
+            names=names,
+            directory_stats=directory_stats,
+            created=[False for _name in names],
+            anchor_directory=root_directory,
+        )
+        leaf_name = components[-1]
+        try:
+            named_leaf_stat = os.stat(
+                leaf_name,
+                dir_fd=parent_directory.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if missing_ok:
+                parent_directory.close()
+                parent_directory = None
+                descriptors = []
+                return None
+            raise
+        if (
+            not stat.S_ISREG(named_leaf_stat.st_mode)
+            or named_leaf_stat.st_nlink != 1
+        ):
+            raise MediaPathError("unsafe_media_file")
+        file_descriptor = _open_regular_nofollow(
+            parent_directory.descriptor,
+            leaf_name,
+        )
+        file_stat = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_nlink != 1
+            or _identity(file_stat) != _identity(named_leaf_stat)
+        ):
+            raise MediaPathError("unsafe_media_file")
+        receipt = MediaFileReceipt(
+            root_directory,
+            parent_directory,
+            leaf_name,
+            file_descriptor,
+            file_stat,
+        )
+        receipt.verify_current()
+        parent_directory = None
+        file_descriptor = None
+        descriptors = []
+        return receipt
+    except BaseException as error:
+        if receipt is not None:
+            try:
+                receipt.close()
+            except BaseException:
+                pass
+        else:
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except BaseException:
+                    pass
+            if parent_directory is not None:
+                try:
+                    parent_directory.close()
+                except BaseException:
+                    pass
+            else:
+                while descriptors:
+                    try:
+                        os.close(descriptors.pop())
+                    except BaseException:
+                        pass
+        if isinstance(error, MediaPathError):
+            if str(error) == "media_path_escape":
+                raise
+            raise MediaPathError("unsafe_media_file") from error
+        if not isinstance(error, Exception):
+            raise
+        raise MediaPathError("unsafe_media_file") from error
 
 
 def remove_media_file(root_directory, relative_name):
@@ -895,7 +1187,7 @@ def _verify_held_media_lifecycle_lock(
 def open_or_create_media_directory_from(root_directory, relative_directory):
     if not isinstance(root_directory, MediaDirectory):
         raise TypeError("root_directory must be a MediaDirectory")
-    if root_directory.names:
+    if root_directory.names and not root_directory.verified_root:
         raise MediaPathError("unsafe_media_directory")
     root_directory.verify_current()
     components = _relative_components(relative_directory)
@@ -948,6 +1240,9 @@ def open_or_create_media_directory_from(root_directory, relative_directory):
             created=created_components,
             root_path=root_directory.root_path,
             root_stat=root_directory.root_stat,
+            anchor_directory=(
+                root_directory if root_directory.verified_root else None
+            ),
         )
     except BaseException:
         partial_directory = MediaDirectory(
@@ -957,6 +1252,9 @@ def open_or_create_media_directory_from(root_directory, relative_directory):
             created=created_components,
             root_path=root_directory.root_path,
             root_stat=root_directory.root_stat,
+            anchor_directory=(
+                root_directory if root_directory.verified_root else None
+            ),
         )
         try:
             partial_directory.remove_created_suffix(1)
