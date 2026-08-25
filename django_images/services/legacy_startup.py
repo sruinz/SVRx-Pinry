@@ -1,0 +1,763 @@
+import json
+import os
+import stat
+import uuid
+
+from django.conf import settings
+from django.core.management import CommandError
+
+from core.services.media_asset_backfill import (
+    MANIFEST_FILENAME as BACKFILL_MANIFEST_FILENAME,
+    MediaAssetBackfiller,
+    recover_incomplete_media_asset_plan,
+)
+from core.version import normalize_source_commit
+from django_images import file_ops
+from django_images.models import Image, Thumbnail
+from django_images.services import migration_state, startup_preflight
+from django_images.services.media_archive import LegacyMediaArchive
+from django_images.services.media_migration_v2 import (
+    AUTO_V2_MANIFEST_FILENAME,
+    AutoV2MediaMigrator,
+    recover_incomplete_auto_v2_plan,
+)
+from django_images.services.sqlite_snapshot import snapshot_sqlite
+
+
+SUMMARY_FILENAME = "migration-summary.json"
+_BACKUP_ROOT_NAME = "legacy-backup"
+_SAFE_BACKFILL_REASONS = frozenset((
+    "extra_derivative",
+    "file_identity_mismatch",
+    "invalid_dimensions",
+    "invalid_media_file",
+    "invalid_named_leaf",
+    "missing_derivative",
+    "multi_owner",
+    "orphan",
+    "pipeline_closure_mismatch",
+    "unsafe_media_file",
+))
+
+
+class LegacyStartupError(Exception):
+    def __init__(self, code):
+        super(LegacyStartupError, self).__init__(code)
+        self.code = code
+
+
+class LegacyStartupCoordinator(object):
+    def __init__(
+        self,
+        service_uid,
+        service_gid,
+        fault_injector=None,
+        archive_adapter=None,
+    ):
+        if (
+            type(service_uid) is not int
+            or service_uid < 0
+            or type(service_gid) is not int
+            or service_gid < 0
+        ):
+            raise LegacyStartupError("media_storage_configuration_invalid")
+        self.service_uid = service_uid
+        self.service_gid = service_gid
+        self.fault_injector = fault_injector
+        self.archive_adapter = archive_adapter
+        self._evidence = None
+        self._allow_missing_media_layout = False
+        self._media_summary = None
+        self._backfill_summary = None
+
+    def prepare_before_schema(self):
+        """증거·state·공간·snapshot을 수렴하고 run 또는 None을 반환한다."""
+        backup_root = self._backup_root()
+        read_only = migration_state.inspect_run_inventory_read_only(
+            backup_root
+        )
+        evidence = startup_preflight.inspect_legacy_evidence(
+            self._database_path(),
+            None,
+            settings.MEDIA_ROOT,
+        )
+        self._evidence = evidence
+        self._allow_missing_media_layout = (
+            not evidence.has_legacy_evidence
+            and (
+                evidence.pending_schema
+                or not evidence.has_named_canonical_paths
+            )
+        )
+        needs_run = evidence.has_legacy_evidence or evidence.pending_schema
+        if not needs_run and not read_only.requires_migration_flag:
+            return None
+
+        initial_space = startup_preflight.calculate_initial_space(
+            evidence.database_bytes,
+            evidence.distinct_legacy_bytes,
+        )
+        resuming = bool(
+            read_only.incomplete_count or read_only.creating_count
+        )
+        initial_space_checked = needs_run and not resuming
+        if initial_space_checked:
+            self._require_space(initial_space.required_bytes)
+        migration_state.ensure_migration_backup_root(backup_root)
+        inventory = migration_state.scan_run_inventory(backup_root)
+        if inventory.invalid_count:
+            raise LegacyStartupError("migration_state_missing_or_invalid")
+        run = migration_state.resolve_or_create_run(
+            inventory,
+            evidence,
+            evidence.pending_schema,
+            normalize_source_commit(
+                getattr(settings, "PINRY_SOURCE_COMMIT", None)
+            )["source_commit"],
+            self.service_uid,
+            self.service_gid,
+            initial_space=initial_space,
+        )
+        if run is None:
+            return None
+
+        status = migration_state.read_run_status(run)
+        if (
+            status.phase in ("initialized", "snapshot_intent")
+            and not initial_space_checked
+        ):
+            self._require_space(status.initial_required_bytes)
+        if status.phase == "initialized" and evidence.database_identity is not None:
+            intent = {
+                "kind": "sqlite_snapshot",
+                "source_device": evidence.database_identity["device"],
+                "source_inode": evidence.database_identity["inode"],
+            }
+            self._transition(
+                run,
+                "initialized",
+                "snapshot_intent",
+                intent=intent,
+            )
+            self._fault("after_snapshot_intent")
+            status = migration_state.read_run_status(run)
+        if status.phase == "snapshot_intent":
+            snapshot = snapshot_sqlite(
+                self._database_path(),
+                run,
+                self.service_uid,
+                self.service_gid,
+            )
+            if snapshot is None:
+                raise LegacyStartupError("sqlite_snapshot_failed")
+            self._fault("after_snapshot")
+            self._transition(
+                run,
+                "snapshot_intent",
+                "snapshot_complete",
+            )
+            self._fault("after_snapshot_complete")
+        return run
+
+    def schema_required(self, run):
+        if run is None:
+            return True
+        return migration_state.read_run_status(run).phase in (
+            "initialized",
+            "snapshot_complete",
+        )
+
+    def converge_after_schema(self, run):
+        """preflight, path, registry, archive, complete를 순서대로 수렴한다."""
+        if run is None and self._evidence is None:
+            self._allow_missing_media_layout = True
+        if run is not None:
+            status = migration_state.read_run_status(run)
+            if status.phase in ("initialized", "snapshot_complete"):
+                self._transition(run, status.phase, "schema_complete")
+                self._fault("after_schema_complete")
+            elif status.phase in ("snapshot_intent",):
+                raise LegacyStartupError("migration_state_phase_mismatch")
+
+        self._ensure_allowed_media_layout()
+        self._configuration_preflight()
+        if run is None:
+            return None
+        self._seal_current_identities(run)
+        status = migration_state.read_run_status(run)
+        if status.phase == "complete":
+            return run
+        if status.phase in ("schema_complete", "copying"):
+            self._converge_media(run)
+            self._seal_current_identities(run)
+            status = migration_state.read_run_status(run)
+        if status.phase == "paths_complete":
+            self._converge_backfill(run)
+            status = migration_state.read_run_status(run)
+        if status.phase in (
+            "registry_complete",
+            "archive_intent",
+            "archive_complete",
+        ):
+            self._converge_archive(run)
+        status = migration_state.read_run_status(run)
+        if status.phase != "complete":
+            raise LegacyStartupError("migration_state_phase_mismatch")
+        self._write_summary(run)
+        return run
+
+    def adjust_ownership(self, startup_lock_descriptor):
+        managed_paths = []
+        for configured in (
+            getattr(settings, "STATIC_ROOT", None),
+            settings.MEDIA_ROOT,
+            self._database_path(),
+            self._backup_root(),
+        ):
+            if configured is not None and os.path.lexists(os.fspath(configured)):
+                managed_paths.append(os.fspath(configured))
+        startup_preflight.adjust_storage_ownership(
+            settings.PINRY_DATA_ROOT,
+            tuple(dict.fromkeys(managed_paths)),
+            self.service_uid,
+            self.service_gid,
+            startup_lock_descriptor,
+        )
+
+    def runtime_check(self, service_uid, service_gid):
+        """service identity로 실제 storage write·lock probe를 실행한다."""
+        result = startup_preflight.validate_storage_runtime_preflight(
+            settings.MEDIA_ROOT,
+            service_uid,
+            service_gid,
+        )
+        if not result.ok:
+            raise LegacyStartupError(result.reason_code)
+        return result
+
+    def _converge_media(self, run):
+        status = migration_state.read_run_status(run)
+        migrator = AutoV2MediaMigrator(
+            run.path,
+            AUTO_V2_MANIFEST_FILENAME,
+            run.run_id,
+            self.service_uid,
+            self.service_gid,
+            fault_injector=self.fault_injector,
+        )
+        resume_torn_execution = False
+        try:
+            planned = migrator.run(execute=False)
+        except CommandError as error:
+            reason = str(error)
+            if reason not in (
+                "auto_v2_plan_incomplete",
+                "media_manifest_torn_tail_requires_execute",
+            ):
+                raise
+            resume_torn_execution = (
+                reason == "media_manifest_torn_tail_requires_execute"
+                and status.phase == "copying"
+                and status.media_plan_sha256 is not None
+            )
+            if not resume_torn_execution:
+                if (
+                    status.phase != "schema_complete"
+                    or status.media_plan_sha256 is not None
+                ):
+                    raise
+                recover_incomplete_auto_v2_plan(
+                    run.path,
+                    AUTO_V2_MANIFEST_FILENAME,
+                    run.run_id,
+                    self.service_uid,
+                    self.service_gid,
+                )
+                planned = migrator.run(execute=False)
+        if resume_torn_execution:
+            recovered = migrator.recover_execution_tail()
+            self._validate_summary_run(recovered, run)
+            if recovered.plan_sha256 != status.media_plan_sha256:
+                raise LegacyStartupError("migration_state_plan_mismatch")
+            migration_state.persist_manifest_identity(
+                run,
+                "copying",
+                "media",
+                recovered.plan_sha256,
+                recovered.manifest_sha256,
+            )
+            remaining = startup_preflight.calculate_remaining_space(
+                recovered.copy_required_bytes,
+                status.initial_margin_bytes,
+            )
+            self._require_space(remaining.required_bytes)
+            expected_plan_sha256 = recovered.plan_sha256
+        else:
+            self._validate_summary_run(planned, run)
+            migration_state.persist_manifest_identity(
+                run,
+                status.phase,
+                "media",
+                planned.plan_sha256,
+                planned.manifest_sha256,
+            )
+            remaining = startup_preflight.calculate_remaining_space(
+                planned.copy_required_bytes,
+                status.initial_margin_bytes,
+            )
+            self._require_space(remaining.required_bytes)
+            if status.phase == "schema_complete":
+                self._transition(
+                    run,
+                    "schema_complete",
+                    "copying",
+                    plan_sha256=planned.plan_sha256,
+                    manifest_sha256=planned.manifest_sha256,
+                )
+                self._fault("after_copying_intent")
+            expected_plan_sha256 = planned.plan_sha256
+        executed = migrator.run(execute=True)
+        self._validate_summary_run(executed, run)
+        if executed.plan_sha256 != expected_plan_sha256:
+            raise LegacyStartupError("migration_state_plan_mismatch")
+        migration_state.persist_manifest_identity(
+            run,
+            "copying",
+            "media",
+            executed.plan_sha256,
+            executed.manifest_sha256,
+        )
+        self._media_summary = executed
+        self._fault("after_media_execute")
+        self._transition(
+            run,
+            "copying",
+            "paths_complete",
+            plan_sha256=executed.plan_sha256,
+            manifest_sha256=executed.manifest_sha256,
+        )
+        self._fault("after_paths_complete")
+
+    def _converge_backfill(self, run):
+        backfiller = MediaAssetBackfiller(
+            run.path,
+            BACKFILL_MANIFEST_FILENAME,
+            run.run_id,
+            self.service_uid,
+            self.service_gid,
+            fault_injector=self.fault_injector,
+        )
+        status = migration_state.read_run_status(run)
+        resume_torn_execution = False
+        try:
+            planned = backfiller.run(execute=False)
+        except CommandError as error:
+            reason = str(error)
+            if reason not in (
+                "media_asset_plan_incomplete",
+                "media_asset_manifest_torn_tail_requires_execute",
+            ):
+                raise
+            resume_torn_execution = (
+                reason == "media_asset_manifest_torn_tail_requires_execute"
+                and status.backfill_plan_sha256 is not None
+            )
+            if not resume_torn_execution:
+                if status.backfill_plan_sha256 is not None:
+                    raise
+                recover_incomplete_media_asset_plan(
+                    run.path,
+                    BACKFILL_MANIFEST_FILENAME,
+                    run.run_id,
+                    self.service_uid,
+                    self.service_gid,
+                )
+                planned = backfiller.run(execute=False)
+        if resume_torn_execution:
+            expected_plan_sha256 = status.backfill_plan_sha256
+        else:
+            self._validate_summary_run(planned, run)
+            migration_state.persist_manifest_identity(
+                run,
+                "paths_complete",
+                "backfill",
+                planned.plan_sha256,
+                planned.manifest_sha256,
+            )
+            expected_plan_sha256 = planned.plan_sha256
+        executed = backfiller.run(execute=True)
+        self._validate_summary_run(executed, run)
+        if executed.plan_sha256 != expected_plan_sha256:
+            raise LegacyStartupError("migration_state_plan_mismatch")
+        migration_state.persist_manifest_identity(
+            run,
+            "paths_complete",
+            "backfill",
+            executed.plan_sha256,
+            executed.manifest_sha256,
+        )
+        self._backfill_summary = executed
+        self._fault("after_backfill_execute")
+        self._transition(
+            run,
+            "paths_complete",
+            "registry_complete",
+            plan_sha256=executed.plan_sha256,
+            manifest_sha256=executed.manifest_sha256,
+        )
+        self._fault("after_registry_complete")
+
+    def _converge_archive(self, run):
+        evidence = self._seal_current_identities(run)
+        status = migration_state.read_run_status(run)
+        if status.phase == "archive_complete":
+            self._transition(run, "archive_complete", "complete")
+            return
+        archive = LegacyMediaArchive(
+            settings.MEDIA_ROOT,
+            run.path,
+            run.path,
+            AUTO_V2_MANIFEST_FILENAME,
+            run.run_id,
+            self.service_uid,
+            self.service_gid,
+        )
+        if status.phase == "registry_complete":
+            plan = archive.prepare(
+                has_media_image_directory=(
+                    evidence.has_media_image_directory
+                ),
+            )
+            if not plan.intents:
+                self._transition(run, "registry_complete", "complete")
+                return
+            first = self._first_incomplete(plan.progress)
+            self._transition(
+                run,
+                "registry_complete",
+                "archive_intent",
+                intent=first,
+                progress=plan.progress,
+            )
+            self._fault("after_archive_intent")
+        else:
+            plan = archive.prepare(progress=status.progress)
+            if self._first_incomplete(plan.progress) != status.intent:
+                raise LegacyStartupError("archive_state_conflict")
+
+        def record_completion(intent, progress, result):
+            del intent, result
+            next_intent = self._first_incomplete(progress)
+            if next_intent is None:
+                self._transition(
+                    run,
+                    "archive_intent",
+                    "archive_complete",
+                )
+            else:
+                self._transition(
+                    run,
+                    "archive_intent",
+                    "archive_intent",
+                    intent=next_intent,
+                    progress=progress,
+                )
+            self._fault("after_archive_progress")
+
+        archive.converge(
+            plan,
+            syscall_adapter=self.archive_adapter,
+            on_item_complete=record_completion,
+        )
+        if migration_state.read_run_status(run).phase != "archive_complete":
+            raise LegacyStartupError("archive_state_conflict")
+        self._transition(run, "archive_complete", "complete")
+
+    def _configuration_preflight(self):
+        image_storage = Image._meta.get_field("image").storage
+        thumbnail_storage = Thumbnail._meta.get_field("image").storage
+        result = startup_preflight.validate_storage_configuration_preflight(
+            settings.MEDIA_ROOT,
+            image_storage,
+            thumbnail_storage,
+            settings.IMAGE_SIZES,
+            self.service_uid,
+            self.service_gid,
+        )
+        if not result.ok:
+            raise LegacyStartupError(result.reason_code)
+        return result
+
+    def _seal_current_identities(self, run):
+        evidence = startup_preflight.inspect_legacy_evidence(
+            self._database_path(),
+            None,
+            settings.MEDIA_ROOT,
+        )
+        migration_state.seal_run_identities(run, evidence)
+        return evidence
+
+    def _ensure_allowed_media_layout(self):
+        try:
+            os.stat(os.fspath(settings.MEDIA_ROOT), follow_symlinks=False)
+            return
+        except FileNotFoundError:
+            pass
+        if not self._allow_missing_media_layout:
+            return
+        startup_preflight.ensure_media_root_layout(
+            settings.PINRY_DATA_ROOT,
+            settings.MEDIA_ROOT,
+            self.service_uid,
+            self.service_gid,
+        )
+
+    def _transition(self, run, expected, next_phase, **kwargs):
+        transitioned = migration_state.transition_state(
+            run,
+            expected,
+            next_phase,
+            **kwargs
+        )
+        self._write_summary(transitioned)
+        return transitioned
+
+    def _write_summary(self, run):
+        status = migration_state.read_run_status(run)
+        media = self._media_summary
+        backfill = self._backfill_summary
+        reasons = {} if backfill is None else dict(backfill.reason_counts)
+        if (
+            any(code not in _SAFE_BACKFILL_REASONS for code in reasons)
+            or any(type(count) is not int or count < 0 for count in reasons.values())
+        ):
+            raise LegacyStartupError("unsafe_migration_summary")
+        payload = {
+            "format_version": 1,
+            "source_commit": normalize_source_commit(
+                status.source_commit
+            )["source_commit"],
+            "run_id": status.run_id,
+            "phase": status.phase,
+            "backup_relative_name": _BACKUP_ROOT_NAME,
+            "media_plan_sha256": status.media_plan_sha256,
+            "media_manifest_sha256": status.media_manifest_sha256,
+            "backfill_plan_sha256": status.backfill_plan_sha256,
+            "backfill_manifest_sha256": status.backfill_manifest_sha256,
+            "media_image_count": _safe_summary_count(
+                0 if media is None else media.image_count
+            ),
+            "media_md5_legacy": _safe_summary_count(
+                0 if media is None else media.md5_legacy
+            ),
+            "media_fixed_slot": _safe_summary_count(
+                0 if media is None else media.fixed_slot
+            ),
+            "media_named_canonical": _safe_summary_count(
+                0 if media is None else media.named_canonical
+            ),
+            "backfill_scanned": _safe_summary_count(
+                0 if backfill is None else backfill.scanned
+            ),
+            "backfill_registered": _safe_summary_count(
+                0 if backfill is None else backfill.registered
+            ),
+            "backfill_already_registered": _safe_summary_count(
+                0 if backfill is None else backfill.already_registered
+            ),
+            "backfill_skipped": _safe_summary_count(
+                0 if backfill is None else backfill.skipped
+            ),
+            "reason_counts": dict(sorted(reasons.items())),
+        }
+        _atomic_write_summary(run, payload)
+
+    def _backup_root(self):
+        return os.path.join(settings.PINRY_DATA_ROOT, _BACKUP_ROOT_NAME)
+
+    @staticmethod
+    def _database_path():
+        return settings.DATABASES["default"]["NAME"]
+
+    def _require_space(self, required_bytes):
+        available = startup_preflight.available_space_bytes(
+            settings.PINRY_DATA_ROOT
+        )
+        if available < required_bytes:
+            raise LegacyStartupError("legacy_migration_space_insufficient")
+
+    @staticmethod
+    def _validate_summary_run(summary, run):
+        if getattr(summary, "run_id", None) != run.run_id:
+            raise LegacyStartupError("migration_state_plan_mismatch")
+
+    @staticmethod
+    def _first_incomplete(progress):
+        if not isinstance(progress, dict):
+            raise LegacyStartupError("archive_state_conflict")
+        items = progress.get("items")
+        if not isinstance(items, list):
+            raise LegacyStartupError("archive_state_conflict")
+        for item in items:
+            if isinstance(item, dict) and item.get("complete") is False:
+                intent = item.get("intent")
+                if isinstance(intent, dict):
+                    return intent
+                break
+        if all(
+            isinstance(item, dict) and item.get("complete") is True
+            for item in items
+        ):
+            return None
+        raise LegacyStartupError("archive_state_conflict")
+
+    def _fault(self, point):
+        if self.fault_injector is not None:
+            self.fault_injector(point)
+
+
+def _atomic_write_summary(run, payload):
+    directory = None
+    temp_descriptor = None
+    temp_identity = None
+    temp_name = ".migration-summary.json.tmp-{}".format(uuid.uuid4())
+    try:
+        directory = file_ops.open_verified_media_root(run.path)
+        directory_stat = os.fstat(directory.descriptor)
+        if (
+            (directory_stat.st_dev, directory_stat.st_ino)
+            != (run.directory_device, run.directory_inode)
+            or directory_stat.st_uid != run.service_uid
+            or directory_stat.st_gid != run.service_gid
+            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        ):
+            raise LegacyStartupError("unsafe_migration_summary")
+        existing_identity = _verified_summary_target(directory, run)
+        content = (
+            json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        temp_descriptor = os.open(
+            temp_name,
+            flags,
+            0o600,
+            dir_fd=directory.descriptor,
+        )
+        created_stat = os.fstat(temp_descriptor)
+        if (
+            not stat.S_ISREG(created_stat.st_mode)
+            or created_stat.st_nlink != 1
+        ):
+            raise LegacyStartupError("unsafe_migration_summary")
+        temp_identity = (created_stat.st_dev, created_stat.st_ino)
+        os.fchmod(temp_descriptor, 0o600)
+        os.fchown(temp_descriptor, run.service_uid, run.service_gid)
+        _write_all(temp_descriptor, content)
+        os.fsync(temp_descriptor)
+        temp_stat = os.fstat(temp_descriptor)
+        if (temp_stat.st_dev, temp_stat.st_ino) != temp_identity:
+            raise LegacyStartupError("unsafe_migration_summary")
+        os.close(temp_descriptor)
+        temp_descriptor = None
+        directory.verify_current()
+        if _verified_summary_target(directory, run) != existing_identity:
+            raise LegacyStartupError("unsafe_migration_summary")
+        named_temp = os.stat(
+            temp_name,
+            dir_fd=directory.descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(named_temp.st_mode)
+            or named_temp.st_nlink != 1
+            or (named_temp.st_dev, named_temp.st_ino)
+            != (temp_stat.st_dev, temp_stat.st_ino)
+        ):
+            raise LegacyStartupError("unsafe_migration_summary")
+        os.replace(
+            temp_name,
+            SUMMARY_FILENAME,
+            src_dir_fd=directory.descriptor,
+            dst_dir_fd=directory.descriptor,
+        )
+        os.fsync(directory.descriptor)
+        _verified_summary_target(directory, run, required=True)
+    except LegacyStartupError:
+        raise
+    except Exception as error:
+        raise LegacyStartupError("unsafe_migration_summary") from error
+    finally:
+        if temp_descriptor is not None:
+            os.close(temp_descriptor)
+        if directory is not None:
+            try:
+                named = os.stat(
+                    temp_name,
+                    dir_fd=directory.descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    temp_identity is not None
+                    and stat.S_ISREG(named.st_mode)
+                    and named.st_nlink == 1
+                    and (named.st_dev, named.st_ino) == temp_identity
+                ):
+                    os.unlink(temp_name, dir_fd=directory.descriptor)
+                    os.fsync(directory.descriptor)
+            except OSError:
+                pass
+            directory.close()
+
+
+def _verified_summary_target(directory, run, required=False):
+    try:
+        named_stat = os.stat(
+            SUMMARY_FILENAME,
+            dir_fd=directory.descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        if required:
+            raise LegacyStartupError("unsafe_migration_summary")
+        return None
+    if (
+        not stat.S_ISREG(named_stat.st_mode)
+        or named_stat.st_nlink != 1
+        or named_stat.st_uid != run.service_uid
+        or named_stat.st_gid != run.service_gid
+        or stat.S_IMODE(named_stat.st_mode) != 0o600
+    ):
+        raise LegacyStartupError("unsafe_migration_summary")
+    descriptor = None
+    try:
+        descriptor = os.open(
+            SUMMARY_FILENAME,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory.descriptor,
+        )
+        opened_stat = os.fstat(descriptor)
+        identity = (opened_stat.st_dev, opened_stat.st_ino)
+        if identity != (named_stat.st_dev, named_stat.st_ino):
+            raise LegacyStartupError("unsafe_migration_summary")
+        return identity
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _write_all(descriptor, content):
+    offset = 0
+    while offset < len(content):
+        written = os.write(descriptor, content[offset:])
+        if written <= 0:
+            raise LegacyStartupError("unsafe_migration_summary")
+        offset += written
+
+
+def _safe_summary_count(value):
+    if type(value) is not int or value < 0:
+        raise LegacyStartupError("unsafe_migration_summary")
+    return value

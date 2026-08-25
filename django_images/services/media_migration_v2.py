@@ -1194,6 +1194,26 @@ class AutoV2ManifestLog(object):
         self.state = self._load_state()
         return quarantine_name
 
+    def _reset_incomplete_plan(self):
+        if self.state.plan_complete:
+            raise _command_error("auto_v2_plan_reset_forbidden")
+        changed = bool(self.state.events or self.state.torn_tail is not None)
+        if not changed:
+            return False
+        if self.state.torn_tail is not None:
+            self.repair_torn_tail()
+        self._ensure_content_current()
+        if self.state.plan_complete or any(
+            event["event"] != "planned" for event in self.state.events
+        ):
+            raise _command_error("auto_v2_plan_reset_forbidden")
+        self._verify_current()
+        os.ftruncate(self.descriptor, 0)
+        os.fsync(self.descriptor)
+        os.fsync(self.run_directory.descriptor)
+        self.state = self._load_state()
+        return True
+
     def summary(self):
         if self.state.torn_tail is not None:
             raise _command_error(
@@ -1294,6 +1314,20 @@ def load_auto_v2_plan(
         return manifest.summary()
 
 
+def recover_incomplete_auto_v2_plan(
+    run_directory, filename, run_id, service_uid, service_gid
+):
+    """완료 marker 이전의 계획 prefix만 같은 run에서 재계획하게 한다."""
+    with AutoV2ManifestLog.open(
+        run_directory,
+        filename,
+        run_id,
+        service_uid,
+        service_gid,
+    ) as manifest:
+        return manifest._reset_incomplete_plan()
+
+
 def load_auto_v2_archive_sources(
     run_directory, filename, run_id, service_uid, service_gid
 ):
@@ -1361,6 +1395,21 @@ class AutoV2MediaMigrator(object):
         self.service_gid = service_gid
         self.batch_size = batch_size
         self.fault_injector = fault_injector
+
+    def recover_execution_tail(self):
+        """완료된 계획 뒤 torn execute event만 복구한다."""
+        with AutoV2ManifestLog.open(
+            self.run_directory,
+            self.filename,
+            self.run_id,
+            self.service_uid,
+            self.service_gid,
+        ) as manifest:
+            if not manifest.state.plan_complete:
+                raise _command_error("auto_v2_plan_incomplete")
+            if manifest.state.torn_tail is not None:
+                manifest.repair_torn_tail()
+            return manifest.summary()
 
     def run(self, execute=False):
         with AutoV2ManifestLog.open(

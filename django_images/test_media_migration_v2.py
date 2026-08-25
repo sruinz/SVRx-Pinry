@@ -33,6 +33,7 @@ from django_images.services.media_migration_v2 import (
     _valid_staging_name,
     load_auto_v2_archive_sources,
     load_auto_v2_plan,
+    recover_incomplete_auto_v2_plan,
 )
 
 
@@ -559,6 +560,111 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         self.assertEqual(executed.plan_sha256, planned.plan_sha256)
         self.assertNotEqual(executed.manifest_sha256, planned.manifest_sha256)
+
+    def test_incomplete_plan_prefix_is_reset_for_same_run_replanning(self):
+        self.make_image()
+        self.make_image()
+        original_record = AutoV2ManifestLog.record_plan
+        recorded = {"value": False}
+
+        def record_then_crash(manifest, plan):
+            original_record(manifest, plan)
+            if not recorded["value"]:
+                recorded["value"] = True
+                raise SimulatedProcessCrash()
+
+        with mock.patch.object(
+            AutoV2ManifestLog,
+            "record_plan",
+            new=record_then_crash,
+        ):
+            with self.assertRaises(SimulatedProcessCrash):
+                self.migrator().run(execute=False)
+
+        self.assertEqual(len(self.manifest_events()), 1)
+        self.assertTrue(recover_incomplete_auto_v2_plan(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ))
+        self.assertEqual(self.manifest_path.read_bytes(), b"")
+
+        summary = self.migrator().run(execute=False)
+
+        self.assertEqual(summary.image_count, 2)
+
+    def test_incomplete_torn_plan_prefix_is_quarantined_then_reset(self):
+        self.make_image()
+        original_record = AutoV2ManifestLog.record_plan
+
+        def record_then_crash(manifest, plan):
+            original_record(manifest, plan)
+            raise SimulatedProcessCrash()
+
+        with mock.patch.object(
+            AutoV2ManifestLog,
+            "record_plan",
+            new=record_then_crash,
+        ):
+            with self.assertRaises(SimulatedProcessCrash):
+                self.migrator().run(execute=False)
+        with self.manifest_path.open("ab") as manifest:
+            manifest.write(b'{"format_version":2')
+
+        self.assertTrue(recover_incomplete_auto_v2_plan(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ))
+
+        self.assertEqual(self.manifest_path.read_bytes(), b"")
+        self.assertEqual(
+            len(list(self.run_directory.glob("media-migration.jsonl.torn-*"))),
+            1,
+        )
+
+    def test_complete_plan_is_never_reset(self):
+        self.make_image()
+        self.migrator().run(execute=False)
+        before = self.manifest_path.read_bytes()
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^auto_v2_plan_reset_forbidden$",
+        ):
+            recover_incomplete_auto_v2_plan(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+            )
+
+        self.assertEqual(self.manifest_path.read_bytes(), before)
+
+    def test_completed_plan_torn_tail_can_be_repaired_without_execution(self):
+        self.make_image()
+        planned = self.migrator().run(execute=False)
+        with self.manifest_path.open("ab") as manifest:
+            manifest.write(b'{"event":"committed"')
+
+        recovered = self.migrator().recover_execution_tail()
+
+        self.assertEqual(recovered.plan_sha256, planned.plan_sha256)
+        self.assertEqual(
+            recovered.manifest_sha256,
+            planned.manifest_sha256,
+        )
+        self.assertEqual(
+            len(list(self.run_directory.glob(
+                "media-migration.jsonl.torn-*"
+            ))),
+            1,
+        )
 
     def test_archive_source_loader_requires_terminal_results_and_filters_fixed_originals(self):
         first = self.make_image(generation="fixed", sizes=())

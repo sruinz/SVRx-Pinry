@@ -33,6 +33,7 @@ from core.services.idempotency import IdempotencyStore
 from core.services.media_asset_backfill import (
     BackfillSummary,
     MediaAssetBackfiller,
+    recover_incomplete_media_asset_plan,
 )
 from core.services.media_storage import MediaStorage
 from core.services.pin_import import ImportMetadata, PinImportService
@@ -402,6 +403,98 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
                 MANIFEST_FILENAME,
             ).read_bytes()
         ).hexdigest())
+
+    def test_incomplete_plan_prefix_is_reset_for_same_run_replanning(self):
+        self._create_candidate(content=_png_bytes("red"))
+        self._create_candidate(content=_png_bytes("blue"))
+        service = self._service()
+        original_record = media_asset_backfill._BackfillManifestLog.record_plan
+        recorded = {"value": False}
+
+        def record_then_crash(manifest, plan):
+            original_record(manifest, plan)
+            if not recorded["value"]:
+                recorded["value"] = True
+                raise RuntimeError("plan interrupted")
+
+        with mock.patch.object(
+            media_asset_backfill._BackfillManifestLog,
+            "record_plan",
+            new=record_then_crash,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "plan interrupted"):
+                service.run(execute=False)
+
+        manifest_path = Path(service.run_directory, MANIFEST_FILENAME)
+        self.assertTrue(recover_incomplete_media_asset_plan(
+            service.run_directory,
+            MANIFEST_FILENAME,
+            service.run_id,
+            service.service_uid,
+            service.service_gid,
+        ))
+        self.assertEqual(manifest_path.read_bytes(), b"")
+
+        summary = service.run(execute=False)
+
+        self.assertEqual(summary.scanned, 2)
+
+    def test_incomplete_torn_plan_prefix_is_quarantined_then_reset(self):
+        self._create_candidate()
+        service = self._service()
+        original_record = media_asset_backfill._BackfillManifestLog.record_plan
+
+        def record_then_crash(manifest, plan):
+            original_record(manifest, plan)
+            raise RuntimeError("plan interrupted")
+
+        with mock.patch.object(
+            media_asset_backfill._BackfillManifestLog,
+            "record_plan",
+            new=record_then_crash,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "plan interrupted"):
+                service.run(execute=False)
+        manifest_path = Path(service.run_directory, MANIFEST_FILENAME)
+        with manifest_path.open("ab") as manifest:
+            manifest.write(b'{"format_version":2')
+
+        self.assertTrue(recover_incomplete_media_asset_plan(
+            service.run_directory,
+            MANIFEST_FILENAME,
+            service.run_id,
+            service.service_uid,
+            service.service_gid,
+        ))
+
+        self.assertEqual(manifest_path.read_bytes(), b"")
+        self.assertEqual(
+            len(list(Path(service.run_directory).glob(
+                "media-asset-backfill.jsonl.torn-*"
+            ))),
+            1,
+        )
+
+    def test_complete_plan_is_never_reset(self):
+        self._create_candidate()
+        service = self._service()
+        service.run(execute=False)
+        manifest_path = Path(service.run_directory, MANIFEST_FILENAME)
+        before = manifest_path.read_bytes()
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^media_asset_plan_reset_forbidden$",
+        ):
+            recover_incomplete_media_asset_plan(
+                service.run_directory,
+                MANIFEST_FILENAME,
+                service.run_id,
+                service.service_uid,
+                service.service_gid,
+            )
+
+        self.assertEqual(manifest_path.read_bytes(), before)
 
     def test_invalid_candidates_are_skipped_with_stable_reason_codes(self):
         orphan = self._create_candidate(owners=())

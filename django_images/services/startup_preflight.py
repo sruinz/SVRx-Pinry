@@ -68,6 +68,8 @@ class LegacyEvidence(object):
     has_named_canonical_paths: bool
     has_media_image_directory: bool
     pending_migrations: tuple
+    database_identity: object
+    media_root_identity: object
 
     @property
     def pending_schema(self):
@@ -110,6 +112,7 @@ def inspect_legacy_evidence(
         media_directory, has_media_image_directory = _open_media_root(
             media_root
         )
+        media_root_identity = _directory_identity(media_directory)
         database_root, database_receipt = _open_database(
             normalized_database_path
         )
@@ -123,6 +126,8 @@ def inspect_legacy_evidence(
                 has_named_canonical_paths=False,
                 has_media_image_directory=has_media_image_directory,
                 pending_migrations=(),
+                database_identity=None,
+                media_root_identity=media_root_identity,
             )
 
         database_receipt.verify_current()
@@ -173,6 +178,8 @@ def inspect_legacy_evidence(
             ),
             has_media_image_directory=has_media_image_directory,
             pending_migrations=pending_migrations,
+            database_identity=_file_identity(database_receipt),
+            media_root_identity=media_root_identity,
         )
         connection.close()
         connection = None
@@ -235,7 +242,7 @@ def available_space_bytes(path):
     return filesystem.f_bavail * filesystem.f_frsize
 
 
-def validate_storage_preflight(
+def validate_storage_configuration_preflight(
     media_root,
     image_storage,
     thumbnail_storage,
@@ -291,6 +298,27 @@ def validate_storage_preflight(
             except BaseException:
                 pass
 
+    return PreflightResult(ok=True)
+
+
+def validate_storage_runtime_preflight(
+    media_root,
+    service_uid,
+    service_gid,
+):
+    normalized_media_root = _configured_path(media_root)
+    if (
+        normalized_media_root is None
+        or not _is_verified_directory(normalized_media_root)
+        or type(service_uid) is not int
+        or service_uid < 0
+        or type(service_gid) is not int
+        or service_gid < 0
+    ):
+        return PreflightResult(
+            ok=False,
+            reason_code="media_storage_configuration_invalid",
+        )
     probe_result = _run_service_probe(
         normalized_media_root,
         service_uid,
@@ -299,6 +327,405 @@ def validate_storage_preflight(
     if probe_result != _PROBE_RESULT_OK:
         return PreflightResult(ok=False, reason_code=probe_result)
     return PreflightResult(ok=True)
+
+
+def validate_storage_preflight(
+    media_root,
+    image_storage,
+    thumbnail_storage,
+    image_sizes,
+    service_uid,
+    service_gid,
+):
+    configuration = validate_storage_configuration_preflight(
+        media_root,
+        image_storage,
+        thumbnail_storage,
+        image_sizes,
+        service_uid,
+        service_gid,
+    )
+    if not configuration.ok:
+        return configuration
+    return validate_storage_runtime_preflight(
+        media_root,
+        service_uid,
+        service_gid,
+    )
+
+
+def ensure_media_root_layout(
+    data_root,
+    media_root,
+    service_uid,
+    service_gid,
+):
+    """보호 data root 아래의 누락 directory component만 생성한다."""
+    if (
+        type(service_uid) is not int
+        or service_uid < 0
+        or type(service_gid) is not int
+        or service_gid < 0
+    ):
+        raise StartupPreflightError(
+            "media_storage_configuration_invalid"
+        )
+    root_directory = None
+    descriptor = None
+    try:
+        data_root, relative_components = _contained_components(
+            data_root,
+            media_root,
+        )
+        root_directory = file_ops.open_verified_media_root(data_root)
+        descriptor = os.dup(root_directory.descriptor)
+        for component in relative_components:
+            created = False
+            try:
+                named_stat = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                os.mkdir(component, 0o700, dir_fd=descriptor)
+                created = True
+                named_stat = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            if not stat.S_ISDIR(named_stat.st_mode):
+                raise StartupPreflightError(
+                    "media_storage_configuration_invalid"
+                )
+            child = os.open(
+                component,
+                _directory_open_flags(),
+                dir_fd=descriptor,
+            )
+            try:
+                opened_stat = os.fstat(child)
+                if (
+                    not stat.S_ISDIR(opened_stat.st_mode)
+                    or _stat_identity(opened_stat)
+                    != _stat_identity(named_stat)
+                ):
+                    raise StartupPreflightError(
+                        "media_storage_configuration_invalid"
+                    )
+                if created:
+                    os.fchown(child, service_uid, service_gid)
+                    os.fchmod(child, 0o700)
+                    os.fsync(child)
+                    os.fsync(descriptor)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        root_directory.verify_current()
+    except StartupPreflightError:
+        raise
+    except Exception as error:
+        raise StartupPreflightError(
+            "media_storage_configuration_invalid"
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if root_directory is not None:
+            root_directory.close()
+
+
+def adjust_storage_ownership(
+    data_root,
+    managed_paths,
+    service_uid,
+    service_gid,
+    startup_lock_descriptor,
+):
+    """필요한 data child만 nofollow로 순회해 service owner로 맞춘다."""
+    if (
+        type(service_uid) is not int
+        or service_uid < 0
+        or type(service_gid) is not int
+        or service_gid < 0
+        or type(startup_lock_descriptor) is not int
+        or type(managed_paths) not in (list, tuple)
+    ):
+        raise StartupPreflightError("unsafe_storage_ownership")
+    root_directory = None
+    try:
+        normalized_root = _configured_path(data_root)
+        if normalized_root is None:
+            raise StartupPreflightError("unsafe_storage_ownership")
+        root_directory = file_ops.open_verified_media_root(normalized_root)
+        lock_stat = _verify_startup_lock_receipt(
+            root_directory,
+            startup_lock_descriptor,
+        )
+        components_by_path = []
+        for managed_path in managed_paths:
+            _root, components = _contained_components(
+                normalized_root,
+                managed_path,
+            )
+            if components[0] == ".svrx-pinry-startup.lock":
+                raise StartupPreflightError("unsafe_storage_ownership")
+            components_by_path.append(components)
+        os.fchown(root_directory.descriptor, service_uid, service_gid)
+        for components in components_by_path:
+            _chown_managed_path(
+                root_directory,
+                components,
+                service_uid,
+                service_gid,
+            )
+        os.fsync(root_directory.descriptor)
+        root_directory.verify_current()
+        if _lock_receipt(os.fstat(startup_lock_descriptor)) != lock_stat:
+            raise StartupPreflightError("unsafe_storage_ownership")
+        if _verify_startup_lock_receipt(
+            root_directory,
+            startup_lock_descriptor,
+        ) != lock_stat:
+            raise StartupPreflightError("unsafe_storage_ownership")
+    except StartupPreflightError as error:
+        if error.code == "unsafe_storage_ownership":
+            raise
+        raise StartupPreflightError("unsafe_storage_ownership") from error
+    except Exception as error:
+        raise StartupPreflightError("unsafe_storage_ownership") from error
+    finally:
+        if root_directory is not None:
+            root_directory.close()
+
+
+def _directory_identity(directory):
+    if directory is None:
+        return None
+    file_stat = os.fstat(directory.descriptor)
+    return {"device": file_stat.st_dev, "inode": file_stat.st_ino}
+
+
+def _file_identity(receipt):
+    file_stat = receipt.file_stat
+    return {"device": file_stat.st_dev, "inode": file_stat.st_ino}
+
+
+def _stat_identity(file_stat):
+    return file_stat.st_dev, file_stat.st_ino
+
+
+def _directory_open_flags():
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _file_open_flags():
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    return flags
+
+
+def _contained_components(data_root, target_path):
+    normalized_root = _configured_path(data_root)
+    normalized_target = _configured_path(target_path)
+    if normalized_root is None or normalized_target is None:
+        raise StartupPreflightError(
+            "media_storage_configuration_invalid"
+        )
+    try:
+        if (
+            normalized_target == normalized_root
+            or os.path.commonpath((normalized_root, normalized_target))
+            != normalized_root
+        ):
+            raise StartupPreflightError(
+                "media_storage_configuration_invalid"
+            )
+        relative = os.path.relpath(normalized_target, normalized_root)
+    except ValueError:
+        raise StartupPreflightError(
+            "media_storage_configuration_invalid"
+        ) from None
+    components = tuple(relative.split(os.sep))
+    if any(component in ("", ".", "..") for component in components):
+        raise StartupPreflightError(
+            "media_storage_configuration_invalid"
+        )
+    return normalized_root, components
+
+
+def _lock_receipt(file_stat):
+    if (
+        not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_nlink != 1
+        or stat.S_IMODE(file_stat.st_mode) != 0o600
+    ):
+        raise StartupPreflightError("unsafe_storage_ownership")
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_uid,
+        file_stat.st_gid,
+        stat.S_IMODE(file_stat.st_mode),
+        file_stat.st_nlink,
+    )
+
+
+def _verify_startup_lock_receipt(root_directory, lock_descriptor):
+    try:
+        root_directory.verify_current()
+        descriptor_stat = os.fstat(lock_descriptor)
+        named_stat = os.stat(
+            ".svrx-pinry-startup.lock",
+            dir_fd=root_directory.descriptor,
+            follow_symlinks=False,
+        )
+    except Exception as error:
+        raise StartupPreflightError("unsafe_storage_ownership") from error
+    descriptor_receipt = _lock_receipt(descriptor_stat)
+    named_receipt = _lock_receipt(named_stat)
+    if descriptor_receipt != named_receipt:
+        raise StartupPreflightError("unsafe_storage_ownership")
+    return descriptor_receipt
+
+
+def _open_child_directory(parent_descriptor, name, named_stat):
+    descriptor = os.open(
+        name,
+        _directory_open_flags(),
+        dir_fd=parent_descriptor,
+    )
+    try:
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened_stat.st_mode)
+            or _stat_identity(opened_stat) != _stat_identity(named_stat)
+        ):
+            raise StartupPreflightError("unsafe_storage_ownership")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _chown_managed_path(
+    root_directory,
+    components,
+    service_uid,
+    service_gid,
+):
+    descriptor = os.dup(root_directory.descriptor)
+    try:
+        for component in components[:-1]:
+            try:
+                named_stat = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            if not stat.S_ISDIR(named_stat.st_mode):
+                raise StartupPreflightError("unsafe_storage_ownership")
+            child = _open_child_directory(
+                descriptor,
+                component,
+                named_stat,
+            )
+            os.close(descriptor)
+            descriptor = child
+        leaf = components[-1]
+        try:
+            leaf_stat = os.stat(
+                leaf,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(leaf_stat.st_mode):
+            child = _open_child_directory(descriptor, leaf, leaf_stat)
+            try:
+                _chown_tree_descriptor(
+                    child,
+                    service_uid,
+                    service_gid,
+                )
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(leaf_stat.st_mode) and leaf_stat.st_nlink == 1:
+            child = os.open(
+                leaf,
+                _file_open_flags(),
+                dir_fd=descriptor,
+            )
+            try:
+                opened_stat = os.fstat(child)
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or opened_stat.st_nlink != 1
+                    or _stat_identity(opened_stat)
+                    != _stat_identity(leaf_stat)
+                ):
+                    raise StartupPreflightError(
+                        "unsafe_storage_ownership"
+                    )
+                os.fchown(child, service_uid, service_gid)
+                os.fsync(child)
+            finally:
+                os.close(child)
+        else:
+            raise StartupPreflightError("unsafe_storage_ownership")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _chown_tree_descriptor(descriptor, service_uid, service_gid):
+    for name in sorted(os.listdir(descriptor)):
+        named_stat = os.stat(
+            name,
+            dir_fd=descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISDIR(named_stat.st_mode):
+            child = _open_child_directory(descriptor, name, named_stat)
+            try:
+                _chown_tree_descriptor(child, service_uid, service_gid)
+            finally:
+                os.close(child)
+            continue
+        if not stat.S_ISREG(named_stat.st_mode) or named_stat.st_nlink != 1:
+            raise StartupPreflightError("unsafe_storage_ownership")
+        child = os.open(
+            name,
+            _file_open_flags(),
+            dir_fd=descriptor,
+        )
+        try:
+            opened_stat = os.fstat(child)
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or opened_stat.st_nlink != 1
+                or _stat_identity(opened_stat)
+                != _stat_identity(named_stat)
+            ):
+                raise StartupPreflightError("unsafe_storage_ownership")
+            os.fchown(child, service_uid, service_gid)
+            os.fsync(child)
+        finally:
+            os.close(child)
+    os.fchown(descriptor, service_uid, service_gid)
+    os.fsync(descriptor)
 
 
 def _open_media_root(media_root):

@@ -167,6 +167,13 @@ class LegacyEvidenceTests(SimpleTestCase):
         self.assertEqual(evidence.database_bytes, 0)
         self.assertFalse(evidence.pending_schema)
         self.assertEqual(evidence.pending_migrations, ())
+        self.assertFalse(evidence.has_legacy_evidence)
+        self.assertIsNone(evidence.database_identity)
+        media_stat = os.stat(str(self.media_root))
+        self.assertEqual(evidence.media_root_identity, {
+            "device": media_stat.st_dev,
+            "inode": media_stat.st_ino,
+        })
 
     def test_pre_schema_md5_paths_and_pending_disk_node_are_detected(self):
         original = (
@@ -333,12 +340,17 @@ class LegacyEvidenceTests(SimpleTestCase):
             "connect",
             wraps=real_connect,
         ) as connect:
-            self._inspect(_DiskGraph())
+            evidence = self._inspect(_DiskGraph())
 
         args, kwargs = connect.call_args
         self.assertTrue(args[0].startswith("file:"))
         self.assertIn("mode=ro", args[0])
         self.assertEqual(kwargs, {"uri": True})
+        database_stat = os.stat(str(self.database_path))
+        self.assertEqual(evidence.database_identity, {
+            "device": database_stat.st_dev,
+            "inode": database_stat.st_ino,
+        })
 
     def test_pathlike_database_setting_uses_the_verified_normalized_path(self):
         self._create_database()
@@ -579,6 +591,166 @@ class StoragePreflightTests(SimpleTestCase):
             any(path.name.startswith(".svrx-pinry-write-probe-")
                 for path in self.media_root.iterdir())
         )
+
+    def test_configuration_preflight_never_forks_service_probe(self):
+        with mock.patch.object(
+            startup_preflight,
+            "_run_service_probe",
+        ) as service_probe:
+            result = startup_preflight.validate_storage_configuration_preflight(
+                str(self.media_root),
+                self._storage(),
+                self._storage(),
+                VALID_IMAGE_SIZES,
+                os.geteuid(),
+                os.getegid(),
+            )
+
+        self.assertTrue(result.ok)
+        service_probe.assert_not_called()
+
+    def test_runtime_preflight_only_runs_the_service_identity_probe(self):
+        with mock.patch.object(
+            startup_preflight.file_ops,
+            "recover_media_lock_state",
+        ) as recover_lock_state, mock.patch.object(
+            startup_preflight,
+            "_run_service_probe",
+            return_value="ok",
+        ) as service_probe:
+            result = startup_preflight.validate_storage_runtime_preflight(
+                str(self.media_root),
+                os.geteuid(),
+                os.getegid(),
+            )
+
+        self.assertTrue(result.ok)
+        recover_lock_state.assert_not_called()
+        service_probe.assert_called_once_with(
+            str(self.media_root),
+            os.geteuid(),
+            os.getegid(),
+        )
+
+    def test_missing_media_layout_is_created_only_below_verified_data_root(self):
+        data_root = self.media_root / "data"
+        data_root.mkdir()
+        media_root = data_root / "static" / "media"
+
+        startup_preflight.ensure_media_root_layout(
+            str(data_root),
+            str(media_root),
+            os.geteuid(),
+            os.getegid(),
+        )
+
+        self.assertTrue(media_root.is_dir())
+        self.assertEqual(media_root.stat().st_uid, os.geteuid())
+        self.assertEqual(media_root.stat().st_gid, os.getegid())
+        self.assertEqual(stat.S_IMODE(media_root.stat().st_mode), 0o700)
+
+    def test_media_layout_rejects_outside_and_symlinked_components(self):
+        data_root = self.media_root / "data"
+        data_root.mkdir()
+        outside = self.media_root / "outside"
+        outside.mkdir()
+        linked = data_root / "linked"
+        linked.symlink_to(outside, target_is_directory=True)
+
+        for media_root in (outside / "media", linked / "media"):
+            with self.subTest(media_root=media_root), self.assertRaisesRegex(
+                startup_preflight.StartupPreflightError,
+                "^media_storage_configuration_invalid$",
+            ):
+                startup_preflight.ensure_media_root_layout(
+                    str(data_root),
+                    str(media_root),
+                    os.geteuid(),
+                    os.getegid(),
+                )
+
+        self.assertFalse((outside / "media").exists())
+
+    def test_selective_ownership_preserves_root_owned_startup_lock(self):
+        data_root = self.media_root / "data"
+        data_root.mkdir()
+        managed = data_root / "static"
+        nested = managed / "media" / "asset.bin"
+        nested.parent.mkdir(parents=True)
+        nested.write_bytes(b"asset")
+        unmanaged = data_root / "unmanaged.bin"
+        unmanaged.write_bytes(b"unmanaged")
+        held = startup_lock.acquire_startup_lock(str(data_root))
+        self.addCleanup(held.close)
+        lock_path = data_root / startup_lock.STARTUP_LOCK_FILENAME
+        lock_before = os.stat(str(lock_path), follow_symlinks=False)
+        unmanaged_before = os.stat(str(unmanaged), follow_symlinks=False)
+        lock_identity = (lock_before.st_dev, lock_before.st_ino)
+        chowned_identities = []
+        real_fchown = os.fchown
+
+        def record_fchown(descriptor, uid, gid):
+            current = os.fstat(descriptor)
+            chowned_identities.append((current.st_dev, current.st_ino))
+            return real_fchown(descriptor, uid, gid)
+
+        with mock.patch.object(
+            startup_preflight.os,
+            "fchown",
+            side_effect=record_fchown,
+        ):
+            startup_preflight.adjust_storage_ownership(
+                str(data_root),
+                (str(managed),),
+                os.geteuid(),
+                os.getegid(),
+                held.fileno(),
+            )
+
+        lock_after = os.stat(str(lock_path), follow_symlinks=False)
+        self.assertNotIn(lock_identity, chowned_identities)
+        self.assertEqual(
+            (
+                lock_after.st_dev,
+                lock_after.st_ino,
+                lock_after.st_uid,
+                lock_after.st_gid,
+                stat.S_IMODE(lock_after.st_mode),
+                lock_after.st_nlink,
+            ),
+            (
+                lock_before.st_dev,
+                lock_before.st_ino,
+                lock_before.st_uid,
+                lock_before.st_gid,
+                stat.S_IMODE(lock_before.st_mode),
+                lock_before.st_nlink,
+            ),
+        )
+        self.assertEqual(
+            (unmanaged.stat().st_dev, unmanaged.stat().st_ino),
+            (unmanaged_before.st_dev, unmanaged_before.st_ino),
+        )
+
+    def test_ownership_normalizes_outside_path_to_unsafe_reason(self):
+        data_root = self.media_root / "data"
+        data_root.mkdir()
+        outside = self.media_root / "outside"
+        outside.mkdir()
+        held = startup_lock.acquire_startup_lock(str(data_root))
+        self.addCleanup(held.close)
+
+        with self.assertRaisesRegex(
+            startup_preflight.StartupPreflightError,
+            "^unsafe_storage_ownership$",
+        ):
+            startup_preflight.adjust_storage_ownership(
+                str(data_root),
+                (str(outside),),
+                os.geteuid(),
+                os.getegid(),
+                held.fileno(),
+            )
 
     def test_default_storage_wrapper_resolves_to_exact_filesystem_storage(self):
         with self.settings(MEDIA_ROOT=str(self.media_root)):

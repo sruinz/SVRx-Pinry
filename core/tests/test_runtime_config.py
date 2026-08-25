@@ -5,6 +5,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -64,6 +65,10 @@ def _write_startup_recorder(path, command_name):
         "    done\n"
         "    printf '\\n'\n"
         "} >> \"$PINRY_STARTUP_CAPTURE\"\n"
+        "if [ '" + command_name + "' = bash ] "
+        "&& [ \"${PINRY_FAIL_BOOTSTRAP:-0}\" = 1 ]; then\n"
+        "    exit 43\n"
+        "fi\n"
         "if [ '" + command_name + "' = python ] "
         "&& [ \"${PINRY_FAIL_MIGRATE:-0}\" = 1 ] "
         "&& [ \"${2:-}\" = migrate ]; then\n"
@@ -288,14 +293,12 @@ class RuntimeConfigTests(unittest.TestCase):
         startup_source = (
             REPOSITORY_ROOT / "docker/scripts/start.sh"
         ).read_text()
-        self.assertEqual(startup_source.count("/usr/sbin/nginx"), 1)
         self.assertEqual(startup_source.count('PROJECT_ROOT="/pinry"'), 1)
         startup_directory = temporary_root / "docker/scripts"
         startup_directory.mkdir(parents=True)
         startup_script = startup_directory / "start.sh"
         startup_script.write_text(
-            startup_source.replace("/usr/sbin/nginx", "nginx", 1)
-            .replace(
+            startup_source.replace(
                 'PROJECT_ROOT="/pinry"',
                 'PROJECT_ROOT="{}"'.format(temporary_root),
                 1,
@@ -315,7 +318,167 @@ class RuntimeConfigTests(unittest.TestCase):
         environment["PINRY_STARTUP_CAPTURE"] = str(capture)
         return environment, capture, startup_script
 
-    def test_start_runs_one_migration_before_services_for_every_database(self):
+    def _python_runner_environment(self):
+        temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.addCleanup(temporary.cleanup)
+        project_root = Path(temporary.name, "project")
+        scripts = project_root / "docker/scripts"
+        scripts.mkdir(parents=True)
+        runner_source = (
+            REPOSITORY_ROOT / "docker/scripts/startup.py"
+        ).read_text("utf-8")
+        nginx = Path(temporary.name, "nginx")
+        nginx.write_text(
+            "#!/bin/sh\n"
+            "printf 'nginx\\n' >> \"$PINRY_STARTUP_CAPTURE\"\n"
+            "if [ \"${PINRY_FAIL_POINT:-}\" = nginx ]; then exit 42; fi\n"
+        )
+        nginx.chmod(0o700)
+        runner = scripts / "startup.py"
+        runner.write_text(runner_source.replace(
+            'NGINX_BINARY = "/usr/sbin/nginx"',
+            'NGINX_BINARY = "{}"'.format(nginx),
+            1,
+        ))
+        gunicorn = scripts / "_start_gunicorn.sh"
+        gunicorn.write_text(
+            "#!/bin/sh\n"
+            "printf 'gunicorn\\n' >> \"$PINRY_STARTUP_CAPTURE\"\n"
+            "while [ -n \"${PINRY_LIFETIME_GATE:-}\" ] "
+            "&& [ -e \"$PINRY_LIFETIME_GATE\" ]; do\n"
+            "    sleep 0.05\n"
+            "done\n"
+        )
+        gunicorn.chmod(0o700)
+
+        def write_module(relative, source):
+            path = project_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source)
+
+        event_source = (
+            "import os\n"
+            "def event(value):\n"
+            "    with open(os.environ['PINRY_STARTUP_CAPTURE'], 'a') as out:\n"
+            "        out.write(value + '\\n')\n"
+        )
+        write_module("runner_events.py", event_source)
+        write_module(
+            "django/__init__.py",
+            "import os\n"
+            "from runner_events import event\n"
+            "def setup():\n"
+            "    event('setup:' + os.environ.get('DJANGO_SETTINGS_MODULE', ''))\n"
+            "    if os.environ.get('PINRY_FAIL_POINT') == 'setup':\n"
+            "        raise RuntimeError('sentinel-secret-db-credential')\n",
+        )
+        write_module("django/core/__init__.py", "")
+        write_module(
+            "django/core/management.py",
+            "import os\n"
+            "from runner_events import event\n"
+            "def call_command(name, *args, **kwargs):\n"
+            "    del args, kwargs\n"
+            "    event(name)\n"
+            "    if os.environ.get('PINRY_FAIL_POINT') == name:\n"
+            "        raise RuntimeError('sentinel-private-command-value')\n",
+        )
+        write_module(
+            "django/conf/__init__.py",
+            "import os\n"
+            "class Settings(object):\n"
+            "    PINRY_DATA_ROOT = os.environ['PINRY_DATA_ROOT']\n"
+            "settings = Settings()\n",
+        )
+        write_module("django_images/__init__.py", "")
+        write_module("django_images/services/__init__.py", "")
+        write_module(
+            "django_images/services/startup_lock.py",
+            "import errno\n"
+            "import fcntl\n"
+            "import os\n"
+            "from runner_events import event\n"
+            "class StartupLockError(Exception):\n"
+            "    def __init__(self, code):\n"
+            "        super(StartupLockError, self).__init__(code)\n"
+            "        self.code = code\n"
+            "class Held(object):\n"
+            "    def __init__(self, descriptor): self.descriptor = descriptor\n"
+            "    def fileno(self): return self.descriptor\n"
+            "    def set_inheritable(self, value):\n"
+            "        event('lock_inheritable')\n"
+            "        os.set_inheritable(self.descriptor, value)\n"
+            "def acquire_startup_lock(root):\n"
+            "    descriptor = os.open(os.path.join(root, '.svrx-pinry-startup.lock'), os.O_RDWR | os.O_CREAT, 0o600)\n"
+            "    os.set_inheritable(descriptor, False)\n"
+            "    try:\n"
+            "        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "    except OSError as error:\n"
+            "        os.close(descriptor)\n"
+            "        if error.errno in (errno.EACCES, errno.EAGAIN):\n"
+            "            raise StartupLockError('startup_lock_busy')\n"
+            "        raise StartupLockError('startup_lock_failed')\n"
+            "    event('lock')\n"
+            "    return Held(descriptor)\n",
+        )
+        write_module(
+            "django_images/services/migration_state.py",
+            "import os\n"
+            "from runner_events import event\n"
+            "class Inventory(object):\n"
+            "    requires_migration_flag = os.environ.get('PINRY_INVENTORY_BLOCK') == '1'\n"
+            "def inspect_run_inventory_read_only(path):\n"
+            "    del path\n"
+            "    event('inventory')\n"
+            "    return Inventory()\n",
+        )
+        write_module(
+            "django_images/services/legacy_startup.py",
+            "import os\n"
+            "from runner_events import event\n"
+            "class Failure(Exception):\n"
+            "    def __init__(self, code):\n"
+            "        super(Failure, self).__init__('sentinel-private-error')\n"
+            "        self.code = code\n"
+            "def fail(point, code):\n"
+            "    if os.environ.get('PINRY_FAIL_POINT') == point: raise Failure(code)\n"
+            "class LegacyStartupCoordinator(object):\n"
+            "    def __init__(self, uid, gid): del uid, gid; event('coordinator')\n"
+            "    def prepare_before_schema(self):\n"
+            "        event('prepare'); fail('prepare', 'sqlite_snapshot_failed'); return object()\n"
+            "    def schema_required(self, run):\n"
+            "        del run; return os.environ.get('PINRY_SCHEMA_REQUIRED', '1') == '1'\n"
+            "    def converge_after_schema(self, run):\n"
+            "        event('converge:none' if run is None else 'converge:run')\n"
+            "        fail('converge', 'migration_state_plan_mismatch')\n"
+            "    def adjust_ownership(self, descriptor):\n"
+            "        del descriptor; event('ownership'); fail('ownership', 'unsafe_storage_ownership')\n"
+            "    def runtime_check(self, uid, gid):\n"
+            "        del uid, gid; event('runtime'); fail('runtime', 'media_root_not_writable')\n",
+        )
+        write_module("pinry/__init__.py", "")
+        write_module("pinry/settings/__init__.py", "")
+        write_module("pinry/settings/docker.py", "")
+
+        data_root = Path(temporary.name, "data")
+        data_root.mkdir(mode=0o700)
+        capture = Path(temporary.name, "runner-events.txt")
+        environment = os.environ.copy()
+        environment.update({
+            "PINRY_DATA_ROOT": str(data_root),
+            "PINRY_STARTUP_CAPTURE": str(capture),
+            "PYTHONPATH": "",
+        })
+        environment.pop("DJANGO_SETTINGS_MODULE", None)
+        return environment, capture, runner, data_root
+
+    @staticmethod
+    def _runner_events(capture):
+        if not capture.exists():
+            return []
+        return capture.read_text("utf-8").splitlines()
+
+    def test_start_shell_delegates_to_bootstrap_then_python_runner(self):
         for database_exists in (False, True):
             with self.subTest(database_exists=database_exists):
                 environment, capture, startup_script = (
@@ -336,27 +499,22 @@ class RuntimeConfigTests(unittest.TestCase):
                     completed.stderr.decode("utf-8"),
                 )
                 events = _read_startup_events(capture)
-                migration = ["python", "manage.py", "migrate", "--noinput"]
-                self.assertEqual(events.count(migration), 1)
-                migration_index = events.index(migration)
-                self.assertIn(["nginx"], events)
-                self.assertTrue(
-                    any(event[0] == "gunicorn" for event in events)
-                )
-                nginx_index = events.index(["nginx"])
-                gunicorn_index = next(
-                    index
-                    for index, event in enumerate(events)
-                    if event[0] == "gunicorn"
-                )
-                self.assertLess(migration_index, nginx_index)
-                self.assertLess(migration_index, gunicorn_index)
+                self.assertEqual(events, [
+                    [
+                        "bash",
+                        str(startup_script.parent / "bootstrap.sh"),
+                    ],
+                    [
+                        "python",
+                        str(startup_script.parent / "startup.py"),
+                    ],
+                ])
 
-    def test_start_stops_before_services_when_migration_fails(self):
+    def test_start_stops_before_runner_when_bootstrap_fails(self):
         environment, capture, startup_script = self._startup_environment(
             False
         )
-        environment["PINRY_FAIL_MIGRATE"] = "1"
+        environment["PINRY_FAIL_BOOTSTRAP"] = "1"
 
         completed = subprocess.run(
             ["/bin/bash", str(startup_script)],
@@ -366,14 +524,216 @@ class RuntimeConfigTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
 
-        self.assertEqual(completed.returncode, 41)
-        events = _read_startup_events(capture)
-        self.assertEqual(
-            events.count(["python", "manage.py", "migrate", "--noinput"]),
-            1,
+        self.assertEqual(completed.returncode, 43)
+        self.assertEqual(_read_startup_events(capture), [[
+            "bash",
+            str(startup_script.parent / "bootstrap.sh"),
+        ]])
+
+    def test_start_rejects_every_non_exact_argument_before_bootstrap(self):
+        cases = (
+            ("--migrate-legacy", "--migrate-legacy"),
+            ("--unknown",),
+            ("--migrate-legacy=value",),
+            ("--migrate-legacy", "value"),
+            ("--",),
         )
-        self.assertFalse(any(event[0] == "nginx" for event in events))
-        self.assertFalse(any(event[0] == "gunicorn" for event in events))
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                environment, capture, startup_script = (
+                    self._startup_environment(False)
+                )
+
+                completed = subprocess.run(
+                    ["/bin/bash", str(startup_script)] + list(arguments),
+                    cwd=str(REPOSITORY_ROOT),
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                self.assertEqual(completed.returncode, 2)
+                self.assertFalse(capture.exists())
+
+    def test_start_passes_the_single_migration_flag_to_runner(self):
+        environment, capture, startup_script = self._startup_environment(False)
+
+        completed = subprocess.run(
+            ["/bin/bash", str(startup_script), "--migrate-legacy"],
+            cwd=str(REPOSITORY_ROOT),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(_read_startup_events(capture), [
+            ["bash", str(startup_script.parent / "bootstrap.sh")],
+            [
+                "python",
+                str(startup_script.parent / "startup.py"),
+                "--migrate-legacy",
+            ],
+        ])
+
+    def test_python_runner_from_tmp_uses_project_root_and_exact_order(self):
+        environment, capture, runner, _data_root = (
+            self._python_runner_environment()
+        )
+
+        completed = subprocess.run(
+            [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)],
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(self._runner_events(capture), [
+            "lock",
+            "setup:pinry.settings.docker",
+            "inventory",
+            "collectstatic",
+            "migrate",
+            "coordinator",
+            "converge:none",
+            "ownership",
+            "runtime",
+            "nginx",
+            "lock_inheritable",
+            "gunicorn",
+        ])
+
+    def test_python_runner_requires_flag_before_pending_inventory_commands(self):
+        environment, capture, runner, _data_root = (
+            self._python_runner_environment()
+        )
+        environment["PINRY_INVENTORY_BLOCK"] = "1"
+
+        completed = subprocess.run(
+            [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)],
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr.decode().strip(),
+                         "legacy_migration_flag_required")
+        self.assertEqual(self._runner_events(capture), [
+            "lock", "setup:pinry.settings.docker", "inventory",
+        ])
+
+    def test_python_runner_skips_schema_on_resumed_post_schema_phase(self):
+        environment, capture, runner, _data_root = (
+            self._python_runner_environment()
+        )
+        environment["PINRY_SCHEMA_REQUIRED"] = "0"
+
+        completed = subprocess.run(
+            [
+                str(REPOSITORY_ROOT / ".venv/bin/python"),
+                str(runner),
+                "--migrate-legacy",
+            ],
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        events = self._runner_events(capture)
+        self.assertNotIn("collectstatic", events)
+        self.assertNotIn("migrate", events)
+        self.assertLess(events.index("prepare"), events.index("converge:run"))
+
+    def test_python_runner_failures_never_start_application_service(self):
+        cases = (
+            ("setup", "media_storage_configuration_invalid"),
+            ("prepare", "sqlite_snapshot_failed"),
+            ("collectstatic", "legacy_startup_failed"),
+            ("migrate", "legacy_startup_failed"),
+            ("converge", "migration_state_plan_mismatch"),
+            ("ownership", "unsafe_storage_ownership"),
+            ("runtime", "media_root_not_writable"),
+            ("nginx", "nginx_start_failed"),
+        )
+        for point, expected in cases:
+            with self.subTest(point=point):
+                environment, capture, runner, _data_root = (
+                    self._python_runner_environment()
+                )
+                environment["PINRY_FAIL_POINT"] = point
+
+                completed = subprocess.run(
+                    [
+                        str(REPOSITORY_ROOT / ".venv/bin/python"),
+                        str(runner),
+                        "--migrate-legacy",
+                    ],
+                    cwd="/private/tmp",
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                rendered = (
+                    completed.stdout + completed.stderr
+                ).decode("utf-8")
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stderr.decode().strip(), expected)
+                self.assertNotIn("sentinel-private", rendered)
+                self.assertNotIn("Traceback", rendered)
+                self.assertNotIn("gunicorn", self._runner_events(capture))
+
+    def test_python_runner_holds_lock_for_final_process_lifetime(self):
+        environment, capture, runner, _data_root = (
+            self._python_runner_environment()
+        )
+        gate = Path(capture.parent, "lifetime-gate")
+        gate.write_text("held")
+        environment["PINRY_LIFETIME_GATE"] = str(gate)
+        command = [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)]
+        first = subprocess.Popen(
+            command,
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(lambda: first.poll() is None and first.kill())
+        deadline = time.monotonic() + 5
+        while (
+            "gunicorn" not in self._runner_events(capture)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        self.assertIn("gunicorn", self._runner_events(capture))
+
+        second = subprocess.run(
+            command,
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(second.returncode, 1)
+        self.assertEqual(second.stderr.decode().strip(), "startup_lock_busy")
+
+        gate.unlink()
+        first_stdout, first_stderr = first.communicate(timeout=5)
+        self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
+        third = subprocess.run(
+            command,
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(third.returncode, 0, third.stderr.decode())
 
     def test_start_script_passes_one_effective_60_second_timeout(self):
         environment, capture = self._capture_environment("gunicorn")
@@ -388,6 +748,129 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
         arguments = _read_recorded_argv(capture)
         self.assertEqual(_timeout_values(arguments), ["60"])
+
+    def test_gunicorn_start_script_replaces_shell_process(self):
+        source = (
+            REPOSITORY_ROOT / "docker/scripts/_start_gunicorn.sh"
+        ).read_text("utf-8")
+        commands = [
+            line.strip()
+            for line in source.splitlines()
+            if line.strip() and not line.startswith("#!")
+        ]
+
+        self.assertTrue(commands[0].startswith("exec gunicorn "))
+
+    def _bootstrap_fixture(self, existing=None):
+        temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name, "project")
+        scripts = root / "docker/scripts"
+        settings_directory = root / "pinry/settings"
+        data = Path(temporary.name, "data")
+        scripts.mkdir(parents=True)
+        settings_directory.mkdir(parents=True)
+        data.mkdir()
+        secret = "sentinel-secret-value-should-never-be-logged"
+        (scripts / "gen_key.sh").write_text(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\n".format(secret)
+        )
+        (scripts / "gen_key.sh").chmod(0o700)
+        (settings_directory / "local_settings.example.py").write_text(
+            "SECRET_KEY = 'secret_key_place_holder'\n"
+        )
+        if existing is not None:
+            (data / "local_settings.py").write_bytes(existing)
+        source = (
+            REPOSITORY_ROOT / "docker/scripts/bootstrap.sh"
+        ).read_text("utf-8")
+        script = scripts / "bootstrap.sh"
+        script.write_text(
+            source.replace(
+                "/pinry/docker/scripts/gen_key.sh",
+                str(scripts / "gen_key.sh"),
+            ).replace(
+                "/pinry/pinry/settings/local_settings.example.py",
+                str(settings_directory / "local_settings.example.py"),
+            ).replace(
+                "/pinry/pinry/settings/local_settings.py",
+                str(settings_directory / "local_settings.py"),
+            ).replace(
+                "/data/local_settings.py",
+                str(data / "local_settings.py"),
+            )
+        )
+        script.chmod(0o700)
+        binary_directory = Path(temporary.name, "bin")
+        binary_directory.mkdir()
+        sed = binary_directory / "sed"
+        sed.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            "expression = sys.argv[2].replace('\\\\_', '_')\n"
+            "prefix = 's/secret_key_place_holder/'\n"
+            "if not expression.startswith(prefix) or not expression.endswith('/'):\n"
+            "    raise SystemExit(2)\n"
+            "replacement = expression[len(prefix):-1]\n"
+            "target = pathlib.Path(sys.argv[3])\n"
+            "target.write_text(target.read_text().replace('secret_key_place_holder', replacement))\n"
+        )
+        sed.chmod(0o700)
+        environment = os.environ.copy()
+        environment["PATH"] = "{}{}{}".format(
+            binary_directory,
+            os.pathsep,
+            environment.get("PATH", ""),
+        )
+        return script, root, data, secret, environment
+
+    def test_bootstrap_stores_generated_secret_without_logging_value(self):
+        script, root, data, secret, environment = self._bootstrap_fixture()
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        rendered = (completed.stdout + completed.stderr).decode("utf-8")
+        self.assertEqual(completed.returncode, 0, rendered)
+        self.assertNotIn(secret, rendered)
+        self.assertIn(
+            secret,
+            (data / "local_settings.py").read_text("utf-8"),
+        )
+        self.assertEqual(
+            (root / "pinry/settings/local_settings.py").read_bytes(),
+            (data / "local_settings.py").read_bytes(),
+        )
+
+    def test_bootstrap_preserves_existing_malformed_local_settings_bytes(self):
+        existing = (
+            b"SECRET_KEY='sentinel-existing-secret'\n"
+            b"raise RuntimeError('sentinel-db-credential')\n"
+        )
+        script, root, data, _secret, environment = (
+            self._bootstrap_fixture(existing)
+        )
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        rendered = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 0, rendered)
+        self.assertEqual((data / "local_settings.py").read_bytes(), existing)
+        self.assertEqual(
+            (root / "pinry/settings/local_settings.py").read_bytes(),
+            existing,
+        )
+        self.assertNotIn(b"sentinel-existing-secret", rendered)
+        self.assertNotIn(b"sentinel-db-credential", rendered)
 
     def test_timeout_counter_counts_long_and_short_forms(self):
         self.assertEqual(

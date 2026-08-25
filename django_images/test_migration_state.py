@@ -11,8 +11,13 @@ from django_images.services.migration_state import (
     PHASES,
     PHASE_TRANSITIONS,
     MigrationStateError,
+    ensure_migration_backup_root,
+    inspect_run_inventory_read_only,
+    persist_manifest_identity,
+    read_run_status,
     resolve_or_create_run,
     scan_run_inventory,
+    seal_run_identities,
     transition_state,
 )
 
@@ -37,7 +42,7 @@ class MigrationStateTests(SimpleTestCase):
 
     def evidence(self, present=True):
         return {
-            "present": present,
+            "has_legacy_evidence": present,
             "database_identity": {"device": 10, "inode": 20},
             "media_root_identity": {"device": 30, "inode": 40},
         }
@@ -83,6 +88,10 @@ class MigrationStateTests(SimpleTestCase):
             "source_commit": "source-commit",
             "database_identity": {"device": 10, "inode": 20},
             "media_root_identity": {"device": 30, "inode": 40},
+            "initial_space": {
+                "margin_bytes": 64,
+                "required_bytes": 128,
+            },
             "manifests": {
                 "media": {"plan_sha256": None, "manifest_sha256": None},
                 "backfill": {"plan_sha256": None, "manifest_sha256": None},
@@ -97,6 +106,241 @@ class MigrationStateTests(SimpleTestCase):
             json.dump(state, state_file)
         os.chmod(state_path, 0o600)
         return run_path
+
+    def test_read_only_inventory_treats_missing_backup_root_as_empty(self):
+        os.rmdir(self.backup_root)
+
+        inventory = inspect_run_inventory_read_only(self.backup_root)
+
+        self.assertFalse(inventory.root_exists)
+        self.assertEqual(inventory.completed_count, 0)
+        self.assertEqual(inventory.incomplete_count, 0)
+        self.assertEqual(inventory.creating_count, 0)
+        self.assertEqual(inventory.invalid_count, 0)
+        self.assertFalse(inventory.requires_migration_flag)
+        self.assertFalse(os.path.exists(self.backup_root))
+
+    def test_flag_path_can_create_exact_backup_root_descriptor_safely(self):
+        os.rmdir(self.backup_root)
+
+        ensure_migration_backup_root(self.backup_root)
+
+        root_stat = os.stat(self.backup_root, follow_symlinks=False)
+        self.assertTrue(stat.S_ISDIR(root_stat.st_mode))
+        self.assertEqual(stat.S_IMODE(root_stat.st_mode), 0o700)
+        self.assertEqual(scan_run_inventory(self.backup_root).incomplete, ())
+
+    def test_backup_root_creation_rejects_symlink_without_touching_target(self):
+        os.rmdir(self.backup_root)
+        outside = os.path.join(self.data_root, "outside")
+        os.mkdir(outside, 0o755)
+        os.symlink(outside, self.backup_root)
+        before = os.stat(outside, follow_symlinks=False)
+
+        with self.assertRaisesRegex(
+            MigrationStateError,
+            "^migration_state_root_invalid$",
+        ):
+            ensure_migration_backup_root(self.backup_root)
+
+        after = os.stat(outside, follow_symlinks=False)
+        self.assertEqual(
+            (after.st_dev, after.st_ino, stat.S_IMODE(after.st_mode)),
+            (before.st_dev, before.st_ino, stat.S_IMODE(before.st_mode)),
+        )
+
+    def test_read_only_inventory_never_promotes_or_fsyncs_creating_run(self):
+        run_id = "20260825T010101Z-11111111-1111-4111-8111-111111111111"
+        creating_path = self.write_run_state(
+            run_id,
+            "initialized",
+            creating=True,
+        )
+
+        with mock.patch(
+            "django_images.services.migration_state.os.rename"
+        ) as rename, mock.patch(
+            "django_images.services.migration_state.os.fsync"
+        ) as fsync:
+            inventory = inspect_run_inventory_read_only(self.backup_root)
+
+        rename.assert_not_called()
+        fsync.assert_not_called()
+        self.assertTrue(inventory.requires_migration_flag)
+        self.assertEqual(inventory.creating_count, 1)
+        self.assertTrue(os.path.isdir(creating_path))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.backup_root,
+            run_id,
+        )))
+
+    def test_read_only_inventory_flags_wrong_root_mode_without_repair(self):
+        os.chmod(self.backup_root, 0o755)
+
+        with mock.patch(
+            "django_images.services.migration_state.os.fchmod"
+        ) as fchmod, mock.patch(
+            "django_images.services.migration_state.os.fsync"
+        ) as fsync:
+            inventory = inspect_run_inventory_read_only(self.backup_root)
+
+        self.assertEqual(inventory.invalid_count, 1)
+        self.assertTrue(inventory.requires_migration_flag)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.backup_root).st_mode),
+            0o755,
+        )
+        fchmod.assert_not_called()
+        fsync.assert_not_called()
+
+    def test_read_only_inventory_reports_invalid_and_incomplete_runs(self):
+        incomplete_id = (
+            "20260825T010101Z-11111111-1111-4111-8111-111111111111"
+        )
+        invalid_id = (
+            "20260825T010102Z-22222222-2222-4222-8222-222222222222"
+        )
+        self.write_run_state(incomplete_id, "copying")
+        os.mkdir(os.path.join(self.backup_root, invalid_id), 0o700)
+
+        inventory = inspect_run_inventory_read_only(self.backup_root)
+
+        self.assertEqual(inventory.incomplete_count, 1)
+        self.assertEqual(inventory.invalid_count, 1)
+        self.assertTrue(inventory.requires_migration_flag)
+
+    def test_explicit_false_evidence_and_no_pending_schema_creates_no_run(self):
+        evidence = type("Evidence", (), {
+            "has_legacy_evidence": False,
+            "database_identity": None,
+            "media_root_identity": None,
+        })()
+
+        run = resolve_or_create_run(
+            scan_run_inventory(self.backup_root),
+            evidence,
+            False,
+            "source-commit",
+            self.uid,
+            self.gid,
+        )
+
+        self.assertIsNone(run)
+        self.assertEqual(os.listdir(self.backup_root), [])
+
+    def test_truthy_object_without_explicit_evidence_flag_is_rejected(self):
+        with self.assertRaisesRegex(
+            MigrationStateError,
+            "^migration_state_invalid$",
+        ):
+            resolve_or_create_run(
+                scan_run_inventory(self.backup_root),
+                object(),
+                False,
+                "source-commit",
+                self.uid,
+                self.gid,
+            )
+
+    def test_initial_space_is_persisted_and_exposed_by_public_status(self):
+        run = resolve_or_create_run(
+            scan_run_inventory(self.backup_root),
+            self.evidence(),
+            False,
+            "source-commit",
+            self.uid,
+            self.gid,
+            initial_space={
+                "margin_bytes": 67108864,
+                "required_bytes": 67109000,
+            },
+        )
+
+        status = read_run_status(run)
+
+        self.assertEqual(status.phase, "initialized")
+        self.assertEqual(status.initial_margin_bytes, 67108864)
+        self.assertEqual(status.initial_required_bytes, 67109000)
+        with open(run.state_path, "r", encoding="utf-8") as state_file:
+            persisted = json.load(state_file)
+        self.assertEqual(persisted["initial_space"], {
+            "margin_bytes": 67108864,
+            "required_bytes": 67109000,
+        })
+
+    def test_missing_identities_can_be_sealed_once_then_cannot_change(self):
+        run = resolve_or_create_run(
+            scan_run_inventory(self.backup_root),
+            {
+                "has_legacy_evidence": True,
+                "database_identity": None,
+                "media_root_identity": None,
+            },
+            False,
+            "source-commit",
+            self.uid,
+            self.gid,
+        )
+        sealed_evidence = {
+            "has_legacy_evidence": True,
+            "database_identity": {"device": 101, "inode": 201},
+            "media_root_identity": {"device": 301, "inode": 401},
+        }
+
+        seal_run_identities(run, sealed_evidence)
+        seal_run_identities(run, sealed_evidence)
+
+        status = read_run_status(run)
+        self.assertEqual(
+            status.database_identity,
+            {"device": 101, "inode": 201},
+        )
+        self.assertEqual(
+            status.media_root_identity,
+            {"device": 301, "inode": 401},
+        )
+        changed = dict(sealed_evidence)
+        changed["media_root_identity"] = {"device": 301, "inode": 402}
+        with self.assertRaisesRegex(
+            MigrationStateError,
+            "^migration_state_identity_changed$",
+        ):
+            seal_run_identities(run, changed)
+
+    def test_manifest_identity_can_be_persisted_without_advancing_phase(self):
+        run = self.create_run()
+        transition_state(run, "initialized", "schema_complete")
+
+        persist_manifest_identity(
+            run,
+            "schema_complete",
+            "media",
+            "1" * 64,
+            "2" * 64,
+        )
+        persist_manifest_identity(
+            run,
+            "schema_complete",
+            "media",
+            "1" * 64,
+            "3" * 64,
+        )
+
+        status = read_run_status(run)
+        self.assertEqual(status.phase, "schema_complete")
+        self.assertEqual(status.media_plan_sha256, "1" * 64)
+        self.assertEqual(status.media_manifest_sha256, "3" * 64)
+        with self.assertRaisesRegex(
+            MigrationStateError,
+            "^migration_state_plan_mismatch$",
+        ):
+            persist_manifest_identity(
+                run,
+                "schema_complete",
+                "media",
+                "4" * 64,
+                "5" * 64,
+            )
 
     def test_single_incomplete_run_is_resumed(self):
         first = self.create_run()

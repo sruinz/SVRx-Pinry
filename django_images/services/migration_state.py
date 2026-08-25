@@ -80,6 +80,19 @@ _ARCHIVE_IDENTITY_KEYS = frozenset((
     "destination_parent_device",
     "destination_parent_inode",
 ))
+_STATE_KEYS = frozenset((
+    "format_version",
+    "run_id",
+    "phase",
+    "source_commit",
+    "database_identity",
+    "media_root_identity",
+    "initial_space",
+    "manifests",
+    "intent",
+    "progress",
+))
+_INITIAL_SPACE_KEYS = frozenset(("margin_bytes", "required_bytes"))
 
 
 class MigrationStateError(Exception):
@@ -111,6 +124,186 @@ class RunInventory(object):
     completed: tuple
     incomplete: tuple
     invalid_count: int
+
+
+@dataclass(frozen=True)
+class ReadOnlyRunInventory(object):
+    backup_root: str
+    root_exists: bool
+    completed_count: int
+    incomplete_count: int
+    creating_count: int
+    invalid_count: int
+
+    @property
+    def requires_migration_flag(self):
+        return bool(
+            self.incomplete_count
+            or self.creating_count
+            or self.invalid_count
+        )
+
+
+@dataclass(frozen=True)
+class MigrationRunStatus(object):
+    run_id: str
+    phase: str
+    source_commit: str
+    database_identity: object
+    media_root_identity: object
+    initial_margin_bytes: int
+    initial_required_bytes: int
+    media_plan_sha256: object
+    media_manifest_sha256: object
+    backfill_plan_sha256: object
+    backfill_manifest_sha256: object
+    intent: object
+    progress: object
+
+
+def ensure_migration_backup_root(backup_root):
+    """flag 경로에서만 exact backup root를 안전하게 생성·복구한다."""
+    _supplied, data_root = _configured_backup_paths(backup_root)
+    data_descriptor = _open_absolute_directory(
+        data_root,
+        "migration_state_root_invalid",
+    )
+    root_descriptor = None
+    try:
+        created = False
+        try:
+            os.mkdir("legacy-backup", 0o700, dir_fd=data_descriptor)
+            created = True
+        except FileExistsError:
+            pass
+        root_descriptor = os.open(
+            "legacy-backup",
+            _DIRECTORY_FLAGS | _NOFOLLOW,
+            dir_fd=data_descriptor,
+        )
+        opened_stat = os.fstat(root_descriptor)
+        named_stat = os.stat(
+            "legacy-backup",
+            dir_fd=data_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(opened_stat.st_mode)
+            or (opened_stat.st_dev, opened_stat.st_ino)
+            != (named_stat.st_dev, named_stat.st_ino)
+        ):
+            raise MigrationStateError("migration_state_root_invalid")
+        if stat.S_IMODE(opened_stat.st_mode) != 0o700:
+            os.fchmod(root_descriptor, 0o700)
+            os.fsync(root_descriptor)
+        if created:
+            os.fsync(root_descriptor)
+            os.fsync(data_descriptor)
+        return os.path.abspath(os.fspath(backup_root))
+    except MigrationStateError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise MigrationStateError("migration_state_root_invalid") from None
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+        os.close(data_descriptor)
+
+
+def inspect_run_inventory_read_only(backup_root):
+    """run namespace를 고치거나 fsync하지 않고 상태 개수만 읽는다."""
+    supplied, data_root = _configured_backup_paths(backup_root)
+    data_descriptor = _open_absolute_directory(
+        data_root,
+        "migration_state_root_invalid",
+    )
+    root_descriptor = None
+    try:
+        try:
+            root_descriptor = os.open(
+                "legacy-backup",
+                _DIRECTORY_FLAGS | _NOFOLLOW,
+                dir_fd=data_descriptor,
+            )
+        except FileNotFoundError:
+            return ReadOnlyRunInventory(
+                backup_root=supplied,
+                root_exists=False,
+                completed_count=0,
+                incomplete_count=0,
+                creating_count=0,
+                invalid_count=0,
+            )
+        opened_stat = os.fstat(root_descriptor)
+        named_stat = os.stat(
+            "legacy-backup",
+            dir_fd=data_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(opened_stat.st_mode)
+            or not stat.S_ISDIR(named_stat.st_mode)
+            or (opened_stat.st_dev, opened_stat.st_ino)
+            != (named_stat.st_dev, named_stat.st_ino)
+        ):
+            raise MigrationStateError("migration_state_root_invalid")
+        completed_count = 0
+        incomplete_count = 0
+        creating_count = 0
+        root_mode_invalid = stat.S_IMODE(opened_stat.st_mode) != 0o700
+        invalid_count = 1 if root_mode_invalid else 0
+        for name in sorted(os.listdir(root_descriptor)):
+            if name.startswith(".creating-"):
+                creating_count += 1
+                continue
+            if not _is_run_id(name):
+                continue
+            try:
+                run = _load_run(
+                    supplied,
+                    root_descriptor,
+                    name,
+                    name,
+                )
+            except MigrationStateError:
+                invalid_count += 1
+                continue
+            if run.state["phase"] == "complete":
+                completed_count += 1
+            else:
+                incomplete_count += 1
+        current_named = os.stat(
+            "legacy-backup",
+            dir_fd=data_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(current_named.st_mode)
+            or (current_named.st_dev, current_named.st_ino)
+            != (opened_stat.st_dev, opened_stat.st_ino)
+        ):
+            raise MigrationStateError("migration_state_root_invalid")
+        if (
+            not root_mode_invalid
+            and stat.S_IMODE(current_named.st_mode) != 0o700
+        ):
+            invalid_count += 1
+        return ReadOnlyRunInventory(
+            backup_root=supplied,
+            root_exists=True,
+            completed_count=completed_count,
+            incomplete_count=incomplete_count,
+            creating_count=creating_count,
+            invalid_count=invalid_count,
+        )
+    except MigrationStateError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise MigrationStateError("migration_state_root_invalid") from None
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+        os.close(data_descriptor)
 
 
 def scan_run_inventory(backup_root):
@@ -192,6 +385,7 @@ def resolve_or_create_run(
     source_commit,
     service_uid,
     service_gid,
+    initial_space=None,
 ):
     """새 run을 즉시 fchown하거나 같은 미완료 run을 재사용한다."""
     if len(inventory.incomplete) > 1:
@@ -210,8 +404,13 @@ def resolve_or_create_run(
             current_identity = _json_value(
                 _evidence_identity(evidence, identity_name)
             )
-            if resumed.state[identity_name] != current_identity:
+            stored_identity = resumed.state[identity_name]
+            if (
+                stored_identity is not None
+                and stored_identity != current_identity
+            ):
                 raise MigrationStateError("migration_state_identity_changed")
+        seal_run_identities(resumed, evidence)
         return resumed
 
     evidence_present = _evidence_present(evidence)
@@ -251,6 +450,7 @@ def resolve_or_create_run(
                     source_commit,
                     _evidence_identity(evidence, "database_identity"),
                     _evidence_identity(evidence, "media_root_identity"),
+                    initial_space,
                 )
                 _validate_state(state, run_id)
                 _write_new_state(
@@ -286,6 +486,89 @@ def resolve_or_create_run(
             raise MigrationStateError("migration_state_create_failed") from None
     finally:
         os.close(root_descriptor)
+
+
+def read_run_status(run):
+    """검증된 최신 state를 typed scalar view로 반환한다."""
+    current = _load_current_run(run)
+    state = current.state
+    return MigrationRunStatus(
+        run_id=current.run_id,
+        phase=state["phase"],
+        source_commit=state["source_commit"],
+        database_identity=copy.deepcopy(state["database_identity"]),
+        media_root_identity=copy.deepcopy(state["media_root_identity"]),
+        initial_margin_bytes=state["initial_space"]["margin_bytes"],
+        initial_required_bytes=state["initial_space"]["required_bytes"],
+        media_plan_sha256=(
+            state["manifests"]["media"]["plan_sha256"]
+        ),
+        media_manifest_sha256=(
+            state["manifests"]["media"]["manifest_sha256"]
+        ),
+        backfill_plan_sha256=(
+            state["manifests"]["backfill"]["plan_sha256"]
+        ),
+        backfill_manifest_sha256=(
+            state["manifests"]["backfill"]["manifest_sha256"]
+        ),
+        intent=copy.deepcopy(state["intent"]),
+        progress=copy.deepcopy(state["progress"]),
+    )
+
+
+def seal_run_identities(run, evidence):
+    """처음 존재한 DB/MEDIA identity만 한 번 state에 고정한다."""
+    _evidence_present(evidence)
+    supplied = {
+        name: _json_value(_evidence_identity(evidence, name))
+        for name in ("database_identity", "media_root_identity")
+    }
+    for identity in supplied.values():
+        _validate_identity(identity)
+
+    def update(state):
+        for name, identity in supplied.items():
+            existing = state[name]
+            if existing is None:
+                if identity is not None:
+                    state[name] = identity
+            elif existing != identity:
+                raise MigrationStateError(
+                    "migration_state_identity_changed"
+                )
+
+    return _replace_current_state(run, None, update)
+
+
+def persist_manifest_identity(
+    run,
+    expected_phase,
+    kind,
+    plan_sha256,
+    manifest_sha256,
+):
+    """phase를 바꾸지 않고 권위 plan/current manifest hash를 fsync한다."""
+    allowed_phases = {
+        "media": frozenset(("schema_complete", "copying")),
+        "backfill": frozenset(("paths_complete",)),
+    }
+    if (
+        kind not in allowed_phases
+        or expected_phase not in allowed_phases[kind]
+    ):
+        raise MigrationStateError("migration_state_invalid")
+
+    def update(state):
+        _update_manifest_hashes(
+            state,
+            state["phase"],
+            None,
+            {kind: plan_sha256},
+            {kind: manifest_sha256},
+        )
+
+    return _replace_current_state(run, expected_phase, update)
 
 
 def transition_state(
@@ -371,6 +654,90 @@ def transition_state(
         os.close(root_descriptor)
 
 
+def _load_current_run(run):
+    root_descriptor = _open_configured_backup_root(run.backup_root)
+    try:
+        root_stat = os.fstat(root_descriptor)
+        if (
+            root_stat.st_dev != run.backup_root_device
+            or root_stat.st_ino != run.backup_root_inode
+        ):
+            raise MigrationStateError("migration_state_conflict")
+        current = _load_run(
+            run.backup_root,
+            root_descriptor,
+            run.run_id,
+            run.run_id,
+        )
+        if (
+            current.directory_device != run.directory_device
+            or current.directory_inode != run.directory_inode
+        ):
+            raise MigrationStateError("migration_state_conflict")
+        return current
+    finally:
+        os.close(root_descriptor)
+
+
+def _replace_current_state(run, expected_phase, update):
+    root_descriptor = _open_configured_backup_root(run.backup_root)
+    try:
+        root_stat = os.fstat(root_descriptor)
+        if (
+            root_stat.st_dev != run.backup_root_device
+            or root_stat.st_ino != run.backup_root_inode
+        ):
+            raise MigrationStateError("migration_state_conflict")
+        current = _load_run(
+            run.backup_root,
+            root_descriptor,
+            run.run_id,
+            run.run_id,
+        )
+        if (
+            current.directory_device != run.directory_device
+            or current.directory_inode != run.directory_inode
+        ):
+            raise MigrationStateError("migration_state_conflict")
+        if (
+            expected_phase is not None
+            and current.state["phase"] != expected_phase
+        ):
+            raise MigrationStateError("migration_state_phase_mismatch")
+        state = copy.deepcopy(current.state)
+        update(state)
+        _validate_state(state, run.run_id)
+        if state == current.state:
+            run.state = state
+            return run
+        run_descriptor = os.open(
+            run.run_id,
+            _DIRECTORY_FLAGS | _NOFOLLOW,
+            dir_fd=root_descriptor,
+        )
+        try:
+            run_stat = os.fstat(run_descriptor)
+            if (
+                run_stat.st_dev != current.directory_device
+                or run_stat.st_ino != current.directory_inode
+            ):
+                raise MigrationStateError("migration_state_conflict")
+            _atomic_replace_state(
+                run_descriptor,
+                state,
+                current.service_uid,
+                current.service_gid,
+            )
+        finally:
+            os.close(run_descriptor)
+        run.state = state
+        run.service_uid = current.service_uid
+        run.service_gid = current.service_gid
+        return run
+    finally:
+        os.close(root_descriptor)
+
+
 def _open_absolute_directory(path, error_code):
     try:
         absolute_path = os.path.abspath(os.fspath(path))
@@ -396,7 +763,7 @@ def _open_absolute_directory(path, error_code):
         raise MigrationStateError(error_code) from None
 
 
-def _open_configured_backup_root(backup_root):
+def _configured_backup_paths(backup_root):
     try:
         data_root = os.path.abspath(os.fspath(settings.PINRY_DATA_ROOT))
         expected = os.path.join(data_root, "legacy-backup")
@@ -405,6 +772,11 @@ def _open_configured_backup_root(backup_root):
         raise MigrationStateError("migration_state_root_invalid") from None
     if supplied != expected:
         raise MigrationStateError("migration_state_root_invalid")
+    return supplied, data_root
+
+
+def _open_configured_backup_root(backup_root):
+    _supplied, data_root = _configured_backup_paths(backup_root)
     data_descriptor = _open_absolute_directory(
         data_root,
         "migration_state_root_invalid",
@@ -502,7 +874,7 @@ def _read_descriptor(descriptor):
 
 
 def _validate_state(state, run_id):
-    if not isinstance(state, dict):
+    if not isinstance(state, dict) or set(state) != _STATE_KEYS:
         raise MigrationStateError("migration_state_missing_or_invalid")
     if (
         state.get("format_version") != FORMAT_VERSION
@@ -513,9 +885,8 @@ def _validate_state(state, run_id):
     ):
         raise MigrationStateError("migration_state_missing_or_invalid")
     for identity_name in ("database_identity", "media_root_identity"):
-        if identity_name not in state:
-            raise MigrationStateError("migration_state_missing_or_invalid")
         _validate_identity(state[identity_name])
+    _validate_initial_space(state["initial_space"])
     if "intent" not in state or (
         state["intent"] is not None
         and not isinstance(state["intent"], dict)
@@ -528,11 +899,16 @@ def _validate_state(state, run_id):
         raise MigrationStateError("migration_state_missing_or_invalid")
     _validate_phase_state(state)
     manifests = state.get("manifests")
-    if not isinstance(manifests, dict):
+    if not isinstance(manifests, dict) or set(manifests) != {
+        "media", "backfill"
+    }:
         raise MigrationStateError("migration_state_missing_or_invalid")
     for kind in ("media", "backfill"):
         values = manifests.get(kind)
-        if not isinstance(values, dict):
+        if (
+            not isinstance(values, dict)
+            or set(values) != {"plan_sha256", "manifest_sha256"}
+        ):
             raise MigrationStateError("migration_state_missing_or_invalid")
         for name in ("plan_sha256", "manifest_sha256"):
             value = values.get(name)
@@ -605,7 +981,9 @@ def _is_identity_number(value):
 def _validate_identity(identity):
     if identity is None:
         return
-    if not isinstance(identity, dict):
+    if not isinstance(identity, dict) or set(identity) != {
+        "device", "inode"
+    }:
         raise MigrationStateError("migration_state_missing_or_invalid")
     for field_name in ("device", "inode"):
         value = identity.get(field_name)
@@ -617,7 +995,46 @@ def _validate_identity(identity):
             raise MigrationStateError("migration_state_missing_or_invalid")
 
 
-def _initial_state(run_id, source_commit, database_identity, media_identity):
+def _validate_initial_space(initial_space):
+    if (
+        not isinstance(initial_space, dict)
+        or set(initial_space) != _INITIAL_SPACE_KEYS
+    ):
+        raise MigrationStateError("migration_state_missing_or_invalid")
+    margin = initial_space["margin_bytes"]
+    required = initial_space["required_bytes"]
+    if (
+        not _is_identity_number(margin)
+        or not _is_identity_number(required)
+        or required < margin
+    ):
+        raise MigrationStateError("migration_state_missing_or_invalid")
+
+
+def _initial_space_value(initial_space):
+    if initial_space is None:
+        return {"margin_bytes": 0, "required_bytes": 0}
+    if isinstance(initial_space, dict):
+        value = {
+            "margin_bytes": initial_space.get("margin_bytes"),
+            "required_bytes": initial_space.get("required_bytes"),
+        }
+    else:
+        value = {
+            "margin_bytes": getattr(initial_space, "margin_bytes", None),
+            "required_bytes": getattr(initial_space, "required_bytes", None),
+        }
+    _validate_initial_space(value)
+    return value
+
+
+def _initial_state(
+    run_id,
+    source_commit,
+    database_identity,
+    media_identity,
+    initial_space,
+):
     return {
         "format_version": FORMAT_VERSION,
         "run_id": run_id,
@@ -625,6 +1042,7 @@ def _initial_state(run_id, source_commit, database_identity, media_identity):
         "source_commit": source_commit,
         "database_identity": _json_value(database_identity),
         "media_root_identity": _json_value(media_identity),
+        "initial_space": _initial_space_value(initial_space),
         "manifests": {
             "media": {"plan_sha256": None, "manifest_sha256": None},
             "backfill": {"plan_sha256": None, "manifest_sha256": None},
@@ -770,13 +1188,20 @@ def _manifest_kind(next_phase, intent):
 
 def _evidence_present(evidence):
     if isinstance(evidence, dict):
-        if "present" in evidence:
-            return bool(evidence["present"])
-        return any(bool(value) for value in evidence.values())
-    for name in ("present", "has_legacy", "has_evidence"):
-        if hasattr(evidence, name):
-            return bool(getattr(evidence, name))
-    return bool(evidence)
+        if "has_legacy_evidence" in evidence:
+            value = evidence["has_legacy_evidence"]
+        elif "present" in evidence:
+            value = evidence["present"]
+        else:
+            raise MigrationStateError("migration_state_invalid")
+    else:
+        try:
+            value = evidence.has_legacy_evidence
+        except AttributeError:
+            raise MigrationStateError("migration_state_invalid") from None
+    if type(value) is not bool:
+        raise MigrationStateError("migration_state_invalid")
+    return value
 
 
 def _evidence_identity(evidence, name):

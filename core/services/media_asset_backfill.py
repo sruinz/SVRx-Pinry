@@ -888,6 +888,26 @@ class _BackfillManifestLog(object):
         self.state = self._load_state()
         return quarantine_name
 
+    def _reset_incomplete_plan(self):
+        if self.state.plan_complete:
+            raise _command_error("media_asset_plan_reset_forbidden")
+        changed = bool(self.state.events or self.state.torn_tail is not None)
+        if not changed:
+            return False
+        if self.state.torn_tail is not None:
+            self.repair_torn_tail()
+        self._ensure_content_current()
+        if self.state.plan_complete or any(
+            event["event"] != "planned" for event in self.state.events
+        ):
+            raise _command_error("media_asset_plan_reset_forbidden")
+        self._verify_current()
+        os.ftruncate(self.descriptor, 0)
+        os.fsync(self.descriptor)
+        os.fsync(self.run_directory.descriptor)
+        self.state = self._load_state()
+        return True
+
     def plan_sha256(self):
         if not self.state.plan_complete:
             raise _command_error("media_asset_plan_incomplete")
@@ -911,6 +931,24 @@ class _BackfillManifestLog(object):
         if self._read_all() != self.state.raw_bytes:
             raise _command_error("unsafe_media_asset_manifest")
         return True
+
+
+def recover_incomplete_media_asset_plan(
+    run_directory,
+    filename,
+    run_id,
+    service_uid,
+    service_gid,
+):
+    """완료 marker 이전의 계획 prefix만 같은 run에서 재계획하게 한다."""
+    with _BackfillManifestLog.open(
+        run_directory,
+        filename,
+        run_id,
+        service_uid,
+        service_gid,
+    ) as manifest:
+        return manifest._reset_incomplete_plan()
 
 
 class MediaAssetBackfiller(object):
