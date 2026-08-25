@@ -7,6 +7,7 @@ import stat
 import sys
 import uuid
 
+from django.conf import settings
 from django.core.management import CommandError
 from django.db.models import Q
 
@@ -229,7 +230,11 @@ class LinuxRenameNoReplaceAdapter(object):
             raise _archive_error("atomic_archive_unsupported")
         try:
             libc = self.libc_factory(None, use_errno=True)
-        except (AttributeError, OSError, TypeError) as error:
+        except OSError as error:
+            if error.errno not in _UNSUPPORTED_ATOMIC_ERRNOS:
+                raise _archive_error("archive_failed", error)
+            raise _archive_error("atomic_archive_unsupported", error)
+        except (AttributeError, TypeError) as error:
             raise _archive_error("atomic_archive_unsupported", error)
         source_bytes = os.fsencode(source_name)
         destination_bytes = os.fsencode(destination_name)
@@ -274,7 +279,11 @@ class LinuxRenameNoReplaceAdapter(object):
     ):
         try:
             machine = os.uname().machine.lower()
-        except (AttributeError, OSError):
+        except OSError as error:
+            if error.errno not in _UNSUPPORTED_ATOMIC_ERRNOS:
+                raise _archive_error("archive_failed", error)
+            raise _archive_error("atomic_archive_unsupported", error)
+        except AttributeError:
             raise _archive_error("atomic_archive_unsupported")
         syscall_number = {
             "aarch64": 276,
@@ -408,16 +417,15 @@ def _open_archive_directory(
                 flags,
                 dir_fd=parent_descriptor,
             )
+            descriptors.append(descriptor)
             opened_stat = os.fstat(descriptor)
             if (
                 not stat.S_ISDIR(opened_stat.st_mode)
                 or _identity(opened_stat) != _identity(named_stat)
             ):
-                os.close(descriptor)
                 raise _archive_error("archive_state_conflict")
             names.append(name)
             directory_stats.append(opened_stat)
-            descriptors.append(descriptor)
             if create:
                 try:
                     os.fsync(descriptor)
@@ -519,6 +527,48 @@ def _open_verified_root(path):
         raise _archive_io_error(error)
     except (TypeError, ValueError) as error:
         raise _archive_error("archive_state_conflict", error)
+
+
+def _absolute_archive_root(path):
+    try:
+        value = os.fspath(path)
+        if not isinstance(value, str):
+            raise TypeError
+        return os.path.abspath(value)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise _archive_error("archive_state_conflict", error)
+
+
+def _verify_configured_archive_roots(
+    source_root, destination_root, run_directory
+):
+    supplied_source = _absolute_archive_root(source_root)
+    configured_source = _absolute_archive_root(settings.MEDIA_ROOT)
+    supplied_destination = _absolute_archive_root(destination_root)
+    configured_destination = _absolute_archive_root(run_directory)
+    if (
+        supplied_source != configured_source
+        or supplied_destination != configured_destination
+    ):
+        raise _archive_error("archive_state_conflict")
+    directories = [None] * 4
+    try:
+        directories[0] = _open_verified_root(supplied_source)
+        directories[1] = _open_verified_root(configured_source)
+        directories[2] = _open_verified_root(supplied_destination)
+        directories[3] = _open_verified_root(configured_destination)
+        identities = tuple(
+            _identity(os.fstat(directory.descriptor))
+            for directory in directories
+        )
+        if identities[0] != identities[1] or identities[2] != identities[3]:
+            raise _archive_error("archive_state_conflict")
+    except MediaArchiveError:
+        raise
+    except OSError as error:
+        raise _archive_io_error(error)
+    finally:
+        _close_archive_resources(*reversed(directories))
 
 
 def _same_filesystem(*file_stats):
@@ -721,6 +771,8 @@ def _load_fixed_slot_sources(
         if code not in allowed_codes:
             code = "archive_manifest_mismatch"
         raise _archive_error(code, error)
+    except OSError as error:
+        raise _archive_error("archive_failed", error)
     if (
         not isinstance(sources, tuple)
         or len(sources) != len(set(sources))
@@ -929,6 +981,11 @@ class LegacyMediaArchive(object):
     ):
         if schema_only:
             return ArchivePlan((), None, schema_only=True)
+        _verify_configured_archive_roots(
+            self.source_root,
+            self.destination_root,
+            self.run_directory,
+        )
         validate_no_legacy_media_references(using=self.using)
         fixed_sources = _load_fixed_slot_sources(
             self.run_directory,
@@ -991,6 +1048,11 @@ class LegacyMediaArchive(object):
             raise _archive_error("archive_state_conflict")
         if plan.schema_only:
             return ArchiveConvergence((), None)
+        _verify_configured_archive_roots(
+            self.source_root,
+            self.destination_root,
+            self.run_directory,
+        )
         if on_item_complete is not None and not callable(on_item_complete):
             raise _archive_error("archive_state_conflict")
         flags = _validate_progress(plan.intents, plan.progress)

@@ -779,6 +779,46 @@ class MediaArchiveFilesystemTests(SimpleTestCase):
                     ),
                 )
 
+    def test_child_fstat_io_error_closes_new_descriptor(self):
+        intent = self.make_fixed_slot_intent()
+        descriptor_directory = "/dev/fd"
+        if not os.path.isdir(descriptor_directory):
+            self.skipTest("descriptor inventory is unavailable")
+        target_identity = (
+            os.stat(str(self.source_root / "originals")).st_dev,
+            os.stat(str(self.source_root / "originals")).st_ino,
+        )
+        real_fstat = os.fstat
+        failed = [False]
+
+        def fail_child_fstat(descriptor):
+            opened_stat = real_fstat(descriptor)
+            if not failed[0] and (
+                opened_stat.st_dev,
+                opened_stat.st_ino,
+            ) == target_identity:
+                failed[0] = True
+                raise OSError(errno.EIO, "injected")
+            return opened_stat
+
+        before = set(os.listdir(descriptor_directory))
+        with mock.patch(
+            "django_images.services.media_archive.os.fstat",
+            side_effect=fail_child_fstat,
+        ):
+            self.assert_archive_error(
+                "archive_failed",
+                lambda: open_archive_session(
+                    str(self.source_root),
+                    str(self.destination_root),
+                    intent,
+                    syscall_adapter=RecordingRenameNoReplaceAdapter(),
+                ),
+            )
+
+        self.assertTrue(failed[0])
+        self.assertEqual(set(os.listdir(descriptor_directory)), before)
+
     def test_default_adapter_has_no_ordinary_rename_fallback(self):
         adapter = LinuxRenameNoReplaceAdapter(platform="unsupported")
 
@@ -803,6 +843,57 @@ class MediaArchiveFilesystemTests(SimpleTestCase):
         self.assertEqual(call[2], 20)
         self.assertEqual(call[3], b"destination")
         self.assertEqual(call[4], 1)
+
+    def test_linux_adapter_libc_load_distinguishes_capability_errno(self):
+        cases = (
+            (errno.ENOSYS, "atomic_archive_unsupported"),
+            (errno.EINVAL, "atomic_archive_unsupported"),
+            (errno.EOPNOTSUPP, "atomic_archive_unsupported"),
+            (errno.ENOTSUP, "atomic_archive_unsupported"),
+            (errno.EIO, "archive_failed"),
+        )
+        for error_number, expected_code in cases:
+            with self.subTest(error_number=error_number):
+                def fail_load(*_args, **_kwargs):
+                    raise OSError(error_number, "injected")
+
+                adapter = LinuxRenameNoReplaceAdapter(
+                    platform="linux",
+                    libc_factory=fail_load,
+                )
+                self.assert_archive_error(
+                    expected_code,
+                    lambda: adapter.rename_noreplace(
+                        10, "source", 20, "destination"
+                    ),
+                )
+
+    def test_linux_adapter_uname_distinguishes_capability_errno(self):
+        cases = (
+            (errno.ENOSYS, "atomic_archive_unsupported"),
+            (errno.EINVAL, "atomic_archive_unsupported"),
+            (errno.EOPNOTSUPP, "atomic_archive_unsupported"),
+            (errno.ENOTSUP, "atomic_archive_unsupported"),
+            (errno.EIO, "archive_failed"),
+        )
+        for error_number, expected_code in cases:
+            with self.subTest(error_number=error_number):
+                adapter = LinuxRenameNoReplaceAdapter(
+                    platform="linux",
+                    libc_factory=(
+                        lambda *_args, **_kwargs: FakeLibc(None)
+                    ),
+                )
+                with mock.patch(
+                    "django_images.services.media_archive.os.uname",
+                    side_effect=OSError(error_number, "injected"),
+                ):
+                    self.assert_archive_error(
+                        expected_code,
+                        lambda: adapter.rename_noreplace(
+                            10, "source", 20, "destination"
+                        ),
+                    )
 
     def test_linux_adapter_normalizes_filesystem_unsupported_errno(self):
         for error_number in (
@@ -975,6 +1066,78 @@ class MediaArchiveGateTests(TestCase):
         return self.prepare_plan(
             has_md5=has_md5, schema_only=schema_only
         ).intents
+
+    def test_archive_rejects_source_root_other_than_effective_media_root(self):
+        source = self.make_fixed_source(
+            "11111111-1111-4111-8111-111111111111"
+        )
+        self.write_manifest((self.fixed_plan(1, source),))
+        alternate_root = self.data_root / "alternate-media-root"
+        alternate_source = alternate_root / source
+        alternate_source.parent.mkdir(parents=True)
+        alternate_source.write_bytes(b"alternate")
+        archiver = LegacyMediaArchive(
+            str(alternate_root),
+            str(self.run_directory),
+            str(self.run_directory),
+            AUTO_V2_MANIFEST_FILENAME,
+            RUN_ID,
+            self.uid,
+            self.gid,
+        )
+        adapter = RecordingRenameNoReplaceAdapter()
+
+        def archive():
+            plan = archiver.prepare()
+            archiver.converge(plan, syscall_adapter=adapter)
+
+        self.assert_archive_error("archive_state_conflict", archive)
+        self.assertEqual(adapter.calls, [])
+        self.assertTrue(alternate_source.exists())
+        self.assertFalse((self.run_directory / "media").exists())
+
+    def test_archive_rejects_destination_root_other_than_run_directory(self):
+        source = self.make_fixed_source(
+            "11111111-1111-4111-8111-111111111111"
+        )
+        self.write_manifest((self.fixed_plan(1, source),))
+        alternate_destination = self.data_root / "alternate-run"
+        alternate_destination.mkdir(mode=0o700)
+        archiver = LegacyMediaArchive(
+            str(self.source_root),
+            str(alternate_destination),
+            str(self.run_directory),
+            AUTO_V2_MANIFEST_FILENAME,
+            RUN_ID,
+            self.uid,
+            self.gid,
+        )
+        adapter = RecordingRenameNoReplaceAdapter()
+
+        def archive():
+            plan = archiver.prepare()
+            archiver.converge(plan, syscall_adapter=adapter)
+
+        self.assert_archive_error("archive_state_conflict", archive)
+        self.assertEqual(adapter.calls, [])
+        self.assertTrue((self.source_root / source).exists())
+        self.assertFalse((alternate_destination / "media").exists())
+
+    def test_manifest_close_io_error_is_normalized(self):
+        self.write_manifest(())
+        real_close = AutoV2ManifestLog.close
+
+        def close_then_fail(manifest):
+            real_close(manifest)
+            raise OSError(errno.EIO, "injected")
+
+        with mock.patch.object(
+            AutoV2ManifestLog,
+            "close",
+            autospec=True,
+            side_effect=close_then_fail,
+        ):
+            self.assert_archive_error("archive_failed", self.prepare)
 
     def test_database_gate_requires_zero_image_root_references(self):
         legacy_image = Image.objects.create(
