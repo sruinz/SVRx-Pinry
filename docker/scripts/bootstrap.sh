@@ -13,6 +13,8 @@ settings_template="${settings_directory}/local_settings.example.py"
 project_settings="${settings_directory}/local_settings.py"
 data_temp=""
 project_temp=""
+service_uid=""
+service_gid=""
 
 cleanup() {
     if [ -n "${data_temp}" ] && [ -e "${data_temp}" ]; then
@@ -39,12 +41,10 @@ stat_value() {
 
 allowed_owner() {
     local path_uid="$1"
-    local service_uid
 
     if [ "${path_uid}" = "$(id -u)" ]; then
         return 0
     fi
-    service_uid="$(id -u www-data 2>/dev/null || true)"
     [ -n "${service_uid}" ] && [ "${path_uid}" = "${service_uid}" ]
 }
 
@@ -73,6 +73,17 @@ validate_regular_file() {
     [ "$(LC_ALL=C wc -c < "${path}")" -le 1048576 ]
 }
 
+validate_service_settings() {
+    local path="$1"
+    local mode
+
+    validate_regular_file "${path}"
+    [ "$(stat_value '%u' '%u' "${path}")" = "${service_uid}" ]
+    [ "$(stat_value '%g' '%g' "${path}")" = "${service_gid}" ]
+    mode="$(stat_value '%a' '%Lp' "${path}")"
+    [ $((8#${mode})) -eq $((8#600)) ]
+}
+
 read_key() {
     local path="$1"
     local byte_count
@@ -91,6 +102,14 @@ read_key() {
 
 [ -d "${data_root}" ] && [ ! -L "${data_root}" ]
 [ -d "${settings_directory}" ] && [ ! -L "${settings_directory}" ]
+service_uid="$(id -u www-data)"
+service_gid="$(id -g www-data)"
+case "${service_uid}" in
+    ''|*[!0-9]*) exit 1 ;;
+esac
+case "${service_gid}" in
+    ''|*[!0-9]*) exit 1 ;;
+esac
 
 if [ -e "${data_settings}" ] || [ -L "${data_settings}" ]; then
     validate_regular_file "${data_settings}"
@@ -134,8 +153,10 @@ fi
 project_temp="$(mktemp "${settings_directory}/.local_settings.py.tmp-XXXXXX")"
 cp "${data_settings}" "${project_temp}"
 chmod 0600 "${project_temp}"
+chown "${service_uid}:${service_gid}" "${project_temp}"
 cmp -s "${data_settings}" "${project_temp}"
+validate_service_settings "${project_temp}"
 mv -f "${project_temp}" "${project_settings}"
 project_temp=""
-validate_regular_file "${project_settings}"
+validate_service_settings "${project_settings}"
 cmp -s "${data_settings}" "${project_settings}"

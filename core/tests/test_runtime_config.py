@@ -66,6 +66,11 @@ def _write_startup_recorder(path, command_name):
         "    done\n"
         "    printf '\\n'\n"
         "} >> \"$PINRY_STARTUP_CAPTURE\"\n"
+        "if [ '" + command_name + "' = python ] "
+        "&& [ -n \"${PINRY_ENV_CAPTURE:-}\" ]; then\n"
+        "    printf '%s' \"${PYTHONDONTWRITEBYTECODE:-}\" "
+        "> \"$PINRY_ENV_CAPTURE\"\n"
+        "fi\n"
         "if [ '" + command_name + "' = bash ] "
         "&& [ \"${PINRY_FAIL_BOOTSTRAP:-0}\" = 1 ]; then\n"
         "    exit 43\n"
@@ -596,6 +601,25 @@ class RuntimeConfigTests(unittest.TestCase):
             ],
         ])
 
+    def test_start_exports_bytecode_suppression_to_python_runner(self):
+        environment, _capture, startup_script = self._startup_environment(
+            False
+        )
+        environment_capture = startup_script.parent / "environment.txt"
+        environment["PINRY_ENV_CAPTURE"] = str(environment_capture)
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+
+        completed = subprocess.run(
+            ["/bin/bash", str(startup_script)],
+            cwd=str(REPOSITORY_ROOT),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(environment_capture.read_text("utf-8"), "1")
+
     def test_python_runner_from_tmp_uses_project_root_and_exact_order(self):
         environment, capture, runner, _data_root = (
             self._python_runner_environment()
@@ -894,6 +918,7 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         if existing is not None:
             (data / "local_settings.py").write_bytes(existing)
+            (data / "local_settings.py").chmod(0o600)
         source = (
             REPOSITORY_ROOT / "docker/scripts/bootstrap.sh"
         ).read_text("utf-8")
@@ -934,6 +959,60 @@ class RuntimeConfigTests(unittest.TestCase):
             "    sys.stdout.write(content)\n"
         )
         sed.chmod(0o700)
+        service_uid = os.getuid()
+        service_gid = os.getgid()
+        real_id = shutil.which("id")
+        real_chown = shutil.which("chown")
+        real_move = shutil.which("mv")
+        self.assertIsNotNone(real_id)
+        self.assertIsNotNone(real_chown)
+        self.assertIsNotNone(real_move)
+        identity = binary_directory / "id"
+        identity.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$#\" -eq 2 ] && [ \"$2\" = www-data ]; then\n"
+            "    if [ \"$1\" = -u ]; then\n"
+            "        if [ \"${PINRY_TEST_ID_UID_FAIL:-0}\" = 1 ]; then\n"
+            "            exit 44\n"
+            "        fi\n"
+            "        printf '%s\\n' \"${PINRY_TEST_ID_UID:-"
+            + str(service_uid)
+            + "}\"\n"
+            "        exit 0\n"
+            "    fi\n"
+            "    if [ \"$1\" = -g ]; then\n"
+            "        if [ \"${PINRY_TEST_ID_GID_FAIL:-0}\" = 1 ]; then\n"
+            "            exit 45\n"
+            "        fi\n"
+            "        printf '%s\\n' \"${PINRY_TEST_ID_GID:-"
+            + str(service_gid)
+            + "}\"\n"
+            "        exit 0\n"
+            "    fi\n"
+            "fi\n"
+            "exec \"" + str(real_id) + "\" \"$@\"\n"
+        )
+        identity.chmod(0o700)
+        chown = binary_directory / "chown"
+        chown.write_text(
+            "#!/bin/sh\n"
+            "for argument in \"$@\"; do\n"
+            "    printf '%s\\0' \"$argument\" >> \"$PINRY_CHOWN_CAPTURE\"\n"
+            "done\n"
+            "if [ \"${PINRY_TEST_CHOWN_FAIL:-0}\" = 1 ]; then exit 46; fi\n"
+            "[ \"$#\" -eq 2 ] && [ -e \"$2\" ]\n"
+            "exec \"" + str(real_chown) + "\" \"$@\"\n"
+        )
+        chown.chmod(0o700)
+        move = binary_directory / "mv"
+        move.write_text(
+            "#!/bin/sh\n"
+            "for argument in \"$@\"; do\n"
+            "    printf '%s\\0' \"$argument\" >> \"$PINRY_MV_CAPTURE\"\n"
+            "done\n"
+            "exec \"" + str(real_move) + "\" \"$@\"\n"
+        )
+        move.chmod(0o700)
         environment = os.environ.copy()
         environment["PATH"] = "{}{}{}".format(
             binary_directory,
@@ -942,7 +1021,126 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         environment["PINRY_DATA_ROOT"] = str(data)
         environment["PINRY_PROJECT_ROOT"] = str(root)
+        environment["PINRY_CHOWN_CAPTURE"] = str(
+            Path(temporary.name, "chown.bin")
+        )
+        environment["PINRY_MV_CAPTURE"] = str(
+            Path(temporary.name, "mv.bin")
+        )
         return script, root, data, secret, environment
+
+    def test_bootstrap_atomically_installs_service_owned_project_copy_only(self):
+        existing = b"SECRET_KEY='sentinel-existing-secret'\n"
+        script, root, data, secret, environment = self._bootstrap_fixture(
+            existing
+        )
+        key_path = data / "production_secret_key.txt"
+        key_path.write_bytes((secret + "\n").encode("ascii"))
+        key_path.chmod(0o600)
+        data_settings = data / "local_settings.py"
+        persistent_before = {
+            path: (
+                path.read_bytes(),
+                stat.S_IMODE(path.stat().st_mode),
+                path.stat().st_uid,
+                path.stat().st_gid,
+            )
+            for path in (data_settings, key_path)
+        }
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        for path, expected in persistent_before.items():
+            self.assertEqual(
+                (
+                    path.read_bytes(),
+                    stat.S_IMODE(path.stat().st_mode),
+                    path.stat().st_uid,
+                    path.stat().st_gid,
+                ),
+                expected,
+            )
+        project_settings = root / "pinry/settings/local_settings.py"
+        self.assertEqual(project_settings.read_bytes(), existing)
+        self.assertEqual(stat.S_IMODE(project_settings.stat().st_mode), 0o600)
+        self.assertEqual(project_settings.stat().st_uid, os.getuid())
+        self.assertEqual(project_settings.stat().st_gid, os.getgid())
+        chown_arguments = _read_recorded_argv(Path(
+            environment["PINRY_CHOWN_CAPTURE"]
+        ))
+        self.assertEqual(chown_arguments[0], "{}:{}".format(
+            os.getuid(), os.getgid()
+        ))
+        self.assertEqual(len(chown_arguments), 2)
+        project_temp = Path(chown_arguments[1])
+        self.assertEqual(project_temp.parent, project_settings.parent)
+        self.assertTrue(project_temp.name.startswith(
+            ".local_settings.py.tmp-"
+        ))
+        move_arguments = _read_recorded_argv(Path(
+            environment["PINRY_MV_CAPTURE"]
+        ))
+        self.assertEqual(
+            move_arguments[-3:],
+            ["-f", str(project_temp), str(project_settings)],
+        )
+        self.assertEqual(
+            list(project_settings.parent.glob(".local_settings.py.tmp-*")),
+            [],
+        )
+
+    def test_bootstrap_fails_closed_without_service_identity_or_chown(self):
+        cases = (
+            ("PINRY_TEST_ID_UID_FAIL", "1"),
+            ("PINRY_TEST_ID_GID_FAIL", "1"),
+            ("PINRY_TEST_ID_UID", "not-a-uid"),
+            ("PINRY_TEST_ID_GID", "not-a-gid"),
+            ("PINRY_TEST_CHOWN_FAIL", "1"),
+        )
+        for variable, value in cases:
+            with self.subTest(variable=variable):
+                existing = b"SECRET_KEY='sentinel-existing-secret'\n"
+                script, root, data, _secret, environment = (
+                    self._bootstrap_fixture(existing)
+                )
+                environment[variable] = value
+                data_settings = data / "local_settings.py"
+                before = (
+                    data_settings.read_bytes(),
+                    stat.S_IMODE(data_settings.stat().st_mode),
+                )
+
+                completed = subprocess.run(
+                    ["/bin/bash", str(script)],
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    (
+                        data_settings.read_bytes(),
+                        stat.S_IMODE(data_settings.stat().st_mode),
+                    ),
+                    before,
+                )
+                settings_directory = root / "pinry/settings"
+                self.assertFalse(
+                    (settings_directory / "local_settings.py").exists()
+                )
+                self.assertEqual(
+                    list(settings_directory.glob(
+                        ".local_settings.py.tmp-*"
+                    )),
+                    [],
+                )
 
     def test_bootstrap_stores_generated_secret_without_logging_value(self):
         script, root, data, secret, environment = self._bootstrap_fixture()

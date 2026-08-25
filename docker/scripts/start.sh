@@ -10,6 +10,7 @@
 set -euo pipefail
 
 PROJECT_ROOT="/pinry"
+export PYTHONDONTWRITEBYTECODE=1
 
 if [ "$#" -gt 1 ] || {
     [ "$#" -eq 1 ] && [ "$1" != "--migrate-legacy" ];
