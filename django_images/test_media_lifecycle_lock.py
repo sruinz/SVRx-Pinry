@@ -805,6 +805,36 @@ class MediaDedupLockTests(SimpleTestCase):
         }
         self.assertEqual(actual, expected)
 
+    def test_global_writer_gate_acquires_stripes_before_lifecycle(self):
+        entered = []
+
+        class RecordingLock(object):
+            def __init__(self, *args, **kwargs):
+                del args
+                self.lock_filename = kwargs.get(
+                    "lock_filename", "media-lifecycle.lock"
+                )
+
+            def __enter__(self):
+                entered.append(self.lock_filename)
+                return self
+
+            def __exit__(self, error_type, error, traceback):
+                del error_type, error, traceback
+                return False
+
+        with mock.patch.object(file_ops, "MediaLifecycleLock", RecordingLock):
+            with file_ops.media_global_writer_gate(self.root_directory):
+                pass
+
+        self.assertEqual(
+            entered,
+            [
+                "media-dedup-{:02x}.lock".format(index)
+                for index in range(256)
+            ] + ["media-lifecycle.lock"],
+        )
+
     def test_same_key_serializes_threads(self):
         entered = threading.Event()
         errors = []

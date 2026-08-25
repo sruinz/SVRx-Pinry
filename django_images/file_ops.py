@@ -15,6 +15,17 @@ except ImportError:  # pragma: no cover - exercised by platform gate tests
     fcntl = None
 
 
+MEDIA_LIFECYCLE_LOCK_FILENAME = "media-lifecycle.lock"
+MEDIA_DEDUP_LOCK_FILENAMES = tuple(
+    "media-dedup-{:02x}.lock".format(index)
+    for index in range(256)
+)
+MEDIA_GLOBAL_LOCK_FILENAMES = (
+    MEDIA_DEDUP_LOCK_FILENAMES + (MEDIA_LIFECYCLE_LOCK_FILENAME,)
+)
+MEDIA_LOCK_FILENAMES = frozenset(MEDIA_GLOBAL_LOCK_FILENAMES)
+
+
 class MediaPathError(Exception):
     pass
 
@@ -57,7 +68,7 @@ class MediaLifecycleLock(object):
         deadline=None,
         clock=None,
         sleeper=None,
-        lock_filename="media-lifecycle.lock",
+        lock_filename=MEDIA_LIFECYCLE_LOCK_FILENAME,
     ):
         self.root_directory = root_directory
         self.exclusive = exclusive
@@ -74,7 +85,7 @@ class MediaLifecycleLock(object):
             lock_filename = self.lock_filename
             _require_lifecycle_lock_filename(lock_filename)
             self._check_deadline()
-            if lock_filename == "media-lifecycle.lock":
+            if lock_filename == MEDIA_LIFECYCLE_LOCK_FILENAME:
                 opened = _open_media_lifecycle_lock(self.root_directory)
             else:
                 opened = _open_media_lifecycle_lock(
@@ -111,7 +122,7 @@ class MediaLifecycleLock(object):
                     continue
                 self._held = True
                 self._check_deadline()
-                if lock_filename == "media-lifecycle.lock":
+                if lock_filename == MEDIA_LIFECYCLE_LOCK_FILENAME:
                     _verify_held_media_lifecycle_lock(
                         self.root_directory,
                         self._directory_descriptor,
@@ -205,22 +216,15 @@ def media_global_writer_gate(
     sleeper=None,
 ):
     with ExitStack() as locks:
-        for stripe in range(256):
+        for lock_filename in MEDIA_GLOBAL_LOCK_FILENAMES:
             locks.enter_context(MediaLifecycleLock(
                 root_directory,
                 exclusive=True,
                 deadline=deadline,
                 clock=clock,
                 sleeper=sleeper,
-                lock_filename="media-dedup-{:02x}.lock".format(stripe),
+                lock_filename=lock_filename,
             ))
-        locks.enter_context(media_lifecycle_lock(
-            root_directory,
-            exclusive=True,
-            deadline=deadline,
-            clock=clock,
-            sleeper=sleeper,
-        ))
         yield
 
 
@@ -245,7 +249,7 @@ def media_dedup_lock(
         raise _lifecycle_lock_error("media_lifecycle_lock_failed")
     key = "{}:{}".format(submitter_id, content_sha256).encode("ascii")
     stripe = hashlib.sha256(key).digest()[0]
-    lock_filename = "media-dedup-{:02x}.lock".format(stripe)
+    lock_filename = MEDIA_DEDUP_LOCK_FILENAMES[stripe]
     return MediaLifecycleLock(
         root_directory,
         exclusive=True,
@@ -1053,21 +1057,9 @@ def _lifecycle_lock_error(code, retryable=False):
 
 
 def _require_lifecycle_lock_filename(lock_filename):
-    dedup_prefix = "media-dedup-"
-    dedup_suffix = ".lock"
-    if type(lock_filename) is not str:
-        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
-    if lock_filename == "media-lifecycle.lock":
-        return
-    if not (
-        lock_filename.startswith(dedup_prefix)
-        and lock_filename.endswith(dedup_suffix)
-    ):
-        raise _lifecycle_lock_error("media_lifecycle_lock_failed")
-    stripe = lock_filename[len(dedup_prefix):-len(dedup_suffix)]
     if (
-        len(stripe) != 2
-        or any(character not in "0123456789abcdef" for character in stripe)
+        type(lock_filename) is not str
+        or lock_filename not in MEDIA_LOCK_FILENAMES
     ):
         raise _lifecycle_lock_error("media_lifecycle_lock_failed")
 
@@ -1092,7 +1084,7 @@ def _require_lifecycle_lock_support():
 
 
 def _open_media_lifecycle_lock(  # noqa: C901
-    root_directory, lock_filename="media-lifecycle.lock"
+    root_directory, lock_filename=MEDIA_LIFECYCLE_LOCK_FILENAME
 ):
     _require_lifecycle_lock_support()
     if not isinstance(root_directory, MediaDirectory):
@@ -1175,7 +1167,7 @@ def _open_media_lifecycle_lock(  # noqa: C901
 
 
 def _open_lifecycle_lock_file(
-    directory_descriptor, lock_filename="media-lifecycle.lock"
+    directory_descriptor, lock_filename=MEDIA_LIFECYCLE_LOCK_FILENAME
 ):
     existing_flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
     create_flags = existing_flags | os.O_CREAT | os.O_EXCL
@@ -1222,7 +1214,7 @@ def _verify_held_media_lifecycle_lock(
     root_directory,
     directory_descriptor,
     lock_descriptor,
-    lock_filename="media-lifecycle.lock",
+    lock_filename=MEDIA_LIFECYCLE_LOCK_FILENAME,
 ):
     try:
         root_directory.verify_current()
@@ -1251,6 +1243,217 @@ def _verify_held_media_lifecycle_lock(
         if not isinstance(error, Exception):
             raise
         raise _lifecycle_lock_error("media_lifecycle_lock_failed") from error
+
+
+def recover_media_lock_state(  # noqa: C901
+    root_directory, service_uid, service_gid
+):
+    if (
+        not isinstance(root_directory, MediaDirectory)
+        or not root_directory.verified_root
+        or type(service_uid) is not int
+        or service_uid < 0
+        or type(service_gid) is not int
+        or service_gid < 0
+    ):
+        raise MediaPathError("unsafe_media_lock_state")
+    _require_lifecycle_lock_support()
+    if (
+        not callable(getattr(os, "fchmod", None))
+        or not callable(getattr(os, "fchown", None))
+    ):
+        raise MediaPathError("unsafe_media_lock_state")
+
+    directory_descriptor = None
+    lock_descriptors = []
+    try:
+        root_directory.verify_current()
+        try:
+            named_directory = os.stat(
+                ".pinry-locks",
+                dir_fd=root_directory.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(named_directory.st_mode):
+            raise MediaPathError("unsafe_media_lock_state")
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC
+        )
+        directory_descriptor = os.open(
+            ".pinry-locks",
+            flags,
+            dir_fd=root_directory.descriptor,
+        )
+        opened_directory = os.fstat(directory_descriptor)
+        if (
+            not stat.S_ISDIR(opened_directory.st_mode)
+            or _identity(opened_directory) != _identity(named_directory)
+        ):
+            raise MediaPathError("unsafe_media_lock_state")
+
+        entry_names = set(os.listdir(directory_descriptor))
+        if any(
+            type(name) is not str or name not in MEDIA_LOCK_FILENAMES
+            for name in entry_names
+        ):
+            raise MediaPathError("unsafe_media_lock_state")
+
+        existing_names = tuple(
+            name for name in MEDIA_GLOBAL_LOCK_FILENAMES
+            if name in entry_names
+        )
+        for name in existing_names:
+            named_file = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(named_file.st_mode)
+                or named_file.st_nlink != 1
+            ):
+                raise MediaPathError("unsafe_media_lock_state")
+            descriptor = _open_recovery_lock_file(
+                directory_descriptor, name
+            )
+            try:
+                opened_file = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened_file.st_mode)
+                    or opened_file.st_nlink != 1
+                    or _identity(opened_file) != _identity(named_file)
+                ):
+                    raise MediaPathError("unsafe_media_lock_state")
+                try:
+                    fcntl.flock(
+                        descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                except OSError as error:
+                    if error.errno in (errno.EACCES, errno.EAGAIN):
+                        raise MediaPathError("unsafe_media_lock_state")
+                    raise
+            except BaseException:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
+                raise
+            lock_descriptors.append((name, descriptor, opened_file))
+
+        _verify_recovery_lock_snapshot(
+            root_directory,
+            directory_descriptor,
+            opened_directory,
+            entry_names,
+            lock_descriptors,
+            verify_metadata=False,
+        )
+
+        for _name, descriptor, _file_stat in lock_descriptors:
+            os.fchown(descriptor, service_uid, service_gid)
+            os.fchmod(descriptor, 0o600)
+        os.fchown(directory_descriptor, service_uid, service_gid)
+        os.fchmod(directory_descriptor, 0o700)
+
+        _verify_recovery_lock_snapshot(
+            root_directory,
+            directory_descriptor,
+            opened_directory,
+            entry_names,
+            lock_descriptors,
+            verify_metadata=True,
+            service_uid=service_uid,
+            service_gid=service_gid,
+        )
+        for _name, descriptor, _file_stat in lock_descriptors:
+            os.fsync(descriptor)
+        os.fsync(directory_descriptor)
+        os.fsync(root_directory.descriptor)
+        return True
+    except BaseException as error:
+        if isinstance(error, MediaPathError):
+            if str(error) == "unsafe_media_lock_state":
+                raise
+            raise MediaPathError("unsafe_media_lock_state") from error
+        if not isinstance(error, Exception):
+            raise
+        raise MediaPathError("unsafe_media_lock_state") from error
+    finally:
+        while lock_descriptors:
+            _name, descriptor, _file_stat = lock_descriptors.pop()
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except BaseException:
+                pass
+
+
+def _open_recovery_lock_file(directory_descriptor, name):
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    return os.open(name, flags, dir_fd=directory_descriptor)
+
+
+def _verify_recovery_lock_snapshot(
+    root_directory,
+    directory_descriptor,
+    expected_directory,
+    expected_names,
+    lock_descriptors,
+    verify_metadata,
+    service_uid=None,
+    service_gid=None,
+):
+    root_directory.verify_current()
+    opened_directory = os.fstat(directory_descriptor)
+    named_directory = os.stat(
+        ".pinry-locks",
+        dir_fd=root_directory.descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISDIR(opened_directory.st_mode)
+        or _identity(opened_directory) != _identity(expected_directory)
+        or _identity(named_directory) != _identity(expected_directory)
+        or set(os.listdir(directory_descriptor)) != expected_names
+    ):
+        raise MediaPathError("unsafe_media_lock_state")
+    if verify_metadata and (
+        opened_directory.st_uid != service_uid
+        or opened_directory.st_gid != service_gid
+        or stat.S_IMODE(opened_directory.st_mode) != 0o700
+    ):
+        raise MediaPathError("unsafe_media_lock_state")
+    for name, descriptor, expected_file in lock_descriptors:
+        opened_file = os.fstat(descriptor)
+        named_file = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened_file.st_mode)
+            or opened_file.st_nlink != 1
+            or _identity(opened_file) != _identity(expected_file)
+            or _identity(named_file) != _identity(expected_file)
+        ):
+            raise MediaPathError("unsafe_media_lock_state")
+        if verify_metadata and (
+            opened_file.st_uid != service_uid
+            or opened_file.st_gid != service_gid
+            or stat.S_IMODE(opened_file.st_mode) != 0o600
+        ):
+            raise MediaPathError("unsafe_media_lock_state")
 
 
 def open_or_create_media_directory_from(root_directory, relative_directory):
