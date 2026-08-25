@@ -17,6 +17,7 @@ from django.db import (
     close_old_connections,
     connection,
     connections,
+    OperationalError,
     transaction,
 )
 from django.db.models.signals import post_save
@@ -143,6 +144,63 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             media_storage=storage,
             fault_injector=fault_injector,
         )
+
+    @staticmethod
+    def _sqlite_fence_connection(
+        probe_error=None,
+        restore_error=None,
+        close_error=None,
+        busy_timeout=875,
+    ):
+        statements = []
+
+        class Operations(object):
+            @staticmethod
+            def quote_name(name):
+                return '"{}"'.format(name)
+
+        class Cursor(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, error_type, error, traceback):
+                del error_type, error, traceback
+                return False
+
+            @staticmethod
+            def fetchone():
+                return (busy_timeout,)
+
+            @staticmethod
+            def execute(statement):
+                statements.append(statement)
+                if statement.startswith("UPDATE ") and probe_error:
+                    raise probe_error
+                if (
+                    statement == "PRAGMA busy_timeout = {}".format(
+                        busy_timeout
+                    )
+                    and restore_error
+                ):
+                    raise restore_error
+
+        class SQLiteConnection(object):
+            vendor = "sqlite"
+            ops = Operations()
+
+            def __init__(self):
+                self.closed = False
+
+            @staticmethod
+            def cursor():
+                return Cursor()
+
+            def close(self):
+                self.closed = True
+                if close_error:
+                    raise close_error
+
+        return SQLiteConnection(), statements
 
     def _create_candidate(
         self,
@@ -672,6 +730,196 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         finally:
             probe.close()
 
+    def test_sqlite_fence_window_restores_busy_timeout_after_success(self):
+        fence_window = getattr(
+            media_asset_backfill,
+            "_database_write_fence_window",
+            None,
+        )
+        acquire_fence = getattr(
+            media_asset_backfill,
+            "_acquire_database_write_fence",
+            None,
+        )
+        self.assertIsNotNone(fence_window)
+        self.assertIsNotNone(acquire_fence)
+        database, statements = self._sqlite_fence_connection()
+
+        with fence_window(database):
+            acquire_fence(database)
+
+        table_name = database.ops.quote_name(MediaAsset._meta.db_table)
+        primary_key = database.ops.quote_name(MediaAsset._meta.pk.column)
+        self.assertEqual(statements, [
+            "PRAGMA busy_timeout",
+            "PRAGMA busy_timeout = 0",
+            "UPDATE {table} SET {pk} = {pk} WHERE 0 = 1".format(
+                table=table_name,
+                pk=primary_key,
+            ),
+            "PRAGMA busy_timeout = 875",
+        ])
+        self.assertFalse(database.closed)
+
+    def test_sqlite_fence_window_restores_timeout_after_busy_failure(self):
+        fence_window = getattr(
+            media_asset_backfill,
+            "_database_write_fence_window",
+            None,
+        )
+        acquire_fence = getattr(
+            media_asset_backfill,
+            "_acquire_database_write_fence",
+            None,
+        )
+        self.assertIsNotNone(fence_window)
+        self.assertIsNotNone(acquire_fence)
+        database, statements = self._sqlite_fence_connection(
+            probe_error=OperationalError(
+                "database is locked: sentinel /private/database.sqlite3"
+            ),
+        )
+
+        with self.assertRaisesRegex(CommandError, "^database_busy$") as caught:
+            with fence_window(database):
+                acquire_fence(database)
+
+        self.assertEqual(statements[-1], "PRAGMA busy_timeout = 875")
+        self.assertEqual(caught.exception.code, "database_busy")
+        self.assertTrue(caught.exception.retryable)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn("sentinel", str(caught.exception))
+        self.assertNotIn("/private", str(caught.exception))
+        self.assertFalse(database.closed)
+
+    def test_sqlite_fence_window_restores_timeout_after_base_exception(self):
+        fence_window = getattr(
+            media_asset_backfill,
+            "_database_write_fence_window",
+            None,
+        )
+        acquire_fence = getattr(
+            media_asset_backfill,
+            "_acquire_database_write_fence",
+            None,
+        )
+        self.assertIsNotNone(fence_window)
+        self.assertIsNotNone(acquire_fence)
+        database, statements = self._sqlite_fence_connection(
+            probe_error=KeyboardInterrupt(),
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            with fence_window(database):
+                acquire_fence(database)
+
+        self.assertEqual(statements[-1], "PRAGMA busy_timeout = 875")
+        self.assertFalse(database.closed)
+
+    def test_sqlite_fence_window_closes_if_success_restore_fails(self):
+        fence_window = getattr(
+            media_asset_backfill,
+            "_database_write_fence_window",
+            None,
+        )
+        self.assertIsNotNone(fence_window)
+        database, statements = self._sqlite_fence_connection(
+            restore_error=OperationalError(
+                "sentinel /private/database.sqlite3"
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^registry_plan_identity_changed$",
+        ) as caught:
+            with fence_window(database):
+                pass
+
+        self.assertEqual(statements[-1], "PRAGMA busy_timeout = 875")
+        self.assertTrue(database.closed)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertNotIn("sentinel", str(caught.exception))
+        self.assertNotIn("/private", str(caught.exception))
+
+    def test_sqlite_fence_window_preserves_error_if_restore_fails(self):
+        fence_window = getattr(
+            media_asset_backfill,
+            "_database_write_fence_window",
+            None,
+        )
+        acquire_fence = getattr(
+            media_asset_backfill,
+            "_acquire_database_write_fence",
+            None,
+        )
+        self.assertIsNotNone(fence_window)
+        self.assertIsNotNone(acquire_fence)
+        database, statements = self._sqlite_fence_connection(
+            probe_error=OperationalError("database is locked"),
+            restore_error=OperationalError("restore sentinel"),
+            close_error=KeyboardInterrupt(),
+        )
+
+        with self.assertRaisesRegex(CommandError, "^database_busy$") as caught:
+            with fence_window(database):
+                acquire_fence(database)
+
+        self.assertEqual(statements[-1], "PRAGMA busy_timeout = 875")
+        self.assertTrue(database.closed)
+        self.assertEqual(caught.exception.code, "database_busy")
+        self.assertTrue(caught.exception.retryable)
+
+    def test_sqlite_fence_window_normalizes_outer_busy_after_restore(self):
+        fence_window = getattr(
+            media_asset_backfill,
+            "_database_write_fence_window",
+            None,
+        )
+        self.assertIsNotNone(fence_window)
+        database, statements = self._sqlite_fence_connection()
+
+        with self.assertRaisesRegex(CommandError, "^database_busy$") as caught:
+            with fence_window(database):
+                raise OperationalError(
+                    "database is locked: sentinel /private/database.sqlite3"
+                )
+
+        self.assertEqual(statements[-1], "PRAGMA busy_timeout = 875")
+        self.assertFalse(database.closed)
+        self.assertEqual(caught.exception.code, "database_busy")
+        self.assertTrue(caught.exception.retryable)
+        self.assertNotIn("sentinel", str(caught.exception))
+        self.assertNotIn("/private", str(caught.exception))
+
+    def test_postgresql_fence_window_normalizes_outer_busy(self):
+        fence_window = getattr(
+            media_asset_backfill,
+            "_database_write_fence_window",
+            None,
+        )
+        self.assertIsNotNone(fence_window)
+
+        class PostgreSQLConnection(object):
+            vendor = "postgresql"
+
+        cause = OperationalError("opaque backend failure")
+        cause.pgcode = "40001"
+        failure = OperationalError(
+            "sentinel /private/database.sql table=core_mediaasset"
+        )
+        failure.__cause__ = cause
+
+        with self.assertRaisesRegex(CommandError, "^database_busy$") as caught:
+            with fence_window(PostgreSQLConnection()):
+                raise failure
+
+        self.assertEqual(caught.exception.code, "database_busy")
+        self.assertTrue(caught.exception.retryable)
+        self.assertNotIn("sentinel", str(caught.exception))
+        self.assertNotIn("/private", str(caught.exception))
+
     def test_postgresql_fence_uses_delete_order_before_row_work(self):
         acquire_fence = getattr(
             media_asset_backfill,
@@ -715,9 +963,215 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             Thumbnail._meta.db_table,
         )
         self.assertEqual(statements, [
-            'LOCK TABLE "{}" IN EXCLUSIVE MODE'.format(table_name)
+            'LOCK TABLE "{}" IN EXCLUSIVE MODE NOWAIT'.format(table_name)
             for table_name in table_names
         ])
+
+    def test_postgresql_busy_sqlstates_are_retryable_and_sanitized(self):
+        acquire_fence = getattr(
+            media_asset_backfill,
+            "_acquire_database_write_fence",
+            None,
+        )
+        self.assertIsNotNone(acquire_fence)
+
+        class Operations(object):
+            @staticmethod
+            def quote_name(name):
+                return '"{}"'.format(name)
+
+        for sqlstate in ("40001", "40P01", "55P03"):
+            statements = []
+            cause = OperationalError("opaque backend failure")
+            cause.pgcode = sqlstate
+            failure = OperationalError(
+                "sentinel /private/database.sql table=core_mediaasset"
+            )
+            failure.__cause__ = cause
+
+            class Cursor(object):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, error_type, error, traceback):
+                    del error_type, error, traceback
+                    return False
+
+                @staticmethod
+                def execute(statement):
+                    statements.append(statement)
+                    raise failure
+
+            class PostgreSQLConnection(object):
+                vendor = "postgresql"
+                ops = Operations()
+
+                @staticmethod
+                def cursor():
+                    return Cursor()
+
+            with self.subTest(sqlstate=sqlstate), self.assertRaisesRegex(
+                CommandError,
+                "^database_busy$",
+            ) as caught:
+                acquire_fence(PostgreSQLConnection())
+
+            self.assertEqual(len(statements), 1)
+            self.assertTrue(statements[0].endswith(" NOWAIT"))
+            self.assertEqual(caught.exception.code, "database_busy")
+            self.assertTrue(caught.exception.retryable)
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertTrue(caught.exception.__suppress_context__)
+            self.assertNotIn("sentinel", str(caught.exception))
+            self.assertNotIn("/private", str(caught.exception))
+            self.assertNotIn("core_mediaasset", str(caught.exception))
+
+    @override_settings(PINRY_FETCH_TOTAL_TIMEOUT=0.15)
+    def test_busy_fence_releases_global_gate_before_outer_second_delete(self):
+        if connection.vendor != "sqlite":
+            self.skipTest("SQLite two-connection writer contract")
+        if connection.creation.is_in_memory_db(
+            connection.settings_dict["NAME"]
+        ):
+            self.skipTest("This concurrency contract requires file SQLite.")
+
+        self._create_candidate(content=_png_bytes("red"))
+        first = self._create_missing_derivative_candidate(
+            _png_bytes("navy")
+        )
+        second = self._create_missing_derivative_candidate(
+            _png_bytes("green")
+        )
+        service = self._service()
+        service.run()
+        first_pin_id = first["pins"][0].pk
+        second_pin_id = second["pins"][0].pk
+
+        first_deleted = threading.Event()
+        release_second_delete = threading.Event()
+        second_delete_started = threading.Event()
+        fence_entered = threading.Event()
+        outer_finished = threading.Event()
+        backfill_finished = threading.Event()
+        result = {}
+
+        def run_outer_transaction():
+            close_old_connections()
+            try:
+                with transaction.atomic():
+                    Pin.objects.get(pk=first_pin_id).delete()
+                    first_deleted.set()
+                    if not release_second_delete.wait(5):
+                        raise AssertionError(
+                            "second legacy Pin delete was not released"
+                        )
+                    second_delete_started.set()
+                    Pin.objects.get(pk=second_pin_id).delete()
+                result["outer"] = "committed"
+            except BaseException as error:
+                result["outer_error"] = getattr(
+                    error,
+                    "code",
+                    error.__class__.__name__,
+                )
+            finally:
+                connections["default"].close()
+                outer_finished.set()
+
+        def run_backfill():
+            close_old_connections()
+            database = connections["default"]
+            try:
+                with database.cursor() as cursor:
+                    cursor.execute("PRAGMA busy_timeout = 1000")
+                try:
+                    service.run(execute=True)
+                    result["backfill"] = "completed"
+                except BaseException as error:
+                    result["backfill_error"] = {
+                        "text": str(error),
+                        "code": getattr(error, "code", None),
+                        "retryable": getattr(error, "retryable", None),
+                        "cause": getattr(error, "__cause__", None),
+                    }
+                with database.cursor() as cursor:
+                    cursor.execute("PRAGMA busy_timeout")
+                    result["backfill_busy_timeout"] = cursor.fetchone()[0]
+                    cursor.execute("SELECT 1")
+                    result["backfill_connection_reused"] = (
+                        cursor.fetchone()[0]
+                    )
+            finally:
+                database.close()
+                backfill_finished.set()
+
+        original_fence = media_asset_backfill._acquire_database_write_fence
+
+        def observe_fence(database_connection):
+            if threading.current_thread().name == "backfill-fence-worker":
+                fence_entered.set()
+            return original_fence(database_connection)
+
+        outer = threading.Thread(
+            target=run_outer_transaction,
+            name="outer-legacy-delete-worker",
+        )
+        backfill = threading.Thread(
+            target=run_backfill,
+            name="backfill-fence-worker",
+        )
+        outer_done = False
+        backfill_done = False
+        try:
+            with mock.patch.object(
+                media_asset_backfill,
+                "_acquire_database_write_fence",
+                side_effect=observe_fence,
+            ):
+                outer.start()
+                self.assertTrue(first_deleted.wait(5))
+                backfill.start()
+                self.assertTrue(fence_entered.wait(5))
+                release_second_delete.set()
+                self.assertTrue(second_delete_started.wait(5))
+                outer_done = outer_finished.wait(3)
+                backfill_done = backfill_finished.wait(3)
+        finally:
+            release_second_delete.set()
+            outer.join(5)
+            backfill.join(5)
+
+        self.assertTrue(outer_done)
+        self.assertTrue(backfill_done)
+        self.assertFalse(outer.is_alive())
+        self.assertFalse(backfill.is_alive())
+        self.assertEqual(result.get("outer"), "committed")
+        self.assertNotIn("outer_error", result)
+        self.assertEqual(result.get("backfill_error"), {
+            "text": "database_busy",
+            "code": "database_busy",
+            "retryable": True,
+            "cause": None,
+        })
+        self.assertNotIn("backfill", result)
+        self.assertEqual(result.get("backfill_busy_timeout"), 1000)
+        self.assertEqual(result.get("backfill_connection_reused"), 1)
+        self.assertFalse(
+            Pin.objects.filter(pk__in=(first_pin_id, second_pin_id)).exists()
+        )
+        self.assertFalse(MediaAsset.objects.exists())
+        self.assertEqual(Image.objects.count(), 1)
+        manifest = Path(service.run_directory, MANIFEST_FILENAME)
+        events = [
+            json.loads(line)["event"]
+            for line in manifest.read_text("utf-8").splitlines()
+        ]
+        self.assertFalse(set(events) & {
+            "registered",
+            "recovered_registered",
+            "already_registered",
+            "skipped",
+        })
 
     def test_database_fence_precedes_plan_closure_without_row_locks(self):
         self._create_candidate()
