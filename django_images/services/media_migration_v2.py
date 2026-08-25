@@ -1294,6 +1294,53 @@ def load_auto_v2_plan(
         return manifest.summary()
 
 
+def load_auto_v2_archive_sources(
+    run_directory, filename, run_id, service_uid, service_gid
+):
+    """완료된 auto-v2 계획에서 fixed-slot 구 원본만 반환한다."""
+    with AutoV2ManifestLog.open(
+        run_directory,
+        filename,
+        run_id,
+        service_uid,
+        service_gid,
+    ) as manifest:
+        manifest.summary()
+        plans = tuple(manifest.state.plans)
+        terminal_by_image = manifest.state.latest_by_image
+        expected_terminal = {
+            "md5_legacy": frozenset(("committed", "recovered_commit")),
+            "fixed_slot": frozenset(("committed", "recovered_commit")),
+            "named_canonical": frozenset(("already_current",)),
+        }
+        if any(
+            terminal_by_image.get(plan.image_id)
+            not in expected_terminal[plan.generation]
+            for plan in plans
+        ):
+            raise _command_error("auto_v2_plan_incomplete")
+
+        canonical_originals = frozenset(
+            plan.new_original for plan in plans
+        )
+        sources = []
+        for plan in plans:
+            if plan.generation != "fixed_slot":
+                continue
+            original = plan.files[0]
+            if (
+                original.kind != "original"
+                or original.thumbnail_id is not None
+                or original.operation != "copy"
+                or original.old_path == original.new_path
+                or original.old_path in canonical_originals
+                or original.old_path in sources
+            ):
+                raise _command_error("manifest_plan_mismatch")
+            sources.append(original.old_path)
+        return tuple(sources)
+
+
 class AutoV2MediaMigrator(object):
     def __init__(
         self,

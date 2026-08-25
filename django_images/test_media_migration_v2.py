@@ -27,9 +27,11 @@ from django_images.paths import (
 from django_images.services.media_migration_v2 import (
     AutoV2ManifestLog,
     AutoV2MediaMigrator,
+    AutoV2MigrationFile,
     AutoV2MigrationPlan,
     AutoV2PlanSummary,
     _valid_staging_name,
+    load_auto_v2_archive_sources,
     load_auto_v2_plan,
 )
 
@@ -557,6 +559,122 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         self.assertEqual(executed.plan_sha256, planned.plan_sha256)
         self.assertNotEqual(executed.manifest_sha256, planned.manifest_sha256)
+
+    def test_archive_source_loader_requires_terminal_results_and_filters_fixed_originals(self):
+        first = self.make_image(generation="fixed", sizes=())
+        self.make_image(generation="named", sizes=())
+        second = self.make_image(generation="fixed", sizes=())
+        expected = (
+            "originals/{}/original.png".format(first.asset_uuid),
+            "originals/{}/original.png".format(second.asset_uuid),
+        )
+        self.migrator().run(execute=False)
+
+        with self.assertRaisesRegex(CommandError, "^auto_v2_plan_incomplete$"):
+            load_auto_v2_archive_sources(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+            )
+
+        self.migrator().run(execute=True)
+        with mock.patch.object(
+            AutoV2ManifestLog,
+            "open",
+            wraps=AutoV2ManifestLog.open,
+        ) as strict_open:
+            sources = load_auto_v2_archive_sources(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+            )
+
+        self.assertIsInstance(sources, tuple)
+        self.assertEqual(sources, expected)
+        self.assertEqual(strict_open.call_count, 1)
+
+    def test_archive_source_loader_rejects_a_live_canonical_original(self):
+        asset_uuid = "11111111-1111-4111-8111-111111111111"
+        fixed_path = "originals/{}/original.png".format(asset_uuid)
+        source = self.write_media(fixed_path, make_image_bytes("red"))
+        source_stat = source.stat()
+        fixed_file = AutoV2MigrationFile(
+            kind="original",
+            old_path=fixed_path,
+            new_path=canonical_original_path(
+                asset_uuid, "renamed.png", ".png"
+            ),
+            operation="copy",
+            size=source_stat.st_size,
+            sha256="0" * 64,
+            image_format="PNG",
+            width=32,
+            height=32,
+            source_device=source_stat.st_dev,
+            source_inode=source_stat.st_ino,
+        )
+        canonical_file = AutoV2MigrationFile(
+            kind="original",
+            old_path=fixed_path,
+            new_path=fixed_path,
+            operation="verify",
+            size=source_stat.st_size,
+            sha256="0" * 64,
+            image_format="PNG",
+            width=32,
+            height=32,
+            source_device=source_stat.st_dev,
+            source_inode=source_stat.st_ino,
+        )
+        plans = (
+            AutoV2MigrationPlan(
+                image_id=101,
+                asset_uuid=asset_uuid,
+                original_filename="renamed.png",
+                image_width=32,
+                image_height=32,
+                generation="fixed_slot",
+                files=(fixed_file,),
+                thumbnail_rows=(),
+                copy_required_bytes=source_stat.st_size,
+            ),
+            AutoV2MigrationPlan(
+                image_id=102,
+                asset_uuid=asset_uuid,
+                original_filename="original.png",
+                image_width=32,
+                image_height=32,
+                generation="named_canonical",
+                files=(canonical_file,),
+                thumbnail_rows=(),
+                copy_required_bytes=0,
+            ),
+        )
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ) as manifest:
+            for plan in plans:
+                manifest.record_plan(plan)
+            manifest.record_plan_complete(plans)
+            manifest.record_result("committed", 101)
+            manifest.record_result("already_current", 102)
+
+        with self.assertRaisesRegex(CommandError, "^manifest_plan_mismatch$"):
+            load_auto_v2_archive_sources(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+            )
 
     def test_plan_freezes_reusable_destination_identity_and_absence(self):
         image = self.make_image(sizes=())
