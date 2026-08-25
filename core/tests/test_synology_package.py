@@ -31,7 +31,22 @@ PACKAGE_CONTROL_PATHS = (
     "scripts/create_synology_output.sh",
     "deploy/synology/build-image.sh",
     "deploy/synology/docker-compose.synology.yml",
+    "deploy/synology/README_KO.md",
+    "LICENSE.md",
+    "NOTICE.md",
+    "UPSTREAM.md",
 )
+
+PACKAGE_TOP_LEVEL_ENTRIES = {
+    "BUILD_INFO",
+    "LICENSE.md",
+    "NOTICE.md",
+    "README_KO.md",
+    "UPSTREAM.md",
+    "build-image.sh",
+    "context",
+    "docker-compose.yml",
+}
 
 
 def _git_output(repository, *arguments):
@@ -93,7 +108,9 @@ def _write_tar_race_wrapper(path, real_tar):
         "            no_xattrs=1\n"
         "            ;;\n"
         "        *)\n"
-        "            package_name=$argument\n"
+        "            if [ -z \"$package_name\" ]; then\n"
+        "                package_name=${argument%%/*}\n"
+        "            fi\n"
         "            ;;\n"
         "    esac\n"
         "done\n"
@@ -103,10 +120,9 @@ def _write_tar_race_wrapper(path, real_tar):
         "    package_root=$package_root/$package_name\n"
         "    test -d \"$package_root/context\"\n"
         "    mkdir -p \"$package_root/context/pinry-spa/src/race\"\n"
-        "    : > \"$package_root/.DS_Store\"\n"
-        "    : > \"$package_root/.DS_Store.backup\"\n"
-        "    : > \"$package_root/._BUILD_INFO\"\n"
-        "    : > \"$package_root/BUILD_INFO._backup\"\n"
+        "    if [ \"${PINRY_INJECT_ROOT_ENTRY:-0}\" = 1 ]; then\n"
+        "        : > \"$package_root/BUILD_INFO._backup\"\n"
+        "    fi\n"
         "    : > \"$package_root/context/pinry-spa/src/race/.DS_Store\"\n"
         "    : > \"$package_root/context/pinry-spa/src/race/.DS_Store.backup\"\n"
         "    : > \"$package_root/context/pinry-spa/src/race/._asset.js\"\n"
@@ -646,12 +662,7 @@ class SynologyPackageTests(unittest.TestCase):
 
         self.assertEqual(
             {path.name for path in self.package_directory.iterdir()},
-            {
-                "BUILD_INFO",
-                "build-image.sh",
-                "context",
-                "docker-compose.yml",
-            },
+            PACKAGE_TOP_LEVEL_ENTRIES,
         )
         required_context = (
             "Dockerfile.autobuild",
@@ -699,6 +710,8 @@ class SynologyPackageTests(unittest.TestCase):
                 "services:",
                 "svrx-pinry:",
                 "image: svrx-pinry:latest",
+                'command: ["/pinry/docker/scripts/start.sh", '
+                '"--migrate-legacy"]',
                 "container_name: svrx-pinry",
                 "ports:",
                 '- "2048:80"',
@@ -778,6 +791,19 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertTrue(self.archive_path.is_file())
         with tarfile.open(str(self.archive_path), "r:gz") as archive:
             names = archive.getnames()
+        archive_parts = [Path(name).parts for name in names]
+        self.assertTrue(
+            all(
+                parts and parts[0] == self.package_name
+                for parts in archive_parts
+            )
+        )
+        archive_top_level = {
+            parts[1]
+            for parts in archive_parts
+            if len(parts) >= 2
+        }
+        self.assertEqual(archive_top_level, PACKAGE_TOP_LEVEL_ENTRIES)
         self.assertIn(
             "{}/build-image.sh".format(self.package_name), names
         )
@@ -798,7 +824,12 @@ class SynologyPackageTests(unittest.TestCase):
                 and ".DS_Store" not in Path(name).parts
                 and (
                     Path(name).name
-                    in {"LICENSE.md", "NOTICE.md", "UPSTREAM.md"}
+                    in {
+                        "LICENSE.md",
+                        "NOTICE.md",
+                        "README_KO.md",
+                        "UPSTREAM.md",
+                    }
                     or Path(name).suffix.lower() not in (".md", ".rst")
                 )
                 for name in names
@@ -862,7 +893,7 @@ class SynologyPackageTests(unittest.TestCase):
                 for key in member.pax_headers
             )
         )
-        self.assertIn("svrx-pinry/.DS_Store.backup", names)
+        self.assertNotIn("svrx-pinry/.DS_Store.backup", names)
         self.assertIn(
             "svrx-pinry/context/pinry-spa/src/.DS_Store.backup", names
         )
@@ -870,7 +901,7 @@ class SynologyPackageTests(unittest.TestCase):
             "svrx-pinry/context/pinry-spa/src/race/.DS_Store.backup",
             names,
         )
-        self.assertIn("svrx-pinry/BUILD_INFO._backup", names)
+        self.assertNotIn("svrx-pinry/BUILD_INFO._backup", names)
         self.assertIn(
             "svrx-pinry/context/pinry-spa/src/race/asset._preview.js",
             names,
@@ -918,6 +949,33 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertTrue((self.context_directory / "core/models.py").is_file())
         self.assertTrue(self.archive_path.is_file())
         self.assertEqual(sentinel.read_text(), "preserve")
+        self.assertEqual(
+            {
+                path.name
+                for path in self.output_root.iterdir()
+                if path.name.startswith(".svrx-pinry.tmp.")
+                or path.name.startswith(".svrx-pinry.archive.")
+            },
+            set(),
+        )
+
+    def test_packager_rejects_top_level_change_during_archive_creation(self):
+        self.output_root.mkdir()
+        binary_directory = self.temporary_root / "top-level-race-tar"
+        binary_directory.mkdir()
+        wrapper = binary_directory / "tar"
+        real_tar = shutil.which("tar")
+        self.assertIsNotNone(real_tar)
+        _write_tar_race_wrapper(wrapper, real_tar)
+        environment = self._tar_environment(wrapper)
+        environment["PINRY_INJECT_ROOT_ENTRY"] = "1"
+
+        completed = self._run_packager(environment)
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"package_layout_changed", completed.stderr)
+        self.assertFalse(self.package_directory.exists())
+        self.assertFalse(self.archive_path.exists())
         self.assertEqual(
             {
                 path.name
@@ -1071,6 +1129,23 @@ class SynologyPackageTests(unittest.TestCase):
             "docker-compose.yml": (
                 "deploy/synology/docker-compose.synology.yml"
             ),
+            "README_KO.md": "deploy/synology/README_KO.md",
+            "LICENSE.md": "LICENSE.md",
+            "NOTICE.md": "NOTICE.md",
+            "UPSTREAM.md": "UPSTREAM.md",
+        }
+        expected_build_info = (
+            "source_commit={}\n"
+            "default_image=svrx-pinry:latest\n".format(self.full_sha)
+        ).encode("utf-8")
+        expected_modes = {
+            "BUILD_INFO": 0o644,
+            "LICENSE.md": 0o644,
+            "NOTICE.md": 0o644,
+            "README_KO.md": 0o644,
+            "UPSTREAM.md": 0o644,
+            "build-image.sh": 0o755,
+            "docker-compose.yml": 0o644,
         }
 
         for packaged_name, tracked_path in packaged_controls.items():
@@ -1083,6 +1158,57 @@ class SynologyPackageTests(unittest.TestCase):
                         tracked_path,
                     ),
                 )
+        self.assertEqual(
+            (self.package_directory / "BUILD_INFO").read_bytes(),
+            expected_build_info,
+        )
+        for packaged_name, expected_mode in expected_modes.items():
+            with self.subTest(
+                artifact="upload-directory-mode",
+                packaged_name=packaged_name,
+            ):
+                self.assertEqual(
+                    (self.package_directory / packaged_name).stat().st_mode
+                    & 0o777,
+                    expected_mode,
+                )
+
+        with tarfile.open(str(self.archive_path), "r:gz") as archive:
+            for packaged_name, tracked_path in packaged_controls.items():
+                with self.subTest(
+                    artifact="archive-bytes",
+                    packaged_name=packaged_name,
+                ):
+                    member = archive.getmember(
+                        "{}/{}".format(self.package_name, packaged_name)
+                    )
+                    extracted = archive.extractfile(member)
+                    self.assertIsNotNone(extracted)
+                    self.assertEqual(
+                        extracted.read(),
+                        _git_blob(
+                            self.repository_root,
+                            self.full_sha,
+                            tracked_path,
+                        ),
+                    )
+            build_info_member = archive.getmember(
+                "{}/BUILD_INFO".format(self.package_name)
+            )
+            extracted_build_info = archive.extractfile(build_info_member)
+            self.assertIsNotNone(extracted_build_info)
+            self.assertEqual(
+                extracted_build_info.read(), expected_build_info
+            )
+            for packaged_name, expected_mode in expected_modes.items():
+                with self.subTest(
+                    artifact="archive-mode",
+                    packaged_name=packaged_name,
+                ):
+                    member = archive.getmember(
+                        "{}/{}".format(self.package_name, packaged_name)
+                    )
+                    self.assertEqual(member.mode & 0o777, expected_mode)
 
     def test_packager_rejects_dirty_tracked_control_before_output(self):
         for index, relative_path in enumerate(PACKAGE_CONTROL_PATHS):
@@ -1192,6 +1318,10 @@ class SynologyPackageTests(unittest.TestCase):
         changed_controls = (
             "deploy/synology/build-image.sh",
             "deploy/synology/docker-compose.synology.yml",
+            "deploy/synology/README_KO.md",
+            "LICENSE.md",
+            "NOTICE.md",
+            "UPSTREAM.md",
         )
         for relative_path in changed_controls:
             changed_control = repository / relative_path
@@ -1288,6 +1418,10 @@ class SynologyPackageTests(unittest.TestCase):
             "docker-compose.yml": (
                 "deploy/synology/docker-compose.synology.yml"
             ),
+            "README_KO.md": "deploy/synology/README_KO.md",
+            "LICENSE.md": "LICENSE.md",
+            "NOTICE.md": "NOTICE.md",
+            "UPSTREAM.md": "UPSTREAM.md",
         }
         for packaged_name, relative_path in packaged_controls.items():
             self.assertEqual(

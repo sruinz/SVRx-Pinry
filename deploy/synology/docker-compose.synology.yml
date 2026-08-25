@@ -3,6 +3,7 @@ version: "3.8"
 services:
   svrx-pinry:
     image: svrx-pinry:latest
+    command: ["/pinry/docker/scripts/start.sh", "--migrate-legacy"]
     container_name: svrx-pinry
     ports:
       - "2048:80"

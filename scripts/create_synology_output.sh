@@ -31,6 +31,10 @@ package_control_paths=(
     scripts/create_synology_output.sh
     deploy/synology/build-image.sh
     deploy/synology/docker-compose.synology.yml
+    deploy/synology/README_KO.md
+    LICENSE.md
+    NOTICE.md
+    UPSTREAM.md
 )
 if ! git diff --quiet "${source_commit}" -- "${package_control_paths[@]}" \
     || ! git diff --cached --quiet "${source_commit}" -- \
@@ -103,6 +107,10 @@ mkdir "${control_directory}"
 git archive --format=tar "${source_commit}" -- \
     deploy/synology/build-image.sh \
     deploy/synology/docker-compose.synology.yml \
+    deploy/synology/README_KO.md \
+    LICENSE.md \
+    NOTICE.md \
+    UPSTREAM.md \
     | tar -xf - -C "${control_directory}"
 git archive --format=tar "${source_commit}" -- \
     Dockerfile.autobuild \
@@ -148,6 +156,14 @@ install -m 0755 \
 install -m 0644 \
     "${control_directory}/deploy/synology/docker-compose.synology.yml" \
     "${temporary_directory}/docker-compose.yml"
+install -m 0644 \
+    "${control_directory}/deploy/synology/README_KO.md" \
+    "${temporary_directory}/README_KO.md"
+for legal_document in LICENSE.md NOTICE.md UPSTREAM.md; do
+    install -m 0644 \
+        "${control_directory}/${legal_document}" \
+        "${temporary_directory}/${legal_document}"
+done
 printf 'source_commit=%s\ndefault_image=svrx-pinry:latest\n' \
     "${source_commit}" \
     > "${temporary_directory}/BUILD_INFO"
@@ -157,7 +173,30 @@ COPYFILE_DISABLE=1 \
     --exclude='.DS_Store' --exclude='*/.DS_Store' \
     --exclude='._*' --exclude='*/._*' \
     -czf "${temporary_archive}" \
-    -C "${temporary_root}" "${package_name}"
+    -C "${temporary_root}" \
+    "${package_name}/BUILD_INFO" \
+    "${package_name}/LICENSE.md" \
+    "${package_name}/NOTICE.md" \
+    "${package_name}/README_KO.md" \
+    "${package_name}/UPSTREAM.md" \
+    "${package_name}/build-image.sh" \
+    "${package_name}/context" \
+    "${package_name}/docker-compose.yml"
+shopt -s nullglob dotglob
+package_entries=("${temporary_directory}"/*)
+shopt -u dotglob nullglob
+if [ "${#package_entries[@]}" -ne 8 ] \
+    || [ ! -f "${temporary_directory}/BUILD_INFO" ] \
+    || [ ! -f "${temporary_directory}/LICENSE.md" ] \
+    || [ ! -f "${temporary_directory}/NOTICE.md" ] \
+    || [ ! -f "${temporary_directory}/README_KO.md" ] \
+    || [ ! -f "${temporary_directory}/UPSTREAM.md" ] \
+    || [ ! -f "${temporary_directory}/build-image.sh" ] \
+    || [ ! -d "${temporary_directory}/context" ] \
+    || [ ! -f "${temporary_directory}/docker-compose.yml" ]; then
+    echo "package_layout_changed" >&2
+    exit 1
+fi
 mv "${temporary_directory}" "${package_directory}"
 if mv "${temporary_archive}" "${archive_path}"; then
     :
