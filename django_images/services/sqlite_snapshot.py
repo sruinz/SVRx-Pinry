@@ -3,6 +3,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import select
 import sqlite3
@@ -15,14 +16,25 @@ from django_images.services.migration_state import (
     MigrationStateError,
     _DIRECTORY_FLAGS,
     _NOFOLLOW,
+    _is_identity_number,
+    _is_sha256,
     _load_run,
     _open_absolute_directory,
     _open_configured_backup_root,
+    _read_descriptor,
+    _write_all,
 )
 
 
 SNAPSHOT_FILENAME = "production.db.before-migration"
 SNAPSHOT_TEMP_FILENAME = ".production.db.before-migration.tmp"
+SNAPSHOT_RECEIPT_FILENAME = ".production.db.before-migration.receipt"
+_SNAPSHOT_RECEIPT_KEYS = frozenset((
+    "size",
+    "sha256",
+    "source_device",
+    "source_inode",
+))
 
 
 class SQLiteSnapshotError(Exception):
@@ -216,22 +228,40 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
         _verify_snapshot_intent_source(current.state, source.file_stat)
         final_exists = _entry_exists(run_descriptor, SNAPSHOT_FILENAME)
         temp_exists = _entry_exists(run_descriptor, SNAPSHOT_TEMP_FILENAME)
+        receipt_exists = _entry_exists(
+            run_descriptor,
+            SNAPSHOT_RECEIPT_FILENAME,
+        )
         if final_exists and temp_exists:
-            _verified_snapshot(
-                run_descriptor,
-                SNAPSHOT_FILENAME,
-                service_uid,
-                service_gid,
-                source.file_stat,
-            )
-            _verified_snapshot(
-                run_descriptor,
-                SNAPSHOT_TEMP_FILENAME,
-                service_uid,
-                service_gid,
-                source.file_stat,
-            )
             raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+        if receipt_exists:
+            if not final_exists and not temp_exists:
+                raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+            receipt = _read_snapshot_receipt(
+                run_descriptor,
+                service_uid,
+                service_gid,
+            )
+            snapshot_name = (
+                SNAPSHOT_FILENAME if final_exists else SNAPSHOT_TEMP_FILENAME
+            )
+            info = _verified_snapshot(
+                run_descriptor,
+                snapshot_name,
+                service_uid,
+                service_gid,
+                source.file_stat,
+            )
+            return _finish_receipted_snapshot(
+                run,
+                run_descriptor,
+                source,
+                receipt,
+                info,
+                snapshot_name,
+                service_uid,
+                service_gid,
+            )
         if final_exists:
             info = _verified_snapshot(
                 run_descriptor,
@@ -244,17 +274,15 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
             source.verify_current()
             return info
         if temp_exists:
-            info = _verified_snapshot(
+            _remove_private_entry(
                 run_descriptor,
                 SNAPSHOT_TEMP_FILENAME,
                 service_uid,
                 service_gid,
-                source.file_stat,
+                "unsafe_sqlite_snapshot",
             )
             _verify_named_run_identity(run, run_descriptor)
             source.verify_current()
-            _promote_snapshot(run_descriptor)
-            return info
 
         _create_snapshot_temp(
             run_descriptor,
@@ -272,8 +300,22 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
         )
         _verify_named_run_identity(run, run_descriptor)
         source.verify_current()
-        _promote_snapshot(run_descriptor)
-        return info
+        receipt = _create_snapshot_receipt(
+            run_descriptor,
+            info,
+            service_uid,
+            service_gid,
+        )
+        return _finish_receipted_snapshot(
+            run,
+            run_descriptor,
+            source,
+            receipt,
+            info,
+            SNAPSHOT_TEMP_FILENAME,
+            service_uid,
+            service_gid,
+        )
     except SQLiteSnapshotError:
         raise
     except MigrationStateError:
@@ -528,6 +570,7 @@ def _verified_snapshot(
             or snapshot_stat.st_gid != service_gid
         ):
             raise SQLiteSnapshotError("unsafe_sqlite_snapshot")
+        os.fsync(descriptor)
         connection = sqlite3.connect(
             "file:{}?mode=ro".format(quote(
                 os.path.join(
@@ -543,7 +586,6 @@ def _verified_snapshot(
             raise SQLiteSnapshotError("corrupt_sqlite_snapshot")
         connection.close()
         connection = None
-        os.fsync(descriptor)
         digest = _hash_descriptor(descriptor)
         return SnapshotInfo(
             size=snapshot_stat.st_size,
@@ -562,6 +604,234 @@ def _verified_snapshot(
             connection.close()
         if descriptor is not None:
             os.close(descriptor)
+
+
+def _finish_receipted_snapshot(
+    run,
+    run_descriptor,
+    source,
+    receipt,
+    info,
+    snapshot_name,
+    service_uid,
+    service_gid,
+):
+    _verify_snapshot_receipt(receipt, info)
+    _verify_named_run_identity(run, run_descriptor)
+    source.verify_current()
+    if snapshot_name == SNAPSHOT_TEMP_FILENAME:
+        _promote_snapshot(run_descriptor)
+        _verify_named_run_identity(run, run_descriptor)
+        info = _verified_snapshot(
+            run_descriptor,
+            SNAPSHOT_FILENAME,
+            service_uid,
+            service_gid,
+            source.file_stat,
+        )
+        _verify_snapshot_receipt(receipt, info)
+        source.verify_current()
+    _remove_snapshot_receipt(
+        run_descriptor,
+        receipt,
+        service_uid,
+        service_gid,
+    )
+    _verify_named_run_identity(run, run_descriptor)
+    source.verify_current()
+    return info
+
+
+def _create_snapshot_receipt(
+    run_descriptor,
+    info,
+    service_uid,
+    service_gid,
+):
+    receipt = _receipt_for_snapshot(info)
+    content = (
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    descriptor = None
+    try:
+        descriptor = os.open(
+            SNAPSHOT_RECEIPT_FILENAME,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+            0o600,
+            dir_fd=run_descriptor,
+        )
+        os.fchmod(descriptor, 0o600)
+        os.fchown(descriptor, service_uid, service_gid)
+        _write_all(descriptor, content)
+        os.fsync(descriptor)
+        os.fsync(run_descriptor)
+        return receipt
+    except (MigrationStateError, OSError) as error:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+            try:
+                os.unlink(
+                    SNAPSHOT_RECEIPT_FILENAME,
+                    dir_fd=run_descriptor,
+                )
+                os.fsync(run_descriptor)
+            except OSError:
+                pass
+        if isinstance(error, OSError) and error.errno == errno.EEXIST:
+            raise SQLiteSnapshotError("sqlite_snapshot_conflict") from None
+        raise SQLiteSnapshotError("sqlite_snapshot_failed") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _read_snapshot_receipt(
+    run_descriptor,
+    service_uid,
+    service_gid,
+):
+    descriptor = _open_private_entry(
+        run_descriptor,
+        SNAPSHOT_RECEIPT_FILENAME,
+        service_uid,
+        service_gid,
+        "sqlite_snapshot_conflict",
+    )
+    try:
+        raw_receipt = _read_descriptor(descriptor)
+        receipt = json.loads(raw_receipt.decode("utf-8"))
+    except SQLiteSnapshotError:
+        raise
+    except (
+        MigrationStateError,
+        OSError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+    ):
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict") from None
+    finally:
+        os.close(descriptor)
+    if (
+        not isinstance(receipt, dict)
+        or set(receipt) != _SNAPSHOT_RECEIPT_KEYS
+        or not _is_identity_number(receipt["size"])
+        or not _is_sha256(receipt["sha256"])
+        or not _is_identity_number(receipt["source_device"])
+        or not _is_identity_number(receipt["source_inode"])
+    ):
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+    return receipt
+
+
+def _verify_snapshot_receipt(receipt, info):
+    if receipt != _receipt_for_snapshot(info):
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+
+
+def _remove_snapshot_receipt(
+    run_descriptor,
+    expected_receipt,
+    service_uid,
+    service_gid,
+):
+    receipt = _read_snapshot_receipt(
+        run_descriptor,
+        service_uid,
+        service_gid,
+    )
+    if receipt != expected_receipt:
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+    _remove_private_entry(
+        run_descriptor,
+        SNAPSHOT_RECEIPT_FILENAME,
+        service_uid,
+        service_gid,
+        "sqlite_snapshot_conflict",
+    )
+
+
+def _receipt_for_snapshot(info):
+    return {
+        "size": info.size,
+        "sha256": info.sha256,
+        "source_device": info.source_device,
+        "source_inode": info.source_inode,
+    }
+
+
+def _open_private_entry(
+    run_descriptor,
+    filename,
+    service_uid,
+    service_gid,
+    invalid_code,
+):
+    descriptor = None
+    try:
+        descriptor = os.open(
+            filename,
+            os.O_RDONLY | _NOFOLLOW,
+            dir_fd=run_descriptor,
+        )
+        if not _is_private_regular_file(
+            os.fstat(descriptor),
+            service_uid,
+            service_gid,
+        ):
+            raise OSError(errno.EPERM, "invalid private snapshot entry")
+        return descriptor
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise SQLiteSnapshotError(invalid_code) from None
+
+
+def _remove_private_entry(
+    run_descriptor,
+    filename,
+    service_uid,
+    service_gid,
+    invalid_code,
+):
+    descriptor = _open_private_entry(
+        run_descriptor,
+        filename,
+        service_uid,
+        service_gid,
+        invalid_code,
+    )
+    try:
+        entry_stat = os.fstat(descriptor)
+        named_stat = os.stat(
+            filename,
+            dir_fd=run_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            named_stat.st_dev != entry_stat.st_dev
+            or named_stat.st_ino != entry_stat.st_ino
+        ):
+            raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+        os.unlink(filename, dir_fd=run_descriptor)
+        os.fsync(run_descriptor)
+    except SQLiteSnapshotError:
+        raise
+    except OSError:
+        raise SQLiteSnapshotError("sqlite_snapshot_failed") from None
+    finally:
+        os.close(descriptor)
+
+
+def _is_private_regular_file(file_stat, service_uid, service_gid):
+    return (
+        stat.S_ISREG(file_stat.st_mode)
+        and file_stat.st_nlink == 1
+        and stat.S_IMODE(file_stat.st_mode) == 0o600
+        and file_stat.st_uid == service_uid
+        and file_stat.st_gid == service_gid
+    )
 
 
 def _promote_snapshot(run_descriptor):

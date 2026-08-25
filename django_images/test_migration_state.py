@@ -9,6 +9,7 @@ from django.test import SimpleTestCase
 
 from django_images.services.migration_state import (
     PHASES,
+    PHASE_TRANSITIONS,
     MigrationStateError,
     resolve_or_create_run,
     scan_run_inventory,
@@ -247,6 +248,32 @@ class MigrationStateTests(SimpleTestCase):
             "^migration_state_phase_mismatch$",
         ):
             transition_state(run, "initialized", "snapshot_complete")
+
+    def test_phase_constants_match_approved_state_machine(self):
+        self.assertEqual(PHASES, (
+            "initialized",
+            "snapshot_intent",
+            "snapshot_complete",
+            "schema_complete",
+            "copying",
+            "paths_complete",
+            "registry_complete",
+            "archive_intent",
+            "archive_complete",
+            "complete",
+        ))
+        self.assertEqual(PHASE_TRANSITIONS, {
+            "initialized": {"snapshot_intent", "schema_complete"},
+            "snapshot_intent": {"snapshot_complete"},
+            "snapshot_complete": {"schema_complete"},
+            "schema_complete": {"copying", "paths_complete"},
+            "copying": {"copying", "paths_complete"},
+            "paths_complete": {"registry_complete"},
+            "registry_complete": {"archive_intent", "complete"},
+            "archive_intent": {"archive_intent", "archive_complete"},
+            "archive_complete": {"complete"},
+            "complete": set(),
+        })
 
     def test_archive_same_phase_update_preserves_each_item_progress(self):
         run = self.create_run()
