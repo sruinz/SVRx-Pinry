@@ -19,6 +19,7 @@ from django_images.services import startup_lock, startup_preflight
 
 MIB = 1024 * 1024
 ASSET_UUID = "12345678-1234-5678-1234-567812345678"
+ASSET_UUID_HEX = "12345678123456781234567812345678"
 VALID_IMAGE_SIZES = {
     "thumbnail": {"size": [240, 0]},
     "standard": {"size": [600, 0]},
@@ -83,13 +84,16 @@ class LegacyEvidenceTests(SimpleTestCase):
             connection.close()
 
     def _add_asset_metadata_and_derivatives(
-        self, original_filename, extension=".png"
+        self,
+        original_filename,
+        extension=".png",
+        database_asset_uuid=ASSET_UUID_HEX,
     ):
         connection = sqlite3.connect(str(self.database_path))
         try:
             connection.execute(
                 "ALTER TABLE django_images_image "
-                "ADD COLUMN asset_uuid VARCHAR(36)"
+                "ADD COLUMN asset_uuid CHAR(32)"
             )
             connection.execute(
                 "ALTER TABLE django_images_image "
@@ -98,7 +102,7 @@ class LegacyEvidenceTests(SimpleTestCase):
             connection.execute(
                 "UPDATE django_images_image "
                 "SET asset_uuid = ?, original_filename = ? WHERE id = 1",
-                (ASSET_UUID, original_filename),
+                (database_asset_uuid, original_filename),
             )
             connection.executemany(
                 "INSERT INTO django_images_thumbnail "
@@ -229,6 +233,38 @@ class LegacyEvidenceTests(SimpleTestCase):
                 self.assertEqual(evidence.has_fixed_slot_paths, fixed_slot)
                 self.assertTrue(evidence.has_named_canonical_paths)
                 self.assertEqual(evidence.distinct_legacy_bytes, legacy_bytes)
+
+    def test_asset_metadata_uuid_accepts_raw_forms_and_rejects_corruption(self):
+        cases = (
+            ("hyphenated", ASSET_UUID, True),
+            ("malformed", "not-a-uuid", False),
+            ("non-string", sqlite3.Binary(b"not-a-text-uuid"), False),
+        )
+        relative_path = "originals/{}/original.png".format(ASSET_UUID)
+        for name, database_asset_uuid, valid in cases:
+            with self.subTest(name=name):
+                if self.database_path.exists():
+                    self.database_path.unlink()
+                self._create_database(image_paths=(relative_path,))
+                self._add_asset_metadata_and_derivatives(
+                    "original.png",
+                    database_asset_uuid=database_asset_uuid,
+                )
+                self._write_media(relative_path, b"image-bytes")
+
+                if valid:
+                    evidence = self._inspect(_DiskGraph())
+                    self.assertFalse(evidence.has_fixed_slot_paths)
+                    self.assertTrue(evidence.has_named_canonical_paths)
+                else:
+                    with self.assertRaises(
+                        startup_preflight.StartupPreflightError
+                    ) as caught:
+                        self._inspect(_DiskGraph())
+                    self.assertEqual(
+                        caught.exception.code,
+                        "legacy_evidence_invalid",
+                    )
 
     def test_old_schema_fixed_slot_requires_canonical_derivative_closure(self):
         relative_path = "originals/{}/original.png".format(ASSET_UUID)
@@ -1104,6 +1140,99 @@ class StoragePreflightTests(SimpleTestCase):
 
         self.assertEqual(result, "ok")
 
+    def test_probe_child_closes_descriptor_above_lowered_soft_limit(self):
+        project_root = str(Path(__file__).resolve().parent.parent)
+        script = "\n".join((
+            "import errno, fcntl, os, resource, sys",
+            "from django_images.services import startup_preflight",
+            "media_root = sys.argv[1]",
+            "soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)",
+            "target = 128 if hard == resource.RLIM_INFINITY else min(128, hard - 1)",
+            "if target < 16:",
+            "    print('unsupported', flush=True)",
+            "    raise SystemExit(0)",
+            "if soft <= target:",
+            "    resource.setrlimit(resource.RLIMIT_NOFILE, (target + 1, hard))",
+            "source = os.open(media_root, os.O_RDONLY)",
+            "high_descriptor = fcntl.fcntl(source, fcntl.F_DUPFD, target)",
+            "expected = os.fstat(high_descriptor)",
+            "lowered_soft = max(8, min(64, high_descriptor - 1))",
+            "resource.setrlimit(resource.RLIMIT_NOFILE, (lowered_soft, hard))",
+            "def reject_retained_descriptor(*unused):",
+            "    try:",
+            "        current = os.fstat(high_descriptor)",
+            "    except OSError as error:",
+            "        if error.errno == errno.EBADF:",
+            "            return 'ok'",
+            "        raise",
+            "    if (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino):",
+            "        return 'media_lock_not_usable'",
+            "    return 'ok'",
+            "startup_preflight._service_probe_child = reject_retained_descriptor",
+            "result = startup_preflight._run_service_probe(",
+            "    media_root, os.geteuid(), os.getegid()",
+            ")",
+            "print(result, flush=True)",
+        ))
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(self.media_root)],
+            cwd=project_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+
+        stdout, stderr = process.communicate(timeout=10)
+
+        self.assertEqual(process.returncode, 0)
+        if stdout.strip() == "unsupported":
+            self.skipTest("RLIMIT_NOFILE hard limit is too small")
+        self.assertEqual(stdout.strip(), "ok")
+        self.assertEqual(stderr, "")
+
+    def test_probe_descriptor_enumeration_uses_macos_dev_fd(self):
+        closed = []
+
+        def list_descriptors(path):
+            if path == "/proc/self/fd":
+                raise FileNotFoundError(path)
+            self.assertEqual(path, "/dev/fd")
+            return ("0", "1", "2", "3", "91", "not-a-descriptor")
+
+        with mock.patch.object(
+            startup_preflight.os,
+            "listdir",
+            side_effect=list_descriptors,
+        ), mock.patch.object(
+            startup_preflight.os,
+            "close",
+            side_effect=closed.append,
+        ), mock.patch.object(
+            startup_preflight.os,
+            "closerange",
+        ) as closerange:
+            startup_preflight._close_service_probe_descriptors()
+
+        self.assertEqual(closed, [91])
+        closerange.assert_not_called()
+
+    def test_probe_descriptor_fallback_uses_hard_rlimit(self):
+        with mock.patch.object(
+            startup_preflight.os,
+            "listdir",
+            side_effect=OSError("descriptor directory unavailable"),
+        ), mock.patch.object(
+            startup_preflight.resource,
+            "getrlimit",
+            return_value=(32, 4096),
+        ), mock.patch.object(
+            startup_preflight.os,
+            "closerange",
+        ) as closerange:
+            startup_preflight._close_service_probe_descriptors()
+
+        closerange.assert_called_once_with(4, 4096)
+
     def test_parent_close_releases_startup_lock_while_probe_child_lives(self):
         project_root = str(Path(__file__).resolve().parent.parent)
         ready_path = self.media_root / "probe-ready"
@@ -1191,6 +1320,45 @@ class StoragePreflightTests(SimpleTestCase):
                     str(self.media_root)
                 )
 
+        self.assertFalse(any(
+            path.name.startswith(".svrx-pinry-write-probe-")
+            for path in self.media_root.iterdir()
+        ))
+
+    def test_write_probe_retries_first_fstat_to_clean_created_file(self):
+        real_fstat = startup_preflight.os.fstat
+        real_open_root = file_ops.open_verified_media_root
+        opening_root = [False]
+        failed_once = [False]
+
+        def capture_root(path):
+            opening_root[0] = True
+            try:
+                return real_open_root(path)
+            finally:
+                opening_root[0] = False
+
+        def fail_first_probe_stat(descriptor):
+            if not opening_root[0] and not failed_once[0]:
+                failed_once[0] = True
+                raise OSError("injected first fstat failure")
+            return real_fstat(descriptor)
+
+        with mock.patch.object(
+            startup_preflight.file_ops,
+            "open_verified_media_root",
+            side_effect=capture_root,
+        ), mock.patch.object(
+            startup_preflight.os,
+            "fstat",
+            side_effect=fail_first_probe_stat,
+        ):
+            with self.assertRaises(OSError):
+                startup_preflight._probe_media_root_write(
+                    str(self.media_root)
+                )
+
+        self.assertTrue(failed_once[0])
         self.assertFalse(any(
             path.name.startswith(".svrx-pinry-write-probe-")
             for path in self.media_root.iterdir()

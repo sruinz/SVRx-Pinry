@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import errno
 import os
 import re
 import resource
@@ -48,6 +49,7 @@ _ALLOWED_PROBE_RESULTS = frozenset((
     _PROBE_RESULT_LOCK,
 ))
 _PROBE_RESULT_DESCRIPTOR = 3
+_DESCRIPTOR_FALLBACK_LIMIT = 1 << 20
 
 
 class StartupPreflightError(Exception):
@@ -444,18 +446,23 @@ def _classify_media_rows(image_rows, thumbnail_rows):
             raise StartupPreflightError("legacy_evidence_invalid")
 
         metadata_available = (
-            type(row.get("asset_uuid")) is str
-            and bool(row["asset_uuid"])
-            and type(row.get("original_filename")) is str
-            and bool(row["original_filename"])
+            "asset_uuid" in row or "original_filename" in row
         )
         if metadata_available:
-            if row["asset_uuid"] != asset_uuid:
+            database_asset_uuid = _canonical_database_uuid(
+                row.get("asset_uuid")
+            )
+            original_filename = row.get("original_filename")
+            if (
+                database_asset_uuid != asset_uuid
+                or type(original_filename) is not str
+                or not original_filename
+            ):
                 raise StartupPreflightError("legacy_evidence_invalid")
             try:
                 expected_path = canonical_original_path(
-                    asset_uuid,
-                    row["original_filename"],
+                    database_asset_uuid,
+                    original_filename,
                     extension,
                 )
             except ValueError as error:
@@ -482,6 +489,18 @@ def _classify_media_rows(image_rows, thumbnail_rows):
         "has_named_canonical_paths": has_named_canonical_paths,
         "copy_paths": copy_paths,
     }
+
+
+def _canonical_database_uuid(value):
+    if type(value) is not str:
+        return None
+    try:
+        parsed = uuid.UUID(str(value))
+    except (AttributeError, ValueError):
+        return None
+    if value.lower() not in (parsed.hex, str(parsed)):
+        return None
+    return str(parsed)
 
 
 def _canonical_derivative_closure(asset_uuid, rows):
@@ -698,23 +717,46 @@ def _prepare_service_probe_child(read_descriptor, write_descriptor):
         os.close(write_descriptor)
     else:
         os.set_inheritable(_PROBE_RESULT_DESCRIPTOR, False)
+    _close_service_probe_descriptors()
+    return _PROBE_RESULT_DESCRIPTOR
+
+
+def _close_service_probe_descriptors():
+    for descriptor_directory in ("/proc/self/fd", "/dev/fd"):
+        try:
+            entries = os.listdir(descriptor_directory)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                descriptor = int(entry)
+            except (TypeError, ValueError):
+                continue
+            if descriptor <= _PROBE_RESULT_DESCRIPTOR:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                if error.errno != errno.EBADF:
+                    raise
+        return
     os.closerange(
         _PROBE_RESULT_DESCRIPTOR + 1,
         _service_probe_descriptor_limit(),
     )
-    return _PROBE_RESULT_DESCRIPTOR
 
 
 def _service_probe_descriptor_limit():
     try:
-        limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        limit = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
     except (AttributeError, OSError, ValueError):
         limit = resource.RLIM_INFINITY
     if limit == resource.RLIM_INFINITY or limit <= _PROBE_RESULT_DESCRIPTOR:
         try:
             limit = os.sysconf("SC_OPEN_MAX")
         except (AttributeError, OSError, ValueError):
-            limit = 65536
+            limit = 0
+        limit = max(limit, _DESCRIPTOR_FALLBACK_LIMIT)
     return max(int(limit), _PROBE_RESULT_DESCRIPTOR + 1)
 
 
@@ -746,6 +788,7 @@ def _drop_service_identity(service_uid, service_gid):
 def _probe_media_root_write(media_root):
     root_directory = file_ops.open_verified_media_root(media_root)
     descriptor = None
+    probe_created = False
     expected_stat = None
     name = ".svrx-pinry-write-probe-{}".format(uuid.uuid4().hex)
     try:
@@ -758,6 +801,7 @@ def _probe_media_root_write(media_root):
             0o600,
             dir_fd=root_directory.descriptor,
         )
+        probe_created = True
         expected_stat = os.fstat(descriptor)
         if (
             not stat.S_ISREG(expected_stat.st_mode)
@@ -786,15 +830,21 @@ def _probe_media_root_write(media_root):
             expected_stat,
         ):
             raise OSError("probe identity changed")
+        probe_created = False
         os.fsync(root_directory.descriptor)
         expected_stat = None
     finally:
+        if probe_created and expected_stat is None and descriptor is not None:
+            try:
+                expected_stat = os.fstat(descriptor)
+            except BaseException:
+                pass
         if descriptor is not None:
             try:
                 os.close(descriptor)
             except BaseException:
                 pass
-        if expected_stat is not None:
+        if probe_created and expected_stat is not None:
             _unlink_probe_if_owned(
                 root_directory.descriptor,
                 name,
