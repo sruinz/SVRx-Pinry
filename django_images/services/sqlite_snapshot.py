@@ -1,8 +1,10 @@
 from dataclasses import dataclass
+import ctypes
 import errno
 import fcntl
 import hashlib
 import os
+import select
 import sqlite3
 import stat
 from urllib.parse import quote
@@ -45,14 +47,17 @@ class _SQLiteSource(object):
         descriptor,
         file_stat,
         connection,
+        mutation_guard,
     ):
         self.path = path
         self.parent_descriptor = parent_descriptor
         self.descriptor = descriptor
         self.file_stat = file_stat
         self.connection = connection
+        self.mutation_guard = mutation_guard
 
     def verify_current(self):
+        self.mutation_guard.verify_unchanged()
         try:
             descriptor_stat = os.fstat(self.descriptor)
             named_stat = os.stat(
@@ -77,6 +82,10 @@ class _SQLiteSource(object):
             connection = self.connection
             self.connection = None
             connection.close()
+        if self.mutation_guard is not None:
+            mutation_guard = self.mutation_guard
+            self.mutation_guard = None
+            mutation_guard.close()
         if self.descriptor is not None:
             descriptor = self.descriptor
             self.descriptor = None
@@ -85,6 +94,92 @@ class _SQLiteSource(object):
             parent_descriptor = self.parent_descriptor
             self.parent_descriptor = None
             os.close(parent_descriptor)
+
+
+class _SourceMutationGuard(object):
+    def __init__(self, descriptor):
+        self._kqueue = None
+        self._inotify_descriptor = None
+        if hasattr(select, "kqueue"):
+            self._open_kqueue(descriptor)
+        elif os.path.isdir("/proc/self/fd"):
+            self._open_inotify(descriptor)
+        else:
+            raise SQLiteSnapshotError("sqlite_source_identity_changed")
+
+    def _open_kqueue(self, descriptor):
+        queue = select.kqueue()
+        flags = select.KQ_NOTE_DELETE | select.KQ_NOTE_RENAME
+        flags |= getattr(select, "KQ_NOTE_REVOKE", 0)
+        event = select.kevent(
+            descriptor,
+            filter=select.KQ_FILTER_VNODE,
+            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+            fflags=flags,
+        )
+        try:
+            queue.control([event], 0, 0)
+        except OSError:
+            queue.close()
+            raise SQLiteSnapshotError(
+                "sqlite_source_identity_changed"
+            ) from None
+        self._kqueue = queue
+
+    def _open_inotify(self, descriptor):
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            initialize = libc.inotify_init1
+            add_watch = libc.inotify_add_watch
+        except AttributeError:
+            raise SQLiteSnapshotError(
+                "sqlite_source_identity_changed"
+            ) from None
+        initialize.argtypes = [ctypes.c_int]
+        initialize.restype = ctypes.c_int
+        add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add_watch.restype = ctypes.c_int
+        watch_descriptor = initialize(os.O_NONBLOCK | os.O_CLOEXEC)
+        if watch_descriptor < 0:
+            raise SQLiteSnapshotError("sqlite_source_identity_changed")
+        source_path = "/proc/self/fd/{}".format(descriptor).encode("ascii")
+        watch_mask = 0x00000400 | 0x00000800
+        if add_watch(watch_descriptor, source_path, watch_mask) < 0:
+            os.close(watch_descriptor)
+            raise SQLiteSnapshotError("sqlite_source_identity_changed")
+        self._inotify_descriptor = watch_descriptor
+
+    def verify_unchanged(self):
+        if self._kqueue is not None:
+            try:
+                events = self._kqueue.control([], 1, 0)
+            except OSError:
+                raise SQLiteSnapshotError(
+                    "sqlite_source_identity_changed"
+                ) from None
+            if events:
+                raise SQLiteSnapshotError("sqlite_source_identity_changed")
+            return
+        try:
+            event = os.read(self._inotify_descriptor, 4096)
+        except OSError as error:
+            if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return
+            raise SQLiteSnapshotError(
+                "sqlite_source_identity_changed"
+            ) from None
+        if event:
+            raise SQLiteSnapshotError("sqlite_source_identity_changed")
+
+    def close(self):
+        if self._kqueue is not None:
+            queue = self._kqueue
+            self._kqueue = None
+            queue.close()
+        if self._inotify_descriptor is not None:
+            descriptor = self._inotify_descriptor
+            self._inotify_descriptor = None
+            os.close(descriptor)
 
 
 def snapshot_sqlite(source_path, run, service_uid, service_gid):
@@ -247,6 +342,7 @@ def _open_sqlite_source(source_path):
         raise SQLiteSnapshotError("unsafe_sqlite_source") from None
     descriptor = None
     connection = None
+    mutation_guard = None
     try:
         descriptor = os.open(
             leaf_name,
@@ -265,7 +361,7 @@ def _open_sqlite_source(source_path):
             _directory_descriptor_path(parent_descriptor),
             leaf_name,
         )
-        descriptors_before = _process_file_descriptors()
+        mutation_guard = _SourceMutationGuard(descriptor)
         connection = sqlite3.connect(
             "file:{}?mode=ro".format(quote(connection_path, safe="/")),
             uri=True,
@@ -275,18 +371,19 @@ def _open_sqlite_source(source_path):
         connection.execute(
             "SELECT rootpage FROM sqlite_master LIMIT 1"
         ).fetchone()
-        _verify_connection_identity(descriptors_before, descriptor_stat)
         source = _SQLiteSource(
             path=source_path,
             parent_descriptor=parent_descriptor,
             descriptor=descriptor,
             file_stat=descriptor_stat,
             connection=connection,
+            mutation_guard=mutation_guard,
         )
+        source.verify_current()
         parent_descriptor = None
         descriptor = None
         connection = None
-        source.verify_current()
+        mutation_guard = None
         return source
     except SQLiteSnapshotError:
         raise
@@ -295,6 +392,8 @@ def _open_sqlite_source(source_path):
     finally:
         if connection is not None:
             connection.close()
+        if mutation_guard is not None:
+            mutation_guard.close()
         if descriptor is not None:
             os.close(descriptor)
         if parent_descriptor is not None:
@@ -337,40 +436,6 @@ def _open_verified_run(run):
         if "root_descriptor" in locals():
             os.close(root_descriptor)
         raise SQLiteSnapshotError("sqlite_snapshot_state_invalid") from None
-
-
-def _process_file_descriptors():
-    descriptor_directory = "/proc/self/fd"
-    if not os.path.isdir(descriptor_directory):
-        descriptor_directory = "/dev/fd"
-    try:
-        names = os.listdir(descriptor_directory)
-    except OSError:
-        raise SQLiteSnapshotError("sqlite_source_identity_changed") from None
-    descriptors = set()
-    for name in names:
-        try:
-            descriptor = int(name)
-            os.fstat(descriptor)
-        except (OSError, ValueError):
-            continue
-        descriptors.add(descriptor)
-    return descriptors
-
-
-def _verify_connection_identity(descriptors_before, expected_stat):
-    for descriptor in _process_file_descriptors() - descriptors_before:
-        try:
-            current = os.fstat(descriptor)
-        except OSError:
-            continue
-        if (
-            stat.S_ISREG(current.st_mode)
-            and current.st_dev == expected_stat.st_dev
-            and current.st_ino == expected_stat.st_ino
-        ):
-            return
-    raise SQLiteSnapshotError("sqlite_source_identity_changed")
 
 
 def _create_snapshot_temp(

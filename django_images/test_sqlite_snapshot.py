@@ -475,7 +475,7 @@ class SQLiteSnapshotTests(SimpleTestCase):
             "production.db.before-migration",
         )))
 
-    def test_source_swap_and_inode_restore_cannot_change_backup_database(self):
+    def test_source_swap_and_inode_restore_during_backup_fails_closed(self):
         trusted = sqlite3.connect(self.source_path)
         trusted.execute("CREATE TABLE records (value TEXT)")
         trusted.execute("INSERT INTO records VALUES ('trusted')")
@@ -503,6 +503,9 @@ class SQLiteSnapshotTests(SimpleTestCase):
         with self.configured(), mock.patch(
             "django_images.services.sqlite_snapshot._copy_database",
             side_effect=swap_during_backup,
+        ), self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_source_identity_changed$",
         ):
             snapshot_sqlite(
                 self.source_path,
@@ -511,15 +514,10 @@ class SQLiteSnapshotTests(SimpleTestCase):
                 os.getgid(),
             )
 
-        snapshot = sqlite3.connect(os.path.join(
+        self.assertFalse(os.path.exists(os.path.join(
             run.path,
             "production.db.before-migration",
-        ))
-        self.addCleanup(snapshot.close)
-        self.assertEqual(
-            snapshot.execute("SELECT value FROM records").fetchall(),
-            [("trusted",)],
-        )
+        )))
 
     def test_source_swap_before_connect_and_restore_after_connect_fails_closed(self):
         trusted = sqlite3.connect(self.source_path)
@@ -566,6 +564,63 @@ class SQLiteSnapshotTests(SimpleTestCase):
             )
 
         self.assertEqual(source_opened, [True])
+        self.assertFalse(os.path.exists(os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )))
+
+    def test_unrelated_matching_fd_cannot_authorize_decoy_connection(self):
+        trusted = sqlite3.connect(self.source_path)
+        trusted.execute("CREATE TABLE records (value TEXT)")
+        trusted.execute("INSERT INTO records VALUES ('trusted')")
+        trusted.commit()
+        trusted.close()
+        decoy_path = os.path.join(self.data_root, "decoy.db")
+        decoy = sqlite3.connect(decoy_path)
+        decoy.execute("CREATE TABLE records (value TEXT)")
+        decoy.execute("INSERT INTO records VALUES ('decoy')")
+        decoy.commit()
+        decoy.close()
+        run = self.create_run()
+        real_connect = sqlite3.connect
+        held_path = "{}.held".format(self.source_path)
+        unrelated_descriptors = []
+
+        def swap_and_open_unrelated_matching_fd(*arguments, **keywords):
+            uri = arguments[0] if arguments else keywords.get("database", "")
+            if not unrelated_descriptors and "mode=ro" in uri:
+                os.rename(self.source_path, held_path)
+                os.rename(decoy_path, self.source_path)
+                try:
+                    connection = real_connect(*arguments, **keywords)
+                finally:
+                    os.rename(self.source_path, decoy_path)
+                    os.rename(held_path, self.source_path)
+                unrelated_descriptors.append(os.open(
+                    self.source_path,
+                    os.O_RDONLY,
+                ))
+                return connection
+            return real_connect(*arguments, **keywords)
+
+        try:
+            with self.configured(), mock.patch(
+                "django_images.services.sqlite_snapshot.sqlite3.connect",
+                side_effect=swap_and_open_unrelated_matching_fd,
+            ), self.assertRaisesRegex(
+                SQLiteSnapshotError,
+                "^sqlite_source_identity_changed$",
+            ):
+                snapshot_sqlite(
+                    self.source_path,
+                    run,
+                    os.getuid(),
+                    os.getgid(),
+                )
+        finally:
+            for descriptor in unrelated_descriptors:
+                os.close(descriptor)
+
         self.assertFalse(os.path.exists(os.path.join(
             run.path,
             "production.db.before-migration",
