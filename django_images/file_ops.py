@@ -768,7 +768,7 @@ def open_verified_media_root(media_root):
         raise MediaPathError("unsafe_media_directory") from error
 
 
-def open_verified_media_file(
+def open_verified_media_file(  # noqa: C901
     root_directory, relative_path, missing_ok=False
 ):
     if (

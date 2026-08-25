@@ -516,7 +516,7 @@ def _classify_generation_for_uuid(asset_uuid, files):
     raise _command_error("mixed_media_state")
 
 
-def _validate_plan(plan):
+def _validate_plan(plan):  # noqa: C901
     invalid = (
         type(plan.image_id) is not int
         or plan.image_id <= 0
@@ -755,7 +755,7 @@ class AutoV2ManifestLog(object):
         self._closed = False
 
     @classmethod
-    def open(
+    def open(  # noqa: C901
         cls,
         run_directory,
         filename,
@@ -949,7 +949,7 @@ class AutoV2ManifestLog(object):
         self._verify_current()
         return b"".join(chunks)
 
-    def _load_state(self):
+    def _load_state(self):  # noqa: C901
         raw = self._read_all()
         state = _AutoV2ManifestState()
         state.raw_bytes = raw
@@ -1491,7 +1491,7 @@ class AutoV2MediaMigrator(object):
             if root_directory is not None:
                 root_directory.close()
 
-    def _execute(self, manifest, plans, plan_sha256):
+    def _execute(self, manifest, plans, plan_sha256):  # noqa: C901
         if manifest.summary().plan_sha256 != plan_sha256:
             raise _command_error("manifest_plan_mismatch")
         self._validate_image_plan_closure(plans)

@@ -202,11 +202,11 @@ class SQLiteSnapshotTests(SimpleTestCase):
         run = self.create_run()
 
         with self.configured(databases={
-                "default": {
-                    "ENGINE": "django.db.backends.sqlite3",
-                    "NAME": outside_path,
-                },
-            }), self.assertRaisesRegex(
+            "default": {
+                "ENGINE": "django.db.backends.sqlite3",
+                "NAME": outside_path,
+            },
+        }), self.assertRaisesRegex(
             SQLiteSnapshotError,
             "^sqlite_source_outside_data_root$",
         ) as captured:
@@ -222,11 +222,11 @@ class SQLiteSnapshotTests(SimpleTestCase):
         sqlite3.connect(self.source_path).close()
         run = self.create_run()
         with self.configured(databases={
-                "default": {
-                    "ENGINE": "django.db.backends.postgresql",
-                    "NAME": self.source_path,
-                },
-            }), self.assertRaisesRegex(
+            "default": {
+                "ENGINE": "django.db.backends.postgresql",
+                "NAME": self.source_path,
+            },
+        }), self.assertRaisesRegex(
             SQLiteSnapshotError,
             "^unsupported_legacy_database_backend$",
         ):

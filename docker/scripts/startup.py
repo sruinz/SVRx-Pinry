@@ -12,7 +12,7 @@ if PROJECT_ROOT in sys.path:
     sys.path.remove(PROJECT_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
 
-from django_images.services import startup_lock
+from django_images.services import startup_lock  # noqa: E402
 
 
 NGINX_BINARY = "/usr/sbin/nginx"
@@ -101,7 +101,7 @@ def _run_schema_commands(call_command):
     call_command("migrate", interactive=False)
 
 
-def _run(arguments):
+def _run(arguments):  # noqa: C901
     if arguments not in ([], [_MIGRATION_FLAG]):
         _write_error("startup_argument_invalid")
         return 2

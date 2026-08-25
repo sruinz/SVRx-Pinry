@@ -859,7 +859,7 @@ def _table_has_rows(connection, tables, table_name):
     ).fetchone() is not None
 
 
-def _classify_media_rows(image_rows, thumbnail_rows):
+def _classify_media_rows(image_rows, thumbnail_rows):  # noqa: C901
     has_md5_paths = False
     has_fixed_slot_paths = False
     has_named_canonical_paths = False
@@ -1093,7 +1093,9 @@ def _valid_image_size_options(options):
     return True
 
 
-def _run_service_probe(media_root, service_uid, service_gid):
+def _run_service_probe(  # noqa: C901
+    media_root, service_uid, service_gid
+):
     if not callable(getattr(os, "fork", None)):
         return _PROBE_RESULT_LOCK
     try:

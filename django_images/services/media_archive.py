@@ -370,7 +370,7 @@ def _validate_leaf_stat(file_stat, expected_kind=None):
     return kind
 
 
-def _open_archive_directory(
+def _open_archive_directory(  # noqa: C901
     root_directory, relative_path, create=False
 ):
     components = _relative_components(relative_path, allow_root=True)

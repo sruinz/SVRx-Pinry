@@ -1,6 +1,5 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
-from io import BytesIO
 import hashlib
 import json
 import os
@@ -533,7 +532,7 @@ class _BackfillManifestLog(object):
         self.state = self._load_state()
 
     @classmethod
-    def open(
+    def open(  # noqa: C901
         cls,
         run_directory,
         filename,
@@ -1334,7 +1333,7 @@ class MediaAssetBackfiller(object):
             return "invalid_named_leaf"
         return None
 
-    def _open_candidate_resources(
+    def _open_candidate_resources(  # noqa: C901
         self,
         image,
         thumbnails,
@@ -1348,9 +1347,6 @@ class MediaAssetBackfiller(object):
         reusable = None
         file_identities = []
         try:
-            thumbnail_by_size = {
-                thumbnail.size: thumbnail for thumbnail in thumbnails
-            }
             thumbnail_signature_by_size = {
                 entry[1]: entry for entry in database_signature[6]
             }
