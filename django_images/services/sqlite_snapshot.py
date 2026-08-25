@@ -265,6 +265,7 @@ def _open_sqlite_source(source_path):
             _directory_descriptor_path(parent_descriptor),
             leaf_name,
         )
+        descriptors_before = _process_file_descriptors()
         connection = sqlite3.connect(
             "file:{}?mode=ro".format(quote(connection_path, safe="/")),
             uri=True,
@@ -274,6 +275,7 @@ def _open_sqlite_source(source_path):
         connection.execute(
             "SELECT rootpage FROM sqlite_master LIMIT 1"
         ).fetchone()
+        _verify_connection_identity(descriptors_before, descriptor_stat)
         source = _SQLiteSource(
             path=source_path,
             parent_descriptor=parent_descriptor,
@@ -335,6 +337,40 @@ def _open_verified_run(run):
         if "root_descriptor" in locals():
             os.close(root_descriptor)
         raise SQLiteSnapshotError("sqlite_snapshot_state_invalid") from None
+
+
+def _process_file_descriptors():
+    descriptor_directory = "/proc/self/fd"
+    if not os.path.isdir(descriptor_directory):
+        descriptor_directory = "/dev/fd"
+    try:
+        names = os.listdir(descriptor_directory)
+    except OSError:
+        raise SQLiteSnapshotError("sqlite_source_identity_changed") from None
+    descriptors = set()
+    for name in names:
+        try:
+            descriptor = int(name)
+            os.fstat(descriptor)
+        except (OSError, ValueError):
+            continue
+        descriptors.add(descriptor)
+    return descriptors
+
+
+def _verify_connection_identity(descriptors_before, expected_stat):
+    for descriptor in _process_file_descriptors() - descriptors_before:
+        try:
+            current = os.fstat(descriptor)
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(current.st_mode)
+            and current.st_dev == expected_stat.st_dev
+            and current.st_ino == expected_stat.st_ino
+        ):
+            return
+    raise SQLiteSnapshotError("sqlite_source_identity_changed")
 
 
 def _create_snapshot_temp(

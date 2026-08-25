@@ -47,6 +47,39 @@ _RUN_ID_PATTERN = re.compile(
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_SNAPSHOT_INTENT_KEYS = frozenset((
+    "kind",
+    "source_device",
+    "source_inode",
+))
+_ARCHIVE_INTENT_KEYS = frozenset((
+    "source_root_device",
+    "source_root_inode",
+    "source_parent_relative",
+    "source_parent_device",
+    "source_parent_inode",
+    "source_name",
+    "source_device",
+    "source_inode",
+    "destination_root_device",
+    "destination_root_inode",
+    "destination_parent_relative",
+    "destination_parent_device",
+    "destination_parent_inode",
+    "destination_name",
+))
+_ARCHIVE_IDENTITY_KEYS = frozenset((
+    "source_root_device",
+    "source_root_inode",
+    "source_parent_device",
+    "source_parent_inode",
+    "source_device",
+    "source_inode",
+    "destination_root_device",
+    "destination_root_inode",
+    "destination_parent_device",
+    "destination_parent_inode",
+))
 
 
 class MigrationStateError(Exception):
@@ -294,10 +327,14 @@ def transition_state(
             raise MigrationStateError("migration_state_invalid_transition")
         state = copy.deepcopy(current.state)
         state["phase"] = next_phase
-        if intent is not None:
-            state["intent"] = _json_value(intent)
-        if progress is not None:
-            state["progress"] = _json_value(progress)
+        if next_phase in ("snapshot_intent", "archive_intent"):
+            if intent is not None:
+                state["intent"] = _json_value(intent)
+            if progress is not None:
+                state["progress"] = _json_value(progress)
+        else:
+            state["intent"] = None
+            state["progress"] = None
         _update_manifest_hashes(
             state,
             next_phase,
@@ -305,6 +342,7 @@ def transition_state(
             plan_sha256,
             manifest_sha256,
         )
+        _validate_state(state, run.run_id)
         run_descriptor = os.open(
             run.run_id,
             _DIRECTORY_FLAGS | _NOFOLLOW,
@@ -488,6 +526,7 @@ def _validate_state(state, run_id):
         and not isinstance(state["progress"], dict)
     ):
         raise MigrationStateError("migration_state_missing_or_invalid")
+    _validate_phase_state(state)
     manifests = state.get("manifests")
     if not isinstance(manifests, dict):
         raise MigrationStateError("migration_state_missing_or_invalid")
@@ -499,6 +538,68 @@ def _validate_state(state, run_id):
             value = values.get(name)
             if value is not None and not _is_sha256(value):
                 raise MigrationStateError("migration_state_missing_or_invalid")
+
+
+def _validate_phase_state(state):
+    phase = state["phase"]
+    intent = state["intent"]
+    progress = state["progress"]
+    if phase == "snapshot_intent":
+        _validate_snapshot_intent(intent)
+        if progress is not None:
+            raise MigrationStateError("migration_state_missing_or_invalid")
+        return
+    if phase == "archive_intent":
+        _validate_archive_intent(intent)
+        _validate_archive_progress(progress, intent)
+        return
+    if intent is not None or progress is not None:
+        raise MigrationStateError("migration_state_missing_or_invalid")
+
+
+def _validate_snapshot_intent(intent):
+    if not isinstance(intent, dict) or set(intent) != _SNAPSHOT_INTENT_KEYS:
+        raise MigrationStateError("migration_state_missing_or_invalid")
+    if intent["kind"] != "sqlite_snapshot":
+        raise MigrationStateError("migration_state_missing_or_invalid")
+    for field_name in ("source_device", "source_inode"):
+        if not _is_identity_number(intent[field_name]):
+            raise MigrationStateError("migration_state_missing_or_invalid")
+
+
+def _validate_archive_intent(intent):
+    if not isinstance(intent, dict) or set(intent) != _ARCHIVE_INTENT_KEYS:
+        raise MigrationStateError("migration_state_missing_or_invalid")
+    for field_name in _ARCHIVE_IDENTITY_KEYS:
+        if not _is_identity_number(intent[field_name]):
+            raise MigrationStateError("migration_state_missing_or_invalid")
+    for field_name in _ARCHIVE_INTENT_KEYS - _ARCHIVE_IDENTITY_KEYS:
+        value = intent[field_name]
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise MigrationStateError("migration_state_missing_or_invalid")
+
+
+def _validate_archive_progress(progress, current_intent):
+    if not isinstance(progress, dict) or set(progress) != {"items"}:
+        raise MigrationStateError("migration_state_missing_or_invalid")
+    items = progress["items"]
+    if not isinstance(items, list) or not items:
+        raise MigrationStateError("migration_state_missing_or_invalid")
+    current_incomplete = False
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"intent", "complete"}:
+            raise MigrationStateError("migration_state_missing_or_invalid")
+        _validate_archive_intent(item["intent"])
+        if not isinstance(item["complete"], bool):
+            raise MigrationStateError("migration_state_missing_or_invalid")
+        if item["intent"] == current_intent and not item["complete"]:
+            current_incomplete = True
+    if not current_incomplete:
+        raise MigrationStateError("migration_state_missing_or_invalid")
+
+
+def _is_identity_number(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _validate_identity(identity):

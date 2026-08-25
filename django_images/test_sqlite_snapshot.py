@@ -1,5 +1,6 @@
 from contextlib import ExitStack
 import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -63,12 +64,13 @@ class SQLiteSnapshotTests(SimpleTestCase):
                 "source_device": source_stat.st_dev,
                 "source_inode": source_stat.st_ino,
             }
-        transition_state(
-            run,
-            "initialized",
-            "snapshot_intent",
-            intent=intent,
-        )
+        if intent is not None:
+            transition_state(
+                run,
+                "initialized",
+                "snapshot_intent",
+                intent=intent,
+            )
         return run
 
     def make_wal_database(self):
@@ -519,6 +521,56 @@ class SQLiteSnapshotTests(SimpleTestCase):
             [("trusted",)],
         )
 
+    def test_source_swap_before_connect_and_restore_after_connect_fails_closed(self):
+        trusted = sqlite3.connect(self.source_path)
+        trusted.execute("CREATE TABLE records (value TEXT)")
+        trusted.execute("INSERT INTO records VALUES ('trusted')")
+        trusted.commit()
+        trusted.close()
+        decoy_path = os.path.join(self.data_root, "decoy.db")
+        decoy = sqlite3.connect(decoy_path)
+        decoy.execute("CREATE TABLE records (value TEXT)")
+        decoy.execute("INSERT INTO records VALUES ('decoy')")
+        decoy.commit()
+        decoy.close()
+        run = self.create_run()
+        real_connect = sqlite3.connect
+        held_path = "{}.held".format(self.source_path)
+        source_opened = []
+
+        def swap_around_source_connect(*arguments, **keywords):
+            uri = arguments[0] if arguments else keywords.get("database", "")
+            if not source_opened and "mode=ro" in uri:
+                source_opened.append(True)
+                os.rename(self.source_path, held_path)
+                os.rename(decoy_path, self.source_path)
+                try:
+                    return real_connect(*arguments, **keywords)
+                finally:
+                    os.rename(self.source_path, decoy_path)
+                    os.rename(held_path, self.source_path)
+            return real_connect(*arguments, **keywords)
+
+        with self.configured(), mock.patch(
+            "django_images.services.sqlite_snapshot.sqlite3.connect",
+            side_effect=swap_around_source_connect,
+        ), self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_source_identity_changed$",
+        ):
+            snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+        self.assertEqual(source_opened, [True])
+        self.assertFalse(os.path.exists(os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )))
+
     def test_missing_snapshot_intent_identity_cannot_adopt_valid_temp(self):
         run = self.create_run()
         source = sqlite3.connect(self.source_path)
@@ -533,6 +585,12 @@ class SQLiteSnapshotTests(SimpleTestCase):
         destination.close()
         source.close()
         os.chmod(temp_path, 0o600)
+        state_path = os.path.join(run.path, "migration-state.json")
+        with open(state_path, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+        state["phase"] = "snapshot_intent"
+        with open(state_path, "w", encoding="utf-8") as state_file:
+            json.dump(state, state_file)
 
         with self.configured(), self.assertRaisesRegex(
             SQLiteSnapshotError,
@@ -563,12 +621,13 @@ class SQLiteSnapshotTests(SimpleTestCase):
             os.getuid(),
             os.getgid(),
         )
-        transition_state(
-            run,
-            "initialized",
-            "snapshot_intent",
-            intent={},
-        )
+        state_path = os.path.join(run.path, "migration-state.json")
+        with open(state_path, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+        state["phase"] = "snapshot_intent"
+        state["intent"] = {}
+        with open(state_path, "w", encoding="utf-8") as state_file:
+            json.dump(state, state_file)
         final_path = os.path.join(
             run.path,
             "production.db.before-migration",

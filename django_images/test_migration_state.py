@@ -51,6 +51,24 @@ class MigrationStateTests(SimpleTestCase):
             self.gid,
         )
 
+    def archive_intent(self, identity):
+        return {
+            "source_root_device": 1,
+            "source_root_inode": 2,
+            "source_parent_relative": "originals",
+            "source_parent_device": 3,
+            "source_parent_inode": 4,
+            "source_name": "{}.jpg".format(identity),
+            "source_device": 5,
+            "source_inode": identity,
+            "destination_root_device": 6,
+            "destination_root_inode": 7,
+            "destination_parent_relative": "media/originals",
+            "destination_parent_device": 8,
+            "destination_parent_inode": 9,
+            "destination_name": "{}.jpg".format(identity),
+        }
+
     def write_run_state(self, run_id, phase, creating=False, payload=None):
         directory_name = run_id
         if creating:
@@ -214,7 +232,16 @@ class MigrationStateTests(SimpleTestCase):
             ):
                 transition_state(run, "initialized", next_phase)
 
-        transition_state(run, "initialized", "snapshot_intent")
+        transition_state(
+            run,
+            "initialized",
+            "snapshot_intent",
+            intent={
+                "kind": "sqlite_snapshot",
+                "source_device": 1,
+                "source_inode": 2,
+            },
+        )
         with self.assertRaisesRegex(
             MigrationStateError,
             "^migration_state_phase_mismatch$",
@@ -223,6 +250,8 @@ class MigrationStateTests(SimpleTestCase):
 
     def test_archive_same_phase_update_preserves_each_item_progress(self):
         run = self.create_run()
+        first_intent = self.archive_intent(10)
+        second_intent = self.archive_intent(11)
         transition_state(run, "initialized", "schema_complete")
         transition_state(run, "schema_complete", "paths_complete")
         transition_state(run, "paths_complete", "registry_complete")
@@ -230,19 +259,21 @@ class MigrationStateTests(SimpleTestCase):
             run,
             "registry_complete",
             "archive_intent",
-            intent={"kind": "media-root", "source_device": 1},
-            progress={"items": [{"kind": "media-root", "complete": False}]},
+            intent=first_intent,
+            progress={
+                "items": [{"intent": first_intent, "complete": False}],
+            },
         )
 
         updated = transition_state(
             run,
             "archive_intent",
             "archive_intent",
-            intent={"kind": "fixed-slot", "source_device": 2},
+            intent=second_intent,
             progress={
                 "items": [
-                    {"kind": "media-root", "complete": True},
-                    {"kind": "fixed-slot", "complete": False},
+                    {"intent": first_intent, "complete": True},
+                    {"intent": second_intent, "complete": False},
                 ],
             },
         )
@@ -529,3 +560,117 @@ class MigrationStateTests(SimpleTestCase):
                     path = os.path.join(self.backup_root, directory_name)
                     if os.path.exists(path):
                         shutil.rmtree(path)
+
+    def test_snapshot_intent_creating_run_requires_exact_source_identity(self):
+        run_id = "20260825T010101Z-11111111-1111-4111-8111-111111111111"
+        valid_intent = {
+            "kind": "sqlite_snapshot",
+            "source_device": 1,
+            "source_inode": 2,
+        }
+        invalid_intents = (
+            {},
+            dict(valid_intent, unexpected=True),
+            dict(valid_intent, kind="other"),
+            dict(valid_intent, source_device=True),
+            dict(valid_intent, source_inode="2"),
+        )
+
+        for intent in invalid_intents:
+            self.write_run_state(
+                run_id,
+                "snapshot_intent",
+                creating=True,
+                payload={"intent": intent},
+            )
+            try:
+                with self.subTest(intent=intent), self.assertRaisesRegex(
+                    MigrationStateError,
+                    "^migration_state_conflict$",
+                ):
+                    scan_run_inventory(self.backup_root)
+            finally:
+                creating_path = os.path.join(
+                    self.backup_root,
+                    ".creating-{}".format(run_id),
+                )
+                if os.path.exists(creating_path):
+                    shutil.rmtree(creating_path)
+
+    def test_archive_intent_creating_run_requires_bound_incomplete_progress(self):
+        run_id = "20260825T010101Z-11111111-1111-4111-8111-111111111111"
+        intent = self.archive_intent(10)
+        valid_progress = {
+            "items": [{"intent": intent, "complete": False}],
+        }
+        invalid_payloads = (
+            {"intent": {}, "progress": valid_progress},
+            {
+                "intent": dict(intent, unexpected=True),
+                "progress": valid_progress,
+            },
+            {"intent": intent, "progress": {"items": []}},
+            {
+                "intent": intent,
+                "progress": {
+                    "items": [{"intent": intent, "complete": True}],
+                },
+            },
+            {
+                "intent": intent,
+                "progress": {
+                    "items": [{"intent": intent, "complete": "no"}],
+                },
+            },
+        )
+
+        for payload in invalid_payloads:
+            self.write_run_state(
+                run_id,
+                "archive_intent",
+                creating=True,
+                payload=payload,
+            )
+            try:
+                with self.subTest(payload=payload), self.assertRaisesRegex(
+                    MigrationStateError,
+                    "^migration_state_conflict$",
+                ):
+                    scan_run_inventory(self.backup_root)
+            finally:
+                creating_path = os.path.join(
+                    self.backup_root,
+                    ".creating-{}".format(run_id),
+                )
+                if os.path.exists(creating_path):
+                    shutil.rmtree(creating_path)
+
+    def test_non_intent_phase_rejects_intent_or_progress(self):
+        run_ids = (
+            "20260825T010101Z-11111111-1111-4111-8111-111111111111",
+            "20260825T010102Z-22222222-2222-4222-8222-222222222222",
+        )
+        payloads = (
+            {"intent": {"kind": "sqlite_snapshot"}},
+            {"progress": {"items": []}},
+        )
+        for run_id, payload in zip(run_ids, payloads):
+            self.write_run_state(
+                run_id,
+                "initialized",
+                creating=True,
+                payload=payload,
+            )
+            try:
+                with self.subTest(payload=payload), self.assertRaisesRegex(
+                    MigrationStateError,
+                    "^migration_state_conflict$",
+                ):
+                    scan_run_inventory(self.backup_root)
+            finally:
+                creating_path = os.path.join(
+                    self.backup_root,
+                    ".creating-{}".format(run_id),
+                )
+                if os.path.exists(creating_path):
+                    shutil.rmtree(creating_path)
