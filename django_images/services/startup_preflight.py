@@ -67,6 +67,7 @@ class LegacyEvidence(object):
     has_fixed_slot_paths: bool
     has_named_canonical_paths: bool
     has_media_image_directory: bool
+    has_media_rows: bool
     pending_migrations: tuple
     database_identity: object
     media_root_identity: object
@@ -125,6 +126,7 @@ def inspect_legacy_evidence(
                 has_fixed_slot_paths=False,
                 has_named_canonical_paths=False,
                 has_media_image_directory=has_media_image_directory,
+                has_media_rows=False,
                 pending_migrations=(),
                 database_identity=None,
                 media_root_identity=media_root_identity,
@@ -145,6 +147,11 @@ def inspect_legacy_evidence(
         }
         image_rows, thumbnail_rows = _read_media_rows(
             connection, tables
+        )
+        has_media_rows = bool(
+            image_rows
+            or thumbnail_rows
+            or _table_has_rows(connection, tables, "core_mediaasset")
         )
         applied_migrations = set()
         if "django_migrations" in tables:
@@ -177,6 +184,7 @@ def inspect_legacy_evidence(
                 classified["has_named_canonical_paths"]
             ),
             has_media_image_directory=has_media_image_directory,
+            has_media_rows=has_media_rows,
             pending_migrations=pending_migrations,
             database_identity=_file_identity(database_receipt),
             media_root_identity=media_root_identity,
@@ -474,7 +482,12 @@ def adjust_storage_ownership(
             if components[0] == ".svrx-pinry-startup.lock":
                 raise StartupPreflightError("unsafe_storage_ownership")
             components_by_path.append(components)
-        os.fchown(root_directory.descriptor, service_uid, service_gid)
+        os.fchown(
+            root_directory.descriptor,
+            lock_stat[2],
+            service_gid,
+        )
+        os.fchmod(root_directory.descriptor, 0o1770)
         for components in components_by_path:
             _chown_managed_path(
                 root_directory,
@@ -484,6 +497,13 @@ def adjust_storage_ownership(
             )
         os.fsync(root_directory.descriptor)
         root_directory.verify_current()
+        normalized_root_stat = os.fstat(root_directory.descriptor)
+        if (
+            normalized_root_stat.st_uid != lock_stat[2]
+            or normalized_root_stat.st_gid != service_gid
+            or stat.S_IMODE(normalized_root_stat.st_mode) != 0o1770
+        ):
+            raise StartupPreflightError("unsafe_storage_ownership")
         if _lock_receipt(os.fstat(startup_lock_descriptor)) != lock_stat:
             raise StartupPreflightError("unsafe_storage_ownership")
         if _verify_startup_lock_receipt(
@@ -829,6 +849,14 @@ def _read_table_rows(connection, table_name, required, optional):
         "SELECT {} FROM {}".format(", ".join(selected), table_name)
     )
     return tuple(dict(zip(selected, row)) for row in rows)
+
+
+def _table_has_rows(connection, tables, table_name):
+    if table_name not in tables:
+        return False
+    return connection.execute(
+        "SELECT 1 FROM {} LIMIT 1".format(table_name)
+    ).fetchone() is not None
 
 
 def _classify_media_rows(image_rows, thumbnail_rows):

@@ -756,7 +756,13 @@ class AutoV2ManifestLog(object):
 
     @classmethod
     def open(
-        cls, run_directory, filename, run_id, service_uid, service_gid
+        cls,
+        run_directory,
+        filename,
+        run_id,
+        service_uid,
+        service_gid,
+        create=True,
     ):
         if not _valid_run_id(run_id):
             raise _command_error("invalid_auto_v2_run_id")
@@ -767,6 +773,7 @@ class AutoV2ManifestLog(object):
             or type(service_gid) is not int
             or service_uid < 0
             or service_gid < 0
+            or type(create) is not bool
         ):
             raise _command_error("unsafe_auto_v2_manifest")
         if os.path.basename(run_directory) != run_id:
@@ -797,6 +804,8 @@ class AutoV2ManifestLog(object):
                     dir_fd=directory.descriptor,
                 )
             except FileNotFoundError:
+                if not create:
+                    raise
                 descriptor = os.open(
                     filename,
                     existing_flags | os.O_CREAT | os.O_EXCL,
@@ -1310,8 +1319,40 @@ def load_auto_v2_plan(
         run_id,
         service_uid,
         service_gid,
+        create=False,
     ) as manifest:
         return manifest.summary()
+
+
+def load_completed_auto_v2_summary(
+    run_directory, filename, run_id, service_uid, service_gid
+):
+    """execute terminal이 전체 완결된 auto-v2 typed 요약만 읽는다."""
+    with AutoV2ManifestLog.open(
+        run_directory,
+        filename,
+        run_id,
+        service_uid,
+        service_gid,
+        create=False,
+    ) as manifest:
+        return _completed_auto_v2_summary(manifest)
+
+
+def _completed_auto_v2_summary(manifest):
+    summary = manifest.summary()
+    expected_terminal = {
+        "md5_legacy": frozenset(("committed", "recovered_commit")),
+        "fixed_slot": frozenset(("committed", "recovered_commit")),
+        "named_canonical": frozenset(("already_current",)),
+    }
+    if any(
+        manifest.state.latest_by_image.get(plan.image_id)
+        not in expected_terminal[plan.generation]
+        for plan in manifest.state.plans
+    ):
+        raise _command_error("auto_v2_plan_incomplete")
+    return summary
 
 
 def recover_incomplete_auto_v2_plan(
@@ -1324,6 +1365,7 @@ def recover_incomplete_auto_v2_plan(
         run_id,
         service_uid,
         service_gid,
+        create=False,
     ) as manifest:
         return manifest._reset_incomplete_plan()
 
@@ -1338,22 +1380,10 @@ def load_auto_v2_archive_sources(
         run_id,
         service_uid,
         service_gid,
+        create=False,
     ) as manifest:
-        manifest.summary()
+        _completed_auto_v2_summary(manifest)
         plans = tuple(manifest.state.plans)
-        terminal_by_image = manifest.state.latest_by_image
-        expected_terminal = {
-            "md5_legacy": frozenset(("committed", "recovered_commit")),
-            "fixed_slot": frozenset(("committed", "recovered_commit")),
-            "named_canonical": frozenset(("already_current",)),
-        }
-        if any(
-            terminal_by_image.get(plan.image_id)
-            not in expected_terminal[plan.generation]
-            for plan in plans
-        ):
-            raise _command_error("auto_v2_plan_incomplete")
-
         canonical_originals = frozenset(
             plan.new_original for plan in plans
         )

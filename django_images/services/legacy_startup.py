@@ -7,8 +7,11 @@ from django.conf import settings
 from django.core.management import CommandError
 
 from core.services.media_asset_backfill import (
+    BackfillSummary,
     MANIFEST_FILENAME as BACKFILL_MANIFEST_FILENAME,
     MediaAssetBackfiller,
+    SAFE_BACKFILL_REASON_CODES,
+    load_completed_media_asset_backfill_summary,
     recover_incomplete_media_asset_plan,
 )
 from core.version import normalize_source_commit
@@ -19,6 +22,8 @@ from django_images.services.media_archive import LegacyMediaArchive
 from django_images.services.media_migration_v2 import (
     AUTO_V2_MANIFEST_FILENAME,
     AutoV2MediaMigrator,
+    AutoV2PlanSummary,
+    load_completed_auto_v2_summary,
     recover_incomplete_auto_v2_plan,
 )
 from django_images.services.sqlite_snapshot import snapshot_sqlite
@@ -26,18 +31,6 @@ from django_images.services.sqlite_snapshot import snapshot_sqlite
 
 SUMMARY_FILENAME = "migration-summary.json"
 _BACKUP_ROOT_NAME = "legacy-backup"
-_SAFE_BACKFILL_REASONS = frozenset((
-    "extra_derivative",
-    "file_identity_mismatch",
-    "invalid_dimensions",
-    "invalid_media_file",
-    "invalid_named_leaf",
-    "missing_derivative",
-    "multi_owner",
-    "orphan",
-    "pipeline_closure_mismatch",
-    "unsafe_media_file",
-))
 
 
 class LegacyStartupError(Exception):
@@ -69,6 +62,19 @@ class LegacyStartupCoordinator(object):
         self._allow_missing_media_layout = False
         self._media_summary = None
         self._backfill_summary = None
+
+    def prepare_no_flag_before_schema(self):
+        """No-flag startup의 pre-schema evidence를 read-only로 고정한다."""
+        evidence = startup_preflight.inspect_legacy_evidence(
+            self._database_path(),
+            None,
+            settings.MEDIA_ROOT,
+        )
+        self._evidence = evidence
+        self._allow_missing_media_layout = not evidence.database_exists
+        if evidence.has_legacy_evidence:
+            raise LegacyStartupError("legacy_migration_flag_required")
+        return evidence
 
     def prepare_before_schema(self):
         """증거·state·공간·snapshot을 수렴하고 run 또는 None을 반환한다."""
@@ -170,7 +176,17 @@ class LegacyStartupCoordinator(object):
     def converge_after_schema(self, run):
         """preflight, path, registry, archive, complete를 순서대로 수렴한다."""
         if run is None and self._evidence is None:
-            self._allow_missing_media_layout = True
+            self._allow_missing_media_layout = False
+        if run is None and self._allow_missing_media_layout:
+            post_schema_evidence = (
+                startup_preflight.inspect_legacy_evidence(
+                    self._database_path(),
+                    None,
+                    settings.MEDIA_ROOT,
+                )
+            )
+            if post_schema_evidence.has_media_rows:
+                self._allow_missing_media_layout = False
         if run is not None:
             status = migration_state.read_run_status(run)
             if status.phase in ("initialized", "snapshot_complete"):
@@ -186,6 +202,7 @@ class LegacyStartupCoordinator(object):
         self._seal_current_identities(run)
         status = migration_state.read_run_status(run)
         if status.phase == "complete":
+            self._write_summary(run)
             return run
         if status.phase in ("schema_complete", "copying"):
             self._converge_media(run)
@@ -203,7 +220,6 @@ class LegacyStartupCoordinator(object):
         status = migration_state.read_run_status(run)
         if status.phase != "complete":
             raise LegacyStartupError("migration_state_phase_mismatch")
-        self._write_summary(run)
         return run
 
     def adjust_ownership(self, startup_lock_descriptor):
@@ -212,7 +228,6 @@ class LegacyStartupCoordinator(object):
             getattr(settings, "STATIC_ROOT", None),
             settings.MEDIA_ROOT,
             self._database_path(),
-            self._backup_root(),
         ):
             if configured is not None and os.path.lexists(os.fspath(configured)):
                 managed_paths.append(os.fspath(configured))
@@ -307,6 +322,7 @@ class LegacyStartupCoordinator(object):
             )
             self._require_space(remaining.required_bytes)
             if status.phase == "schema_complete":
+                self._media_summary = planned
                 self._transition(
                     run,
                     "schema_complete",
@@ -411,7 +427,7 @@ class LegacyStartupCoordinator(object):
         evidence = self._seal_current_identities(run)
         status = migration_state.read_run_status(run)
         if status.phase == "archive_complete":
-            self._transition(run, "archive_complete", "complete")
+            self._transition_complete(run, "archive_complete")
             return
         archive = LegacyMediaArchive(
             settings.MEDIA_ROOT,
@@ -429,7 +445,7 @@ class LegacyStartupCoordinator(object):
                 ),
             )
             if not plan.intents:
-                self._transition(run, "registry_complete", "complete")
+                self._transition_complete(run, "registry_complete")
                 return
             first = self._first_incomplete(plan.progress)
             self._transition(
@@ -471,7 +487,7 @@ class LegacyStartupCoordinator(object):
         )
         if migration_state.read_run_status(run).phase != "archive_complete":
             raise LegacyStartupError("archive_state_conflict")
-        self._transition(run, "archive_complete", "complete")
+        self._transition_complete(run, "archive_complete")
 
     def _configuration_preflight(self):
         image_storage = Image._meta.get_field("image").storage
@@ -504,7 +520,9 @@ class LegacyStartupCoordinator(object):
         except FileNotFoundError:
             pass
         if not self._allow_missing_media_layout:
-            return
+            raise LegacyStartupError(
+                "media_storage_configuration_invalid"
+            )
         startup_preflight.ensure_media_root_layout(
             settings.PINRY_DATA_ROOT,
             settings.MEDIA_ROOT,
@@ -522,13 +540,34 @@ class LegacyStartupCoordinator(object):
         self._write_summary(transitioned)
         return transitioned
 
-    def _write_summary(self, run):
+    def _transition_complete(self, run, expected):
         status = migration_state.read_run_status(run)
+        if status.phase != expected:
+            raise LegacyStartupError("migration_state_phase_mismatch")
+        self._restore_summary_values(run, status)
+        if (
+            not isinstance(self._media_summary, AutoV2PlanSummary)
+            or not isinstance(self._backfill_summary, BackfillSummary)
+        ):
+            raise LegacyStartupError("migration_state_plan_mismatch")
+        self._write_summary(run, phase_override="complete")
+        self._fault("after_complete_summary")
+        return migration_state.transition_state(
+            run,
+            expected,
+            "complete",
+        )
+
+    def _write_summary(self, run, phase_override=None):
+        if phase_override not in (None, "complete"):
+            raise LegacyStartupError("unsafe_migration_summary")
+        status = migration_state.read_run_status(run)
+        self._restore_summary_values(run, status)
         media = self._media_summary
         backfill = self._backfill_summary
         reasons = {} if backfill is None else dict(backfill.reason_counts)
         if (
-            any(code not in _SAFE_BACKFILL_REASONS for code in reasons)
+            any(code not in SAFE_BACKFILL_REASON_CODES for code in reasons)
             or any(type(count) is not int or count < 0 for count in reasons.values())
         ):
             raise LegacyStartupError("unsafe_migration_summary")
@@ -538,7 +577,7 @@ class LegacyStartupCoordinator(object):
                 status.source_commit
             )["source_commit"],
             "run_id": status.run_id,
-            "phase": status.phase,
+            "phase": status.phase if phase_override is None else phase_override,
             "backup_relative_name": _BACKUP_ROOT_NAME,
             "media_plan_sha256": status.media_plan_sha256,
             "media_manifest_sha256": status.media_manifest_sha256,
@@ -571,6 +610,80 @@ class LegacyStartupCoordinator(object):
             "reason_counts": dict(sorted(reasons.items())),
         }
         _atomic_write_summary(run, payload)
+
+    def _restore_summary_values(self, run, status):
+        media_hashes = (
+            status.media_plan_sha256,
+            status.media_manifest_sha256,
+        )
+        if (media_hashes[0] is None) != (media_hashes[1] is None):
+            raise LegacyStartupError("migration_state_plan_mismatch")
+        if self._media_summary is None and media_hashes[0] is not None:
+            try:
+                summary = load_completed_auto_v2_summary(
+                    run.path,
+                    AUTO_V2_MANIFEST_FILENAME,
+                    run.run_id,
+                    self.service_uid,
+                    self.service_gid,
+                )
+            except CommandError as error:
+                raise LegacyStartupError(
+                    "migration_state_plan_mismatch"
+                ) from error
+            self._validate_summary_identity(
+                summary,
+                run,
+                media_hashes,
+            )
+            self._media_summary = summary
+        elif self._media_summary is not None and media_hashes[0] is not None:
+            self._validate_summary_identity(
+                self._media_summary,
+                run,
+                media_hashes,
+            )
+
+        backfill_hashes = (
+            status.backfill_plan_sha256,
+            status.backfill_manifest_sha256,
+        )
+        if (backfill_hashes[0] is None) != (backfill_hashes[1] is None):
+            raise LegacyStartupError("migration_state_plan_mismatch")
+        if self._backfill_summary is None and backfill_hashes[0] is not None:
+            try:
+                summary = load_completed_media_asset_backfill_summary(
+                    run.path,
+                    BACKFILL_MANIFEST_FILENAME,
+                    run.run_id,
+                    self.service_uid,
+                    self.service_gid,
+                )
+            except CommandError as error:
+                raise LegacyStartupError(
+                    "migration_state_plan_mismatch"
+                ) from error
+            self._validate_summary_identity(
+                summary,
+                run,
+                backfill_hashes,
+            )
+            self._backfill_summary = summary
+        elif self._backfill_summary is not None and backfill_hashes[0] is not None:
+            self._validate_summary_identity(
+                self._backfill_summary,
+                run,
+                backfill_hashes,
+            )
+
+    @classmethod
+    def _validate_summary_identity(cls, summary, run, hashes):
+        cls._validate_summary_run(summary, run)
+        if (
+            summary.plan_sha256 != hashes[0]
+            or summary.manifest_sha256 != hashes[1]
+        ):
+            raise LegacyStartupError("migration_state_plan_mismatch")
 
     def _backup_root(self):
         return os.path.join(settings.PINRY_DATA_ROOT, _BACKUP_ROOT_NAME)

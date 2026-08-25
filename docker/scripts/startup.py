@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 
-PROJECT_ROOT = os.path.abspath(
+PROJECT_ROOT = os.path.realpath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
 )
 if PROJECT_ROOT in sys.path:
@@ -16,6 +16,12 @@ from django_images.services import startup_lock
 
 
 NGINX_BINARY = "/usr/sbin/nginx"
+BOOTSTRAP_SCRIPT = os.path.join(
+    PROJECT_ROOT,
+    "docker",
+    "scripts",
+    "bootstrap.sh",
+)
 _MIGRATION_FLAG = "--migrate-legacy"
 _DEFAULT_DATA_ROOT = "/data"
 _DEFAULT_SERVICE_UID = 33
@@ -25,6 +31,7 @@ _SAFE_ERROR_CODES = frozenset((
     "archive_manifest_mismatch",
     "archive_state_conflict",
     "atomic_archive_unsupported",
+    "bootstrap_failed",
     "corrupt_sqlite_snapshot",
     "legacy_evidence_invalid",
     "legacy_media_still_referenced",
@@ -108,6 +115,26 @@ def _run(arguments):
         _write_error(_safe_error_code(error, "startup_lock_failed"))
         return 1
 
+    try:
+        os.chdir(PROJECT_ROOT)
+        if not os.path.samefile(os.getcwd(), PROJECT_ROOT):
+            raise OSError("project root identity changed")
+    except BaseException:
+        _write_error("media_storage_configuration_invalid")
+        return 1
+
+    try:
+        subprocess.run(
+            ["/bin/bash", BOOTSTRAP_SCRIPT],
+            check=True,
+            close_fds=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        _write_error("bootstrap_failed")
+        return 1
+
     os.environ["DJANGO_SETTINGS_MODULE"] = "pinry.settings.docker"
     try:
         import django
@@ -140,7 +167,6 @@ def _run(arguments):
             if inventory.requires_migration_flag:
                 _write_error("legacy_migration_flag_required")
                 return 1
-            _run_schema_commands(call_command)
 
         service_uid, service_gid = _service_identity()
         coordinator = LegacyStartupCoordinator(service_uid, service_gid)
@@ -148,12 +174,15 @@ def _run(arguments):
             run = coordinator.prepare_before_schema()
             if coordinator.schema_required(run):
                 _run_schema_commands(call_command)
+        else:
+            coordinator.prepare_no_flag_before_schema()
+            _run_schema_commands(call_command)
         coordinator.converge_after_schema(run)
         coordinator.adjust_ownership(held_lock.fileno())
         coordinator.runtime_check(service_uid, service_gid)
         try:
             subprocess.run([NGINX_BINARY], check=True, close_fds=True)
-        except subprocess.CalledProcessError:
+        except (OSError, subprocess.CalledProcessError):
             _write_error("nginx_start_failed")
             return 1
         held_lock.set_inheritable(True)

@@ -3,6 +3,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -340,10 +341,27 @@ class RuntimeConfigTests(unittest.TestCase):
             'NGINX_BINARY = "{}"'.format(nginx),
             1,
         ))
+        bootstrap = scripts / "bootstrap.sh"
+        bootstrap.write_text(
+            "#!/bin/sh\n"
+            "printf 'bootstrap\\n' >> \"$PINRY_STARTUP_CAPTURE\"\n"
+            "if [ \"${PINRY_FAIL_POINT:-}\" = bootstrap ]; then\n"
+            "    printf 'sentinel-private-bootstrap-secret\\n' >&2\n"
+            "    exit 42\n"
+            "fi\n"
+            "while [ -n \"${PINRY_BOOTSTRAP_GATE:-}\" ] "
+            "&& [ -e \"$PINRY_BOOTSTRAP_GATE\" ]; do\n"
+            "    sleep 0.05\n"
+            "done\n"
+        )
+        bootstrap.chmod(0o700)
         gunicorn = scripts / "_start_gunicorn.sh"
         gunicorn.write_text(
             "#!/bin/sh\n"
             "printf 'gunicorn\\n' >> \"$PINRY_STARTUP_CAPTURE\"\n"
+            "if [ \"${PINRY_ASSERT_WSGI_IMPORT:-0}\" = 1 ]; then\n"
+            "    \"$PINRY_REAL_PYTHON\" -c 'import pinry.wsgi'\n"
+            "fi\n"
             "while [ -n \"${PINRY_LIFETIME_GATE:-}\" ] "
             "&& [ -e \"$PINRY_LIFETIME_GATE\" ]; do\n"
             "    sleep 0.05\n"
@@ -444,6 +462,8 @@ class RuntimeConfigTests(unittest.TestCase):
             "    if os.environ.get('PINRY_FAIL_POINT') == point: raise Failure(code)\n"
             "class LegacyStartupCoordinator(object):\n"
             "    def __init__(self, uid, gid): del uid, gid; event('coordinator')\n"
+            "    def prepare_no_flag_before_schema(self):\n"
+            "        event('prepare_no_flag'); fail('prepare_no_flag', 'legacy_migration_flag_required')\n"
             "    def prepare_before_schema(self):\n"
             "        event('prepare'); fail('prepare', 'sqlite_snapshot_failed'); return object()\n"
             "    def schema_required(self, run):\n"
@@ -457,6 +477,12 @@ class RuntimeConfigTests(unittest.TestCase):
             "        del uid, gid; event('runtime'); fail('runtime', 'media_root_not_writable')\n",
         )
         write_module("pinry/__init__.py", "")
+        write_module(
+            "pinry/wsgi.py",
+            "import os\n"
+            "from runner_events import event\n"
+            "event('wsgi_import:' + os.getcwd())\n",
+        )
         write_module("pinry/settings/__init__.py", "")
         write_module("pinry/settings/docker.py", "")
 
@@ -468,6 +494,7 @@ class RuntimeConfigTests(unittest.TestCase):
             "PINRY_DATA_ROOT": str(data_root),
             "PINRY_STARTUP_CAPTURE": str(capture),
             "PYTHONPATH": "",
+            "PINRY_REAL_PYTHON": str(REPOSITORY_ROOT / ".venv/bin/python"),
         })
         environment.pop("DJANGO_SETTINGS_MODULE", None)
         return environment, capture, runner, data_root
@@ -478,7 +505,7 @@ class RuntimeConfigTests(unittest.TestCase):
             return []
         return capture.read_text("utf-8").splitlines()
 
-    def test_start_shell_delegates_to_bootstrap_then_python_runner(self):
+    def test_start_shell_delegates_directly_to_python_runner(self):
         for database_exists in (False, True):
             with self.subTest(database_exists=database_exists):
                 environment, capture, startup_script = (
@@ -499,18 +526,12 @@ class RuntimeConfigTests(unittest.TestCase):
                     completed.stderr.decode("utf-8"),
                 )
                 events = _read_startup_events(capture)
-                self.assertEqual(events, [
-                    [
-                        "bash",
-                        str(startup_script.parent / "bootstrap.sh"),
-                    ],
-                    [
+                self.assertEqual(events, [[
                         "python",
                         str(startup_script.parent / "startup.py"),
-                    ],
-                ])
+                    ]])
 
-    def test_start_stops_before_runner_when_bootstrap_fails(self):
+    def test_start_shell_never_runs_bootstrap_outside_lifetime_lock(self):
         environment, capture, startup_script = self._startup_environment(
             False
         )
@@ -524,10 +545,10 @@ class RuntimeConfigTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
 
-        self.assertEqual(completed.returncode, 43)
+        self.assertEqual(completed.returncode, 0)
         self.assertEqual(_read_startup_events(capture), [[
-            "bash",
-            str(startup_script.parent / "bootstrap.sh"),
+            "python",
+            str(startup_script.parent / "startup.py"),
         ]])
 
     def test_start_rejects_every_non_exact_argument_before_bootstrap(self):
@@ -568,7 +589,6 @@ class RuntimeConfigTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(_read_startup_events(capture), [
-            ["bash", str(startup_script.parent / "bootstrap.sh")],
             [
                 "python",
                 str(startup_script.parent / "startup.py"),
@@ -592,11 +612,13 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
         self.assertEqual(self._runner_events(capture), [
             "lock",
+            "bootstrap",
             "setup:pinry.settings.docker",
             "inventory",
+            "coordinator",
+            "prepare_no_flag",
             "collectstatic",
             "migrate",
-            "coordinator",
             "converge:none",
             "ownership",
             "runtime",
@@ -623,7 +645,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(completed.stderr.decode().strip(),
                          "legacy_migration_flag_required")
         self.assertEqual(self._runner_events(capture), [
-            "lock", "setup:pinry.settings.docker", "inventory",
+            "lock", "bootstrap", "setup:pinry.settings.docker", "inventory",
         ])
 
     def test_python_runner_skips_schema_on_resumed_post_schema_phase(self):
@@ -652,6 +674,7 @@ class RuntimeConfigTests(unittest.TestCase):
 
     def test_python_runner_failures_never_start_application_service(self):
         cases = (
+            ("bootstrap", "bootstrap_failed"),
             ("setup", "media_storage_configuration_invalid"),
             ("prepare", "sqlite_snapshot_failed"),
             ("collectstatic", "legacy_startup_failed"),
@@ -688,6 +711,92 @@ class RuntimeConfigTests(unittest.TestCase):
                 self.assertNotIn("sentinel-private", rendered)
                 self.assertNotIn("Traceback", rendered)
                 self.assertNotIn("gunicorn", self._runner_events(capture))
+
+    def test_python_runner_bootstrap_is_once_between_lock_and_django_setup(self):
+        environment, capture, runner, _data_root = (
+            self._python_runner_environment()
+        )
+
+        completed = subprocess.run(
+            [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)],
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        events = self._runner_events(capture)
+        self.assertEqual(events.count("bootstrap"), 1)
+        self.assertLess(events.index("lock"), events.index("bootstrap"))
+        self.assertLess(
+            events.index("bootstrap"),
+            events.index("setup:pinry.settings.docker"),
+        )
+
+    def test_python_runner_final_process_imports_wsgi_from_project_cwd(self):
+        environment, capture, runner, _data_root = (
+            self._python_runner_environment()
+        )
+        environment["PINRY_ASSERT_WSGI_IMPORT"] = "1"
+
+        completed = subprocess.run(
+            [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)],
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertIn(
+            "wsgi_import:{}".format(runner.parents[2]),
+            self._runner_events(capture),
+        )
+
+    def test_python_runner_serializes_bootstrap_under_lifetime_lock(self):
+        environment, capture, runner, _data_root = (
+            self._python_runner_environment()
+        )
+        gate = Path(capture.parent, "bootstrap-gate")
+        gate.write_text("held")
+        environment["PINRY_BOOTSTRAP_GATE"] = str(gate)
+        command = [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)]
+        first = subprocess.Popen(
+            command,
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(lambda: first.poll() is None and first.kill())
+        deadline = time.monotonic() + 5
+        while (
+            "bootstrap" not in self._runner_events(capture)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        self.assertEqual(self._runner_events(capture).count("bootstrap"), 1)
+
+        second = subprocess.run(
+            command,
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(second.returncode, 1)
+        self.assertEqual(second.stderr.decode().strip(), "startup_lock_busy")
+        self.assertEqual(self._runner_events(capture).count("bootstrap"), 1)
+        self.assertNotIn(
+            "setup:pinry.settings.docker",
+            self._runner_events(capture),
+        )
+
+        gate.unlink()
+        first_stdout, first_stderr = first.communicate(timeout=5)
+        self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
 
     def test_python_runner_holds_lock_for_final_process_lifetime(self):
         environment, capture, runner, _data_root = (
@@ -771,9 +880,13 @@ class RuntimeConfigTests(unittest.TestCase):
         scripts.mkdir(parents=True)
         settings_directory.mkdir(parents=True)
         data.mkdir()
-        secret = "sentinel-secret-value-should-never-be-logged"
+        secret = "A1" * 32 + "B"
         (scripts / "gen_key.sh").write_text(
-            "#!/bin/sh\nprintf '%s\\n' '{}'\n".format(secret)
+            "#!/bin/sh\n"
+            "if [ \"${{PINRY_PWGEN_FAIL:-0}}\" = 1 ]; then exit 47; fi\n"
+            "printf '%s\\n' '{}' > \"$PINRY_DATA_ROOT/production_secret_key.txt\"\n"
+            "chmod 600 \"$PINRY_DATA_ROOT/production_secret_key.txt\"\n"
+            "printf '%s\\n' '{}'\n".format(secret, secret)
         )
         (scripts / "gen_key.sh").chmod(0o700)
         (settings_directory / "local_settings.example.py").write_text(
@@ -807,13 +920,18 @@ class RuntimeConfigTests(unittest.TestCase):
         sed.write_text(
             "#!/usr/bin/env python3\n"
             "import pathlib, sys\n"
-            "expression = sys.argv[2].replace('\\\\_', '_')\n"
+            "in_place = len(sys.argv) == 4 and sys.argv[1] == '-i'\n"
+            "expression = sys.argv[2 if in_place else 1].replace('\\\\_', '_')\n"
             "prefix = 's/secret_key_place_holder/'\n"
             "if not expression.startswith(prefix) or not expression.endswith('/'):\n"
             "    raise SystemExit(2)\n"
             "replacement = expression[len(prefix):-1]\n"
-            "target = pathlib.Path(sys.argv[3])\n"
-            "target.write_text(target.read_text().replace('secret_key_place_holder', replacement))\n"
+            "target = pathlib.Path(sys.argv[3 if in_place else 2])\n"
+            "content = target.read_text().replace('secret_key_place_holder', replacement)\n"
+            "if in_place:\n"
+            "    target.write_text(content)\n"
+            "else:\n"
+            "    sys.stdout.write(content)\n"
         )
         sed.chmod(0o700)
         environment = os.environ.copy()
@@ -822,6 +940,8 @@ class RuntimeConfigTests(unittest.TestCase):
             os.pathsep,
             environment.get("PATH", ""),
         )
+        environment["PINRY_DATA_ROOT"] = str(data)
+        environment["PINRY_PROJECT_ROOT"] = str(root)
         return script, root, data, secret, environment
 
     def test_bootstrap_stores_generated_secret_without_logging_value(self):
@@ -845,6 +965,20 @@ class RuntimeConfigTests(unittest.TestCase):
             (root / "pinry/settings/local_settings.py").read_bytes(),
             (data / "local_settings.py").read_bytes(),
         )
+        self.assertEqual(
+            (data / "production_secret_key.txt").read_bytes(),
+            (secret + "\n").encode("ascii"),
+        )
+        self.assertNotIn(
+            b"secret_key_place_holder",
+            (data / "local_settings.py").read_bytes(),
+        )
+        for path in (
+            data / "production_secret_key.txt",
+            data / "local_settings.py",
+            root / "pinry/settings/local_settings.py",
+        ):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_bootstrap_preserves_existing_malformed_local_settings_bytes(self):
         existing = (
@@ -871,6 +1005,150 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         self.assertNotIn(b"sentinel-existing-secret", rendered)
         self.assertNotIn(b"sentinel-db-credential", rendered)
+
+    def test_bootstrap_key_generation_failure_is_not_overwritten_by_success(self):
+        script, root, data, secret, environment = self._bootstrap_fixture()
+        environment["PINRY_PWGEN_FAIL"] = "1"
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        rendered = completed.stdout + completed.stderr
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn(secret.encode("ascii"), rendered)
+        self.assertFalse((data / "local_settings.py").exists())
+        self.assertFalse((root / "pinry/settings/local_settings.py").exists())
+
+    def test_bootstrap_rejects_template_without_exact_placeholder(self):
+        script, root, data, secret, environment = self._bootstrap_fixture()
+        template = root / "pinry/settings/local_settings.example.py"
+        template.write_text("SECRET_KEY = 'missing-placeholder'\n")
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn(
+            secret.encode("ascii"),
+            completed.stdout + completed.stderr,
+        )
+        self.assertFalse((data / "local_settings.py").exists())
+        self.assertFalse((root / "pinry/settings/local_settings.py").exists())
+
+    def test_bootstrap_rejects_hardlinked_existing_local_settings(self):
+        existing = b"SECRET_KEY='existing-compatible-value'\n"
+        script, root, data, _secret, environment = self._bootstrap_fixture(
+            existing
+        )
+        os.link(
+            str(data / "local_settings.py"),
+            str(data / "local_settings-linked.py"),
+        )
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual((data / "local_settings.py").read_bytes(), existing)
+        self.assertFalse((root / "pinry/settings/local_settings.py").exists())
+
+    def _gen_key_fixture(self):
+        temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        data = root / "data"
+        binary = root / "bin"
+        data.mkdir()
+        binary.mkdir()
+        secret = "C3" * 32 + "D"
+        pwgen = binary / "pwgen"
+        pwgen.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${PINRY_PWGEN_FAIL:-0}\" = 1 ]; then exit 48; fi\n"
+            "printf '%s\\n' \"$PINRY_TEST_SECRET\"\n"
+        )
+        pwgen.chmod(0o700)
+        source = (
+            REPOSITORY_ROOT / "docker/scripts/gen_key.sh"
+        ).read_text("utf-8")
+        script = root / "gen_key.sh"
+        script.write_text(source.replace("/data", str(data)))
+        script.chmod(0o700)
+        environment = os.environ.copy()
+        environment["PATH"] = "{}{}{}".format(
+            binary,
+            os.pathsep,
+            environment.get("PATH", ""),
+        )
+        environment["PINRY_DATA_ROOT"] = str(data)
+        environment["PINRY_TEST_SECRET"] = secret
+        return script, data, secret, environment
+
+    def test_gen_key_atomically_creates_exact_private_key_without_logging(self):
+        script, data, secret, environment = self._gen_key_fixture()
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        rendered = completed.stdout + completed.stderr
+        key_path = data / "production_secret_key.txt"
+        self.assertEqual(completed.returncode, 0, rendered)
+        self.assertNotIn(secret.encode("ascii"), rendered)
+        self.assertEqual(key_path.read_bytes(), (secret + "\n").encode())
+        self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+        self.assertEqual(
+            list(data.glob(".production_secret_key.txt.tmp-*")),
+            [],
+        )
+
+    def test_gen_key_rejects_invalid_generator_output_without_target(self):
+        script, data, _secret, environment = self._gen_key_fixture()
+        environment["PINRY_TEST_SECRET"] = "too-short"
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse((data / "production_secret_key.txt").exists())
+
+    def test_gen_key_preserves_compatible_existing_key_without_generator(self):
+        script, data, secret, environment = self._gen_key_fixture()
+        key_path = data / "production_secret_key.txt"
+        key_path.write_bytes((secret + "\n").encode("ascii"))
+        key_path.chmod(0o600)
+        before = key_path.read_bytes()
+        environment["PINRY_PWGEN_FAIL"] = "1"
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(key_path.read_bytes(), before)
+        self.assertNotIn(secret.encode("ascii"), completed.stdout)
 
     def test_timeout_counter_counts_long_and_short_forms(self):
         self.assertEqual(

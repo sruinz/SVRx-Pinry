@@ -92,6 +92,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             has_fixed_slot_paths=False,
             has_named_canonical_paths=False,
             has_media_image_directory=present,
+            has_media_rows=present,
             pending_migrations=tuple(pending),
             database_identity=(
                 {"device": 1, "inode": 2}
@@ -133,19 +134,101 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
 
     def test_no_flag_fresh_install_creates_missing_media_layout(self):
         self.media_root.rmdir()
+        before_schema = self.evidence(
+            present=False,
+            database_exists=False,
+        )
+        after_schema = self.evidence(
+            present=False,
+            database_exists=True,
+        )
+        coordinator = self.coordinator()
 
         with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            side_effect=(before_schema, after_schema),
+        ), mock.patch(
             "django_images.services.legacy_startup."
             "startup_preflight.validate_storage_configuration_preflight",
             return_value=PreflightResult(ok=True),
         ):
-            self.coordinator().converge_after_schema(None)
+            coordinator.prepare_no_flag_before_schema()
+            coordinator.converge_after_schema(None)
 
         self.assertTrue(self.media_root.is_dir())
         self.assertEqual(
             stat.S_IMODE(self.media_root.stat().st_mode),
             0o700,
         )
+
+    def test_no_flag_existing_database_never_creates_missing_media_layout(self):
+        self.media_root.rmdir()
+        evidence = self.evidence(
+            present=False,
+            database_exists=True,
+        )
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=evidence,
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^media_storage_configuration_invalid$",
+        ):
+            coordinator.prepare_no_flag_before_schema()
+            coordinator.converge_after_schema(None)
+
+        self.assertFalse(self.media_root.exists())
+
+    def test_no_flag_fresh_candidate_rejects_rows_created_during_schema(self):
+        self.media_root.rmdir()
+        before_schema = self.evidence(
+            present=False,
+            database_exists=False,
+        )
+        after_schema = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                ).__dict__,
+                has_media_rows=True,
+            )
+        )
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            side_effect=(before_schema, after_schema),
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_configuration_preflight",
+            return_value=PreflightResult(ok=True),
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^media_storage_configuration_invalid$",
+        ):
+            coordinator.prepare_no_flag_before_schema()
+            coordinator.converge_after_schema(None)
+
+        self.assertFalse(self.media_root.exists())
+
+    def test_no_flag_legacy_evidence_requires_explicit_flag_before_schema(self):
+        evidence = self.evidence(present=True)
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=evidence,
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^legacy_migration_flag_required$",
+        ):
+            self.coordinator().prepare_no_flag_before_schema()
 
     def test_flag_fresh_current_empty_database_creates_missing_media_layout(
         self,
@@ -173,6 +256,22 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             stat.S_IMODE(self.media_root.stat().st_mode),
             0o700,
         )
+
+    def test_adjust_ownership_excludes_backup_root_and_payload(self):
+        self.database_path.write_bytes(b"database")
+        self.backup_root.mkdir()
+        held_lock = mock.Mock()
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.adjust_storage_ownership",
+        ) as adjust:
+            coordinator.adjust_ownership(held_lock)
+
+        args = adjust.call_args.args
+        self.assertNotIn(str(self.backup_root), args[1])
+        self.assertEqual(adjust.call_args.kwargs, {})
 
     def test_full_run_uses_exact_phase_and_service_order(self):
         events = []
@@ -402,6 +501,30 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             initial_space=SpaceBudget(300, 64, 364),
         )
 
+    @staticmethod
+    def _set_terminal_summaries(coordinator, run):
+        coordinator._media_summary = AutoV2PlanSummary(
+            run_id=run.run_id,
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+            image_count=1,
+            md5_legacy=1,
+            fixed_slot=0,
+            named_canonical=0,
+            copy_required_bytes=1,
+        )
+        coordinator._backfill_summary = BackfillSummary(
+            run_id=run.run_id,
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+            scanned=1,
+            eligible=1,
+            registered=1,
+            already_registered=0,
+            skipped=0,
+            reason_counts={},
+        )
+
     def test_summary_rejects_symlink_hardlink_and_wrong_mode_target(self):
         mutators = (
             "symlink",
@@ -550,6 +673,196 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             coordinator._write_summary(run)
 
         self.assertFalse(Path(run.path, "migration-summary.json").exists())
+
+    def test_summary_accepts_shared_backfill_collision_reason_codes(self):
+        run = self._summary_run()
+        coordinator = self.coordinator()
+        coordinator._backfill_summary = BackfillSummary(
+            run_id=run.run_id,
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+            scanned=3,
+            eligible=0,
+            registered=0,
+            already_registered=0,
+            skipped=3,
+            reason_counts={
+                "existing_registry_collision": 1,
+                "duplicate_registry_collision": 2,
+            },
+        )
+
+        coordinator._write_summary(run)
+
+        summary = json.loads(
+            Path(run.path, "migration-summary.json").read_text("utf-8")
+        )
+        self.assertEqual(summary["reason_counts"], {
+            "duplicate_registry_collision": 2,
+            "existing_registry_collision": 1,
+        })
+
+    def test_summary_restores_typed_counts_from_persisted_manifest_hashes(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run,
+            "initialized",
+            "schema_complete",
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "paths_complete",
+            "registry_complete",
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+        )
+        media = AutoV2PlanSummary(
+            run_id=run.run_id,
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+            image_count=7,
+            md5_legacy=2,
+            fixed_slot=3,
+            named_canonical=2,
+            copy_required_bytes=50,
+        )
+        backfill = BackfillSummary(
+            run_id=run.run_id,
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+            scanned=7,
+            eligible=4,
+            registered=4,
+            already_registered=1,
+            skipped=2,
+            reason_counts={"duplicate_registry_collision": 2},
+        )
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_auto_v2_summary",
+            return_value=media,
+            create=True,
+        ) as load_media, mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_media_asset_backfill_summary",
+            return_value=backfill,
+            create=True,
+        ) as load_backfill:
+            coordinator._write_summary(run)
+
+        load_media.assert_called_once()
+        load_backfill.assert_called_once()
+        summary = json.loads(
+            Path(run.path, "migration-summary.json").read_text("utf-8")
+        )
+        self.assertEqual(summary["media_image_count"], 7)
+        self.assertEqual(summary["backfill_registered"], 4)
+        self.assertEqual(
+            summary["reason_counts"],
+            {"duplicate_registry_collision": 2},
+        )
+
+    def test_summary_rejects_restored_manifest_hash_mismatch(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run,
+            "initialized",
+            "schema_complete",
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        mismatched = AutoV2PlanSummary(
+            run_id=run.run_id,
+            plan_sha256="1" * 64,
+            manifest_sha256="9" * 64,
+            image_count=1,
+            md5_legacy=1,
+            fixed_slot=0,
+            named_canonical=0,
+            copy_required_bytes=1,
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_auto_v2_summary",
+            return_value=mismatched,
+            create=True,
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^migration_state_plan_mismatch$",
+        ):
+            self.coordinator()._write_summary(run)
+
+    def test_complete_resume_repairs_missing_summary_from_typed_manifests(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run, "initialized", "schema_complete"
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "paths_complete",
+            "registry_complete",
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "registry_complete",
+            "complete",
+        )
+        coordinator = self.coordinator()
+        self._set_terminal_summaries(coordinator, run)
+        media = coordinator._media_summary
+        backfill = coordinator._backfill_summary
+        coordinator._media_summary = None
+        coordinator._backfill_summary = None
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=self.evidence(present=False),
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_configuration_preflight",
+            return_value=PreflightResult(ok=True),
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_auto_v2_summary",
+            return_value=media,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_media_asset_backfill_summary",
+            return_value=backfill,
+        ):
+            coordinator.converge_after_schema(run)
+
+        summary = json.loads(
+            Path(run.path, "migration-summary.json").read_text("utf-8")
+        )
+        self.assertEqual(summary["phase"], "complete")
+        self.assertEqual(summary["media_image_count"], 1)
+        self.assertEqual(summary["backfill_registered"], 1)
 
     def test_resume_at_schema_complete_never_repeats_snapshot_or_first_space(self):
         run = self._summary_run()
@@ -767,6 +1080,8 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                 return executed
 
         coordinator = self.coordinator()
+        self._set_terminal_summaries(coordinator, run)
+        coordinator._backfill_summary = None
         with mock.patch(
             "django_images.services.legacy_startup.MediaAssetBackfiller",
             return_value=Backfiller(),
@@ -851,6 +1166,8 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         )
         evidence = self.evidence(present=False)
 
+        coordinator = self.coordinator()
+        self._set_terminal_summaries(coordinator, run)
         with mock.patch(
             "django_images.services.legacy_startup."
             "startup_preflight.inspect_legacy_evidence",
@@ -863,10 +1180,129 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "django_images.services.legacy_startup.LegacyMediaArchive",
             return_value=archive,
         ):
-            self.coordinator().converge_after_schema(run)
+            coordinator.converge_after_schema(run)
 
         self.assertEqual(
             migration_state.read_run_status(run).phase,
             "complete",
         )
         archive.converge.assert_not_called()
+
+    def test_complete_summary_failure_leaves_state_resumable(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run, "initialized", "schema_complete"
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "paths_complete",
+            "registry_complete",
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+        )
+        coordinator = self.coordinator()
+        self._set_terminal_summaries(coordinator, run)
+        archive = mock.Mock()
+        archive.prepare.return_value = SimpleNamespace(
+            intents=(),
+            progress=None,
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=self.evidence(present=False),
+        ), mock.patch(
+            "django_images.services.legacy_startup.LegacyMediaArchive",
+            return_value=archive,
+        ), mock.patch(
+            "django_images.services.legacy_startup._atomic_write_summary",
+            side_effect=LegacyStartupError("unsafe_migration_summary"),
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^unsafe_migration_summary$",
+        ):
+            coordinator._converge_archive(run)
+
+        self.assertEqual(
+            migration_state.read_run_status(run).phase,
+            "registry_complete",
+        )
+
+    def test_complete_summary_is_durable_before_state_transition_fault(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run, "initialized", "schema_complete"
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "paths_complete",
+            "registry_complete",
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+        )
+
+        def crash(point):
+            if point == "after_complete_summary":
+                raise RuntimeError("simulated complete transition crash")
+
+        coordinator = self.coordinator(fault_injector=crash)
+        self._set_terminal_summaries(coordinator, run)
+        archive = mock.Mock()
+        archive.prepare.return_value = SimpleNamespace(
+            intents=(),
+            progress=None,
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=self.evidence(present=False),
+        ), mock.patch(
+            "django_images.services.legacy_startup.LegacyMediaArchive",
+            return_value=archive,
+        ), self.assertRaisesRegex(
+            RuntimeError,
+            "^simulated complete transition crash$",
+        ):
+            coordinator._converge_archive(run)
+
+        self.assertEqual(
+            migration_state.read_run_status(run).phase,
+            "registry_complete",
+        )
+        summary = json.loads(
+            Path(run.path, "migration-summary.json").read_text("utf-8")
+        )
+        self.assertEqual(summary["phase"], "complete")
+
+        resumed = self.coordinator()
+        self._set_terminal_summaries(resumed, run)
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=self.evidence(present=False),
+        ), mock.patch(
+            "django_images.services.legacy_startup.LegacyMediaArchive",
+            return_value=archive,
+        ):
+            resumed._converge_archive(run)
+
+        self.assertEqual(
+            migration_state.read_run_status(run).phase,
+            "complete",
+        )

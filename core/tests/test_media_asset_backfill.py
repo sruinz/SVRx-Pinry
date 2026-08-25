@@ -33,6 +33,9 @@ from core.services.idempotency import IdempotencyStore
 from core.services.media_asset_backfill import (
     BackfillSummary,
     MediaAssetBackfiller,
+    SAFE_BACKFILL_REASON_CODES,
+    load_completed_media_asset_backfill_summary,
+    load_media_asset_plan,
     recover_incomplete_media_asset_plan,
 )
 from core.services.media_storage import MediaStorage
@@ -404,6 +407,113 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             ).read_bytes()
         ).hexdigest())
 
+        loaded = load_media_asset_plan(
+            service.run_directory,
+            MANIFEST_FILENAME,
+            service.run_id,
+            os.geteuid(),
+            os.getegid(),
+        )
+        self.assertEqual(loaded, executed)
+        self.assertEqual(
+            load_completed_media_asset_backfill_summary(
+                service.run_directory,
+                MANIFEST_FILENAME,
+                service.run_id,
+                os.geteuid(),
+                os.getegid(),
+            ),
+            executed,
+        )
+
+    def test_public_plan_loader_never_creates_a_missing_manifest(self):
+        run_id, run_directory = self._new_run()
+        manifest = run_directory / MANIFEST_FILENAME
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^unsafe_media_asset_manifest$",
+        ):
+            load_media_asset_plan(
+                str(run_directory),
+                MANIFEST_FILENAME,
+                run_id,
+                os.geteuid(),
+                os.getegid(),
+            )
+
+        self.assertFalse(manifest.exists())
+        with self.assertRaisesRegex(
+            CommandError,
+            "^unsafe_media_asset_manifest$",
+        ):
+            load_completed_media_asset_backfill_summary(
+                str(run_directory),
+                MANIFEST_FILENAME,
+                run_id,
+                os.geteuid(),
+                os.getegid(),
+            )
+        self.assertFalse(manifest.exists())
+
+    def test_public_recovery_never_creates_a_missing_manifest(self):
+        run_id, run_directory = self._new_run()
+        manifest = run_directory / MANIFEST_FILENAME
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^unsafe_media_asset_manifest$",
+        ):
+            recover_incomplete_media_asset_plan(
+                str(run_directory),
+                MANIFEST_FILENAME,
+                run_id,
+                os.geteuid(),
+                os.getegid(),
+            )
+
+        self.assertFalse(manifest.exists())
+
+    def test_public_plan_loader_rejects_torn_terminal_tail(self):
+        self._create_candidate()
+        service = self._service()
+        service.run(execute=True)
+        manifest = Path(service.run_directory, MANIFEST_FILENAME)
+        before = manifest.read_bytes() + b'{"format_version":2'
+        with manifest.open("ab") as file_obj:
+            file_obj.write(b'{"format_version":2')
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^media_asset_manifest_torn_tail_requires_execute$",
+        ):
+            load_media_asset_plan(
+                service.run_directory,
+                MANIFEST_FILENAME,
+                service.run_id,
+                os.geteuid(),
+                os.getegid(),
+            )
+
+        self.assertEqual(manifest.read_bytes(), before)
+
+    def test_completed_summary_loader_rejects_plan_before_execution(self):
+        self._create_candidate()
+        service = self._service()
+        service.run(execute=False)
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^media_asset_plan_incomplete$",
+        ):
+            load_completed_media_asset_backfill_summary(
+                service.run_directory,
+                MANIFEST_FILENAME,
+                service.run_id,
+                os.geteuid(),
+                os.getegid(),
+            )
+
     def test_incomplete_plan_prefix_is_reset_for_same_run_replanning(self):
         self._create_candidate(content=_png_bytes("red"))
         self._create_candidate(content=_png_bytes("blue"))
@@ -612,6 +722,10 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             summary.reason_counts,
             {"existing_registry_collision": 1},
         )
+        self.assertIn(
+            "existing_registry_collision",
+            SAFE_BACKFILL_REASON_CODES,
+        )
         self.assertEqual(MediaAsset.objects.count(), 1)
         self.assertFalse(
             MediaAsset.objects.filter(image=legacy["image"]).exists()
@@ -630,6 +744,10 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         self.assertEqual(
             summary.reason_counts,
             {"duplicate_registry_collision": 2},
+        )
+        self.assertIn(
+            "duplicate_registry_collision",
+            SAFE_BACKFILL_REASON_CODES,
         )
         self.assertFalse(MediaAsset.objects.exists())
 

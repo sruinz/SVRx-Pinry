@@ -168,6 +168,7 @@ class LegacyEvidenceTests(SimpleTestCase):
         self.assertFalse(evidence.pending_schema)
         self.assertEqual(evidence.pending_migrations, ())
         self.assertFalse(evidence.has_legacy_evidence)
+        self.assertFalse(evidence.has_media_rows)
         self.assertIsNone(evidence.database_identity)
         media_stat = os.stat(str(self.media_root))
         self.assertEqual(evidence.media_root_identity, {
@@ -209,6 +210,35 @@ class LegacyEvidenceTests(SimpleTestCase):
         self.assertTrue(evidence.pending_schema)
         self.assertEqual(evidence.distinct_legacy_bytes, 13)
         self.assertTrue(evidence.has_legacy_evidence)
+
+    def test_existing_canonical_image_is_explicit_media_row_evidence(self):
+        self._create_database(
+            image_paths=(
+                "originals/{}/photo.jpg".format(ASSET_UUID),
+            ),
+        )
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertTrue(evidence.has_media_rows)
+        self.assertFalse(evidence.has_legacy_evidence)
+
+    def test_existing_media_asset_is_explicit_media_row_evidence(self):
+        self._create_database()
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            connection.execute(
+                "CREATE TABLE core_mediaasset (id INTEGER PRIMARY KEY)"
+            )
+            connection.execute("INSERT INTO core_mediaasset (id) VALUES (1)")
+            connection.commit()
+        finally:
+            connection.close()
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertTrue(evidence.has_media_rows)
+        self.assertFalse(evidence.has_legacy_evidence)
 
     def test_original_leaf_uses_asset_metadata_to_distinguish_generation(self):
         cases = (
@@ -731,6 +761,48 @@ class StoragePreflightTests(SimpleTestCase):
             (unmanaged.stat().st_dev, unmanaged.stat().st_ino),
             (unmanaged_before.st_dev, unmanaged_before.st_ino),
         )
+        root_after = os.stat(str(data_root), follow_symlinks=False)
+        self.assertEqual(root_after.st_uid, lock_before.st_uid)
+        self.assertEqual(root_after.st_gid, os.getegid())
+        self.assertEqual(stat.S_IMODE(root_after.st_mode), 0o1770)
+
+    def test_ownership_never_normalizes_backup_root_or_archived_payload(self):
+        data_root = self.media_root / "data"
+        data_root.mkdir()
+        backup_root = data_root / "legacy-backup"
+        archived = backup_root / "old-run" / "media" / "asset.bin"
+        archived.parent.mkdir(parents=True)
+        archived.write_bytes(b"archived")
+        held = startup_lock.acquire_startup_lock(str(data_root))
+        self.addCleanup(held.close)
+        backup_identity = (
+            backup_root.stat().st_dev,
+            backup_root.stat().st_ino,
+        )
+        archived_identity = (archived.stat().st_dev, archived.stat().st_ino)
+        chowned_identities = []
+        real_fchown = os.fchown
+
+        def record_fchown(descriptor, uid, gid):
+            current = os.fstat(descriptor)
+            chowned_identities.append((current.st_dev, current.st_ino))
+            return real_fchown(descriptor, uid, gid)
+
+        with mock.patch.object(
+            startup_preflight.os,
+            "fchown",
+            side_effect=record_fchown,
+        ):
+            startup_preflight.adjust_storage_ownership(
+                str(data_root),
+                (),
+                os.geteuid(),
+                os.getegid(),
+                held.fileno(),
+            )
+
+        self.assertNotIn(backup_identity, chowned_identities)
+        self.assertNotIn(archived_identity, chowned_identities)
 
     def test_ownership_normalizes_outside_path_to_unsafe_reason(self):
         data_root = self.media_root / "data"

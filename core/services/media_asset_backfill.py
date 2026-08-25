@@ -54,6 +54,13 @@ _PRELIMINARY_REASONS = {
     "pipeline_closure_mismatch",
     "unsafe_media_file",
 }
+SAFE_BACKFILL_REASON_CODES = frozenset(
+    _PRELIMINARY_REASONS
+    | {
+        "existing_registry_collision",
+        "duplicate_registry_collision",
+    }
+)
 _RESULT_EVENTS = {
     "registered",
     "skipped",
@@ -533,6 +540,7 @@ class _BackfillManifestLog(object):
         run_id,
         service_uid,
         service_gid,
+        create=True,
     ):
         if (
             type(run_id) is not str
@@ -546,6 +554,7 @@ class _BackfillManifestLog(object):
             or service_uid < 0
             or type(service_gid) is not int
             or service_gid < 0
+            or type(create) is not bool
         ):
             raise _command_error("unsafe_media_asset_manifest")
         if os.path.basename(run_directory) != run_id:
@@ -576,6 +585,8 @@ class _BackfillManifestLog(object):
                     dir_fd=run_handle.descriptor,
                 )
             except FileNotFoundError:
+                if not create:
+                    raise
                 descriptor = os.open(
                     filename,
                     flags | os.O_CREAT | os.O_EXCL,
@@ -947,8 +958,109 @@ def recover_incomplete_media_asset_plan(
         run_id,
         service_uid,
         service_gid,
+        create=False,
     ) as manifest:
         return manifest._reset_incomplete_plan()
+
+
+def load_media_asset_plan(
+    run_directory,
+    filename,
+    run_id,
+    service_uid,
+    service_gid,
+):
+    """완성되고 fsync된 backfill 계획을 typed 요약으로 읽는다."""
+    with _BackfillManifestLog.open(
+        run_directory,
+        filename,
+        run_id,
+        service_uid,
+        service_gid,
+        create=False,
+    ) as manifest:
+        plans = list(manifest.state.plans)
+        manifest.plan_sha256()
+        decisions = MediaAssetBackfiller._decisions(plans)
+        MediaAssetBackfiller._validate_terminal_events(
+            manifest,
+            plans,
+            decisions,
+        )
+        return _build_backfill_summary(
+            manifest,
+            plans,
+            decisions,
+            run_id,
+        )
+
+
+def load_completed_media_asset_backfill_summary(
+    run_directory,
+    filename,
+    run_id,
+    service_uid,
+    service_gid,
+):
+    """execute terminal이 전체 완결된 backfill typed 요약만 읽는다."""
+    with _BackfillManifestLog.open(
+        run_directory,
+        filename,
+        run_id,
+        service_uid,
+        service_gid,
+        create=False,
+    ) as manifest:
+        plans = list(manifest.state.plans)
+        manifest.plan_sha256()
+        decisions = MediaAssetBackfiller._decisions(plans)
+        MediaAssetBackfiller._validate_terminal_events(
+            manifest,
+            plans,
+            decisions,
+            require_complete=True,
+        )
+        return _build_backfill_summary(
+            manifest,
+            plans,
+            decisions,
+            run_id,
+        )
+
+
+def _build_backfill_summary(manifest, plans, decisions, run_id):
+    reason_counts = {}
+    eligible = 0
+    already_registered = 0
+    skipped = 0
+    for plan in plans:
+        decision = decisions[plan.image_id]
+        if decision == "register":
+            eligible += 1
+        elif decision == "already_registered":
+            already_registered += 1
+        else:
+            skipped += 1
+            reason_counts[decision] = reason_counts.get(decision, 0) + 1
+    registered = sum(
+        1
+        for event in manifest.state.latest_by_image.values()
+        if event["event"] in (
+            "registered",
+            "recovered_registered",
+        )
+    )
+    return BackfillSummary(
+        run_id=run_id,
+        plan_sha256=manifest.plan_sha256(),
+        manifest_sha256=manifest.manifest_sha256(),
+        scanned=len(plans),
+        eligible=eligible,
+        registered=registered,
+        already_registered=already_registered,
+        skipped=skipped,
+        reason_counts=dict(sorted(reason_counts.items())),
+    )
 
 
 class MediaAssetBackfiller(object):
@@ -1530,10 +1642,17 @@ class MediaAssetBackfiller(object):
         return decisions
 
     @staticmethod
-    def _validate_terminal_events(manifest, plans, decisions):
+    def _validate_terminal_events(
+        manifest,
+        plans,
+        decisions,
+        require_complete=False,
+    ):
         for plan in plans:
             terminal = manifest.state.latest_by_image.get(plan.image_id)
             if terminal is None:
+                if require_complete:
+                    raise _command_error("media_asset_plan_incomplete")
                 continue
             decision = decisions[plan.image_id]
             event_name = terminal["event"]
@@ -1998,37 +2117,11 @@ class MediaAssetBackfiller(object):
                 return
 
     def _summary(self, manifest, plans, decisions):
-        reason_counts = {}
-        eligible = 0
-        already_registered = 0
-        skipped = 0
-        for plan in plans:
-            decision = decisions[plan.image_id]
-            if decision == "register":
-                eligible += 1
-            elif decision == "already_registered":
-                already_registered += 1
-            else:
-                skipped += 1
-                reason_counts[decision] = reason_counts.get(decision, 0) + 1
-        registered = sum(
-            1
-            for event in manifest.state.latest_by_image.values()
-            if event["event"] in (
-                "registered",
-                "recovered_registered",
-            )
-        )
-        return BackfillSummary(
-            run_id=self.run_id,
-            plan_sha256=manifest.plan_sha256(),
-            manifest_sha256=manifest.manifest_sha256(),
-            scanned=len(plans),
-            eligible=eligible,
-            registered=registered,
-            already_registered=already_registered,
-            skipped=skipped,
-            reason_counts=dict(sorted(reason_counts.items())),
+        return _build_backfill_summary(
+            manifest,
+            plans,
+            decisions,
+            self.run_id,
         )
 
     def _fault(self, event):

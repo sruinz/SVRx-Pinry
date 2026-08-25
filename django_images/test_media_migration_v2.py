@@ -32,6 +32,7 @@ from django_images.services.media_migration_v2 import (
     AutoV2PlanSummary,
     _valid_staging_name,
     load_auto_v2_archive_sources,
+    load_completed_auto_v2_summary,
     load_auto_v2_plan,
     recover_incomplete_auto_v2_plan,
 )
@@ -560,6 +561,66 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         self.assertEqual(executed.plan_sha256, planned.plan_sha256)
         self.assertNotEqual(executed.manifest_sha256, planned.manifest_sha256)
+        self.assertEqual(
+            load_completed_auto_v2_summary(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+            ),
+            executed,
+        )
+
+    def test_public_plan_loader_never_creates_a_missing_manifest(self):
+        self.assertFalse(self.manifest_path.exists())
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^unsafe_auto_v2_manifest$",
+        ):
+            load_auto_v2_plan(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+            )
+
+        self.assertFalse(self.manifest_path.exists())
+        with self.assertRaisesRegex(
+            CommandError,
+            "^unsafe_auto_v2_manifest$",
+        ):
+            load_completed_auto_v2_summary(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+            )
+        self.assertFalse(self.manifest_path.exists())
+
+    def test_completed_summary_loader_rejects_plan_before_execution(self):
+        self.make_image()
+        planned = self.migrator().run(execute=False)
+        self.assertEqual(planned.image_count, 1)
+        self.assertEqual(
+            [event["event"] for event in self.manifest_events()],
+            ["planned", "plan_complete"],
+        )
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^auto_v2_plan_incomplete$",
+        ):
+            load_completed_auto_v2_summary(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+            )
 
     def test_incomplete_plan_prefix_is_reset_for_same_run_replanning(self):
         self.make_image()

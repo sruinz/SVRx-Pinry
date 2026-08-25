@@ -18,6 +18,4 @@ if [ "$#" -gt 1 ] || {
     exit 2
 fi
 
-bash "${PROJECT_ROOT}/docker/scripts/bootstrap.sh"
-
 exec python "${PROJECT_ROOT}/docker/scripts/startup.py" "$@"
