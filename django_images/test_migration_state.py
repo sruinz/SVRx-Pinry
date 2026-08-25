@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import stat
 import tempfile
 from unittest import mock
@@ -21,6 +22,10 @@ class MigrationStateTests(SimpleTestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
         temporary_root = os.path.realpath(self.temporary_directory.name)
+        self.data_root = temporary_root
+        self.settings_override = self.settings(PINRY_DATA_ROOT=self.data_root)
+        self.settings_override.enable()
+        self.addCleanup(self.settings_override.disable)
         self.backup_root = os.path.join(
             temporary_root,
             "legacy-backup",
@@ -392,3 +397,135 @@ class MigrationStateTests(SimpleTestCase):
             ],
             [],
         )
+
+    def test_inventory_rejects_backup_root_outside_configured_data_root(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        outside_root = os.path.realpath(outside.name)
+        outside_backup = os.path.join(outside_root, "legacy-backup")
+        os.mkdir(outside_backup, 0o700)
+
+        with self.assertRaisesRegex(
+            MigrationStateError,
+            "^migration_state_root_invalid$",
+        ) as captured:
+            scan_run_inventory(outside_backup)
+
+        self.assertNotIn(outside_backup, str(captured.exception))
+
+    def test_inventory_rejects_symlinked_configured_backup_root(self):
+        configured_root = os.path.join(self.data_root, "configured")
+        os.mkdir(configured_root, 0o700)
+        outside_root = os.path.join(self.data_root, "outside")
+        os.mkdir(outside_root, 0o700)
+        outside_backup = os.path.join(outside_root, "legacy-backup")
+        os.mkdir(outside_backup, 0o700)
+        configured_backup = os.path.join(configured_root, "legacy-backup")
+        os.symlink(outside_backup, configured_backup)
+
+        with self.settings(PINRY_DATA_ROOT=configured_root), self.assertRaisesRegex(
+            MigrationStateError,
+            "^migration_state_root_invalid$",
+        ):
+            scan_run_inventory(configured_backup)
+
+    def test_resume_rejects_database_or_media_root_identity_change(self):
+        run = self.create_run()
+
+        for identity_name, replacement in (
+            ("database_identity", {"device": 10, "inode": 21}),
+            ("media_root_identity", {"device": 30, "inode": 41}),
+        ):
+            evidence = self.evidence()
+            evidence[identity_name] = replacement
+            with self.subTest(identity_name=identity_name), self.assertRaisesRegex(
+                MigrationStateError,
+                "^migration_state_identity_changed$",
+            ):
+                resolve_or_create_run(
+                    scan_run_inventory(self.backup_root),
+                    evidence,
+                    False,
+                    "source-commit",
+                    self.uid,
+                    self.gid,
+                )
+        self.assertEqual(run.state["phase"], "initialized")
+
+    def test_plan_hash_cannot_change_after_first_persist(self):
+        run = self.create_run()
+        transition_state(
+            run,
+            "initialized",
+            "schema_complete",
+        )
+        transition_state(
+            run,
+            "schema_complete",
+            "copying",
+            plan_sha256="1" * 64,
+        )
+
+        with self.assertRaisesRegex(
+            MigrationStateError,
+            "^migration_state_plan_mismatch$",
+        ):
+            transition_state(
+                run,
+                "copying",
+                "copying",
+                plan_sha256="2" * 64,
+            )
+
+        inventory = scan_run_inventory(self.backup_root)
+        self.assertEqual(
+            inventory.incomplete[0].state["manifests"]["media"][
+                "plan_sha256"
+            ],
+            "1" * 64,
+        )
+
+    def test_creating_run_requires_strict_identity_intent_progress_structure(self):
+        cases = (
+            ("database_identity", "malformed"),
+            ("media_root_identity", "missing"),
+            ("intent", "malformed"),
+            ("progress", "malformed"),
+        )
+        run_ids = (
+            "20260825T010101Z-11111111-1111-4111-8111-111111111111",
+            "20260825T010102Z-22222222-2222-4222-8222-222222222222",
+            "20260825T010103Z-33333333-3333-4333-8333-333333333333",
+            "20260825T010104Z-44444444-4444-4444-8444-444444444444",
+        )
+        for run_id, case in zip(run_ids, cases):
+            field_name, mutation = case
+            creating_path = self.write_run_state(
+                run_id,
+                "initialized",
+                creating=True,
+            )
+            state_path = os.path.join(creating_path, "migration-state.json")
+            with open(state_path, "r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+            if mutation == "missing":
+                del state[field_name]
+            else:
+                state[field_name] = []
+            with open(state_path, "w", encoding="utf-8") as state_file:
+                json.dump(state, state_file)
+
+            try:
+                with self.subTest(field_name=field_name), self.assertRaisesRegex(
+                    MigrationStateError,
+                    "^migration_state_conflict$",
+                ):
+                    scan_run_inventory(self.backup_root)
+            finally:
+                for directory_name in (
+                    ".creating-{}".format(run_id),
+                    run_id,
+                ):
+                    path = os.path.join(self.backup_root, directory_name)
+                    if os.path.exists(path):
+                        shutil.rmtree(path)

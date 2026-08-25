@@ -15,6 +15,7 @@ from django_images.services.migration_state import (
     _NOFOLLOW,
     _load_run,
     _open_absolute_directory,
+    _open_configured_backup_root,
 )
 
 
@@ -36,6 +37,56 @@ class SnapshotInfo(object):
     source_inode: int
 
 
+class _SQLiteSource(object):
+    def __init__(
+        self,
+        path,
+        parent_descriptor,
+        descriptor,
+        file_stat,
+        connection,
+    ):
+        self.path = path
+        self.parent_descriptor = parent_descriptor
+        self.descriptor = descriptor
+        self.file_stat = file_stat
+        self.connection = connection
+
+    def verify_current(self):
+        try:
+            descriptor_stat = os.fstat(self.descriptor)
+            named_stat = os.stat(
+                os.path.basename(self.path),
+                dir_fd=self.parent_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            raise SQLiteSnapshotError("sqlite_source_identity_changed") from None
+        for current in (descriptor_stat, named_stat):
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_nlink != 1
+                or current.st_dev != self.file_stat.st_dev
+                or current.st_ino != self.file_stat.st_ino
+                or current.st_size != self.file_stat.st_size
+            ):
+                raise SQLiteSnapshotError("sqlite_source_identity_changed")
+
+    def close(self):
+        if self.connection is not None:
+            connection = self.connection
+            self.connection = None
+            connection.close()
+        if self.descriptor is not None:
+            descriptor = self.descriptor
+            self.descriptor = None
+            os.close(descriptor)
+        if self.parent_descriptor is not None:
+            parent_descriptor = self.parent_descriptor
+            self.parent_descriptor = None
+            os.close(parent_descriptor)
+
+
 def snapshot_sqlite(source_path, run, service_uid, service_gid):
     """mode=ro source를 online backup하고 quick_check·fsync한다."""
     configured = settings.DATABASES["default"]
@@ -46,12 +97,14 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
         )
     source_absolute = _configured_source_path(source_path, configured)
     _require_contained_source(source_absolute, settings.PINRY_DATA_ROOT)
-    source_stat = _source_identity(source_absolute)
-    if source_stat is None:
+    source = _open_sqlite_source(source_absolute)
+    if source is None:
         return None
 
-    root_descriptor, run_descriptor = _open_verified_run(run)
+    root_descriptor = None
+    run_descriptor = None
     try:
+        root_descriptor, run_descriptor = _open_verified_run(run)
         current = _load_run(
             run.backup_root,
             root_descriptor,
@@ -65,7 +118,7 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
             raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
         if current.state["phase"] != "snapshot_intent":
             raise SQLiteSnapshotError("sqlite_snapshot_phase_invalid")
-        _verify_snapshot_intent_source(current.state, source_stat)
+        _verify_snapshot_intent_source(current.state, source.file_stat)
         final_exists = _entry_exists(run_descriptor, SNAPSHOT_FILENAME)
         temp_exists = _entry_exists(run_descriptor, SNAPSHOT_TEMP_FILENAME)
         if final_exists and temp_exists:
@@ -74,14 +127,14 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
                 SNAPSHOT_FILENAME,
                 service_uid,
                 service_gid,
-                source_stat,
+                source.file_stat,
             )
             _verified_snapshot(
                 run_descriptor,
                 SNAPSHOT_TEMP_FILENAME,
                 service_uid,
                 service_gid,
-                source_stat,
+                source.file_stat,
             )
             raise SQLiteSnapshotError("sqlite_snapshot_conflict")
         if final_exists:
@@ -90,9 +143,10 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
                 SNAPSHOT_FILENAME,
                 service_uid,
                 service_gid,
-                source_stat,
+                source.file_stat,
             )
             _verify_named_run_identity(run, run_descriptor)
+            source.verify_current()
             return info
         if temp_exists:
             info = _verified_snapshot(
@@ -100,16 +154,16 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
                 SNAPSHOT_TEMP_FILENAME,
                 service_uid,
                 service_gid,
-                source_stat,
+                source.file_stat,
             )
             _verify_named_run_identity(run, run_descriptor)
+            source.verify_current()
             _promote_snapshot(run_descriptor)
             return info
 
         _create_snapshot_temp(
             run_descriptor,
-            source_absolute,
-            source_stat,
+            source,
             service_uid,
             service_gid,
         )
@@ -119,9 +173,10 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
             SNAPSHOT_TEMP_FILENAME,
             service_uid,
             service_gid,
-            source_stat,
+            source.file_stat,
         )
         _verify_named_run_identity(run, run_descriptor)
+        source.verify_current()
         _promote_snapshot(run_descriptor)
         return info
     except SQLiteSnapshotError:
@@ -131,8 +186,11 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
     except (OSError, sqlite3.Error, TypeError, ValueError):
         raise SQLiteSnapshotError("sqlite_snapshot_failed") from None
     finally:
-        os.close(run_descriptor)
-        os.close(root_descriptor)
+        if run_descriptor is not None:
+            os.close(run_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+        source.close()
 
 
 def _configured_source_path(source_path, configured):
@@ -165,7 +223,7 @@ def _require_contained_source(source_path, data_root):
         os.close(descriptor)
 
 
-def _source_identity(source_path):
+def _open_sqlite_source(source_path):
     try:
         source_stat = os.lstat(source_path)
     except OSError as error:
@@ -188,6 +246,7 @@ def _source_identity(source_path):
     except MigrationStateError:
         raise SQLiteSnapshotError("unsafe_sqlite_source") from None
     descriptor = None
+    connection = None
     try:
         descriptor = os.open(
             leaf_name,
@@ -202,23 +261,55 @@ def _source_identity(source_path):
             or descriptor_stat.st_ino != source_stat.st_ino
         ):
             raise SQLiteSnapshotError("unsafe_sqlite_source")
-        return descriptor_stat
+        connection_path = os.path.join(
+            _directory_descriptor_path(parent_descriptor),
+            leaf_name,
+        )
+        connection = sqlite3.connect(
+            "file:{}?mode=ro".format(quote(connection_path, safe="/")),
+            uri=True,
+        )
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        connection.execute(
+            "SELECT rootpage FROM sqlite_master LIMIT 1"
+        ).fetchone()
+        source = _SQLiteSource(
+            path=source_path,
+            parent_descriptor=parent_descriptor,
+            descriptor=descriptor,
+            file_stat=descriptor_stat,
+            connection=connection,
+        )
+        parent_descriptor = None
+        descriptor = None
+        connection = None
+        source.verify_current()
+        return source
     except SQLiteSnapshotError:
         raise
-    except OSError:
+    except (OSError, sqlite3.Error):
         raise SQLiteSnapshotError("unsafe_sqlite_source") from None
     finally:
+        if connection is not None:
+            connection.close()
         if descriptor is not None:
             os.close(descriptor)
-        os.close(parent_descriptor)
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
 
 
 def _open_verified_run(run):
     try:
-        root_descriptor = _open_absolute_directory(
+        root_descriptor = _open_configured_backup_root(
             run.backup_root,
-            "sqlite_snapshot_state_invalid",
         )
+        root_stat = os.fstat(root_descriptor)
+        if (
+            root_stat.st_dev != run.backup_root_device
+            or root_stat.st_ino != run.backup_root_inode
+        ):
+            raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
         run_descriptor = os.open(
             run.run_id,
             _DIRECTORY_FLAGS | _NOFOLLOW,
@@ -248,8 +339,7 @@ def _open_verified_run(run):
 
 def _create_snapshot_temp(
     run_descriptor,
-    source_path,
-    source_stat,
+    source,
     service_uid,
     service_gid,
 ):
@@ -266,12 +356,12 @@ def _create_snapshot_temp(
         os.fchown(descriptor, service_uid, service_gid)
         ownership_set = True
         _copy_database(
-            source_path,
+            source,
             run_descriptor,
             SNAPSHOT_TEMP_FILENAME,
         )
         os.fsync(descriptor)
-        _verify_source_unchanged(source_path, source_stat)
+        source.verify_current()
     except SQLiteSnapshotError as error:
         if error.code == "sqlite_source_identity_changed":
             if descriptor is not None:
@@ -298,26 +388,19 @@ def _create_snapshot_temp(
             os.close(descriptor)
 
 
-def _copy_database(source_path, destination_descriptor, destination_name):
-    source = None
+def _copy_database(source, destination_descriptor, destination_name):
     destination = None
     try:
         destination_path = os.path.join(
             _directory_descriptor_path(destination_descriptor),
             destination_name,
         )
-        source = sqlite3.connect(
-            "file:{}?mode=ro".format(quote(source_path, safe="/")),
-            uri=True,
-        )
         destination = sqlite3.connect(destination_path)
-        source.backup(destination)
+        source.connection.backup(destination)
         destination.commit()
     finally:
         if destination is not None:
             destination.close()
-        if source is not None:
-            source.close()
 
 
 def _verified_snapshot(
@@ -397,25 +480,15 @@ def _promote_snapshot(run_descriptor):
         raise SQLiteSnapshotError("sqlite_snapshot_failed") from None
 
 
-def _verify_source_unchanged(source_path, expected_stat):
-    current = _source_identity(source_path)
-    if current is None or (
-        current.st_dev != expected_stat.st_dev
-        or current.st_ino != expected_stat.st_ino
-        or current.st_size != expected_stat.st_size
-    ):
-        raise SQLiteSnapshotError("sqlite_source_identity_changed")
-
-
 def _verify_snapshot_intent_source(state, source_stat):
     intent = state.get("intent")
-    if intent is None:
-        return
     if not isinstance(intent, dict):
+        raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
+    if intent.get("kind") != "sqlite_snapshot":
         raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
     has_device = "source_device" in intent
     has_inode = "source_inode" in intent
-    if has_device != has_inode:
+    if not has_device or not has_inode:
         raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
     if has_device and (
         intent["source_device"] != source_stat.st_dev
@@ -425,11 +498,22 @@ def _verify_snapshot_intent_source(state, source_stat):
 
 
 def _verify_named_run_identity(run, run_descriptor):
+    root_descriptor = None
     named_descriptor = None
     try:
-        named_descriptor = _open_absolute_directory(
-            run.path,
-            "sqlite_snapshot_state_invalid",
+        root_descriptor = _open_configured_backup_root(
+            run.backup_root,
+        )
+        root_stat = os.fstat(root_descriptor)
+        if (
+            root_stat.st_dev != run.backup_root_device
+            or root_stat.st_ino != run.backup_root_inode
+        ):
+            raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
+        named_descriptor = os.open(
+            run.run_id,
+            _DIRECTORY_FLAGS | _NOFOLLOW,
+            dir_fd=root_descriptor,
         )
         named_stat = os.fstat(named_descriptor)
         held_stat = os.fstat(run_descriptor)
@@ -445,6 +529,8 @@ def _verify_named_run_identity(run, run_descriptor):
     finally:
         if named_descriptor is not None:
             os.close(named_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
 
 
 def _directory_descriptor_path(descriptor):
