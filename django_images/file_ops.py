@@ -1,4 +1,5 @@
 import ctypes
+from contextlib import ExitStack, contextmanager
 import errno
 import hashlib
 import os
@@ -194,6 +195,33 @@ def media_lifecycle_lock(
         clock=clock,
         sleeper=sleeper,
     )
+
+
+@contextmanager
+def media_global_writer_gate(
+    root_directory,
+    deadline=None,
+    clock=None,
+    sleeper=None,
+):
+    with ExitStack() as locks:
+        for stripe in range(256):
+            locks.enter_context(MediaLifecycleLock(
+                root_directory,
+                exclusive=True,
+                deadline=deadline,
+                clock=clock,
+                sleeper=sleeper,
+                lock_filename="media-dedup-{:02x}.lock".format(stripe),
+            ))
+        locks.enter_context(media_lifecycle_lock(
+            root_directory,
+            exclusive=True,
+            deadline=deadline,
+            clock=clock,
+            sleeper=sleeper,
+        ))
+        yield
 
 
 def media_dedup_lock(

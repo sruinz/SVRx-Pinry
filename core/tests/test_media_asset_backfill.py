@@ -6,17 +6,25 @@ from pathlib import Path
 import sqlite3
 import stat
 import tempfile
+import threading
+import time
 import uuid
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import connection, transaction
+from django.db import (
+    close_old_connections,
+    connection,
+    connections,
+    transaction,
+)
 from django.db.models.signals import post_save
 from django.test import TransactionTestCase, override_settings
 import mock
 from PIL import Image as PILImage
 
+from core import models as core_models
 from core.models import MediaAsset, Pin
 from core.services import media_asset_backfill
 from core.services.idempotency import IdempotencyStore
@@ -662,6 +670,166 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             event == ("closure", True) for event in events
         ))
 
+    def test_global_writer_gate_spans_registry_commit_to_terminal_phase(self):
+        candidate = self._create_candidate(content=_png_bytes("red"))
+        service = self._service()
+        service.run()
+        planned_digest = hashlib.sha256(
+            candidate["fetched"].content
+        ).hexdigest()
+        planned_key = "{}:{}".format(
+            self.owner.pk,
+            planned_digest,
+        ).encode("ascii")
+        planned_stripe = hashlib.sha256(planned_key).digest()[0]
+        writer_content = None
+        for color in ("navy", "green", "blue", "purple"):
+            content = _png_bytes(color)
+            digest = hashlib.sha256(content).hexdigest()
+            writer_key = "{}:{}".format(
+                self.other_owner.pk,
+                digest,
+            ).encode("ascii")
+            if hashlib.sha256(writer_key).digest()[0] != planned_stripe:
+                writer_content = content
+                break
+        self.assertIsNotNone(writer_content)
+
+        writer_digest = hashlib.sha256(writer_content).hexdigest()
+        writer_result = {}
+
+        def run_writer():
+            close_old_connections()
+            root_directory = None
+            try:
+                root_directory = file_ops.open_media_root(
+                    self.temporary_media.name
+                )
+                deadline = time.monotonic() + 0.1
+                with file_ops.media_dedup_lock(
+                    root_directory,
+                    self.other_owner.pk,
+                    writer_digest,
+                    deadline=deadline,
+                ), file_ops.media_lifecycle_lock(
+                    root_directory,
+                    deadline=deadline,
+                ):
+                    image = Image.objects.create(
+                        image="legacy/concurrent.png",
+                        asset_uuid=uuid.uuid4(),
+                        original_filename="concurrent.png",
+                        width=1,
+                        height=1,
+                    )
+                    writer_result["image_id"] = image.pk
+            except BaseException as error:
+                writer_result["error"] = getattr(
+                    error,
+                    "code",
+                    error.__class__.__name__,
+                )
+            finally:
+                if root_directory is not None:
+                    root_directory.close()
+                connections["default"].close()
+
+        def contend_after_registry_commit(event):
+            if event != "after_registry_commit":
+                return
+            writer = threading.Thread(target=run_writer)
+            writer.start()
+            writer.join(2)
+            if writer.is_alive():
+                raise AssertionError("concurrent writer did not finish")
+
+        service.fault_injector = contend_after_registry_commit
+        command_error = None
+        try:
+            summary = service.run(execute=True)
+        except CommandError as error:
+            command_error = str(error)
+            summary = None
+
+        self.assertEqual(
+            (
+                command_error,
+                None if summary is None else summary.registered,
+                writer_result,
+                MediaAsset.objects.count(),
+                Image.objects.count(),
+            ),
+            (
+                None,
+                1,
+                {"error": "media_lifecycle_busy"},
+                1,
+                1,
+            ),
+        )
+
+    @override_settings(PINRY_FETCH_TOTAL_TIMEOUT=0.1)
+    def test_global_writer_gate_blocks_legacy_cleanup_between_phases(self):
+        self._create_candidate(content=_png_bytes("red"))
+        orphan = self._create_candidate(
+            owners=(),
+            content=_png_bytes("navy"),
+        )
+        service = self._service()
+        service.run()
+        cleanup_result = {}
+
+        def run_cleanup():
+            close_old_connections()
+            try:
+                core_models._delete_legacy_unreferenced_image(
+                    orphan["image"].pk,
+                    "default",
+                )
+                cleanup_result["deleted"] = True
+            except BaseException as error:
+                cleanup_result["error"] = getattr(
+                    error,
+                    "code",
+                    error.__class__.__name__,
+                )
+            finally:
+                connections["default"].close()
+
+        def contend_after_registry_commit(event):
+            if event != "after_registry_commit":
+                return
+            cleanup = threading.Thread(target=run_cleanup)
+            cleanup.start()
+            cleanup.join(2)
+            if cleanup.is_alive():
+                raise AssertionError("legacy cleanup did not finish")
+
+        service.fault_injector = contend_after_registry_commit
+        command_error = None
+        try:
+            summary = service.run(execute=True)
+        except CommandError as error:
+            command_error = str(error)
+            summary = None
+
+        self.assertEqual(
+            (
+                command_error,
+                None if summary is None else summary.registered,
+                cleanup_result,
+                MediaAsset.objects.count(),
+                Image.objects.count(),
+            ),
+            (
+                None,
+                1,
+                {"error": "media_lifecycle_busy"},
+                1,
+                2,
+            ),
+        )
+
     def test_precommit_fence_rechecks_owner_after_registry_insert(self):
         candidate = self._create_candidate()
         service = self._service()
@@ -971,9 +1139,14 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             "_verify_registry_event",
             side_effect=verify_then_delete,
         ):
-            service.run(execute=True)
+            with self.assertRaisesRegex(
+                CommandError,
+                "^registry_plan_identity_changed$",
+            ):
+                service.run(execute=True)
 
         self.assertTrue(observed["terminal_before_delete"])
+        self.assertTrue(MediaAsset.objects.exists())
 
     def test_partial_terminal_crash_resumes_after_all_registry_commits(self):
         self._create_candidate(content=_png_bytes("red"))

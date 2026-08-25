@@ -2096,17 +2096,22 @@ class PinMediaLifecycleTest(
         self.assertIsInstance(writer_result["error"], OperationalError)
         self.assertFalse(Image.objects.filter(pk=image_id).exists())
 
-    def test_cleanup_locks_image_before_recheck_and_instance_delete(self):
+    def test_cleanup_locks_media_asset_before_image_and_delete(self):
         image = create_image()
         pin = create_pin(self.owner, image, [])
         image_id = image.pk
         events = []
+        original_media_asset_lock = MediaAsset.objects.select_for_update
         original_select_for_update = BaseImage.objects.select_for_update
         original_pin_filter = Pin.objects.filter
         original_image_delete = BaseImage.delete
 
+        def observe_media_asset_lock(*args, **kwargs):
+            events.append(("media_asset_lock", connection.in_atomic_block))
+            return original_media_asset_lock(*args, **kwargs)
+
         def observe_lock(*args, **kwargs):
-            events.append(("lock", connection.in_atomic_block))
+            events.append(("image_lock", connection.in_atomic_block))
             return original_select_for_update(*args, **kwargs)
 
         def observe_reference_check(*args, **kwargs):
@@ -2120,6 +2125,10 @@ class PinMediaLifecycleTest(
             return original_image_delete(instance, *args, **kwargs)
 
         with mock.patch.object(
+            MediaAsset.objects,
+            "select_for_update",
+            side_effect=observe_media_asset_lock,
+        ), mock.patch.object(
             BaseImage.objects,
             "select_for_update",
             side_effect=observe_lock,
@@ -2137,7 +2146,8 @@ class PinMediaLifecycleTest(
         self.assertEqual(
             events,
             [
-                ("lock", True),
+                ("media_asset_lock", True),
+                ("image_lock", True),
                 ("reference_check", True),
                 ("instance_delete", True),
             ],

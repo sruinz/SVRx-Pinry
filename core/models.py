@@ -8,7 +8,11 @@ from django.db import connections, models, router, transaction
 from django.dispatch import receiver
 
 from django_images.models import Image as BaseImage, Thumbnail
-from django_images.file_ops import media_dedup_lock, open_media_root
+from django_images.file_ops import (
+    media_dedup_lock,
+    media_lifecycle_lock,
+    open_media_root,
+)
 from django_images.paths import (
     FORMAT_EXTENSIONS,
     canonical_original_path,
@@ -602,18 +606,37 @@ def _delete_pin_with_registry_lock(
 
 
 def _delete_legacy_unreferenced_image(image_id, using):
-    with transaction.atomic(using=using):
-        image = (
-            BaseImage.objects.select_for_update()
-            .using(using)
-            .filter(pk=image_id)
-            .first()
-        )
-        if image is None:
-            return
-        if Pin.objects.filter(image_id=image_id).using(using).exists():
-            return
-        image.delete(using=using)
+    root_directory = open_media_root(settings.MEDIA_ROOT)
+    try:
+        clock = time.monotonic
+        deadline = clock() + settings.PINRY_FETCH_TOTAL_TIMEOUT
+        with transaction.atomic(using=using):
+            with media_lifecycle_lock(
+                root_directory,
+                deadline=deadline,
+                clock=clock,
+            ):
+                registry = (
+                    MediaAsset.objects.select_for_update()
+                    .using(using)
+                    .filter(image_id=image_id)
+                    .first()
+                )
+                if registry is not None:
+                    return
+                image = (
+                    BaseImage.objects.select_for_update()
+                    .using(using)
+                    .filter(pk=image_id)
+                    .first()
+                )
+                if image is None:
+                    return
+                if Pin.objects.filter(image_id=image_id).using(using).exists():
+                    return
+                image.delete(using=using)
+    finally:
+        root_directory.close()
 
 
 def _delete_registered_unreferenced_image(image_id, registry, using):

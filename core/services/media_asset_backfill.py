@@ -1,4 +1,3 @@
-from contextlib import ExitStack
 from dataclasses import dataclass
 from io import BytesIO
 import hashlib
@@ -18,8 +17,7 @@ from core.services.media_storage import MediaStorage, MediaStorageError
 from core.services.safe_url_fetch import FetchedImage
 from django_images.file_ops import (
     MediaPathError,
-    media_dedup_lock,
-    media_lifecycle_lock,
+    media_global_writer_gate,
     open_verified_media_file,
     open_verified_media_root,
     sha256_file_descriptor,
@@ -1406,34 +1404,7 @@ class MediaAssetBackfiller(object):
             if manifest.plan_sha256() != plan_sha256:
                 raise _command_error("manifest_plan_mismatch")
 
-            with ExitStack() as file_locks:
-                dedup_keys = {}
-                for plan in plans:
-                    if (
-                        plan.submitter_id is None
-                        or plan.content_sha256 is None
-                    ):
-                        continue
-                    key = "{}:{}".format(
-                        plan.submitter_id,
-                        plan.content_sha256,
-                    ).encode("ascii")
-                    stripe = hashlib.sha256(key).digest()[0]
-                    dedup_keys.setdefault(
-                        stripe,
-                        (plan.submitter_id, plan.content_sha256),
-                    )
-                for stripe in sorted(dedup_keys):
-                    submitter_id, content_sha256 = dedup_keys[stripe]
-                    file_locks.enter_context(media_dedup_lock(
-                        root_directory,
-                        submitter_id,
-                        content_sha256,
-                    ))
-                file_locks.enter_context(
-                    media_lifecycle_lock(root_directory)
-                )
-
+            with media_global_writer_gate(root_directory):
                 registry_events = {}
                 with transaction.atomic():
                     _acquire_database_write_fence(connection)
@@ -1496,6 +1467,12 @@ class MediaAssetBackfiller(object):
                                 registry_events[plan.image_id],
                             )
                         root_directory.verify_current()
+                    self._verify_current_plans(
+                        manifest,
+                        plans,
+                        decisions,
+                        root_directory,
+                    )
         except CommandError:
             raise
         except (MediaPathError, OSError) as error:
