@@ -1,16 +1,20 @@
+from contextlib import ExitStack
 import fcntl
 import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
+import sys
 import tempfile
+import time
 
 from django.core.files.storage import DefaultStorage, FileSystemStorage
 from django.test import SimpleTestCase
 import mock
 
 from django_images import file_ops
-from django_images.services import startup_preflight
+from django_images.services import startup_lock, startup_preflight
 
 
 MIB = 1024 * 1024
@@ -48,7 +52,9 @@ class LegacyEvidenceTests(SimpleTestCase):
                 );
                 CREATE TABLE django_images_thumbnail (
                     id INTEGER PRIMARY KEY,
-                    image VARCHAR(255) NOT NULL
+                    image VARCHAR(255) NOT NULL,
+                    original_id INTEGER,
+                    size VARCHAR(100)
                 );
                 CREATE TABLE django_migrations (
                     id INTEGER PRIMARY KEY,
@@ -71,6 +77,61 @@ class LegacyEvidenceTests(SimpleTestCase):
                 VALUES (?, ?, '2026-08-25 00:00:00')
                 """,
                 list(applied),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _add_asset_metadata_and_derivatives(
+        self, original_filename, extension=".png"
+    ):
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            connection.execute(
+                "ALTER TABLE django_images_image "
+                "ADD COLUMN asset_uuid VARCHAR(36)"
+            )
+            connection.execute(
+                "ALTER TABLE django_images_image "
+                "ADD COLUMN original_filename VARCHAR(255)"
+            )
+            connection.execute(
+                "UPDATE django_images_image "
+                "SET asset_uuid = ?, original_filename = ? WHERE id = 1",
+                (ASSET_UUID, original_filename),
+            )
+            connection.executemany(
+                "INSERT INTO django_images_thumbnail "
+                "(image, original_id, size) VALUES (?, 1, ?)",
+                [
+                    (
+                        "derivatives/{}/{}{}".format(
+                            ASSET_UUID, size, extension
+                        ),
+                        size,
+                    )
+                    for size in ("thumbnail", "standard", "square")
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def _add_old_schema_derivatives(self, extension=".png"):
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            connection.executemany(
+                "INSERT INTO django_images_thumbnail "
+                "(image, original_id, size) VALUES (?, 1, ?)",
+                [
+                    (
+                        "derivatives/{}/{}{}".format(
+                            ASSET_UUID, size, extension
+                        ),
+                        size,
+                    )
+                    for size in ("thumbnail", "standard", "square")
+                ],
             )
             connection.commit()
         finally:
@@ -138,37 +199,62 @@ class LegacyEvidenceTests(SimpleTestCase):
         self.assertEqual(evidence.distinct_legacy_bytes, 13)
         self.assertTrue(evidence.has_legacy_evidence)
 
-    def test_fixed_slot_and_named_canonical_paths_are_distinct(self):
+    def test_original_leaf_uses_asset_metadata_to_distinguish_generation(self):
         cases = (
             (
-                "fixed-slot",
-                "originals/{}/original.jpg".format(ASSET_UUID),
-                True,
+                "named-original-leaf",
+                "original.png",
                 False,
+                0,
             ),
             (
-                "named-canonical",
-                "originals/{}/holiday.jpg".format(ASSET_UUID),
-                False,
+                "true-fixed-slot",
+                "holiday.png",
                 True,
+                len(b"image-bytes"),
             ),
         )
-        for name, relative_path, fixed_slot, named in cases:
+        relative_path = "originals/{}/original.png".format(ASSET_UUID)
+        for name, original_filename, fixed_slot, legacy_bytes in cases:
             with self.subTest(name=name):
                 if self.database_path.exists():
                     self.database_path.unlink()
                 self._create_database(image_paths=(relative_path,))
+                self._add_asset_metadata_and_derivatives(original_filename)
                 self._write_media(relative_path, b"image-bytes")
 
                 evidence = self._inspect(_DiskGraph())
 
                 self.assertFalse(evidence.has_md5_paths)
                 self.assertEqual(evidence.has_fixed_slot_paths, fixed_slot)
-                self.assertEqual(evidence.has_named_canonical_paths, named)
-                self.assertEqual(
-                    evidence.distinct_legacy_bytes,
-                    len(b"image-bytes") if fixed_slot else 0,
-                )
+                self.assertTrue(evidence.has_named_canonical_paths)
+                self.assertEqual(evidence.distinct_legacy_bytes, legacy_bytes)
+
+    def test_old_schema_fixed_slot_requires_canonical_derivative_closure(self):
+        relative_path = "originals/{}/original.png".format(ASSET_UUID)
+        self._create_database(image_paths=(relative_path,))
+        self._add_old_schema_derivatives()
+        self._write_media(relative_path, b"legacy-fixed-slot")
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertTrue(evidence.has_fixed_slot_paths)
+        self.assertTrue(evidence.has_named_canonical_paths)
+        self.assertEqual(
+            evidence.distinct_legacy_bytes,
+            len(b"legacy-fixed-slot"),
+        )
+
+    def test_old_schema_non_fixed_original_remains_named_evidence(self):
+        relative_path = "originals/{}/holiday.png".format(ASSET_UUID)
+        self._create_database(image_paths=(relative_path,))
+        self._write_media(relative_path, b"named-canonical")
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertFalse(evidence.has_fixed_slot_paths)
+        self.assertTrue(evidence.has_named_canonical_paths)
+        self.assertEqual(evidence.distinct_legacy_bytes, 0)
 
     def test_effective_media_image_directory_is_independent_evidence(self):
         self._create_database()
@@ -432,8 +518,23 @@ class StoragePreflightTests(SimpleTestCase):
         os.chmod(str(path), mode)
         return path
 
+    def _service_identity_probe_context(self):
+        stack = ExitStack()
+        if os.geteuid() != 0:
+            stack.enter_context(mock.patch.object(
+                startup_preflight,
+                "_drop_service_identity",
+            ))
+            stack.enter_context(mock.patch.object(
+                startup_preflight.os,
+                "getgroups",
+                return_value=[],
+            ))
+        return stack
+
     def test_valid_local_storage_sizes_and_service_probes_succeed(self):
-        result = self._validate()
+        with self._service_identity_probe_context():
+            result = self._validate()
 
         self.assertTrue(result.ok)
         self.assertIsNone(result.reason_code)
@@ -446,14 +547,19 @@ class StoragePreflightTests(SimpleTestCase):
     def test_default_storage_wrapper_resolves_to_exact_filesystem_storage(self):
         with self.settings(MEDIA_ROOT=str(self.media_root)):
             storage = DefaultStorage()
-            result = startup_preflight.validate_storage_preflight(
-                str(self.media_root),
-                storage,
-                storage,
-                VALID_IMAGE_SIZES,
-                os.geteuid(),
-                os.getegid(),
-            )
+            with mock.patch.object(
+                startup_preflight,
+                "_run_service_probe",
+                return_value="ok",
+            ):
+                result = startup_preflight.validate_storage_preflight(
+                    str(self.media_root),
+                    storage,
+                    storage,
+                    VALID_IMAGE_SIZES,
+                    os.geteuid(),
+                    os.getegid(),
+                )
 
         self.assertTrue(result.ok)
 
@@ -544,6 +650,7 @@ class StoragePreflightTests(SimpleTestCase):
     def test_image_size_options_reject_unsupported_runtime_shapes(self):
         invalid_options = (
             {"size": [0, 0]},
+            {"size": [0, 0], "crop": True},
             {"size": [100]},
             {"size": [100, True]},
             {"size": [100, 100], "crop": "yes"},
@@ -560,6 +667,20 @@ class StoragePreflightTests(SimpleTestCase):
                     "media_storage_configuration_invalid",
                 )
                 self.assertEqual(result.field_classes, ("IMAGE_SIZES",))
+
+    def test_crop_allows_one_runtime_unbounded_dimension(self):
+        for size in ([125, 0], [0, 125]):
+            with self.subTest(size=size):
+                sizes = dict(VALID_IMAGE_SIZES)
+                sizes["square"] = {"size": size, "crop": True}
+                with mock.patch.object(
+                    startup_preflight,
+                    "_run_service_probe",
+                    return_value="ok",
+                ):
+                    result = self._validate(image_sizes=sizes)
+
+                self.assertTrue(result.ok)
 
     def test_unknown_symlink_hardlink_and_wrong_name_change_nothing(self):
         outside = self.media_root / "outside"
@@ -695,7 +816,8 @@ class StoragePreflightTests(SimpleTestCase):
             for path in (lifecycle, dedup)
         }
 
-        result = self._validate()
+        with self._service_identity_probe_context():
+            result = self._validate()
 
         self.assertTrue(result.ok)
         self.assertEqual(lifecycle.read_bytes(), b"lifecycle-content")
@@ -746,12 +868,13 @@ class StoragePreflightTests(SimpleTestCase):
         os.chmod(str(self.media_root), 0o500)
         self.addCleanup(lambda: os.chmod(str(self.media_root), 0o700))
 
-        result = self._validate()
+        with self._service_identity_probe_context():
+            result = self._validate()
 
         self.assertEqual(result.reason_code, "media_root_not_writable")
 
     def test_actual_service_child_distinguishes_lock_failure(self):
-        with mock.patch(
+        with self._service_identity_probe_context(), mock.patch(
             "django_images.services.startup_preflight.file_ops."
             "media_dedup_lock",
             side_effect=file_ops.MediaPathError("sensitive-lock-error"),
@@ -782,6 +905,90 @@ class StoragePreflightTests(SimpleTestCase):
             calls,
             [("groups", []), ("gid", 456), ("uid", 123)],
         )
+
+    def test_service_probe_clears_groups_when_ids_already_match(self):
+        calls = []
+        groups = [777]
+
+        def clear_groups(value):
+            calls.append(("groups", value))
+            groups[:] = []
+
+        with mock.patch.object(
+            startup_preflight.os,
+            "geteuid",
+            return_value=123,
+        ), mock.patch.object(
+            startup_preflight.os,
+            "getegid",
+            return_value=456,
+        ), mock.patch.object(
+            startup_preflight.os,
+            "getgroups",
+            side_effect=lambda: list(groups),
+        ), mock.patch.object(
+            startup_preflight.os,
+            "setgroups",
+            side_effect=clear_groups,
+        ), mock.patch.object(
+            startup_preflight.os,
+            "setgid",
+            side_effect=lambda gid: calls.append(("gid", gid)),
+        ), mock.patch.object(
+            startup_preflight.os,
+            "setuid",
+            side_effect=lambda uid: calls.append(("uid", uid)),
+        ), mock.patch.object(
+            startup_preflight,
+            "_probe_media_root_write",
+        ), mock.patch.object(
+            startup_preflight,
+            "_probe_media_locks",
+        ):
+            result = startup_preflight._service_probe_child(
+                str(self.media_root),
+                123,
+                456,
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(
+            calls,
+            [("groups", []), ("gid", 456), ("uid", 123)],
+        )
+
+    def test_service_probe_rejects_groups_left_with_matching_ids(self):
+        with mock.patch.object(
+            startup_preflight,
+            "_drop_service_identity",
+        ), mock.patch.object(
+            startup_preflight.os,
+            "geteuid",
+            return_value=123,
+        ), mock.patch.object(
+            startup_preflight.os,
+            "getegid",
+            return_value=456,
+        ), mock.patch.object(
+            startup_preflight.os,
+            "getgroups",
+            return_value=[777],
+        ), mock.patch.object(
+            startup_preflight,
+            "_probe_media_root_write",
+        ) as write_probe, mock.patch.object(
+            startup_preflight,
+            "_probe_media_locks",
+        ) as lock_probe:
+            result = startup_preflight._service_probe_child(
+                str(self.media_root),
+                123,
+                456,
+            )
+
+        self.assertEqual(result, "media_root_not_writable")
+        write_probe.assert_not_called()
+        lock_probe.assert_not_called()
 
     def test_service_probe_rejects_ineffective_identity_drop(self):
         with mock.patch.object(
@@ -846,6 +1053,188 @@ class StoragePreflightTests(SimpleTestCase):
                 )
 
             self.assertEqual(result, "media_lock_not_usable")
+
+    def test_pipe_creation_failure_is_normalized_to_allowlisted_reason(self):
+        with mock.patch.object(
+            startup_preflight.os,
+            "pipe",
+            side_effect=OSError("sensitive-pipe-error"),
+        ):
+            try:
+                result = startup_preflight._run_service_probe(
+                    str(self.media_root),
+                    os.geteuid(),
+                    os.getegid(),
+                )
+            except OSError:
+                self.fail("pipe failure escaped the fixed reason contract")
+
+        self.assertEqual(result, "media_lock_not_usable")
+
+    def test_probe_child_closes_unrelated_inherited_descriptor(self):
+        inherited = os.open(str(self.media_root), os.O_RDONLY)
+        self.addCleanup(os.close, inherited)
+        expected = os.fstat(inherited)
+
+        def reject_open_descriptor(media_root, service_uid, service_gid):
+            del media_root, service_uid, service_gid
+            try:
+                current = os.fstat(inherited)
+            except OSError as error:
+                if error.errno == 9:
+                    return "ok"
+                raise
+            if (current.st_dev, current.st_ino) == (
+                expected.st_dev,
+                expected.st_ino,
+            ):
+                return "media_lock_not_usable"
+            return "ok"
+
+        with mock.patch.object(
+            startup_preflight,
+            "_service_probe_child",
+            side_effect=reject_open_descriptor,
+        ):
+            result = startup_preflight._run_service_probe(
+                str(self.media_root),
+                os.geteuid(),
+                os.getegid(),
+            )
+
+        self.assertEqual(result, "ok")
+
+    def test_parent_close_releases_startup_lock_while_probe_child_lives(self):
+        project_root = str(Path(__file__).resolve().parent.parent)
+        ready_path = self.media_root / "probe-ready"
+        release_path = self.media_root / "probe-release"
+        closed_path = self.media_root / "parent-lock-closed"
+        script = "\n".join((
+            "import os, pathlib, sys, time",
+            "from django_images.services import startup_lock, startup_preflight",
+            "data_root, ready_path, release_path, closed_path = sys.argv[1:]",
+            "held = startup_lock.acquire_startup_lock(data_root)",
+            "def close_parent_lock():",
+            "    held.close()",
+            "    pathlib.Path(closed_path).write_bytes(b'closed')",
+            "os.register_at_fork(after_in_parent=close_parent_lock)",
+            "def blocking_probe(*unused):",
+            "    pathlib.Path(ready_path).write_bytes(b'ready')",
+            "    while not pathlib.Path(release_path).exists():",
+            "        time.sleep(0.01)",
+            "    return 'ok'",
+            "startup_preflight._service_probe_child = blocking_probe",
+            "result = startup_preflight._run_service_probe(",
+            "    data_root, os.geteuid(), os.getegid()",
+            ")",
+            "print(result, flush=True)",
+        ))
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(self.media_root),
+                str(ready_path),
+                str(release_path),
+                str(closed_path),
+            ],
+            cwd=project_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+
+        def release_probe():
+            if not release_path.exists():
+                release_path.write_bytes(b"release")
+            if process.poll() is None:
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+
+        self.addCleanup(release_probe)
+        deadline = time.monotonic() + 5
+        while not (ready_path.exists() and closed_path.exists()):
+            if process.poll() is not None or time.monotonic() >= deadline:
+                stdout, stderr = process.communicate(timeout=5)
+                self.fail(
+                    "probe did not stay alive: stdout={!r} stderr={!r}".format(
+                        stdout, stderr
+                    )
+                )
+            time.sleep(0.01)
+
+        self.assertIsNone(process.poll())
+        try:
+            with startup_lock.acquire_startup_lock(str(self.media_root)):
+                pass
+        except startup_lock.StartupLockError as error:
+            self.fail("probe child retained startup lock: {}".format(error.code))
+
+        release_path.write_bytes(b"release")
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(stdout.strip(), "ok")
+        self.assertEqual(stderr, "")
+
+    def test_write_probe_cleans_owned_file_when_fchmod_fails(self):
+        with mock.patch.object(
+            startup_preflight.os,
+            "fchmod",
+            side_effect=OSError("injected fchmod failure"),
+        ):
+            with self.assertRaises(OSError):
+                startup_preflight._probe_media_root_write(
+                    str(self.media_root)
+                )
+
+        self.assertFalse(any(
+            path.name.startswith(".svrx-pinry-write-probe-")
+            for path in self.media_root.iterdir()
+        ))
+
+    def test_write_probe_cleans_owned_file_when_post_chmod_fstat_fails(self):
+        real_fstat = startup_preflight.os.fstat
+        real_open_root = file_ops.open_verified_media_root
+        opening_root = [False]
+        probe_stats = {}
+
+        def capture_root(path):
+            opening_root[0] = True
+            try:
+                return real_open_root(path)
+            finally:
+                opening_root[0] = False
+
+        def fail_second_probe_stat(descriptor):
+            if not opening_root[0]:
+                count = probe_stats.get(descriptor, 0) + 1
+                probe_stats[descriptor] = count
+                if count == 2:
+                    raise OSError("injected post-chmod fstat failure")
+            return real_fstat(descriptor)
+
+        with mock.patch.object(
+            startup_preflight.file_ops,
+            "open_verified_media_root",
+            side_effect=capture_root,
+        ), mock.patch.object(
+            startup_preflight.os,
+            "fstat",
+            side_effect=fail_second_probe_stat,
+        ):
+            with self.assertRaises(OSError):
+                startup_preflight._probe_media_root_write(
+                    str(self.media_root)
+                )
+
+        self.assertFalse(any(
+            path.name.startswith(".svrx-pinry-write-probe-")
+            for path in self.media_root.iterdir()
+        ))
 
     def test_probe_cleanup_never_unlinks_a_replacement_inode(self):
         flags = os.O_RDONLY | os.O_DIRECTORY

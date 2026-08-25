@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import os
 import re
+import resource
 import sqlite3
 import stat
 from urllib.parse import quote
@@ -11,6 +12,11 @@ from django.db.migrations.loader import MigrationLoader
 from django.utils.functional import LazyObject
 
 from django_images import file_ops
+from django_images.paths import (
+    canonical_derivative_path,
+    canonical_original_path,
+    is_valid_original_leaf,
+)
 
 
 MIB = 1024 * 1024
@@ -20,15 +26,12 @@ _MD5_PATH = re.compile(
     r"^image/(?:original|thumbnail)/by-md5/"
     r"[0-9a-fA-F]/[0-9a-fA-F]/[0-9a-fA-F]{32}/[^/]+$"
 )
-_FIXED_SLOT_PATH = re.compile(
+_ORIGINAL_PATH = re.compile(
     r"^originals/"
+    r"(?P<asset_uuid>"
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-    r"[0-9a-f]{4}-[0-9a-f]{12}/original\.[a-z0-9]+$"
-)
-_NAMED_ORIGINAL_PATH = re.compile(
-    r"^originals/"
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-    r"[0-9a-f]{4}-[0-9a-f]{12}/(?!original\.)[^/]+\.[a-z0-9]+$"
+    r"[0-9a-f]{4}-[0-9a-f]{12})/"
+    r"(?P<leaf>[^/]+)$"
 )
 _CANONICAL_DERIVATIVE_PATH = re.compile(
     r"^derivatives/"
@@ -44,6 +47,7 @@ _ALLOWED_PROBE_RESULTS = frozenset((
     _PROBE_RESULT_WRITE,
     _PROBE_RESULT_LOCK,
 ))
+_PROBE_RESULT_DESCRIPTOR = 3
 
 
 class StartupPreflightError(Exception):
@@ -132,18 +136,9 @@ def inspect_legacy_evidence(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        paths = []
-        for table_name in (
-            "django_images_image",
-            "django_images_thumbnail",
-        ):
-            if table_name in tables:
-                paths.extend(
-                    row[0]
-                    for row in connection.execute(
-                        "SELECT image FROM {}".format(table_name)
-                    )
-                )
+        image_rows, thumbnail_rows = _read_media_rows(
+            connection, tables
+        )
         applied_migrations = set()
         if "django_migrations" in tables:
             applied_migrations = {
@@ -158,7 +153,7 @@ def inspect_legacy_evidence(
             disk_migration_graph = MigrationLoader(None).graph
         disk_nodes = _migration_nodes(disk_migration_graph)
         pending_migrations = tuple(sorted(disk_nodes - applied_migrations))
-        classified = _classify_paths(paths)
+        classified = _classify_media_rows(image_rows, thumbnail_rows)
         distinct_legacy_bytes = _distinct_legacy_bytes(
             media_directory,
             classified["copy_paths"],
@@ -369,31 +364,148 @@ def _migration_nodes(graph):
     return node_set
 
 
-def _classify_paths(paths):
+def _read_media_rows(connection, tables):
+    image_rows = ()
+    thumbnail_rows = ()
+    if "django_images_image" in tables:
+        image_rows = _read_table_rows(
+            connection,
+            "django_images_image",
+            ("id", "image"),
+            ("asset_uuid", "original_filename"),
+        )
+    if "django_images_thumbnail" in tables:
+        thumbnail_rows = _read_table_rows(
+            connection,
+            "django_images_thumbnail",
+            ("id", "image"),
+            ("original_id", "size"),
+        )
+    return image_rows, thumbnail_rows
+
+
+def _read_table_rows(connection, table_name, required, optional):
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info({})".format(table_name)
+        )
+    }
+    if not set(required).issubset(columns):
+        raise StartupPreflightError("legacy_evidence_invalid")
+    selected = tuple(required) + tuple(
+        name for name in optional if name in columns
+    )
+    rows = connection.execute(
+        "SELECT {} FROM {}".format(", ".join(selected), table_name)
+    )
+    return tuple(dict(zip(selected, row)) for row in rows)
+
+
+def _classify_media_rows(image_rows, thumbnail_rows):
     has_md5_paths = False
     has_fixed_slot_paths = False
     has_named_canonical_paths = False
     copy_paths = set()
-    for path in paths:
+    thumbnails_by_original = {}
+    for row in thumbnail_rows:
+        path = row["image"]
         if type(path) is not str or not path:
             raise StartupPreflightError("legacy_evidence_invalid")
         if _MD5_PATH.fullmatch(path):
             has_md5_paths = True
             copy_paths.add(path)
-        elif _FIXED_SLOT_PATH.fullmatch(path):
-            has_fixed_slot_paths = True
-            copy_paths.add(path)
-        elif (
-            _NAMED_ORIGINAL_PATH.fullmatch(path)
-            or _CANONICAL_DERIVATIVE_PATH.fullmatch(path)
-        ):
+        elif _CANONICAL_DERIVATIVE_PATH.fullmatch(path):
             has_named_canonical_paths = True
+        original_id = row.get("original_id")
+        if type(original_id) is int:
+            thumbnails_by_original.setdefault(original_id, []).append(row)
+
+    for row in image_rows:
+        path = row["image"]
+        if type(path) is not str or not path:
+            raise StartupPreflightError("legacy_evidence_invalid")
+        if _MD5_PATH.fullmatch(path):
+            has_md5_paths = True
+            copy_paths.add(path)
+            continue
+        match = _ORIGINAL_PATH.fullmatch(path)
+        if match is None:
+            continue
+        asset_uuid = match.group("asset_uuid")
+        leaf = match.group("leaf")
+        if not is_valid_original_leaf(asset_uuid, leaf):
+            continue
+        extension = os.path.splitext(leaf)[1]
+        derivative_rows = thumbnails_by_original.get(row["id"], ())
+        if not _canonical_derivative_closure(
+            asset_uuid, derivative_rows
+        ):
+            raise StartupPreflightError("legacy_evidence_invalid")
+
+        metadata_available = (
+            type(row.get("asset_uuid")) is str
+            and bool(row["asset_uuid"])
+            and type(row.get("original_filename")) is str
+            and bool(row["original_filename"])
+        )
+        if metadata_available:
+            if row["asset_uuid"] != asset_uuid:
+                raise StartupPreflightError("legacy_evidence_invalid")
+            try:
+                expected_path = canonical_original_path(
+                    asset_uuid,
+                    row["original_filename"],
+                    extension,
+                )
+            except ValueError as error:
+                raise StartupPreflightError(
+                    "legacy_evidence_invalid"
+                ) from error
+            if path == expected_path:
+                has_named_canonical_paths = True
+                continue
+            if leaf != "original{}".format(extension):
+                raise StartupPreflightError("legacy_evidence_invalid")
+        elif leaf != "original{}".format(extension):
+            has_named_canonical_paths = True
+            continue
+        elif not derivative_rows:
+            raise StartupPreflightError("legacy_evidence_invalid")
+
+        has_fixed_slot_paths = True
+        copy_paths.add(path)
+
     return {
         "has_md5_paths": has_md5_paths,
         "has_fixed_slot_paths": has_fixed_slot_paths,
         "has_named_canonical_paths": has_named_canonical_paths,
         "copy_paths": copy_paths,
     }
+
+
+def _canonical_derivative_closure(asset_uuid, rows):
+    seen_sizes = set()
+    for row in rows:
+        path = row["image"]
+        size = row.get("size")
+        if (
+            type(path) is not str
+            or type(size) is not str
+            or size in seen_sizes
+        ):
+            return False
+        extension = os.path.splitext(path)[1]
+        try:
+            expected_path = canonical_derivative_path(
+                asset_uuid, size, extension
+            )
+        except ValueError:
+            return False
+        if path != expected_path:
+            return False
+        seen_sizes.add(size)
+    return True
 
 
 def _distinct_legacy_bytes(media_directory, copy_paths):
@@ -498,8 +610,6 @@ def _valid_image_size_options(options):
             and type(options[boolean_name]) is not bool
         ):
             return False
-    if options.get("crop", False) and any(value == 0 for value in size):
-        return False
     if "quality" in options:
         quality = options["quality"]
         if quality is not None and (
@@ -512,7 +622,10 @@ def _valid_image_size_options(options):
 def _run_service_probe(media_root, service_uid, service_gid):
     if not callable(getattr(os, "fork", None)):
         return _PROBE_RESULT_LOCK
-    read_descriptor, write_descriptor = os.pipe()
+    try:
+        read_descriptor, write_descriptor = os.pipe()
+    except Exception:
+        return _PROBE_RESULT_LOCK
     try:
         child_pid = os.fork()
     except BaseException:
@@ -520,22 +633,27 @@ def _run_service_probe(media_root, service_uid, service_gid):
         os.close(write_descriptor)
         return _PROBE_RESULT_LOCK
     if child_pid == 0:  # pragma: no cover - assertions run in parent
+        result_descriptor = None
         try:
-            os.close(read_descriptor)
+            result_descriptor = _prepare_service_probe_child(
+                read_descriptor,
+                write_descriptor,
+            )
             result = _service_probe_child(
                 media_root,
                 service_uid,
                 service_gid,
             )
             try:
-                os.write(write_descriptor, result.encode("ascii"))
+                os.write(result_descriptor, result.encode("ascii"))
             except BaseException:
                 pass
         finally:
-            try:
-                os.close(write_descriptor)
-            except BaseException:
-                pass
+            if result_descriptor is not None:
+                try:
+                    os.close(result_descriptor)
+                except BaseException:
+                    pass
             os._exit(0)
 
     os.close(write_descriptor)
@@ -569,19 +687,46 @@ def _run_service_probe(media_root, service_uid, service_gid):
     return result
 
 
+def _prepare_service_probe_child(read_descriptor, write_descriptor):
+    os.close(read_descriptor)
+    if write_descriptor != _PROBE_RESULT_DESCRIPTOR:
+        os.dup2(
+            write_descriptor,
+            _PROBE_RESULT_DESCRIPTOR,
+            inheritable=False,
+        )
+        os.close(write_descriptor)
+    else:
+        os.set_inheritable(_PROBE_RESULT_DESCRIPTOR, False)
+    os.closerange(
+        _PROBE_RESULT_DESCRIPTOR + 1,
+        _service_probe_descriptor_limit(),
+    )
+    return _PROBE_RESULT_DESCRIPTOR
+
+
+def _service_probe_descriptor_limit():
+    try:
+        limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except (AttributeError, OSError, ValueError):
+        limit = resource.RLIM_INFINITY
+    if limit == resource.RLIM_INFINITY or limit <= _PROBE_RESULT_DESCRIPTOR:
+        try:
+            limit = os.sysconf("SC_OPEN_MAX")
+        except (AttributeError, OSError, ValueError):
+            limit = 65536
+    return max(int(limit), _PROBE_RESULT_DESCRIPTOR + 1)
+
+
 def _service_probe_child(media_root, service_uid, service_gid):
     try:
-        identity_changed = os.geteuid() == 0 or (
-            os.geteuid() != service_uid or os.getegid() != service_gid
-        )
-        if identity_changed:
-            _drop_service_identity(service_uid, service_gid)
-            if (
-                os.geteuid() != service_uid
-                or os.getegid() != service_gid
-                or os.getgroups()
-            ):
-                return _PROBE_RESULT_WRITE
+        _drop_service_identity(service_uid, service_gid)
+        if (
+            os.geteuid() != service_uid
+            or os.getegid() != service_gid
+            or os.getgroups()
+        ):
+            return _PROBE_RESULT_WRITE
         _probe_media_root_write(media_root)
     except BaseException:
         return _PROBE_RESULT_WRITE
@@ -613,14 +758,24 @@ def _probe_media_root_write(media_root):
             0o600,
             dir_fd=root_directory.descriptor,
         )
-        os.fchmod(descriptor, 0o600)
         expected_stat = os.fstat(descriptor)
         if (
             not stat.S_ISREG(expected_stat.st_mode)
             or expected_stat.st_nlink != 1
-            or stat.S_IMODE(expected_stat.st_mode) != 0o600
             or expected_stat.st_uid != os.geteuid()
             or expected_stat.st_gid != os.getegid()
+        ):
+            raise OSError("invalid probe identity")
+        os.fchmod(descriptor, 0o600)
+        current_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(current_stat.st_mode)
+            or current_stat.st_nlink != 1
+            or stat.S_IMODE(current_stat.st_mode) != 0o600
+            or current_stat.st_uid != os.geteuid()
+            or current_stat.st_gid != os.getegid()
+            or (current_stat.st_dev, current_stat.st_ino)
+            != (expected_stat.st_dev, expected_stat.st_ino)
         ):
             raise OSError("invalid probe identity")
         os.fsync(descriptor)
