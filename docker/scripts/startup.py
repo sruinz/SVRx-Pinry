@@ -26,6 +26,11 @@ _MIGRATION_FLAG = "--migrate-legacy"
 _DEFAULT_DATA_ROOT = "/data"
 _DEFAULT_SERVICE_UID = 33
 _DEFAULT_SERVICE_GID = 33
+_SAFE_BOOTSTRAP_ERROR_CODES = frozenset((
+    "bootstrap_environment_invalid",
+    "bootstrap_persistent_settings_invalid",
+    "bootstrap_project_settings_invalid",
+))
 _SAFE_ERROR_CODES = frozenset((
     "archive_failed",
     "archive_manifest_mismatch",
@@ -88,6 +93,20 @@ def _safe_error_code(error, fallback="legacy_startup_failed"):
     return fallback
 
 
+def _safe_bootstrap_error_code(error):
+    payload = getattr(error, "stderr", None)
+    if not isinstance(payload, bytes) or len(payload) > 4096:
+        return "bootstrap_failed"
+    try:
+        lines = payload.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        return "bootstrap_failed"
+    for line in reversed(lines):
+        if line in _SAFE_BOOTSTRAP_ERROR_CODES:
+            return line
+    return "bootstrap_failed"
+
+
 def _service_identity():
     try:
         account = pwd.getpwnam("www-data")
@@ -129,10 +148,13 @@ def _run(arguments):  # noqa: C901
             check=True,
             close_fds=True,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except OSError:
         _write_error("bootstrap_failed")
+        return 1
+    except subprocess.CalledProcessError as error:
+        _write_error(_safe_bootstrap_error_code(error))
         return 1
 
     os.environ["DJANGO_SETTINGS_MODULE"] = "pinry.settings.docker"

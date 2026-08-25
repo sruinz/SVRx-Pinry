@@ -6,6 +6,8 @@ umask 077
 data_root="${PINRY_DATA_ROOT:-/data}"
 key_file="${data_root}/production_secret_key.txt"
 temp_file=""
+data_owner_uid=""
+service_uid=""
 
 cleanup() {
     if [ -n "${temp_file}" ] && [ -e "${temp_file}" ]; then
@@ -27,29 +29,15 @@ stat_value() {
     stat -f "${bsd_format}" "${path}"
 }
 
-allowed_owner() {
-    local path_uid="$1"
-    local service_uid
-
-    if [ "${path_uid}" = "$(id -u)" ]; then
-        return 0
-    fi
-    service_uid="$(id -u www-data 2>/dev/null || true)"
-    [ -n "${service_uid}" ] && [ "${path_uid}" = "${service_uid}" ]
-}
-
 validate_regular_file() {
     local path="$1"
     local link_count
     local mode
     local mode_value
-    local owner_uid
 
     [ ! -L "${path}" ] && [ -f "${path}" ]
     link_count="$(stat_value '%h' '%l' "${path}")"
     [ "${link_count}" = "1" ]
-    owner_uid="$(stat_value '%u' '%u' "${path}")"
-    allowed_owner "${owner_uid}"
     mode="$(stat_value '%a' '%Lp' "${path}")"
     case "${mode}" in
         [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
@@ -61,13 +49,26 @@ validate_regular_file() {
     [ $((mode_value & 0400)) -ne 0 ]
 }
 
+allowed_owner() {
+    local owner_uid="$1"
+
+    if [ "${owner_uid}" = "$(id -u)" ] \
+        || [ "${owner_uid}" = "${data_owner_uid}" ]; then
+        return 0
+    fi
+    [ -n "${service_uid}" ] && [ "${owner_uid}" = "${service_uid}" ]
+}
+
 validate_key_file() {
     local path="$1"
     local byte_count
     local key
     local line_count
+    local owner_uid
 
     validate_regular_file "${path}"
+    owner_uid="$(stat_value '%u' '%u' "${path}")"
+    allowed_owner "${owner_uid}"
     byte_count="$(LC_ALL=C wc -c < "${path}")"
     line_count="$(LC_ALL=C wc -l < "${path}")"
     [ "${byte_count}" -eq 66 ]
@@ -77,6 +78,14 @@ validate_key_file() {
 }
 
 [ -d "${data_root}" ] && [ ! -L "${data_root}" ]
+data_owner_uid="$(stat_value '%u' '%u' "${data_root}")"
+case "${data_owner_uid}" in
+    ''|*[!0-9]*) exit 1 ;;
+esac
+service_uid="$(id -u www-data 2>/dev/null || true)"
+case "${service_uid}" in
+    ''|*[!0-9]*) service_uid="" ;;
+esac
 
 if [ -e "${key_file}" ] || [ -L "${key_file}" ]; then
     validate_key_file "${key_file}"

@@ -15,6 +15,24 @@ data_temp=""
 project_temp=""
 service_uid=""
 service_gid=""
+data_owner_uid=""
+bootstrap_failure_code="bootstrap_environment_invalid"
+
+report_failure() {
+    local status=$?
+
+    trap - ERR
+    printf '%s\n' "${bootstrap_failure_code}" >&2
+    exit "${status}"
+}
+
+abort_current_stage() {
+    trap - ERR
+    printf '%s\n' "${bootstrap_failure_code}" >&2
+    exit 1
+}
+
+trap report_failure ERR
 
 cleanup() {
     if [ -n "${data_temp}" ] && [ -e "${data_temp}" ]; then
@@ -39,49 +57,51 @@ stat_value() {
     stat -f "${bsd_format}" "${path}"
 }
 
-allowed_owner() {
-    local path_uid="$1"
-
-    if [ "${path_uid}" = "$(id -u)" ]; then
-        return 0
-    fi
-    [ -n "${service_uid}" ] && [ "${path_uid}" = "${service_uid}" ]
-}
-
 validate_regular_file() {
     local path="$1"
     local link_count
     local mode
     local mode_value
-    local owner_uid
 
-    [ ! -L "${path}" ] && [ -f "${path}" ]
-    link_count="$(stat_value '%h' '%l' "${path}")"
-    [ "${link_count}" = "1" ]
-    owner_uid="$(stat_value '%u' '%u' "${path}")"
-    allowed_owner "${owner_uid}"
-    mode="$(stat_value '%a' '%Lp' "${path}")"
+    [ ! -L "${path}" ] && [ -f "${path}" ] || return 1
+    link_count="$(stat_value '%h' '%l' "${path}")" || return 1
+    [ "${link_count}" = "1" ] || return 1
+    mode="$(stat_value '%a' '%Lp' "${path}")" || return 1
     case "${mode}" in
         [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
         *) return 1 ;;
     esac
     mode_value=$((8#${mode}))
-    [ $((mode_value & 0022)) -eq 0 ]
-    [ $((mode_value & 0111)) -eq 0 ]
-    [ $((mode_value & 0400)) -ne 0 ]
-    [ "$(LC_ALL=C wc -c < "${path}")" -gt 0 ]
-    [ "$(LC_ALL=C wc -c < "${path}")" -le 1048576 ]
+    [ $((mode_value & 0022)) -eq 0 ] || return 1
+    [ $((mode_value & 0111)) -eq 0 ] || return 1
+    [ $((mode_value & 0400)) -ne 0 ] || return 1
+    [ "$(LC_ALL=C wc -c < "${path}")" -gt 0 ] || return 1
+    [ "$(LC_ALL=C wc -c < "${path}")" -le 1048576 ] || return 1
+}
+
+validate_persistent_file() {
+    local path="$1"
+    local owner_uid
+
+    validate_regular_file "${path}" || return 1
+    owner_uid="$(stat_value '%u' '%u' "${path}")" || return 1
+    [ "${owner_uid}" = "$(id -u)" ] \
+        || [ "${owner_uid}" = "${service_uid}" ] \
+        || [ "${owner_uid}" = "${data_owner_uid}" ] \
+        || return 1
 }
 
 validate_service_settings() {
     local path="$1"
     local mode
 
-    validate_regular_file "${path}"
-    [ "$(stat_value '%u' '%u' "${path}")" = "${service_uid}" ]
-    [ "$(stat_value '%g' '%g' "${path}")" = "${service_gid}" ]
-    mode="$(stat_value '%a' '%Lp' "${path}")"
-    [ $((8#${mode})) -eq $((8#600)) ]
+    validate_regular_file "${path}" || return 1
+    [ "$(stat_value '%u' '%u' "${path}")" = "${service_uid}" ] \
+        || return 1
+    [ "$(stat_value '%g' '%g' "${path}")" = "${service_gid}" ] \
+        || return 1
+    mode="$(stat_value '%a' '%Lp' "${path}")" || return 1
+    [ $((8#${mode})) -eq $((8#600)) ] || return 1
 }
 
 read_key() {
@@ -90,31 +110,40 @@ read_key() {
     local key
     local line_count
 
-    validate_regular_file "${path}"
-    byte_count="$(LC_ALL=C wc -c < "${path}")"
-    line_count="$(LC_ALL=C wc -l < "${path}")"
-    [ "${byte_count}" -eq 66 ]
-    [ "${line_count}" -eq 1 ]
-    IFS= read -r key < "${path}"
-    [[ "${key}" =~ ^[A-Za-z0-9]{65}$ ]]
+    validate_persistent_file "${path}" || return 1
+    byte_count="$(LC_ALL=C wc -c < "${path}")" || return 1
+    line_count="$(LC_ALL=C wc -l < "${path}")" || return 1
+    [ "${byte_count}" -eq 66 ] || return 1
+    [ "${line_count}" -eq 1 ] || return 1
+    IFS= read -r key < "${path}" || return 1
+    [[ "${key}" =~ ^[A-Za-z0-9]{65}$ ]] || return 1
     printf '%s' "${key}"
 }
 
-[ -d "${data_root}" ] && [ ! -L "${data_root}" ]
-[ -d "${settings_directory}" ] && [ ! -L "${settings_directory}" ]
+if [ ! -d "${data_root}" ] || [ -L "${data_root}" ]; then
+    abort_current_stage
+fi
+if [ ! -d "${settings_directory}" ] || [ -L "${settings_directory}" ]; then
+    abort_current_stage
+fi
 service_uid="$(id -u www-data)"
 service_gid="$(id -g www-data)"
+data_owner_uid="$(stat_value '%u' '%u' "${data_root}")"
 case "${service_uid}" in
-    ''|*[!0-9]*) exit 1 ;;
+    ''|*[!0-9]*) abort_current_stage ;;
 esac
 case "${service_gid}" in
-    ''|*[!0-9]*) exit 1 ;;
+    ''|*[!0-9]*) abort_current_stage ;;
+esac
+case "${data_owner_uid}" in
+    ''|*[!0-9]*) abort_current_stage ;;
 esac
 
+bootstrap_failure_code="bootstrap_persistent_settings_invalid"
 if [ -e "${data_settings}" ] || [ -L "${data_settings}" ]; then
-    validate_regular_file "${data_settings}"
+    validate_persistent_file "${data_settings}" || abort_current_stage
     if grep -q 'secret_key_place_holder' "${data_settings}"; then
-        exit 1
+        abort_current_stage
     fi
     data_temp="$(mktemp "${data_root}/.local_settings.py.tmp-XXXXXX")"
     cp "${data_settings}" "${data_temp}"
@@ -124,7 +153,7 @@ if [ -e "${data_settings}" ] || [ -L "${data_settings}" ]; then
 else
     /bin/bash "${gen_key_script}" >/dev/null 2>/dev/null
     secret_key="$(read_key "${key_file}")"
-    validate_regular_file "${settings_template}"
+    validate_regular_file "${settings_template}" || abort_current_stage
     placeholder_count="$(
         grep -o 'secret_key_place_holder' "${settings_template}" | wc -l
     )"
@@ -133,7 +162,7 @@ else
     sed "s/secret_key_place_holder/${secret_key}/" \
         "${settings_template}" > "${data_temp}"
     if grep -q 'secret_key_place_holder' "${data_temp}"; then
-        exit 1
+        abort_current_stage
     fi
     grep -Fq "${secret_key}" "${data_temp}"
     chmod 0600 "${data_temp}"
@@ -141,12 +170,13 @@ else
     data_temp=""
 fi
 
-validate_regular_file "${data_settings}"
+validate_persistent_file "${data_settings}" || abort_current_stage
 chmod 0600 "${data_settings}"
 if grep -q 'secret_key_place_holder' "${data_settings}"; then
-    exit 1
+    abort_current_stage
 fi
 
+bootstrap_failure_code="bootstrap_project_settings_invalid"
 if [ -e "${project_settings}" ] || [ -L "${project_settings}" ]; then
     validate_regular_file "${project_settings}"
 fi
@@ -160,3 +190,4 @@ mv -f "${project_temp}" "${project_settings}"
 project_temp=""
 validate_service_settings "${project_settings}"
 cmp -s "${data_settings}" "${project_settings}"
+trap - ERR
