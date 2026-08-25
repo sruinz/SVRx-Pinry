@@ -5,9 +5,9 @@ umask 077
 
 data_root="${PINRY_DATA_ROOT:-/data}"
 key_file="${data_root}/production_secret_key.txt"
+script_directory="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+normalize_script="${PINRY_NORMALIZE_SCRIPT:-${script_directory}/normalize_persistent_file.py}"
 temp_file=""
-data_owner_uid=""
-service_uid=""
 
 cleanup() {
     if [ -n "${temp_file}" ] && [ -e "${temp_file}" ]; then
@@ -49,26 +49,17 @@ validate_regular_file() {
     [ $((mode_value & 0400)) -ne 0 ]
 }
 
-allowed_owner() {
-    local owner_uid="$1"
-
-    if [ "${owner_uid}" = "$(id -u)" ] \
-        || [ "${owner_uid}" = "${data_owner_uid}" ]; then
-        return 0
-    fi
-    [ -n "${service_uid}" ] && [ "${owner_uid}" = "${service_uid}" ]
-}
-
 validate_key_file() {
     local path="$1"
     local byte_count
     local key
     local line_count
-    local owner_uid
+    local mode
 
     validate_regular_file "${path}"
-    owner_uid="$(stat_value '%u' '%u' "${path}")"
-    allowed_owner "${owner_uid}"
+    [ "$(stat_value '%u' '%u' "${path}")" = "$(id -u)" ]
+    mode="$(stat_value '%a' '%Lp' "${path}")"
+    [ $((8#${mode})) -eq $((8#600)) ]
     byte_count="$(LC_ALL=C wc -c < "${path}")"
     line_count="$(LC_ALL=C wc -l < "${path}")"
     [ "${byte_count}" -eq 66 ]
@@ -78,22 +69,11 @@ validate_key_file() {
 }
 
 [ -d "${data_root}" ] && [ ! -L "${data_root}" ]
-data_owner_uid="$(stat_value '%u' '%u' "${data_root}")"
-case "${data_owner_uid}" in
-    ''|*[!0-9]*) exit 1 ;;
-esac
-service_uid="$(id -u www-data 2>/dev/null || true)"
-case "${service_uid}" in
-    ''|*[!0-9]*) service_uid="" ;;
-esac
+[ -f "${normalize_script}" ] && [ ! -L "${normalize_script}" ]
 
 if [ -e "${key_file}" ] || [ -L "${key_file}" ]; then
-    validate_key_file "${key_file}"
-    temp_file="$(mktemp "${data_root}/.production_secret_key.txt.tmp-XXXXXX")"
-    cp "${key_file}" "${temp_file}"
-    chmod 0600 "${temp_file}"
-    mv -f "${temp_file}" "${key_file}"
-    temp_file=""
+    python3 "${normalize_script}" \
+        "${data_root}" "${key_file}" key >/dev/null 2>/dev/null
     validate_key_file "${key_file}"
     exit 0
 fi

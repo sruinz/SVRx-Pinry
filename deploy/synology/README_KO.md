@@ -145,10 +145,10 @@ File Station에서 그 폴더의 **내용 전체**를
 `data` 폴더 자체를 넣어 `data/data`가 되지 않도록 주의한다. 이 작업 전에
 중지된 기존 데이터 폴더 전체를 NAS 밖에도 백업한다.
 
-File Station이 복사한 `local_settings.py`와 비밀키는 `data` 폴더와 같은
-DSM 사용자 소유여도 시작할 수 있다. 다만 심볼릭 링크·하드 링크이거나
-그룹/다른 사용자 쓰기 또는 실행 권한이 설정된 파일은 안전하지 않은
-설정으로 판단해 거부한다.
+File Station이 복사한 `local_settings.py`와 비밀키는 `data` 폴더와 소유자가
+다르거나 권한 표시가 달라도 시작할 때 컨테이너 root 소유 `0600`으로 자동
+정규화된다. 심볼릭 링크·하드 링크·일반 파일이 아닌 항목과 잘못된 내용은
+원본을 바꾸지 않고 거부한다.
 
 ## 자동 이관과 서버 시작
 
@@ -183,7 +183,10 @@ docker compose up -d --force-recreate
 `media_storage_configuration_invalid`, `migration_state_plan_mismatch`,
 `archive_state_conflict`, `atomic_archive_unsupported` 같은 reason code만
 남는다. `bootstrap_persistent_settings_invalid`는 `data` 폴더에 보존된 설정
-또는 비밀키의 파일 형식·권한·소유 경계 검증에 실패했다는 뜻이고,
+또는 비밀키가 심볼릭 링크·하드 링크·일반 파일이 아닌 형식이거나 내용 검증에
+실패했다는 뜻이다. File Station으로 복사하면서 달라진 소유자와 권한은 시작할
+때 컨테이너 root 소유 `0600`으로 자동 정규화된다. 따라서 `data` 공유 폴더는
+관리자만 쓸 수 있게 유지하고, 복사 중에는 기존 컨테이너를 정지해야 한다.
 `bootstrap_project_settings_invalid`는 컨테이너 내부 설정 복사본을 안전한
 권한으로 만들지 못했다는 뜻이다. 원인을 해결하고 같은 Compose project를
 다시 시작하면 새 run을 만들지 않고 기록된 snapshot·state·manifest에서

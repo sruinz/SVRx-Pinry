@@ -1,3 +1,4 @@
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -7,7 +8,9 @@ import stat
 import subprocess
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -939,6 +942,12 @@ class RuntimeConfigTests(unittest.TestCase):
             "printf '%s\\n' '{}'\n".format(secret, secret)
         )
         (scripts / "gen_key.sh").chmod(0o700)
+        (scripts / "normalize_persistent_file.py").write_text(
+            (
+                REPOSITORY_ROOT
+                / "docker/scripts/normalize_persistent_file.py"
+            ).read_text("utf-8")
+        )
         (settings_directory / "local_settings.example.py").write_text(
             "SECRET_KEY = 'secret_key_place_holder'\n"
         )
@@ -1046,6 +1055,13 @@ class RuntimeConfigTests(unittest.TestCase):
             "#!/bin/sh\n"
             "if [ \"${PINRY_TEST_STAT_UID_PATH:-}\" = \"${3:-}\" ] "
             "&& [ \"${2:-}\" = %u ]; then\n"
+            "    if [ \"${PINRY_TEST_STAT_UID_UNTIL_MODE_600:-0}\" = 1 ]; then\n"
+            "        mode=\"$(\"" + str(real_stat) + "\" -c %a \"${3:-}\" "
+            "2>/dev/null || \"" + str(real_stat) + "\" -f %Lp \"${3:-}\")\"\n"
+            "        if [ \"$mode\" = 600 ]; then\n"
+            "            exec \"" + str(real_stat) + "\" \"$@\"\n"
+            "        fi\n"
+            "    fi\n"
             "    printf '%s\\n' \"$PINRY_TEST_STAT_UID\"\n"
             "    exit 0\n"
             "fi\n"
@@ -1079,11 +1095,38 @@ class RuntimeConfigTests(unittest.TestCase):
             self._bootstrap_fixture(existing)
         )
         data_settings = data / "local_settings.py"
+        data_settings.chmod(0o666)
         synology_uid = os.getuid() + 10000
         environment["PINRY_TEST_STAT_UID_PATH"] = str(data_settings)
         environment["PINRY_TEST_STAT_UID"] = str(synology_uid)
-        environment["PINRY_TEST_STAT_UID_PATH_2"] = str(data)
-        environment["PINRY_TEST_STAT_UID_2"] = str(synology_uid)
+        environment["PINRY_TEST_STAT_UID_UNTIL_MODE_600"] = "1"
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(data_settings.read_bytes(), existing)
+        self.assertEqual(stat.S_IMODE(data_settings.stat().st_mode), 0o600)
+        self.assertEqual(data_settings.stat().st_uid, os.getuid())
+        self.assertEqual(
+            (root / "pinry/settings/local_settings.py").read_bytes(),
+            existing,
+        )
+
+    def test_bootstrap_normalizes_existing_settings_and_key_together(self):
+        existing = b"SECRET_KEY='sentinel-existing-secret'\n"
+        script, root, data, secret, environment = (
+            self._bootstrap_fixture(existing)
+        )
+        data_settings = data / "local_settings.py"
+        key_path = data / "production_secret_key.txt"
+        key_path.write_bytes((secret + "\n").encode("ascii"))
+        for path in (data_settings, key_path):
+            path.chmod(0o666)
 
         completed = subprocess.run(
             ["/bin/bash", str(script)],
@@ -1095,33 +1138,16 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
         self.assertEqual(data_settings.read_bytes(), existing)
         self.assertEqual(
+            key_path.read_bytes(),
+            (secret + "\n").encode("ascii"),
+        )
+        for path in (data_settings, key_path):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(path.stat().st_uid, os.getuid())
+        self.assertEqual(
             (root / "pinry/settings/local_settings.py").read_bytes(),
             existing,
         )
-
-    def test_bootstrap_rejects_settings_owned_outside_data_trust_boundary(self):
-        existing = b"SECRET_KEY='sentinel-existing-secret'\n"
-        script, root, data, _secret, environment = (
-            self._bootstrap_fixture(existing)
-        )
-        environment["PINRY_TEST_STAT_UID_PATH"] = str(
-            data / "local_settings.py"
-        )
-        environment["PINRY_TEST_STAT_UID"] = str(os.getuid() + 10000)
-
-        completed = subprocess.run(
-            ["/bin/bash", str(script)],
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(
-            completed.stderr.decode().strip(),
-            "bootstrap_persistent_settings_invalid",
-        )
-        self.assertFalse((root / "pinry/settings/local_settings.py").exists())
 
     def test_bootstrap_reports_invalid_environment_before_file_work(self):
         for invalid_path in ("data_root", "settings_directory"):
@@ -1385,6 +1411,55 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual((data / "local_settings.py").read_bytes(), existing)
         self.assertFalse((root / "pinry/settings/local_settings.py").exists())
 
+    def test_bootstrap_rejects_symlinked_settings_without_touching_target(self):
+        script, root, data, _secret, environment = self._bootstrap_fixture()
+        target = data.parent / "outside-local-settings.py"
+        existing = b"SECRET_KEY='outside-secret'\n"
+        target.write_bytes(existing)
+        target.chmod(0o644)
+        (data / "local_settings.py").symlink_to(target)
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stderr.decode().strip(),
+            "bootstrap_persistent_settings_invalid",
+        )
+        self.assertEqual(target.read_bytes(), existing)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+        self.assertTrue((data / "local_settings.py").is_symlink())
+        self.assertFalse((root / "pinry/settings/local_settings.py").exists())
+
+    def test_bootstrap_rejects_placeholder_before_replacing_source(self):
+        existing = b"SECRET_KEY='secret_key_place_holder'\n"
+        script, root, data, _secret, environment = (
+            self._bootstrap_fixture(existing)
+        )
+        data_settings = data / "local_settings.py"
+        data_settings.chmod(0o666)
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(data_settings.read_bytes(), existing)
+        self.assertEqual(stat.S_IMODE(data_settings.stat().st_mode), 0o666)
+        self.assertEqual(
+            list(data.glob(".local_settings.py.tmp-*")),
+            [],
+        )
+        self.assertFalse((root / "pinry/settings/local_settings.py").exists())
+
     def _gen_key_fixture(self):
         temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
         self.addCleanup(temporary.cleanup)
@@ -1408,6 +1483,13 @@ class RuntimeConfigTests(unittest.TestCase):
             "#!/bin/sh\n"
             "if [ \"${PINRY_TEST_STAT_UID_PATH:-}\" = \"${3:-}\" ] "
             "&& [ \"${2:-}\" = %u ]; then\n"
+            "    if [ \"${PINRY_TEST_STAT_UID_UNTIL_MODE_600:-0}\" = 1 ]; then\n"
+            "        mode=\"$(\"" + str(real_stat) + "\" -c %a \"${3:-}\" "
+            "2>/dev/null || \"" + str(real_stat) + "\" -f %Lp \"${3:-}\")\"\n"
+            "        if [ \"$mode\" = 600 ]; then\n"
+            "            exec \"" + str(real_stat) + "\" \"$@\"\n"
+            "        fi\n"
+            "    fi\n"
             "    printf '%s\\n' \"$PINRY_TEST_STAT_UID\"\n"
             "    exit 0\n"
             "fi\n"
@@ -1432,6 +1514,9 @@ class RuntimeConfigTests(unittest.TestCase):
             environment.get("PATH", ""),
         )
         environment["PINRY_DATA_ROOT"] = str(data)
+        environment["PINRY_NORMALIZE_SCRIPT"] = str(
+            REPOSITORY_ROOT / "docker/scripts/normalize_persistent_file.py"
+        )
         environment["PINRY_TEST_SECRET"] = secret
         return script, data, secret, environment
 
@@ -1493,12 +1578,11 @@ class RuntimeConfigTests(unittest.TestCase):
         script, data, secret, environment = self._gen_key_fixture()
         key_path = data / "production_secret_key.txt"
         key_path.write_bytes((secret + "\n").encode("ascii"))
-        key_path.chmod(0o600)
+        key_path.chmod(0o666)
         synology_uid = os.getuid() + 10000
         environment["PINRY_TEST_STAT_UID_PATH"] = str(key_path)
         environment["PINRY_TEST_STAT_UID"] = str(synology_uid)
-        environment["PINRY_TEST_STAT_UID_PATH_2"] = str(data)
-        environment["PINRY_TEST_STAT_UID_2"] = str(synology_uid)
+        environment["PINRY_TEST_STAT_UID_UNTIL_MODE_600"] = "1"
         environment["PINRY_PWGEN_FAIL"] = "1"
 
         completed = subprocess.run(
@@ -1513,14 +1597,74 @@ class RuntimeConfigTests(unittest.TestCase):
             key_path.read_bytes(),
             (secret + "\n").encode("ascii"),
         )
+        self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+        self.assertEqual(key_path.stat().st_uid, os.getuid())
 
-    def test_gen_key_rejects_key_owned_outside_data_trust_boundary(self):
+    def test_normalizer_accepts_foreign_source_uid(self):
+        temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.addCleanup(temporary.cleanup)
+        data = Path(temporary.name, "data")
+        data.mkdir()
+        settings = data / "local_settings.py"
+        existing = b"SECRET_KEY='sentinel-existing-secret'\n"
+        settings.write_bytes(existing)
+        settings.chmod(0o666)
+        helper_path = (
+            REPOSITORY_ROOT / "docker/scripts/normalize_persistent_file.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "test_normalize_persistent_file",
+            str(helper_path),
+        )
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        real_fstat = helper.os.fstat
+        real_lstat = helper.os.lstat
+        foreign_uid = os.getuid() + 10000
+
+        def with_foreign_uid(result):
+            values = {
+                name: getattr(result, name)
+                for name in dir(result)
+                if name.startswith("st_")
+            }
+            values["st_uid"] = foreign_uid
+            return SimpleNamespace(**values)
+
+        def fake_fstat(descriptor):
+            result = real_fstat(descriptor)
+            if stat.S_IMODE(result.st_mode) == 0o666:
+                return with_foreign_uid(result)
+            return result
+
+        def fake_lstat(path):
+            result = real_lstat(path)
+            if (
+                os.path.abspath(os.fspath(path)) == os.path.abspath(settings)
+                and stat.S_IMODE(result.st_mode) == 0o666
+            ):
+                return with_foreign_uid(result)
+            return result
+
+        with mock.patch.object(helper.os, "fstat", side_effect=fake_fstat):
+            with mock.patch.object(
+                helper.os,
+                "lstat",
+                side_effect=fake_lstat,
+            ):
+                helper.normalize(str(data), str(settings), "settings")
+
+        self.assertEqual(settings.read_bytes(), existing)
+        self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o600)
+        self.assertEqual(settings.stat().st_uid, os.getuid())
+
+    def test_gen_key_rejects_hardlinked_existing_key(self):
         script, data, secret, environment = self._gen_key_fixture()
         key_path = data / "production_secret_key.txt"
-        key_path.write_bytes((secret + "\n").encode("ascii"))
-        key_path.chmod(0o600)
-        environment["PINRY_TEST_STAT_UID_PATH"] = str(key_path)
-        environment["PINRY_TEST_STAT_UID"] = str(os.getuid() + 10000)
+        existing = (secret + "\n").encode("ascii")
+        key_path.write_bytes(existing)
+        key_path.chmod(0o666)
+        os.link(str(key_path), str(data / "production_secret_key-linked.txt"))
         environment["PINRY_PWGEN_FAIL"] = "1"
 
         completed = subprocess.run(
@@ -1531,7 +1675,12 @@ class RuntimeConfigTests(unittest.TestCase):
         )
 
         self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(key_path.read_bytes(), (secret + "\n").encode())
+        self.assertEqual(key_path.read_bytes(), existing)
+        self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o666)
+        self.assertEqual(
+            list(data.glob(".production_secret_key.txt.tmp-*")),
+            [],
+        )
 
     def test_timeout_counter_counts_long_and_short_forms(self):
         self.assertEqual(

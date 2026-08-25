@@ -8,6 +8,7 @@ project_root="${PINRY_PROJECT_ROOT:-/pinry}"
 data_settings="${data_root}/local_settings.py"
 key_file="${data_root}/production_secret_key.txt"
 gen_key_script="${project_root}/docker/scripts/gen_key.sh"
+normalize_script="${project_root}/docker/scripts/normalize_persistent_file.py"
 settings_directory="${project_root}/pinry/settings"
 settings_template="${settings_directory}/local_settings.example.py"
 project_settings="${settings_directory}/local_settings.py"
@@ -15,7 +16,6 @@ data_temp=""
 project_temp=""
 service_uid=""
 service_gid=""
-data_owner_uid=""
 bootstrap_failure_code="bootstrap_environment_invalid"
 
 report_failure() {
@@ -82,13 +82,14 @@ validate_regular_file() {
 validate_persistent_file() {
     local path="$1"
     local owner_uid
+    local mode
 
     validate_regular_file "${path}" || return 1
     owner_uid="$(stat_value '%u' '%u' "${path}")" || return 1
     [ "${owner_uid}" = "$(id -u)" ] \
-        || [ "${owner_uid}" = "${service_uid}" ] \
-        || [ "${owner_uid}" = "${data_owner_uid}" ] \
         || return 1
+    mode="$(stat_value '%a' '%Lp' "${path}")" || return 1
+    [ $((8#${mode})) -eq $((8#600)) ] || return 1
 }
 
 validate_service_settings() {
@@ -128,28 +129,25 @@ if [ ! -d "${settings_directory}" ] || [ -L "${settings_directory}" ]; then
 fi
 service_uid="$(id -u www-data)"
 service_gid="$(id -g www-data)"
-data_owner_uid="$(stat_value '%u' '%u' "${data_root}")"
 case "${service_uid}" in
     ''|*[!0-9]*) abort_current_stage ;;
 esac
 case "${service_gid}" in
     ''|*[!0-9]*) abort_current_stage ;;
 esac
-case "${data_owner_uid}" in
-    ''|*[!0-9]*) abort_current_stage ;;
-esac
+[ -f "${normalize_script}" ] && [ ! -L "${normalize_script}" ] \
+    || abort_current_stage
 
 bootstrap_failure_code="bootstrap_persistent_settings_invalid"
 if [ -e "${data_settings}" ] || [ -L "${data_settings}" ]; then
-    validate_persistent_file "${data_settings}" || abort_current_stage
-    if grep -q 'secret_key_place_holder' "${data_settings}"; then
-        abort_current_stage
+    python3 "${normalize_script}" \
+        "${data_root}" "${data_settings}" settings \
+        >/dev/null 2>/dev/null || abort_current_stage
+    if [ -e "${key_file}" ] || [ -L "${key_file}" ]; then
+        python3 "${normalize_script}" \
+            "${data_root}" "${key_file}" key \
+            >/dev/null 2>/dev/null || abort_current_stage
     fi
-    data_temp="$(mktemp "${data_root}/.local_settings.py.tmp-XXXXXX")"
-    cp "${data_settings}" "${data_temp}"
-    chmod 0600 "${data_temp}"
-    mv -f "${data_temp}" "${data_settings}"
-    data_temp=""
 else
     /bin/bash "${gen_key_script}" >/dev/null 2>/dev/null
     secret_key="$(read_key "${key_file}")"
@@ -171,7 +169,6 @@ else
 fi
 
 validate_persistent_file "${data_settings}" || abort_current_stage
-chmod 0600 "${data_settings}"
 if grep -q 'secret_key_place_holder' "${data_settings}"; then
     abort_current_stage
 fi
