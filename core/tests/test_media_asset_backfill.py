@@ -25,8 +25,9 @@ import mock
 from PIL import Image as PILImage
 
 from core import models as core_models
-from core.models import MediaAsset, Pin
+from core.models import Board, MediaAsset, Pin
 from core.services import media_asset_backfill
+from core.services.bulk_pin_management import BulkPinManagementService
 from core.services.idempotency import IdempotencyStore
 from core.services.media_asset_backfill import (
     BackfillSummary,
@@ -210,6 +211,95 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
                 for kind in file_rows
             },
         }
+
+    def _create_missing_derivative_candidate(self, content):
+        candidate = self._create_candidate(content=content)
+        Thumbnail.objects.filter(
+            original=candidate["image"],
+            size="square",
+        ).delete()
+        return candidate
+
+    def _execute_with_after_registry_commit_contender(
+        self,
+        service,
+        operation,
+    ):
+        contender_result = {}
+
+        def run_contender():
+            close_old_connections()
+            try:
+                contender_result["value"] = operation()
+            except BaseException as error:
+                contender_result["error"] = getattr(
+                    error,
+                    "code",
+                    error.__class__.__name__,
+                )
+            finally:
+                connections["default"].close()
+
+        def contend_after_registry_commit(event):
+            if event != "after_registry_commit":
+                return
+            contender = threading.Thread(target=run_contender)
+            contender.start()
+            contender.join(2)
+            if contender.is_alive():
+                raise AssertionError("legacy Pin contender did not finish")
+
+        service.fault_injector = contend_after_registry_commit
+        command_error = None
+        summary = None
+        try:
+            summary = service.run(execute=True)
+        except CommandError as error:
+            command_error = str(error)
+        return command_error, summary, contender_result
+
+    def _assert_writer_gate_blocks_legacy_pin_operation(
+        self,
+        service,
+        operation,
+        eligible,
+        legacy_candidates,
+        pin_ids,
+        expected_contender,
+    ):
+        command_error, summary, contender_result = (
+            self._execute_with_after_registry_commit_contender(
+                service,
+                operation,
+            )
+        )
+        legacy_image_ids = tuple(
+            candidate["image"].pk for candidate in legacy_candidates
+        )
+        self.assertEqual({
+            "command_error": command_error,
+            "registered": None if summary is None else summary.registered,
+            "contender": contender_result,
+            "pin_ids": set(Pin.objects.filter(pk__in=pin_ids).values_list(
+                "pk",
+                flat=True,
+            )),
+            "eligible_registered": MediaAsset.objects.filter(
+                image=eligible["image"],
+            ).exists(),
+            "legacy_registered": MediaAsset.objects.filter(
+                image_id__in=legacy_image_ids,
+            ).exists(),
+            "registry_count": MediaAsset.objects.count(),
+        }, {
+            "command_error": None,
+            "registered": 1,
+            "contender": expected_contender,
+            "pin_ids": set(pin_ids),
+            "eligible_registered": True,
+            "legacy_registered": False,
+            "registry_count": 1,
+        })
 
     @staticmethod
     def _assert_code(code, function):
@@ -829,6 +919,114 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
                 2,
             ),
         )
+
+    @override_settings(PINRY_FETCH_TOTAL_TIMEOUT=0.1)
+    def test_global_writer_gate_blocks_actual_legacy_pin_delete(self):
+        eligible = self._create_candidate(content=_png_bytes("red"))
+        legacy = self._create_missing_derivative_candidate(
+            _png_bytes("navy")
+        )
+        service = self._service()
+        service.run()
+        pin_id = legacy["pins"][0].pk
+
+        self._assert_writer_gate_blocks_legacy_pin_operation(
+            service,
+            lambda: Pin.objects.get(pk=pin_id).delete(),
+            eligible,
+            (legacy,),
+            (pin_id,),
+            {"error": "media_lifecycle_busy"},
+        )
+
+    @override_settings(PINRY_FETCH_TOTAL_TIMEOUT=0.1)
+    def test_global_writer_gate_blocks_single_legacy_queryset_delete(self):
+        eligible = self._create_candidate(content=_png_bytes("red"))
+        legacy = self._create_missing_derivative_candidate(
+            _png_bytes("green")
+        )
+        service = self._service()
+        service.run()
+        pin_id = legacy["pins"][0].pk
+
+        self._assert_writer_gate_blocks_legacy_pin_operation(
+            service,
+            lambda: Pin.objects.filter(pk=pin_id).delete(),
+            eligible,
+            (legacy,),
+            (pin_id,),
+            {"error": "media_lifecycle_busy"},
+        )
+
+    @override_settings(PINRY_FETCH_TOTAL_TIMEOUT=0.1)
+    def test_global_writer_gate_blocks_multi_legacy_queryset_delete(self):
+        eligible = self._create_candidate(content=_png_bytes("red"))
+        first = self._create_missing_derivative_candidate(
+            _png_bytes("navy")
+        )
+        second = self._create_missing_derivative_candidate(
+            _png_bytes("green")
+        )
+        service = self._service()
+        service.run()
+        pin_ids = (first["pins"][0].pk, second["pins"][0].pk)
+
+        self._assert_writer_gate_blocks_legacy_pin_operation(
+            service,
+            lambda: Pin.objects.filter(pk__in=pin_ids).delete(),
+            eligible,
+            (first, second),
+            pin_ids,
+            {"error": "media_lifecycle_busy"},
+        )
+
+    @override_settings(PINRY_FETCH_TOTAL_TIMEOUT=0.1)
+    def test_global_writer_gate_blocks_conditional_legacy_service_delete(self):
+        eligible = self._create_candidate(content=_png_bytes("red"))
+        legacy = self._create_missing_derivative_candidate(
+            _png_bytes("purple")
+        )
+        source = Board.objects.create(
+            submitter=self.owner,
+            name="backfill-conditional-source",
+        )
+        source.pins.add(legacy["pins"][0])
+        service = self._service()
+        service.run()
+        pin_id = legacy["pins"][0].pk
+        owner_id = self.owner.pk
+
+        def delete_through_service():
+            return BulkPinManagementService().execute(
+                User.objects.get(pk=owner_id),
+                {
+                    "operation": "delete_if_exclusive_to_board",
+                    "pin_ids": [pin_id],
+                    "source_board_id": source.pk,
+                },
+                time.monotonic(),
+            )
+
+        self._assert_writer_gate_blocks_legacy_pin_operation(
+            service,
+            delete_through_service,
+            eligible,
+            (legacy,),
+            (pin_id,),
+            {"value": {
+                "operation": "delete_if_exclusive_to_board",
+                "succeeded": 0,
+                "preserved": 0,
+                "failed": 1,
+                "results": [{
+                    "id": pin_id,
+                    "status": "failed",
+                    "code": "internal_error",
+                    "retryable": False,
+                }],
+            }},
+        )
+        self.assertTrue(source.pins.filter(pk=pin_id).exists())
 
     def test_precommit_fence_rechecks_owner_after_registry_insert(self):
         candidate = self._create_candidate()

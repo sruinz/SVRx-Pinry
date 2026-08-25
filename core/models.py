@@ -106,6 +106,7 @@ class Board(models.Model):
 
 
 _pin_queryset_delete_state = threading.local()
+_RETRY_REGISTERED_PIN_DELETE = object()
 
 
 def _delete_pin_queryset_with_registry_guard(queryset):
@@ -118,6 +119,34 @@ def _delete_pin_queryset_with_registry_guard(queryset):
             _pin_queryset_delete_state.depth = previous_depth
         else:
             del _pin_queryset_delete_state.depth
+
+
+def _delete_pin_queryset_with_lifecycle_lock(queryset, using):
+    root_directory = open_media_root(settings.MEDIA_ROOT)
+    result = None
+    try:
+        clock = time.monotonic
+        deadline = clock() + settings.PINRY_FETCH_TOTAL_TIMEOUT
+        with transaction.atomic(using=using):
+            with media_lifecycle_lock(
+                root_directory,
+                deadline=deadline,
+                clock=clock,
+            ):
+                result = _delete_pin_queryset_with_registry_guard(
+                    queryset.using(using)
+                )
+    except BaseException:
+        try:
+            root_directory.close()
+        except BaseException:
+            pass
+        raise
+    try:
+        root_directory.close()
+    except Exception as error:
+        _log_pin_image_cleanup_failure(None, error)
+    return result
 
 
 class PinQuerySet(models.QuerySet):
@@ -145,8 +174,9 @@ class PinQuerySet(models.QuerySet):
             self._result_cache = None
             return 0, {}
         if len(pin_ids) != 1:
-            result = _delete_pin_queryset_with_registry_guard(
-                self.using(database_alias)
+            result = _delete_pin_queryset_with_lifecycle_lock(
+                self,
+                database_alias,
             )
             self._result_cache = None
             return result
@@ -158,12 +188,6 @@ class PinQuerySet(models.QuerySet):
         if pin is None:
             self._result_cache = None
             return 0, {}
-        if not MediaAsset.objects.using(
-            database_alias
-        ).filter(image_id=pin.image_id).exists():
-            result = _delete_pin_queryset_with_registry_guard(candidates)
-            self._result_cache = None
-            return result
         result = pin.delete(using=database_alias)
         self._result_cache = None
         return result
@@ -337,27 +361,70 @@ def _require_pin_delete_autocommit(using):
         raise RuntimeError("registered_pin_delete_requires_autocommit")
 
 
-def _delete_legacy_pin_with_condition(
+def _delete_legacy_pin_with_registry_lock(
     pin,
-    condition,
     using,
     keep_parents,
+    exclusive_condition,
 ):
-    _require_pin_delete_autocommit(using)
-    with transaction.atomic(using=using):
-        current_pin, condition_result = _locked_exclusive_pin_status(
-            pin,
-            condition,
-            using,
-        )
-        if condition_result is not None:
-            return condition_result
-        super(Pin, current_pin).delete(
-            using=using,
-            keep_parents=keep_parents,
-        )
-    pin.pk = None
-    return "deleted", None
+    if exclusive_condition is not None:
+        _require_pin_delete_autocommit(using)
+    root_directory = open_media_root(settings.MEDIA_ROOT)
+    result = None
+    deleted = False
+    try:
+        clock = time.monotonic
+        deadline = clock() + settings.PINRY_FETCH_TOTAL_TIMEOUT
+        with transaction.atomic(using=using):
+            with media_lifecycle_lock(
+                root_directory,
+                deadline=deadline,
+                clock=clock,
+            ):
+                registry = (
+                    MediaAsset.objects.select_for_update()
+                    .using(using)
+                    .filter(image_id=pin.image_id)
+                    .first()
+                )
+                if registry is not None:
+                    result = _RETRY_REGISTERED_PIN_DELETE
+                elif exclusive_condition is not None:
+                    current_pin, condition_result = (
+                        _locked_exclusive_pin_status(
+                            pin,
+                            exclusive_condition,
+                            using,
+                        )
+                    )
+                    if condition_result is not None:
+                        result = condition_result
+                    else:
+                        super(Pin, current_pin).delete(
+                            using=using,
+                            keep_parents=keep_parents,
+                        )
+                        result = ("deleted", None)
+                        deleted = True
+                else:
+                    result = super(Pin, pin).delete(
+                        using=using,
+                        keep_parents=keep_parents,
+                    )
+    except BaseException:
+        try:
+            root_directory.close()
+        except BaseException:
+            pass
+        raise
+
+    if deleted:
+        pin.pk = None
+    try:
+        root_directory.close()
+    except Exception as error:
+        _log_pin_image_cleanup_failure(pin.image_id, error)
+    return result
 
 
 def _lock_registered_asset(registry, using):
@@ -521,29 +588,28 @@ def _delete_pin_with_registry_lock(
             keep_parents=keep_parents,
         )
     database_alias = using or router.db_for_write(Pin, instance=pin)
-    registry = (
-        MediaAsset.objects.using(database_alias)
-        .filter(image_id=pin.image_id)
-        .values(
-            "pk",
-            "image_id",
-            "submitter_id",
-            "content_sha256",
-        )
-        .first()
-    )
-    if registry is None:
-        if exclusive_condition is not None:
-            return _delete_legacy_pin_with_condition(
-                pin,
-                exclusive_condition,
-                database_alias,
-                keep_parents,
+    while True:
+        registry = (
+            MediaAsset.objects.using(database_alias)
+            .filter(image_id=pin.image_id)
+            .values(
+                "pk",
+                "image_id",
+                "submitter_id",
+                "content_sha256",
             )
-        return super(Pin, pin).delete(
-            using=database_alias,
-            keep_parents=keep_parents,
+            .first()
         )
+        if registry is not None:
+            break
+        result = _delete_legacy_pin_with_registry_lock(
+            pin,
+            database_alias,
+            keep_parents,
+            exclusive_condition,
+        )
+        if result is not _RETRY_REGISTERED_PIN_DELETE:
+            return result
     image_snapshot = (
         BaseImage.objects.using(database_alias)
         .filter(pk=registry["image_id"])

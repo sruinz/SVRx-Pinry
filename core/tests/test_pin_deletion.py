@@ -16,6 +16,7 @@ from django.db import close_old_connections, connection, connections
 from django.db import OperationalError, transaction
 from django.db.models.deletion import Collector
 from django.db.models.query import QuerySet
+from django.db.models.signals import pre_delete
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
@@ -448,6 +449,105 @@ class PinMediaLifecycleTest(
         )
         self.assertEqual(media_snapshot(self.temporary_media.name), {})
         self.assertTrue(all(not path.exists() for path in directories))
+
+    def test_registry_appearing_after_legacy_probe_retries_registered_delete(
+        self,
+    ):
+        image = create_image()
+        image_id = image.pk
+        pin = create_pin(self.owner, image, [])
+        pin_id = pin.pk
+        self._assert_four_image_files(image)
+        registry_probe_returned = threading.Event()
+        release_registry_probe = threading.Event()
+        registry_probe_resuming = threading.Event()
+        pin_delete_started = threading.Event()
+        worker_finished = threading.Event()
+        observed_managed_flags = []
+        worker_result = {}
+        original_first = QuerySet.first
+        paused = {"value": False}
+
+        def pause_after_missing_registry(queryset):
+            result = original_first(queryset)
+            if (
+                threading.current_thread().name
+                == "legacy-registry-race-worker"
+                and queryset.model is MediaAsset
+                and result is None
+                and not paused["value"]
+            ):
+                paused["value"] = True
+                registry_probe_returned.set()
+                if not release_registry_probe.wait(5):
+                    raise AssertionError("registry probe was not released")
+                registry_probe_resuming.set()
+            return result
+
+        def observe_pin_delete(sender, instance, using, **kwargs):
+            del sender, using, kwargs
+            if instance.pk == pin_id:
+                observed_managed_flags.append(bool(getattr(
+                    instance,
+                    "_media_delete_managed",
+                    False,
+                )))
+                pin_delete_started.set()
+
+        def delete_pin():
+            close_old_connections()
+            try:
+                current = Pin.objects.get(pk=pin_id)
+                delete_result = current.delete()
+                worker_result["value"] = (delete_result, current.pk)
+            except BaseException as error:
+                worker_result["error"] = error
+            finally:
+                connections["default"].close()
+                worker_finished.set()
+
+        root_directory = file_ops.open_media_root(
+            self.temporary_media.name
+        )
+        worker = threading.Thread(
+            target=delete_pin,
+            name="legacy-registry-race-worker",
+        )
+        pre_delete.connect(observe_pin_delete, sender=Pin, weak=False)
+        try:
+            with mock.patch.object(
+                QuerySet,
+                "first",
+                new=pause_after_missing_registry,
+            ):
+                with file_ops.media_lifecycle_lock(
+                    root_directory,
+                    exclusive=True,
+                ):
+                    worker.start()
+                    self.assertTrue(registry_probe_returned.wait(5))
+                    asset = self._register_asset(image)
+                    release_registry_probe.set()
+                    self.assertTrue(registry_probe_resuming.wait(5))
+                    delete_started_while_gate = pin_delete_started.wait(0.2)
+                worker.join(5)
+        finally:
+            release_registry_probe.set()
+            worker.join(5)
+            pre_delete.disconnect(observe_pin_delete, sender=Pin)
+            root_directory.close()
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(delete_started_while_gate)
+        self.assertEqual(observed_managed_flags, [True])
+        self.assertEqual(
+            worker_result,
+            {"value": ((1, {"core.Pin": 1}), None)},
+        )
+        self.assertFalse(Pin.objects.filter(pk=pin_id).exists())
+        self.assertFalse(Image.objects.filter(pk=image_id).exists())
+        self.assertFalse(MediaAsset.objects.filter(pk=asset.pk).exists())
+        self.assertEqual(media_snapshot(self.temporary_media.name), {})
 
     @skipUnless(
         connection.vendor == "sqlite",
@@ -2096,7 +2196,7 @@ class PinMediaLifecycleTest(
         self.assertIsInstance(writer_result["error"], OperationalError)
         self.assertFalse(Image.objects.filter(pk=image_id).exists())
 
-    def test_cleanup_locks_media_asset_before_image_and_delete(self):
+    def test_pin_and_cleanup_lock_media_asset_before_legacy_mutations(self):
         image = create_image()
         pin = create_pin(self.owner, image, [])
         image_id = image.pk
@@ -2146,6 +2246,7 @@ class PinMediaLifecycleTest(
         self.assertEqual(
             events,
             [
+                ("media_asset_lock", True),
                 ("media_asset_lock", True),
                 ("image_lock", True),
                 ("reference_check", True),
