@@ -29,6 +29,7 @@ from django_images.paths import (
     FORMAT_EXTENSIONS,
     canonical_derivative_path,
     canonical_original_path,
+    pinry_direct_md5_root,
 )
 
 
@@ -105,6 +106,8 @@ class AutoV2MigrationFile(object):
     source_inode: int
     thumbnail_id: int = None
     derivative_size: str = None
+    archive_root_device: int = None
+    archive_root_inode: int = None
 
     @property
     def kind_key(self):
@@ -129,6 +132,9 @@ class AutoV2MigrationFile(object):
         if self.thumbnail_id is not None:
             value["thumbnail_id"] = self.thumbnail_id
             value["derivative_size"] = self.derivative_size
+        if self.archive_root_device is not None:
+            value["archive_root_device"] = self.archive_root_device
+            value["archive_root_inode"] = self.archive_root_inode
         return value
 
     @classmethod
@@ -162,6 +168,8 @@ class AutoV2MigrationFile(object):
             source_inode=value["source_inode"],
             thumbnail_id=value.get("thumbnail_id"),
             derivative_size=value.get("derivative_size"),
+            archive_root_device=value.get("archive_root_device"),
+            archive_root_inode=value.get("archive_root_inode"),
         )
 
 
@@ -228,6 +236,10 @@ class AutoV2MigrationPlan(object):
                     root_directory, record.image.name
                 )
                 details = _inspect_receipt(receipt)
+                archive_root_identity = _archive_root_identity(
+                    receipt,
+                    record.image.name,
+                )
                 database_width = record.width
                 database_height = record.height
                 if (
@@ -236,7 +248,14 @@ class AutoV2MigrationPlan(object):
                 ):
                     raise _command_error("invalid_legacy_media")
                 inspected.append(
-                    (kind, record, thumbnail, receipt.file_stat, details)
+                    (
+                        kind,
+                        record,
+                        thumbnail,
+                        receipt.file_stat,
+                        details,
+                        archive_root_identity,
+                    )
                 )
             except (MediaPathError, OSError) as error:
                 raise _command_error("unsafe_media_file", error)
@@ -248,7 +267,14 @@ class AutoV2MigrationPlan(object):
 
         files = []
         reusable_destination_identities = []
-        for kind, record, thumbnail, source_stat, details in inspected:
+        for (
+            kind,
+            record,
+            thumbnail,
+            source_stat,
+            details,
+            archive_root_identity,
+        ) in inspected:
             image_format, extension, digest, width, height, file_size = details
             if kind == "original":
                 try:
@@ -313,6 +339,16 @@ class AutoV2MigrationPlan(object):
                     source_inode=source_stat.st_ino,
                     thumbnail_id=thumbnail.pk if thumbnail else None,
                     derivative_size=thumbnail.size if thumbnail else None,
+                    archive_root_device=(
+                        archive_root_identity[0]
+                        if archive_root_identity is not None
+                        else None
+                    ),
+                    archive_root_inode=(
+                        archive_root_identity[1]
+                        if archive_root_identity is not None
+                        else None
+                    ),
                 )
             )
 
@@ -422,6 +458,26 @@ def _validate_derivative_records(records):
         seen.add(record.size)
 
 
+def _archive_root_identity(receipt, relative_path):
+    direct_root = pinry_direct_md5_root(relative_path)
+    archive_root = (
+        direct_root
+        if direct_root is not None
+        else "image" if relative_path.startswith("image/") else None
+    )
+    if archive_root is None:
+        return None
+    parent = receipt.parent_directory
+    if (
+        not parent.names
+        or parent.names[0] != archive_root
+        or not parent.directory_stats
+    ):
+        raise _command_error("unsafe_media_file")
+    archive_root_stat = parent.directory_stats[0]
+    return archive_root_stat.st_dev, archive_root_stat.st_ino
+
+
 def _inspect_receipt(receipt):
     receipt.verify_current()
     digest = sha256_file_descriptor(receipt.descriptor)
@@ -501,12 +557,19 @@ def _classify_generation_for_uuid(asset_uuid, files):
         )
     ):
         return "fixed_slot"
-    if (
+    prefixed_md5 = (
         original.old_path.startswith("image/original/by-md5/")
         and all(
             file_plan.old_path.startswith("image/thumbnail/by-md5/")
             for file_plan in derivative_files
         )
+    )
+    pinry_direct_md5 = all(
+        pinry_direct_md5_root(file_plan.old_path) is not None
+        for file_plan in files
+    )
+    if (
+        (prefixed_md5 or pinry_direct_md5)
         and all(
             file_plan.old_path != file_plan.new_path
             for file_plan in files
@@ -548,6 +611,35 @@ def _validate_plan(plan):  # noqa: C901
     except (AttributeError, TypeError, ValueError):
         canonical_uuid = False
     if invalid or not canonical_uuid:
+        raise _command_error("invalid_auto_v2_manifest")
+    prefixed_archive_identities = set()
+    for file_plan in plan.files:
+        direct_root = pinry_direct_md5_root(file_plan.old_path)
+        prefixed_root = file_plan.old_path.startswith("image/")
+        archive_identity = (
+            file_plan.archive_root_device,
+            file_plan.archive_root_inode,
+        )
+        if direct_root is not None:
+            if (
+                type(archive_identity[0]) is not int
+                or archive_identity[0] < 0
+                or type(archive_identity[1]) is not int
+                or archive_identity[1] <= 0
+            ):
+                raise _command_error("invalid_auto_v2_manifest")
+        elif prefixed_root:
+            if archive_identity != (None, None) and (
+                type(archive_identity[0]) is not int
+                or archive_identity[0] < 0
+                or type(archive_identity[1]) is not int
+                or archive_identity[1] <= 0
+            ):
+                raise _command_error("invalid_auto_v2_manifest")
+            prefixed_archive_identities.add(archive_identity)
+        elif archive_identity != (None, None):
+            raise _command_error("invalid_auto_v2_manifest")
+    if len(prefixed_archive_identities) > 1:
         raise _command_error("invalid_auto_v2_manifest")
     original = plan.files[0]
     if (
@@ -662,6 +754,26 @@ def _validate_plan(plan):  # noqa: C901
         raise _command_error("manifest_plan_mismatch")
 
 
+def _validate_new_plan_archive_authority(plan):
+    """현재 writer는 archive root identity가 빠진 계획을 만들지 않는다."""
+    if not isinstance(plan, AutoV2MigrationPlan):
+        raise _command_error("invalid_auto_v2_manifest")
+    _validate_plan(plan)
+    for file_plan in plan.files:
+        if (
+            pinry_direct_md5_root(file_plan.old_path) is None
+            and not file_plan.old_path.startswith("image/")
+        ):
+            continue
+        if (
+            type(file_plan.archive_root_device) is not int
+            or file_plan.archive_root_device < 0
+            or type(file_plan.archive_root_inode) is not int
+            or file_plan.archive_root_inode <= 0
+        ):
+            raise _command_error("invalid_auto_v2_manifest")
+
+
 def _safe_relative_path(value):
     if (
         not isinstance(value, str)
@@ -686,6 +798,17 @@ class AutoV2PlanSummary(object):
     fixed_slot: int
     named_canonical: int
     copy_required_bytes: int
+
+
+@dataclass(frozen=True)
+class AutoV2ArchiveAuthority(object):
+    summary: AutoV2PlanSummary
+    fixed_slot_sources: tuple
+    fixed_slot_files: tuple
+    prefixed_files: tuple
+    prefixed_root_identity: tuple
+    direct_files: tuple
+    direct_root_identities: tuple
 
 
 class _AutoV2ManifestState(object):
@@ -1072,7 +1195,18 @@ class AutoV2ManifestLog(object):
                 "media_manifest_torn_tail_requires_execute"
             )
         self._ensure_content_current()
-        event = dict(event)
+        try:
+            event = dict(event)
+        except (TypeError, ValueError) as error:
+            raise _command_error("invalid_auto_v2_manifest", error)
+        if event.get("event") == "planned":
+            if set(event) != {"event", "plan"}:
+                raise _command_error("invalid_auto_v2_manifest")
+            plan_payload = event.get("plan")
+            plan = AutoV2MigrationPlan.from_dict(plan_payload)
+            _validate_new_plan_archive_authority(plan)
+            if plan.as_dict() != plan_payload:
+                raise _command_error("invalid_auto_v2_manifest")
         event.update(
             {
                 "format_version": 2,
@@ -1094,6 +1228,7 @@ class AutoV2ManifestLog(object):
         self.state = self._load_state()
 
     def record_plan(self, plan):
+        _validate_new_plan_archive_authority(plan)
         self.append({"event": "planned", "plan": plan.as_dict()})
 
     def record_plan_complete(self, plans):
@@ -1374,6 +1509,15 @@ def load_auto_v2_archive_sources(
     run_directory, filename, run_id, service_uid, service_gid
 ):
     """완료된 auto-v2 계획에서 fixed-slot 구 원본만 반환한다."""
+    return load_auto_v2_archive_authority(
+        run_directory, filename, run_id, service_uid, service_gid
+    ).fixed_slot_sources
+
+
+def load_auto_v2_archive_authority(
+    run_directory, filename, run_id, service_uid, service_gid
+):
+    """단일 manifest snapshot에서 archive 권위 전체를 반환한다."""
     with AutoV2ManifestLog.open(
         run_directory,
         filename,
@@ -1382,12 +1526,13 @@ def load_auto_v2_archive_sources(
         service_gid,
         create=False,
     ) as manifest:
-        _completed_auto_v2_summary(manifest)
+        summary = _completed_auto_v2_summary(manifest)
         plans = tuple(manifest.state.plans)
         canonical_originals = frozenset(
             plan.new_original for plan in plans
         )
         sources = []
+        fixed_slot_files = []
         for plan in plans:
             if plan.generation != "fixed_slot":
                 continue
@@ -1402,7 +1547,117 @@ def load_auto_v2_archive_sources(
             ):
                 raise _command_error("manifest_plan_mismatch")
             sources.append(original.old_path)
-        return tuple(sources)
+            fixed_slot_files.append(original)
+        prefixed_files = []
+        prefixed_root_identity = None
+        prefixed_root_identity_missing = False
+        direct_files = []
+        direct_root_identities = {}
+        for plan in plans:
+            if plan.generation != "md5_legacy":
+                continue
+            roots = tuple(
+                pinry_direct_md5_root(file_plan.old_path)
+                for file_plan in plan.files
+            )
+            if plan.files and all(root is not None for root in roots):
+                for file_plan, root_name in zip(plan.files, roots):
+                    identity = (
+                        file_plan.archive_root_device,
+                        file_plan.archive_root_inode,
+                    )
+                    if (
+                        type(identity[0]) is not int
+                        or identity[0] < 0
+                        or type(identity[1]) is not int
+                        or identity[1] <= 0
+                        or (
+                            root_name in direct_root_identities
+                            and direct_root_identities[root_name] != identity
+                        )
+                    ):
+                        raise _command_error("manifest_plan_mismatch")
+                    direct_root_identities[root_name] = identity
+                    direct_files.append(file_plan)
+                continue
+            paths = tuple(file_plan.old_path for file_plan in plan.files)
+            if not (
+                paths
+                and paths[0].startswith("image/original/by-md5/")
+                and all(
+                    path.startswith("image/thumbnail/by-md5/")
+                    for path in paths[1:]
+                )
+            ):
+                raise _command_error("manifest_plan_mismatch")
+            for file_plan in plan.files:
+                identity = (
+                    file_plan.archive_root_device,
+                    file_plan.archive_root_inode,
+                )
+                if identity == (None, None):
+                    if prefixed_root_identity is not None:
+                        raise _command_error("manifest_plan_mismatch")
+                    prefixed_root_identity_missing = True
+                    continue
+                if (
+                    prefixed_root_identity_missing
+                    or type(identity[0]) is not int
+                    or identity[0] < 0
+                    or type(identity[1]) is not int
+                    or identity[1] <= 0
+                    or (
+                        prefixed_root_identity is not None
+                        and prefixed_root_identity != identity
+                    )
+                ):
+                    raise _command_error("manifest_plan_mismatch")
+                prefixed_root_identity = identity
+            prefixed_files.extend(plan.files)
+        archive_paths = tuple(
+            file_plan.old_path
+            for file_plan in (
+                fixed_slot_files + prefixed_files + direct_files
+            )
+        )
+        if len(archive_paths) != len(set(archive_paths)):
+            raise _command_error("manifest_plan_mismatch")
+        return AutoV2ArchiveAuthority(
+            summary=summary,
+            fixed_slot_sources=tuple(sources),
+            fixed_slot_files=tuple(sorted(
+                fixed_slot_files,
+                key=lambda file_plan: file_plan.old_path,
+            )),
+            prefixed_files=tuple(sorted(
+                prefixed_files,
+                key=lambda file_plan: file_plan.old_path,
+            )),
+            prefixed_root_identity=prefixed_root_identity,
+            direct_files=tuple(sorted(
+                direct_files, key=lambda file_plan: file_plan.old_path
+            )),
+            direct_root_identities=tuple(sorted(
+                (
+                    root_name,
+                    identity[0],
+                    identity[1],
+                )
+                for root_name, identity in direct_root_identities.items()
+            )),
+        )
+
+
+def load_auto_v2_archive_direct_roots(
+    run_directory, filename, run_id, service_uid, service_gid
+):
+    """완료된 계획이 참조하는 실제 Pinry MD5 최상위 root를 반환한다."""
+    authority = load_auto_v2_archive_authority(
+        run_directory, filename, run_id, service_uid, service_gid
+    )
+    return tuple(
+        item[0] for item in authority.direct_root_identities
+    )
 
 
 class AutoV2MediaMigrator(object):

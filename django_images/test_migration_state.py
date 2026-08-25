@@ -107,6 +107,18 @@ class MigrationStateTests(SimpleTestCase):
         os.chmod(state_path, 0o600)
         return run_path
 
+    def frozen_manifests(self):
+        return {
+            "media": {
+                "plan_sha256": "1" * 64,
+                "manifest_sha256": "2" * 64,
+            },
+            "backfill": {
+                "plan_sha256": "3" * 64,
+                "manifest_sha256": "4" * 64,
+            },
+        }
+
     def test_read_only_inventory_treats_missing_backup_root_as_empty(self):
         os.rmdir(self.backup_root)
 
@@ -384,7 +396,11 @@ class MigrationStateTests(SimpleTestCase):
         completed_id = (
             "20260825T010101Z-11111111-1111-4111-8111-111111111111"
         )
-        self.write_run_state(completed_id, "complete")
+        self.write_run_state(
+            completed_id,
+            "complete",
+            payload={"manifests": self.frozen_manifests()},
+        )
 
         created = resolve_or_create_run(
             scan_run_inventory(self.backup_root),
@@ -524,7 +540,16 @@ class MigrationStateTests(SimpleTestCase):
         first_intent = self.archive_intent(10)
         second_intent = self.archive_intent(11)
         transition_state(run, "initialized", "schema_complete")
-        transition_state(run, "schema_complete", "paths_complete")
+        transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256={"media": "1" * 64, "backfill": "3" * 64},
+            manifest_sha256={
+                "media": "2" * 64,
+                "backfill": "4" * 64,
+            },
+        )
         transition_state(run, "paths_complete", "registry_complete")
         transition_state(
             run,
@@ -553,6 +578,86 @@ class MigrationStateTests(SimpleTestCase):
         self.assertEqual(updated.state["progress"]["items"][0]["complete"], True)
         with open(updated.state_path, "r", encoding="utf-8") as state_file:
             self.assertEqual(json.load(state_file), updated.state)
+
+    def test_archive_complete_preserves_completed_progress(self):
+        run = self.create_run()
+        first_intent = self.archive_intent(10)
+        second_intent = self.archive_intent(11)
+        progress = {
+            "items": [
+                {"intent": first_intent, "complete": True},
+                {"intent": second_intent, "complete": True},
+            ],
+        }
+        transition_state(run, "initialized", "schema_complete")
+        transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256={"media": "1" * 64, "backfill": "3" * 64},
+            manifest_sha256={
+                "media": "2" * 64,
+                "backfill": "4" * 64,
+            },
+        )
+        transition_state(run, "paths_complete", "registry_complete")
+        transition_state(
+            run,
+            "registry_complete",
+            "archive_intent",
+            intent=first_intent,
+            progress={
+                "items": [
+                    {"intent": first_intent, "complete": False},
+                    {"intent": second_intent, "complete": False},
+                ],
+            },
+        )
+
+        completed = transition_state(
+            run,
+            "archive_intent",
+            "archive_complete",
+            progress=progress,
+        )
+
+        self.assertEqual(completed.state["progress"], progress)
+        self.assertIsNone(completed.state["intent"])
+
+    def test_current_writer_rejects_archive_complete_without_progress(self):
+        run = self.create_run()
+        intent = self.archive_intent(10)
+        transition_state(run, "initialized", "schema_complete")
+        transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256={"media": "1" * 64, "backfill": "3" * 64},
+            manifest_sha256={
+                "media": "2" * 64,
+                "backfill": "4" * 64,
+            },
+        )
+        transition_state(run, "paths_complete", "registry_complete")
+        transition_state(
+            run,
+            "registry_complete",
+            "archive_intent",
+            intent=intent,
+            progress={
+                "items": [{"intent": intent, "complete": False}],
+            },
+        )
+
+        with self.assertRaisesRegex(
+            MigrationStateError,
+            "^migration_state_invalid_transition$",
+        ):
+            transition_state(
+                run,
+                "archive_intent",
+                "archive_complete",
+            )
 
     def test_state_update_uses_exclusive_private_temp_and_fsync_order(self):
         run = self.create_run()
@@ -915,6 +1020,39 @@ class MigrationStateTests(SimpleTestCase):
                 )
                 if os.path.exists(creating_path):
                     shutil.rmtree(creating_path)
+
+    def test_archive_phases_require_frozen_manifest_hashes(self):
+        cases = (
+            (
+                "20260825T010105Z-55555555-5555-4555-8555-555555555555",
+                "archive_intent",
+                {
+                    "intent": self.archive_intent(10),
+                    "progress": {
+                        "items": [{
+                            "intent": self.archive_intent(10),
+                            "complete": False,
+                        }],
+                    },
+                },
+            ),
+            (
+                "20260825T010106Z-66666666-6666-4666-8666-666666666666",
+                "archive_complete",
+                {},
+            ),
+        )
+
+        for run_id, phase, payload in cases:
+            self.write_run_state(run_id, phase, payload=payload)
+            try:
+                inventory = scan_run_inventory(self.backup_root)
+                self.assertEqual(inventory.invalid_count, 1)
+                self.assertEqual(inventory.incomplete, ())
+            finally:
+                run_path = os.path.join(self.backup_root, run_id)
+                if os.path.exists(run_path):
+                    shutil.rmtree(run_path)
 
     def test_non_intent_phase_rejects_intent_or_progress(self):
         run_ids = (

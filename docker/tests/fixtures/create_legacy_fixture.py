@@ -41,6 +41,7 @@ FIXTURE_KINDS = (
     "pending-schema",
 )
 DERIVATIVE_KINDS = ("thumbnail", "standard", "square")
+PINRY_DIRECT_MD5_ROOTS = tuple("0123456789abcdef")
 _HOST_PATTERN = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$"
 )
@@ -293,14 +294,22 @@ def _write_media_file(media_root, relative_path, value):
 
 def _legacy_md5_path(kind, leaf, value):
     digest = _md5(value)
-    legacy_kind = "original" if kind == "original" else "thumbnail"
-    return "image/{}/by-md5/{}/{}/{}/{}".format(
-        legacy_kind,
+    return "{}/{}/{}/{}".format(
         digest[0],
         digest[1],
         digest,
         leaf,
     )
+
+
+def _orphan_sentinel_bytes(root_name):
+    for nonce in range(4096):
+        value = "fixture-orphan-{}-{}".format(root_name, nonce).encode(
+            "ascii"
+        )
+        if _md5(value).startswith(root_name):
+            return value
+    raise FixtureError("orphan_sentinel_generation_failed")
 
 
 def _target_for_kind(kind):
@@ -459,16 +468,58 @@ def _create_fixture(kind, data_root, count, receipt_path):
         "count": count,
         "board_id": board.pk,
         "archive_root_identity": None,
+        "expected_direct_roots": None,
+        "orphan_sentinel": None,
         "items": receipt_items,
     }
     if kind == "legacy-md5":
-        legacy_root_stat = os.stat(
-            os.path.join(media_root, "image"),
-            follow_symlinks=False,
+        referenced_roots = {
+            item["legacy_original_path"].split("/", 1)[0]
+            for item in receipt_items
+        } | {
+            derivative["legacy_path"].split("/", 1)[0]
+            for item in receipt_items
+            for derivative in item["derivatives"]
+        }
+        orphan_root = next(
+            (
+                root_name
+                for root_name in PINRY_DIRECT_MD5_ROOTS
+                if root_name not in referenced_roots
+            ),
+            PINRY_DIRECT_MD5_ROOTS[0],
         )
-        receipt["archive_root_identity"] = {
-            "device": legacy_root_stat.st_dev,
-            "inode": legacy_root_stat.st_ino,
+        sentinel_bytes = _orphan_sentinel_bytes(orphan_root)
+        sentinel_path = _legacy_md5_path(
+            "orphan",
+            "orphan-sentinel.bin",
+            sentinel_bytes,
+        )
+        sentinel_identity = _write_media_file(
+            media_root, sentinel_path, sentinel_bytes
+        )
+        for root_name in PINRY_DIRECT_MD5_ROOTS:
+            os.makedirs(
+                os.path.join(media_root, root_name),
+                mode=0o750,
+                exist_ok=True,
+            )
+        root_identities = {}
+        for root_name in PINRY_DIRECT_MD5_ROOTS:
+            root_stat = os.stat(
+                os.path.join(media_root, root_name),
+                follow_symlinks=False,
+            )
+            root_identities[root_name] = {
+                "device": root_stat.st_dev,
+                "inode": root_stat.st_ino,
+            }
+        receipt["archive_root_identity"] = root_identities
+        receipt["expected_direct_roots"] = list(PINRY_DIRECT_MD5_ROOTS)
+        receipt["orphan_sentinel"] = {
+            "path": sentinel_path,
+            "sha256": _sha256(sentinel_bytes),
+            "source_identity": sentinel_identity,
         }
     serialized = json.dumps(
         receipt,
@@ -652,7 +703,8 @@ def _load_receipt(path, data_root):
         not isinstance(receipt, dict)
         or set(receipt) != {
             "schema_version", "kind", "count", "board_id",
-            "archive_root_identity", "items"
+            "archive_root_identity", "expected_direct_roots",
+            "orphan_sentinel", "items"
         }
         or receipt.get("schema_version") != 1
         or receipt.get("kind") not in FIXTURE_KINDS
@@ -1064,18 +1116,24 @@ def _verify_migration(data_root, receipt_path):  # noqa: C901
             ):
                 raise FixtureError("legacy_source_not_archived")
             if receipt["kind"] == "legacy-md5":
-                archived_root = os.path.join(run_path, "media", "image")
-                archived_root_stat = os.stat(
-                    archived_root, follow_symlinks=False
-                )
-                root_identity = receipt["archive_root_identity"]
-                if (
-                    os.path.lexists(os.path.join(media_root, "image"))
-                    or not stat.S_ISDIR(archived_root_stat.st_mode)
-                    or archived_root_stat.st_dev != root_identity.get("device")
-                    or archived_root_stat.st_ino != root_identity.get("inode")
+                for root_name, root_identity in (
+                    receipt["archive_root_identity"].items()
                 ):
-                    raise FixtureError("legacy_root_archive_mismatch")
+                    archived_root = os.path.join(
+                        run_path, "media", root_name
+                    )
+                    archived_root_stat = os.stat(
+                        archived_root, follow_symlinks=False
+                    )
+                    if (
+                        os.path.lexists(os.path.join(media_root, root_name))
+                        or not stat.S_ISDIR(archived_root_stat.st_mode)
+                        or archived_root_stat.st_dev
+                        != root_identity.get("device")
+                        or archived_root_stat.st_ino
+                        != root_identity.get("inode")
+                    ):
+                        raise FixtureError("legacy_root_archive_mismatch")
                 _assert_backup_file(
                     run_path,
                     "media/{}".format(item["legacy_original_path"]),
@@ -1102,6 +1160,23 @@ def _verify_migration(data_root, receipt_path):  # noqa: C901
             os.path.join(run_path, "media")
         ):
             raise FixtureError("unexpected_archive_payload")
+        if receipt["kind"] == "legacy-md5":
+            if (
+                receipt["expected_direct_roots"]
+                != list(PINRY_DIRECT_MD5_ROOTS)
+                or sorted(receipt["archive_root_identity"])
+                != list(PINRY_DIRECT_MD5_ROOTS)
+            ):
+                raise FixtureError("legacy_root_archive_mismatch")
+            orphan = receipt["orphan_sentinel"]
+            if os.path.lexists(os.path.join(media_root, orphan["path"])):
+                raise FixtureError("legacy_source_not_archived")
+            _assert_backup_file(
+                run_path,
+                "media/{}".format(orphan["path"]),
+                orphan["sha256"],
+                orphan["source_identity"],
+            )
     except FixtureError:
         raise
     except (KeyError, TypeError, ValueError, sqlite3.Error):

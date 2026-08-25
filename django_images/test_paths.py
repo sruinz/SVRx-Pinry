@@ -15,6 +15,7 @@ from django_images.paths import (
     canonical_extension,
     canonical_derivative_path,
     canonical_original_path,
+    pinry_direct_md5_root,
     is_valid_original_leaf,
     sanitize_original_filename,
 )
@@ -56,6 +57,32 @@ class CanonicalExtensionTest(SimpleTestCase):
                     canonical_extension(image), expected_extension
                 )
                 self.assertEqual(image.tell(), 3)
+
+
+class PinryDirectMd5PathTest(SimpleTestCase):
+    def test_valid_path_returns_legacy_root(self):
+        self.assertEqual(
+            pinry_direct_md5_root(
+                "a/b/ab0123456789abcdef0123456789abcd/photo.png"
+            ),
+            "a",
+        )
+
+    def test_rejects_non_pinry_paths(self):
+        invalid = (
+            "a/c/ab0123456789abcdef0123456789abcd/photo.png",
+            "A/b/Ab0123456789abcdef0123456789abcd/photo.png",
+            "a/b/ab0123456789abcdef0123456789abcd",
+            "a/b/ab0123456789abcdef0123456789abcd/folder/photo.png",
+            (
+                "image/original/by-md5/a/b/"
+                "ab0123456789abcdef0123456789abcd/photo.png"
+            ),
+            "originals/a/b/ab0123456789abcdef0123456789abcd/photo.png",
+        )
+        for path in invalid:
+            with self.subTest(path=path):
+                self.assertIsNone(pinry_direct_md5_root(path))
 
 
 class OriginalFilenameTest(SimpleTestCase):

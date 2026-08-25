@@ -142,6 +142,20 @@ git archive --format=tar "${source_commit}" -- \
     ':(exclude,glob)**/.DS_Store' \
     ':(exclude,glob)**/._*' \
     | tar -xf - -C "${temporary_directory}/context"
+required_startup_paths=(
+    docker/scripts/start.sh
+    docker/scripts/startup.py
+    docker/scripts/bootstrap.sh
+    docker/scripts/gen_key.sh
+    docker/scripts/normalize_persistent_file.py
+    docker/scripts/_start_gunicorn.sh
+)
+for required_path in "${required_startup_paths[@]}"; do
+    if [ ! -e "${temporary_directory}/context/${required_path}" ]; then
+        echo "package_layout_changed" >&2
+        exit 1
+    fi
+done
 printf '%s\n' \
     Dockerfile.autobuild \
     .dockerignore \

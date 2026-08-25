@@ -165,6 +165,13 @@ docker compose up -d --force-recreate
 때마다 실행되며, 이관할 증거가 없거나 이전 이관이 이미 완료되었으면
 멱등적인 no-op으로 끝난 뒤 정상 서비스를 시작한다.
 
+이전 시험 이미지가 archive root identity 또는 완료 진행표를 남기지 못한
+prefixed·direct MD5 상태는 정상 폴더와 교체된 폴더를 안전하게 구분할 수
+없으므로 `archive_manifest_mismatch` 또는 `archive_state_conflict`로 중단한다.
+root archive가 없고 파일 identity를 검증할 수 있는 fixed-slot-only 완료 상태는
+안전하게 재개한다. 현재 산출물은 필요한 정보를 archive 전에 기록하므로 새
+이관에서는 같은 불완전 상태를 만들지 않는다.
+
 기존 데이터 또는 pending schema가 발견되면 다음 순서로 진행한다.
 
 1. 컨테이너 수명 전체의 startup lock과 저장소 설정을 검증한다.
@@ -182,7 +189,26 @@ docker compose up -d --force-recreate
 원본 파일명 대신 `legacy_migration_space_insufficient`,
 `media_storage_configuration_invalid`, `migration_state_plan_mismatch`,
 `archive_state_conflict`, `atomic_archive_unsupported` 같은 reason code만
-남는다. `bootstrap_persistent_settings_invalid`는 `data` 폴더에 보존된 설정
+남는다. 이관 증거 검사에서 중단되면 다음처럼 검사 단계별 reason code가
+표시된다.
+
+- `legacy_database_invalid`: 기존 DB 파일의 형식·위치·identity가 안전하지 않다.
+- `legacy_database_schema_invalid`: 기존 SQLite DB를 읽을 수 없거나 필요한
+  테이블 구조가 유효하지 않다.
+- `legacy_media_root_invalid`: 미디어 root가 디렉터리가 아니거나 안전하게
+  고정할 수 없는 항목이 있다.
+- `legacy_media_rows_invalid`: 기존 Image·Thumbnail row의 미디어 경로가
+  허용된 레거시 또는 현재 형식이 아니다.
+- `legacy_media_files_invalid`: DB가 참조하는 레거시 파일을 안전하게 읽을 수
+  없다.
+- `legacy_migration_graph_invalid`: 이미지에 포함된 Django migration graph를
+  안전하게 검사할 수 없다.
+
+완전히 빈 신규 `data` 폴더에서는 이관 검사가 no-op으로 끝나야 한다. 위
+코드가 표시되면 신규 설치로 생각한 폴더에도 기존 DB·미디어·불완전한 복사
+항목이 남아 있는 것이므로 해당 코드에 맞는 항목을 확인한다.
+
+`bootstrap_persistent_settings_invalid`는 `data` 폴더에 보존된 설정
 또는 비밀키가 심볼릭 링크·하드 링크·일반 파일이 아닌 형식이거나 내용 검증에
 실패했다는 뜻이다. File Station으로 복사하면서 달라진 소유자와 권한은 시작할
 때 컨테이너 root 소유 `0600`으로 자동 정규화된다. 따라서 `data` 공유 폴더는
@@ -205,7 +231,8 @@ docker compose up -d --force-recreate
 ├── media-asset-backfill.jsonl
 ├── migration-summary.json
 └── media/
-    ├── image/  # 기존 MD5 미디어 폴더가 있을 때
+    ├── 0/ ... f/  # 실제 존재했던 Pinry MD5 최상위 폴더
+    ├── image/  # 이전 호환 MD5 경로가 있었을 때만
     └── fixed-slot-originals/
         └── originals/<uuid>/original.<ext>
 ```
@@ -236,13 +263,17 @@ backup은 사용자가 직접 삭제한다.
    File Station의 `/volume1/docker/svrx-pinry/data/production.db`
    (컨테이너 내부 `/data/production.db`) 위치로 복원한다. 현재 DB는 바로
    덮어쓰지 말고 별도 이름이나 폴더로 보관한다.
-4. backup의 `media/image/`가 있으면 원래
+4. backup의 `media/0/`부터 `media/f/` 중 존재하는 폴더를 각각 원래
+   `/volume1/docker/svrx-pinry/data/static/media/0/`부터
+   `/volume1/docker/svrx-pinry/data/static/media/f/`의 같은 이름 위치로
+   복원한다. 이것이 실제 Pinry의 MD5 미로형 폴더 구조이다.
+5. backup의 `media/image/`가 있으면 이전 호환 경로이므로 원래
    `/volume1/docker/svrx-pinry/data/static/media/image/` 위치로 폴더 구조와
    함께 복원한다.
-5. backup의 `media/fixed-slot-originals/originals/`가 있으면 그 아래 내용을
+6. backup의 `media/fixed-slot-originals/originals/`가 있으면 그 아래 내용을
    원래 `/volume1/docker/svrx-pinry/data/static/media/originals/` 아래에 같은
    상대경로로 복원한다.
-6. 기존 Pinry 이미지와 Compose를 다시 사용해 서비스를 시작한다. 현재
+7. 기존 Pinry 이미지와 Compose를 다시 사용해 서비스를 시작한다. 현재
    SVRx Pinry Compose를 시작하면 자동 이관이 다시 실행된다.
 
 서버가 정상 시작한 뒤 만든 신규 Pin과 수정 사항은 이관 전 DB snapshot에

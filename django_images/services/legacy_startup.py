@@ -426,9 +426,8 @@ class LegacyStartupCoordinator(object):
     def _converge_archive(self, run):
         evidence = self._seal_current_identities(run)
         status = migration_state.read_run_status(run)
-        if status.phase == "archive_complete":
-            self._transition_complete(run, "archive_complete")
-            return
+        if evidence.has_md5_paths or evidence.has_fixed_slot_paths:
+            raise LegacyStartupError("legacy_media_still_referenced")
         archive = LegacyMediaArchive(
             settings.MEDIA_ROOT,
             run.path,
@@ -438,10 +437,40 @@ class LegacyStartupCoordinator(object):
             self.service_uid,
             self.service_gid,
         )
+        if status.phase == "archive_complete":
+            if status.progress is None:
+                plan = archive.prepare(
+                    recover_completed_fixed=True,
+                    expected_plan_sha256=status.media_plan_sha256,
+                    expected_manifest_sha256=(
+                        status.media_manifest_sha256
+                    ),
+                )
+            else:
+                plan = archive.prepare(
+                    progress=status.progress,
+                    expected_plan_sha256=status.media_plan_sha256,
+                    expected_manifest_sha256=(
+                        status.media_manifest_sha256
+                    ),
+                )
+            archive.converge(
+                plan,
+                syscall_adapter=self.archive_adapter,
+            )
+            self._transition_complete(run, "archive_complete")
+            return
         if status.phase == "registry_complete":
             plan = archive.prepare(
                 has_media_image_directory=(
                     evidence.has_media_image_directory
+                ),
+                has_pinry_direct_md5_directory=(
+                    evidence.has_pinry_direct_md5_directory
+                ),
+                expected_plan_sha256=status.media_plan_sha256,
+                expected_manifest_sha256=(
+                    status.media_manifest_sha256
                 ),
             )
             if not plan.intents:
@@ -457,7 +486,13 @@ class LegacyStartupCoordinator(object):
             )
             self._fault("after_archive_intent")
         else:
-            plan = archive.prepare(progress=status.progress)
+            plan = archive.prepare(
+                progress=status.progress,
+                expected_plan_sha256=status.media_plan_sha256,
+                expected_manifest_sha256=(
+                    status.media_manifest_sha256
+                ),
+            )
             if self._first_incomplete(plan.progress) != status.intent:
                 raise LegacyStartupError("archive_state_conflict")
 
@@ -469,6 +504,7 @@ class LegacyStartupCoordinator(object):
                     run,
                     "archive_intent",
                     "archive_complete",
+                    progress=progress,
                 )
             else:
                 self._transition(
@@ -544,7 +580,7 @@ class LegacyStartupCoordinator(object):
         status = migration_state.read_run_status(run)
         if status.phase != expected:
             raise LegacyStartupError("migration_state_phase_mismatch")
-        self._restore_summary_values(run, status)
+        self._restore_summary_values(run, status, force_reload=True)
         if (
             not isinstance(self._media_summary, AutoV2PlanSummary)
             or not isinstance(self._backfill_summary, BackfillSummary)
@@ -552,6 +588,10 @@ class LegacyStartupCoordinator(object):
             raise LegacyStartupError("migration_state_plan_mismatch")
         self._write_summary(run, phase_override="complete")
         self._fault("after_complete_summary")
+        status = migration_state.read_run_status(run)
+        if status.phase != expected:
+            raise LegacyStartupError("migration_state_phase_mismatch")
+        self._restore_summary_values(run, status, force_reload=True)
         return migration_state.transition_state(
             run,
             expected,
@@ -611,14 +651,17 @@ class LegacyStartupCoordinator(object):
         }
         _atomic_write_summary(run, payload)
 
-    def _restore_summary_values(self, run, status):
+    def _restore_summary_values(self, run, status, force_reload=False):
         media_hashes = (
             status.media_plan_sha256,
             status.media_manifest_sha256,
         )
         if (media_hashes[0] is None) != (media_hashes[1] is None):
             raise LegacyStartupError("migration_state_plan_mismatch")
-        if self._media_summary is None and media_hashes[0] is not None:
+        if (
+            media_hashes[0] is not None
+            and (force_reload or self._media_summary is None)
+        ):
             try:
                 summary = load_completed_auto_v2_summary(
                     run.path,
@@ -650,7 +693,10 @@ class LegacyStartupCoordinator(object):
         )
         if (backfill_hashes[0] is None) != (backfill_hashes[1] is None):
             raise LegacyStartupError("migration_state_plan_mismatch")
-        if self._backfill_summary is None and backfill_hashes[0] is not None:
+        if (
+            backfill_hashes[0] is not None
+            and (force_reload or self._backfill_summary is None)
+        ):
             try:
                 summary = load_completed_media_asset_backfill_summary(
                     run.path,

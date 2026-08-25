@@ -369,11 +369,23 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             return real_seal(run, current_evidence)
 
         coordinator = self.coordinator()
+        archive_evidence = LegacyEvidence(
+            **dict(
+                evidence.__dict__,
+                has_md5_paths=False,
+                has_fixed_slot_paths=False,
+            )
+        )
         patches = (
             mock.patch(
                 "django_images.services.legacy_startup."
                 "startup_preflight.inspect_legacy_evidence",
-                return_value=evidence,
+                side_effect=(
+                    evidence,
+                    evidence,
+                    evidence,
+                    archive_evidence,
+                ),
             ),
             mock.patch(
                 "django_images.services.legacy_startup."
@@ -432,10 +444,20 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                 "migration_state.seal_run_identities",
                 side_effect=seal,
             ),
+            mock.patch(
+                "django_images.services.legacy_startup."
+                "load_completed_auto_v2_summary",
+                return_value=media_execute,
+            ),
+            mock.patch(
+                "django_images.services.legacy_startup."
+                "load_completed_media_asset_backfill_summary",
+                return_value=backfill_execute,
+            ),
         )
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
                 patches[5], patches[6], patches[7], patches[8], patches[9], \
-                patches[10], patches[11]:
+                patches[10], patches[11], patches[12], patches[13]:
             run = coordinator.prepare_before_schema()
             events.extend(("collectstatic", "migrate"))
             coordinator.converge_after_schema(run)
@@ -806,6 +828,83 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "^migration_state_plan_mismatch$",
         ):
             self.coordinator()._write_summary(run)
+
+    def test_transition_complete_reloads_cached_terminal_manifests(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run, "initialized", "schema_complete"
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "paths_complete",
+            "registry_complete",
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+        )
+        coordinator = self.coordinator()
+        self._set_terminal_summaries(coordinator, run)
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_auto_v2_summary",
+            return_value=coordinator._media_summary,
+        ) as load_media, mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_media_asset_backfill_summary",
+            return_value=coordinator._backfill_summary,
+        ) as load_backfill:
+            coordinator._transition_complete(run, "registry_complete")
+
+        self.assertGreaterEqual(load_media.call_count, 1)
+        self.assertGreaterEqual(load_backfill.call_count, 1)
+
+    def test_transition_complete_rejects_tampered_cached_backfill_manifest(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run, "initialized", "schema_complete"
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "paths_complete",
+            "registry_complete",
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+        )
+        coordinator = self.coordinator()
+        self._set_terminal_summaries(coordinator, run)
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_auto_v2_summary",
+            return_value=coordinator._media_summary,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_media_asset_backfill_summary",
+            side_effect=CommandError("unsafe_media_asset_manifest"),
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^migration_state_plan_mismatch$",
+        ):
+            coordinator._transition_complete(run, "registry_complete")
+
+        self.assertEqual(
+            migration_state.read_run_status(run).phase,
+            "registry_complete",
+        )
 
     def test_complete_resume_repairs_missing_summary_from_typed_manifests(self):
         run = self._summary_run()
@@ -1179,6 +1278,14 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         ), mock.patch(
             "django_images.services.legacy_startup.LegacyMediaArchive",
             return_value=archive,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_auto_v2_summary",
+            return_value=coordinator._media_summary,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_media_asset_backfill_summary",
+            return_value=coordinator._backfill_summary,
         ):
             coordinator.converge_after_schema(run)
 
@@ -1187,6 +1294,148 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "complete",
         )
         archive.converge.assert_not_called()
+        self.assertEqual(
+            archive.prepare.call_args.kwargs["expected_plan_sha256"],
+            "1" * 64,
+        )
+        self.assertEqual(
+            archive.prepare.call_args.kwargs["expected_manifest_sha256"],
+            "2" * 64,
+        )
+
+    def test_archive_complete_resume_revalidates_archived_media(self):
+        run = SimpleNamespace(path="/backup/run", run_id=RUN_ID)
+        progress = {
+            "items": [{
+                "intent": _Intent(10).as_dict(),
+                "complete": True,
+            }],
+        }
+        status = SimpleNamespace(
+            phase="archive_complete",
+            progress=progress,
+            media_plan_sha256="1" * 64,
+            media_manifest_sha256="2" * 64,
+        )
+        plan = SimpleNamespace(intents=(_Intent(10),), progress=progress)
+        archive = mock.Mock()
+        archive.prepare.return_value = plan
+        coordinator = self.coordinator()
+
+        with mock.patch.object(
+            coordinator,
+            "_seal_current_identities",
+            return_value=self.evidence(present=False),
+        ), mock.patch.object(
+            coordinator, "_transition_complete"
+        ) as transition_complete, mock.patch(
+            "django_images.services.legacy_startup."
+            "migration_state.read_run_status",
+            return_value=status,
+        ), mock.patch(
+            "django_images.services.legacy_startup.LegacyMediaArchive",
+            return_value=archive,
+        ):
+            coordinator._converge_archive(run)
+
+        archive.prepare.assert_called_once_with(
+            progress=progress,
+            expected_plan_sha256="1" * 64,
+            expected_manifest_sha256="2" * 64,
+        )
+        archive.converge.assert_called_once_with(
+            plan,
+            syscall_adapter=coordinator.archive_adapter,
+        )
+        transition_complete.assert_called_once_with(
+            run, "archive_complete"
+        )
+
+    def test_legacy_archive_complete_recovers_fixed_only_archive(self):
+        run = SimpleNamespace(path="/backup/run", run_id=RUN_ID)
+        progress = {
+            "items": [{
+                "intent": _Intent(10).as_dict(),
+                "complete": True,
+            }],
+        }
+        status = SimpleNamespace(
+            phase="archive_complete",
+            progress=None,
+            media_plan_sha256="1" * 64,
+            media_manifest_sha256="2" * 64,
+        )
+        archive = mock.Mock()
+        recovered = SimpleNamespace(
+            intents=(_Intent(10),), progress=progress
+        )
+        archive.prepare.return_value = recovered
+        coordinator = self.coordinator()
+
+        with mock.patch.object(
+            coordinator,
+            "_seal_current_identities",
+            return_value=self.evidence(present=False),
+        ), mock.patch.object(
+            coordinator, "_transition_complete"
+        ) as transition_complete, mock.patch(
+            "django_images.services.legacy_startup."
+            "migration_state.read_run_status",
+            return_value=status,
+        ), mock.patch(
+            "django_images.services.legacy_startup.LegacyMediaArchive",
+            return_value=archive,
+        ):
+            coordinator._converge_archive(run)
+
+        archive.prepare.assert_called_once_with(
+            recover_completed_fixed=True,
+            expected_plan_sha256="1" * 64,
+            expected_manifest_sha256="2" * 64,
+        )
+        archive.converge.assert_called_once_with(
+            recovered,
+            syscall_adapter=coordinator.archive_adapter,
+        )
+        transition_complete.assert_called_once_with(
+            run, "archive_complete"
+        )
+
+    def test_archive_rejects_fresh_legacy_database_references(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run, "initialized", "schema_complete"
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "paths_complete",
+            "registry_complete",
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+        )
+        archive = mock.Mock()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=self.evidence(present=True),
+        ), mock.patch(
+            "django_images.services.legacy_startup.LegacyMediaArchive",
+            return_value=archive,
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^legacy_media_still_referenced$",
+        ):
+            self.coordinator()._converge_archive(run)
+
+        archive.prepare.assert_not_called()
 
     def test_complete_summary_failure_leaves_state_resumable(self):
         run = self._summary_run()
@@ -1222,6 +1471,14 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         ), mock.patch(
             "django_images.services.legacy_startup.LegacyMediaArchive",
             return_value=archive,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_auto_v2_summary",
+            return_value=coordinator._media_summary,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_media_asset_backfill_summary",
+            return_value=coordinator._backfill_summary,
         ), mock.patch(
             "django_images.services.legacy_startup._atomic_write_summary",
             side_effect=LegacyStartupError("unsafe_migration_summary"),
@@ -1275,6 +1532,14 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         ), mock.patch(
             "django_images.services.legacy_startup.LegacyMediaArchive",
             return_value=archive,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_auto_v2_summary",
+            return_value=coordinator._media_summary,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_media_asset_backfill_summary",
+            return_value=coordinator._backfill_summary,
         ), self.assertRaisesRegex(
             RuntimeError,
             "^simulated complete transition crash$",
@@ -1299,6 +1564,14 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         ), mock.patch(
             "django_images.services.legacy_startup.LegacyMediaArchive",
             return_value=archive,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_auto_v2_summary",
+            return_value=resumed._media_summary,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_media_asset_backfill_summary",
+            return_value=resumed._backfill_summary,
         ):
             resumed._converge_archive(run)
 

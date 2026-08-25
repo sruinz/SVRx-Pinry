@@ -4,11 +4,6 @@ from .base import *
 
 
 # SECURITY WARNING: keep the secret key used in production secret!
-if 'SECRET_KEY' not in os.environ:
-    logging.warning(
-        "No SECRET_KEY given in environ, please have a check."
-        "If you have a local_settings file, please ignore this warning."
-    )
 SECRET_KEY = os.environ.get('SECRET_KEY', "PLEASE_REPLACE_ME")
 
 # SECURITY WARNING: don't run with debug turned on in production!
@@ -38,3 +33,6 @@ REST_FRAMEWORK['DEFAULT_RENDERER_CLASSES'] = [
 
 # should not ignore import error in production, local_settings is required
 from .local_settings import *
+
+if not SECRET_KEY or SECRET_KEY == "PLEASE_REPLACE_ME":
+    logging.warning("No usable SECRET_KEY is configured.")

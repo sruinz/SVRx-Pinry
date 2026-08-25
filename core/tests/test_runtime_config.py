@@ -6,6 +6,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -261,6 +262,46 @@ def _assert_nginx_contract(source):
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def _import_docker_settings(self, local_secret, environment_secret=None):
+        script = (
+            "import sys, types\n"
+            "local_settings = types.ModuleType("
+            "'pinry.settings.local_settings')\n"
+            "local_settings.SECRET_KEY = {!r}\n"
+            "sys.modules['pinry.settings.local_settings'] = local_settings\n"
+            "from pinry.settings import docker\n"
+            "print(docker.SECRET_KEY)\n"
+        ).format(local_secret)
+        environment = os.environ.copy()
+        if environment_secret is None:
+            environment.pop("SECRET_KEY", None)
+        else:
+            environment["SECRET_KEY"] = environment_secret
+        return subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(REPOSITORY_ROOT),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def test_docker_settings_do_not_warn_for_effective_local_secret(self):
+        completed = self._import_docker_settings("effective-local-secret")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(completed.stdout.decode().strip(), "effective-local-secret")
+        self.assertEqual(completed.stderr, b"")
+
+    def test_docker_settings_warn_for_effective_placeholder_secret(self):
+        completed = self._import_docker_settings(
+            "PLEASE_REPLACE_ME",
+            environment_secret="overridden-environment-secret",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(completed.stdout.decode().strip(), "PLEASE_REPLACE_ME")
+        self.assertIn(b"SECRET_KEY", completed.stderr)
+
     def _capture_environment(self, binary_name):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -327,7 +368,7 @@ class RuntimeConfigTests(unittest.TestCase):
         environment["PINRY_STARTUP_CAPTURE"] = str(capture)
         return environment, capture, startup_script
 
-    def _python_runner_environment(self):
+    def _python_runner_environment(self, real_bootstrap=False):
         temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
         self.addCleanup(temporary.cleanup)
         project_root = Path(temporary.name, "project")
@@ -350,21 +391,32 @@ class RuntimeConfigTests(unittest.TestCase):
             1,
         ))
         bootstrap = scripts / "bootstrap.sh"
-        bootstrap.write_text(
-            "#!/bin/sh\n"
-            "printf 'bootstrap\\n' >> \"$PINRY_STARTUP_CAPTURE\"\n"
-            "if [ \"${PINRY_FAIL_POINT:-}\" = bootstrap ]; then\n"
-            "    printf '%s\\n' "
-            "\"${PINRY_BOOTSTRAP_REASON:-sentinel-private-bootstrap-secret}\" "
-            ">&2\n"
-            "    exit 42\n"
-            "fi\n"
-            "while [ -n \"${PINRY_BOOTSTRAP_GATE:-}\" ] "
-            "&& [ -e \"$PINRY_BOOTSTRAP_GATE\" ]; do\n"
-            "    sleep 0.05\n"
-            "done\n"
-        )
-        bootstrap.chmod(0o700)
+        if real_bootstrap:
+            for name in (
+                "bootstrap.sh",
+                "gen_key.sh",
+                "normalize_persistent_file.py",
+            ):
+                shutil.copy2(
+                    REPOSITORY_ROOT / "docker/scripts" / name,
+                    scripts / name,
+                )
+        else:
+            bootstrap.write_text(
+                "#!/bin/sh\n"
+                "printf 'bootstrap\\n' >> \"$PINRY_STARTUP_CAPTURE\"\n"
+                "if [ \"${PINRY_FAIL_POINT:-}\" = bootstrap ]; then\n"
+                "    printf '%s\\n' "
+                "\"${PINRY_BOOTSTRAP_REASON:-sentinel-private-bootstrap-secret}\" "
+                ">&2\n"
+                "    exit 42\n"
+                "fi\n"
+                "while [ -n \"${PINRY_BOOTSTRAP_GATE:-}\" ] "
+                "&& [ -e \"$PINRY_BOOTSTRAP_GATE\" ]; do\n"
+                "    sleep 0.05\n"
+                "done\n"
+            )
+            bootstrap.chmod(0o700)
         gunicorn = scripts / "_start_gunicorn.sh"
         gunicorn.write_text(
             "#!/bin/sh\n"
@@ -495,6 +547,12 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         write_module("pinry/settings/__init__.py", "")
         write_module("pinry/settings/docker.py", "")
+        if real_bootstrap:
+            shutil.copy2(
+                REPOSITORY_ROOT
+                / "pinry/settings/local_settings.example.py",
+                project_root / "pinry/settings/local_settings.example.py",
+            )
 
         data_root = Path(temporary.name, "data")
         data_root.mkdir(mode=0o700)
@@ -502,10 +560,41 @@ class RuntimeConfigTests(unittest.TestCase):
         environment = os.environ.copy()
         environment.update({
             "PINRY_DATA_ROOT": str(data_root),
+            "PINRY_PROJECT_ROOT": str(project_root),
             "PINRY_STARTUP_CAPTURE": str(capture),
             "PYTHONPATH": "",
             "PINRY_REAL_PYTHON": str(REPOSITORY_ROOT / ".venv/bin/python"),
         })
+        if real_bootstrap:
+            binary_directory = Path(temporary.name, "bootstrap-bin")
+            binary_directory.mkdir()
+            identity = binary_directory / "id"
+            identity.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = -u ] && [ \"${2:-}\" = www-data ]; then\n"
+                "    printf '%s\\n' '" + str(os.getuid()) + "'\n"
+                "    exit 0\n"
+                "fi\n"
+                "if [ \"${1:-}\" = -g ] && [ \"${2:-}\" = www-data ]; then\n"
+                "    printf '%s\\n' '"
+                + str(project_root.stat().st_gid)
+                + "'\n"
+                "    exit 0\n"
+                "fi\n"
+                "exec \"" + str(shutil.which("id")) + "\" \"$@\"\n"
+            )
+            identity.chmod(0o700)
+            chown = binary_directory / "chown"
+            chown.write_text("#!/bin/sh\nexit 0\n")
+            chown.chmod(0o700)
+            pwgen = binary_directory / "pwgen"
+            pwgen.write_text("#!/bin/sh\nprintf '%065d\\n' 0\n")
+            pwgen.chmod(0o700)
+            environment["PATH"] = "{}{}{}".format(
+                binary_directory,
+                os.pathsep,
+                environment.get("PATH", ""),
+            )
         environment.pop("DJANGO_SETTINGS_MODULE", None)
         return environment, capture, runner, data_root
 
@@ -655,6 +744,58 @@ class RuntimeConfigTests(unittest.TestCase):
             "lock_inheritable",
             "gunicorn",
         ])
+
+    def test_python_runner_bootstraps_completely_empty_data_root(self):
+        environment, capture, runner, data_root = (
+            self._python_runner_environment(real_bootstrap=True)
+        )
+        self.assertEqual(tuple(data_root.iterdir()), ())
+
+        completed = subprocess.run(
+            [
+                str(REPOSITORY_ROOT / ".venv/bin/python"),
+                str(runner),
+                "--migrate-legacy",
+            ],
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        rendered = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 0, rendered)
+        self.assertNotIn(b"legacy_evidence_invalid", rendered)
+        self.assertFalse((data_root / "legacy-backup").exists())
+        persistent_settings = data_root / "local_settings.py"
+        project_settings = runner.parents[2] / "pinry/settings/local_settings.py"
+        secret_key = data_root / "production_secret_key.txt"
+        self.assertTrue(persistent_settings.is_file())
+        self.assertTrue(project_settings.is_file())
+        self.assertTrue(secret_key.is_file())
+        self.assertEqual(
+            persistent_settings.read_bytes(), project_settings.read_bytes()
+        )
+        self.assertNotIn(
+            b"secret_key_place_holder", persistent_settings.read_bytes()
+        )
+        self.assertEqual(
+            self._runner_events(capture),
+            [
+                "lock",
+                "setup:pinry.settings.docker",
+                "coordinator",
+                "prepare",
+                "collectstatic",
+                "migrate",
+                "converge:run",
+                "ownership",
+                "runtime",
+                "nginx",
+                "lock_inheritable",
+                "gunicorn",
+            ],
+        )
 
     def test_python_runner_requires_flag_before_pending_inventory_commands(self):
         environment, capture, runner, _data_root = (

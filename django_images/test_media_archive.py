@@ -1,6 +1,9 @@
 import ctypes
 import errno
+import hashlib
+import json
 import os
+import shutil
 import stat
 import tempfile
 from dataclasses import replace
@@ -8,9 +11,13 @@ from pathlib import Path
 from unittest import mock
 import uuid
 
+from django.core.management import CommandError
 from django.test import SimpleTestCase, TestCase
 
-from django_images.file_ops import open_verified_media_root
+from django_images.file_ops import (
+    open_verified_media_file,
+    open_verified_media_root,
+)
 from django_images.models import Image, Thumbnail
 from django_images.paths import canonical_original_path
 from django_images.services.media_archive import (
@@ -21,13 +28,17 @@ from django_images.services.media_archive import (
     build_archive_intent,
     fixed_slot_destination_path,
     open_archive_session,
+    _validate_archive_intent_layout,
     validate_no_legacy_media_references,
 )
 from django_images.services.media_migration_v2 import (
     AUTO_V2_MANIFEST_FILENAME,
+    AUTO_V2_TARGET_SIGNATURE,
     AutoV2ManifestLog,
     AutoV2MigrationFile,
     AutoV2MigrationPlan,
+    load_auto_v2_archive_authority,
+    load_completed_auto_v2_summary,
 )
 
 
@@ -977,7 +988,9 @@ class MediaArchiveGateTests(TestCase):
             new_path=new_path,
             operation="copy",
             size=source_stat.st_size,
-            sha256="0" * 64,
+            sha256=hashlib.sha256(
+                (self.source_root / source_relative).read_bytes()
+            ).hexdigest(),
             image_format="PNG",
             width=1,
             height=1,
@@ -1024,6 +1037,95 @@ class MediaArchiveGateTests(TestCase):
             copy_required_bytes=0,
         )
 
+    def direct_md5_plan(self, image_id, source_relative):
+        asset_uuid = "11111111-1111-4111-8111-111111111111"
+        source_path = self.source_root / source_relative
+        source_stat = os.stat(str(source_path))
+        archive_root_stat = os.stat(
+            str(self.source_root / source_relative.split("/", 1)[0])
+        )
+        new_path = canonical_original_path(
+            asset_uuid,
+            "legacy-{}.png".format(image_id),
+            ".png",
+        )
+        file_plan = AutoV2MigrationFile(
+            kind="original",
+            old_path=source_relative,
+            new_path=new_path,
+            operation="copy",
+            size=source_stat.st_size,
+            sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            image_format="PNG",
+            width=1,
+            height=1,
+            source_device=source_stat.st_dev,
+            source_inode=source_stat.st_ino,
+            archive_root_device=archive_root_stat.st_dev,
+            archive_root_inode=archive_root_stat.st_ino,
+        )
+        return AutoV2MigrationPlan(
+            image_id=image_id,
+            asset_uuid=asset_uuid,
+            original_filename="legacy-{}.png".format(image_id),
+            image_width=1,
+            image_height=1,
+            generation="md5_legacy",
+            files=(file_plan,),
+            thumbnail_rows=(),
+            copy_required_bytes=source_stat.st_size,
+        )
+
+    def prefixed_md5_plan(self, image_id, source_relative):
+        asset_uuid = "22222222-2222-4222-8222-222222222222"
+        source_path = self.source_root / source_relative
+        source_stat = os.stat(str(source_path))
+        archive_root_stat = os.stat(str(self.source_root / "image"))
+        file_plan = AutoV2MigrationFile(
+            kind="original",
+            old_path=source_relative,
+            new_path=canonical_original_path(
+                asset_uuid,
+                "legacy-{}.png".format(image_id),
+                ".png",
+            ),
+            operation="copy",
+            size=source_stat.st_size,
+            sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            image_format="PNG",
+            width=1,
+            height=1,
+            source_device=source_stat.st_dev,
+            source_inode=source_stat.st_ino,
+            archive_root_device=archive_root_stat.st_dev,
+            archive_root_inode=archive_root_stat.st_ino,
+        )
+        return AutoV2MigrationPlan(
+            image_id=image_id,
+            asset_uuid=asset_uuid,
+            original_filename="legacy-{}.png".format(image_id),
+            image_width=1,
+            image_height=1,
+            generation="md5_legacy",
+            files=(file_plan,),
+            thumbnail_rows=(),
+            copy_required_bytes=source_stat.st_size,
+        )
+
+    def legacy_prefixed_md5_plan(self, image_id, source_relative):
+        plan = self.prefixed_md5_plan(image_id, source_relative)
+        return replace(
+            plan,
+            files=tuple(
+                replace(
+                    file_plan,
+                    archive_root_device=None,
+                    archive_root_inode=None,
+                )
+                for file_plan in plan.files
+            ),
+        )
+
     def write_manifest(self, plans, terminal=True):
         with AutoV2ManifestLog.open(
             str(self.run_directory),
@@ -1044,6 +1146,72 @@ class MediaArchiveGateTests(TestCase):
                     )
                     manifest.record_result(event_name, plan.image_id)
 
+    def write_legacy_manifest(self, plans, terminal=True):
+        """현재 writer 검증을 거치지 않은 구 v2 event를 재현한다."""
+        common = {
+            "format_version": 2,
+            "target_signature": AUTO_V2_TARGET_SIGNATURE,
+            "run_id": RUN_ID,
+        }
+        events = [
+            dict(common, event="planned", plan=plan.as_dict())
+            for plan in plans
+        ]
+        counts = {
+            generation: sum(
+                1 for plan in plans if plan.generation == generation
+            )
+            for generation in (
+                "md5_legacy",
+                "fixed_slot",
+                "named_canonical",
+            )
+        }
+        events.append(dict(
+            common,
+            event="plan_complete",
+            image_count=len(plans),
+            md5_legacy=counts["md5_legacy"],
+            fixed_slot=counts["fixed_slot"],
+            named_canonical=counts["named_canonical"],
+            copy_required_bytes=sum(
+                plan.copy_required_bytes for plan in plans
+            ),
+        ))
+        lines = [
+            json.dumps(
+                event,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8") + b"\n"
+            for event in events
+        ]
+        plan_sha256 = hashlib.sha256(b"".join(lines)).hexdigest()
+        if terminal:
+            for plan in plans:
+                event_name = (
+                    "already_current"
+                    if plan.generation == "named_canonical"
+                    else "committed"
+                )
+                lines.append(json.dumps(
+                    dict(
+                        common,
+                        event=event_name,
+                        image_id=plan.image_id,
+                        plan_sha256=plan_sha256,
+                    ),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8") + b"\n")
+        manifest_path = (
+            self.run_directory / AUTO_V2_MANIFEST_FILENAME
+        )
+        manifest_path.write_bytes(b"".join(lines))
+        os.chmod(str(manifest_path), 0o600)
+
     def archiver(self):
         return LegacyMediaArchive(
             str(self.source_root),
@@ -1055,9 +1223,12 @@ class MediaArchiveGateTests(TestCase):
             self.gid,
         )
 
-    def prepare_plan(self, has_md5=False, schema_only=False, **kwargs):
+    def prepare_plan(
+        self, has_md5=False, has_direct=False, schema_only=False, **kwargs
+    ):
         return self.archiver().prepare(
             has_media_image_directory=has_md5,
+            has_pinry_direct_md5_directory=has_direct,
             schema_only=schema_only,
             **kwargs
         )
@@ -1066,6 +1237,25 @@ class MediaArchiveGateTests(TestCase):
         return self.prepare_plan(
             has_md5=has_md5, schema_only=schema_only
         ).intents
+
+    def test_archive_freezes_orphan_direct_roots_without_manifest_rows(self):
+        orphan = (
+            self.source_root / "a" / "b"
+            / "ab0123456789abcdef0123456789abcd" / "orphan.png"
+        )
+        orphan.parent.mkdir(parents=True)
+        orphan.write_bytes(b"orphan")
+        self.write_manifest((self.named_plan(1),))
+
+        plan = self.prepare_plan(has_direct=True)
+
+        self.assertEqual(
+            tuple(
+                (intent.source_name, intent.destination_name)
+                for intent in plan.intents
+            ),
+            (("a", "a"),),
+        )
 
     def test_archive_rejects_source_root_other_than_effective_media_root(self):
         source = self.make_fixed_source(
@@ -1178,6 +1368,576 @@ class MediaArchiveGateTests(TestCase):
         )
         self.assertTrue(validate_no_legacy_media_references())
 
+    def test_database_gate_rejects_pinry_direct_md5_references(self):
+        Image.objects.create(
+            image="a/b/ab0123456789abcdef0123456789abcd/photo.png",
+            asset_uuid=uuid.uuid4(),
+            original_filename="photo.png",
+            width=1,
+            height=1,
+        )
+
+        self.assert_archive_error(
+            "legacy_media_still_referenced",
+            validate_no_legacy_media_references,
+        )
+
+    def test_database_gate_rejects_exact_direct_root_reference(self):
+        Image.objects.create(
+            image="a",
+            asset_uuid=uuid.uuid4(),
+            original_filename="legacy.png",
+            width=1,
+            height=1,
+        )
+
+        self.assert_archive_error(
+            "legacy_media_still_referenced",
+            validate_no_legacy_media_references,
+        )
+
+    def test_database_gate_rejects_manifest_fixed_slot_reference(self):
+        source = self.make_fixed_source(
+            "11111111-1111-4111-8111-111111111111"
+        )
+        Image.objects.create(
+            image=source,
+            asset_uuid=uuid.uuid4(),
+            original_filename="legacy.png",
+            width=1,
+            height=1,
+        )
+
+        self.assert_archive_error(
+            "legacy_media_still_referenced",
+            lambda: validate_no_legacy_media_references(
+                fixed_slot_sources=(source,)
+            ),
+        )
+
+    def test_prepare_archives_all_pinry_direct_md5_root_directories(self):
+        source = "a/b/ab0123456789abcdef0123456789abcd/photo.png"
+        source_file = self.source_root / source
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(b"legacy")
+        orphan = (
+            self.source_root
+            / "f"
+            / "0"
+            / "f00123456789abcdef0123456789abcd"
+            / "orphan.bin"
+        )
+        orphan.parent.mkdir(parents=True)
+        orphan.write_bytes(b"orphan")
+        self.write_manifest((self.direct_md5_plan(1, source),))
+
+        authority = load_auto_v2_archive_authority(
+            str(self.run_directory),
+            AUTO_V2_MANIFEST_FILENAME,
+            RUN_ID,
+            self.uid,
+            self.gid,
+        )
+        file_plan = authority.direct_files[0]
+        root_stat = os.stat(str(self.source_root / "a"))
+        source_stat = os.stat(str(source_file))
+        self.assertEqual(
+            authority.direct_root_identities,
+            (("a", root_stat.st_dev, root_stat.st_ino),),
+        )
+        self.assertEqual(
+            (file_plan.source_device, file_plan.source_inode),
+            (source_stat.st_dev, source_stat.st_ino),
+        )
+        self.assertEqual(file_plan.size, source_stat.st_size)
+        self.assertEqual(
+            file_plan.sha256,
+            hashlib.sha256(source_file.read_bytes()).hexdigest(),
+        )
+        root_directory = open_verified_media_root(str(self.source_root))
+        receipt = open_verified_media_file(root_directory, source)
+        try:
+            self.assertEqual(
+                (
+                    receipt.parent_directory.directory_stats[0].st_dev,
+                    receipt.parent_directory.directory_stats[0].st_ino,
+                ),
+                (root_stat.st_dev, root_stat.st_ino),
+            )
+        finally:
+            receipt.close()
+            root_directory.close()
+
+        plan = self.prepare_plan()
+        intents = plan.intents
+
+        source_paths = tuple(intent.source_name for intent in intents)
+        destination_paths = tuple(
+            "{}/{}".format(
+                intent.destination_parent_relative,
+                intent.destination_name,
+            )
+            for intent in intents
+        )
+        self.assertEqual(source_paths, ("a", "f"))
+        self.assertEqual(destination_paths, ("media/a", "media/f"))
+        self.assert_archive_error(
+            "archive_state_conflict",
+            lambda: _validate_archive_intent_layout(
+                intents[:1], (), ("a", "f")
+            ),
+        )
+
+        outcome = self.archiver().converge(
+            plan,
+            syscall_adapter=RecordingRenameNoReplaceAdapter(),
+        )
+
+        self.assertEqual(
+            tuple(result.status for result in outcome.results),
+            ("archived", "archived"),
+        )
+        self.assertFalse((self.source_root / "a").exists())
+        self.assertFalse((self.source_root / "f").exists())
+        self.assertEqual(
+            (self.run_directory / "media" / "a" / source.split("/", 1)[1])
+            .read_bytes(),
+            b"legacy",
+        )
+        self.assertEqual(
+            (
+                self.run_directory
+                / "media"
+                / "f"
+                / "0"
+                / "f00123456789abcdef0123456789abcd"
+                / "orphan.bin"
+            ).read_bytes(),
+            b"orphan",
+        )
+
+    def test_prepare_rejects_replaced_fixed_slot_source(self):
+        source = self.make_fixed_source(
+            "11111111-1111-4111-8111-111111111111", b"legacy"
+        )
+        self.write_manifest((self.fixed_plan(1, source),))
+        source_path = self.source_root / source
+        source_path.unlink()
+        source_path.write_bytes(b"forged")
+
+        self.assert_archive_error("archive_manifest_mismatch", self.prepare)
+
+    def test_prepare_rejects_replaced_prefixed_md5_source(self):
+        source = (
+            "image/original/by-md5/a/b/"
+            "ab0123456789abcdef0123456789abcd/photo.png"
+        )
+        source_path = self.source_root / source
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"legacy")
+        self.write_manifest((self.prefixed_md5_plan(1, source),))
+        shutil.rmtree(str(self.source_root / "image"))
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"forged")
+
+        self.assert_archive_error(
+            "archive_manifest_mismatch",
+            lambda: self.prepare(has_md5=True),
+        )
+
+    def test_prepare_rejects_replaced_prefixed_md5_root_with_same_file(self):
+        source = (
+            "image/original/by-md5/a/b/"
+            "ab0123456789abcdef0123456789abcd/photo.png"
+        )
+        source_path = self.source_root / source
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"legacy")
+        orphan = self.source_root / "image" / "orphan.bin"
+        orphan.write_bytes(b"orphan")
+        self.write_manifest((self.prefixed_md5_plan(1, source),))
+
+        old_root = self.source_root / "image-old"
+        (self.source_root / "image").rename(old_root)
+        source_path.parent.mkdir(parents=True)
+        (old_root / source.split("/", 1)[1]).rename(source_path)
+
+        self.assert_archive_error(
+            "archive_manifest_mismatch",
+            lambda: self.prepare(has_md5=True),
+        )
+
+    def test_current_writer_rejects_prefixed_manifest_without_root_authority(
+        self,
+    ):
+        source = (
+            "image/original/by-md5/a/b/"
+            "ab0123456789abcdef0123456789abcd/photo.png"
+        )
+        source_path = self.source_root / source
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"legacy")
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^invalid_auto_v2_manifest$",
+        ):
+            self.write_manifest((self.legacy_prefixed_md5_plan(1, source),))
+
+    def test_public_append_rejects_prefixed_plan_without_root_authority(self):
+        source = (
+            "image/original/by-md5/a/b/"
+            "ab0123456789abcdef0123456789abcd/photo.png"
+        )
+        source_path = self.source_root / source
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"legacy")
+        manifest_path = (
+            self.run_directory / AUTO_V2_MANIFEST_FILENAME
+        )
+
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            AUTO_V2_MANIFEST_FILENAME,
+            RUN_ID,
+            self.uid,
+            self.gid,
+        ) as manifest:
+            with self.assertRaisesRegex(
+                CommandError,
+                "^invalid_auto_v2_manifest$",
+            ):
+                manifest.append({
+                    "event": "planned",
+                    "plan": self.legacy_prefixed_md5_plan(
+                        1, source
+                    ).as_dict(),
+                })
+
+        self.assertEqual(manifest_path.read_bytes(), b"")
+
+    def test_public_append_rejects_unrecognized_nested_plan_fields(self):
+        source = "a/b/ab0123456789abcdef0123456789abcd/photo.png"
+        source_path = self.source_root / source
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"legacy")
+        plan = self.direct_md5_plan(1, source)
+        manifest_path = (
+            self.run_directory / AUTO_V2_MANIFEST_FILENAME
+        )
+
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            AUTO_V2_MANIFEST_FILENAME,
+            RUN_ID,
+            self.uid,
+            self.gid,
+        ) as manifest:
+            for location in ("plan", "file"):
+                with self.subTest(location=location):
+                    payload = json.loads(json.dumps(plan.as_dict()))
+                    if location == "plan":
+                        payload["unrecognized"] = True
+                    else:
+                        payload["files"][0]["unrecognized"] = True
+                    with self.assertRaisesRegex(
+                        CommandError,
+                        "^invalid_auto_v2_manifest$",
+                    ):
+                        manifest.append({
+                            "event": "planned",
+                            "plan": payload,
+                        })
+
+        self.assertEqual(manifest_path.read_bytes(), b"")
+
+    def test_legacy_prefixed_registry_state_without_authority_fails_closed(
+        self,
+    ):
+        source = (
+            "image/original/by-md5/a/b/"
+            "ab0123456789abcdef0123456789abcd/photo.png"
+        )
+        source_path = self.source_root / source
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"legacy")
+        self.write_legacy_manifest((
+            self.legacy_prefixed_md5_plan(1, source),
+        ))
+
+        self.assert_archive_error(
+            "archive_manifest_mismatch",
+            lambda: self.prepare_plan(has_md5=True),
+        )
+
+    def test_legacy_prefixed_archive_intent_resumes_with_frozen_identity(self):
+        source = (
+            "image/original/by-md5/a/b/"
+            "ab0123456789abcdef0123456789abcd/photo.png"
+        )
+        source_path = self.source_root / source
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"legacy")
+        self.write_legacy_manifest((
+            self.legacy_prefixed_md5_plan(1, source),
+        ))
+        (self.run_directory / "media").mkdir()
+        intent = build_archive_intent(
+            str(self.source_root),
+            "image",
+            str(self.run_directory),
+            "media/image",
+        )
+        progress = {
+            "items": [{"intent": intent.as_dict(), "complete": False}],
+        }
+
+        resumed = self.prepare_plan(progress=progress)
+
+        self.assertEqual(resumed.intents, (intent,))
+        self.assertEqual(resumed.progress, progress)
+
+    def test_legacy_completed_fixed_only_archive_recovers(self):
+        source = self.make_fixed_source(
+            "33333333-3333-4333-8333-333333333333",
+            b"legacy-fixed",
+        )
+        self.write_manifest((self.fixed_plan(1, source),))
+        archiver = self.archiver()
+        initial = archiver.prepare()
+        archiver.converge(
+            initial,
+            syscall_adapter=RecordingRenameNoReplaceAdapter(),
+        )
+
+        recovered = archiver.prepare(recover_completed_fixed=True)
+        outcome = archiver.converge(
+            recovered,
+            syscall_adapter=RecordingRenameNoReplaceAdapter(),
+        )
+
+        self.assertTrue(all(
+            item["complete"] for item in recovered.progress["items"]
+        ))
+        self.assertEqual(
+            tuple(result.status for result in outcome.results),
+            ("recovered",),
+        )
+
+    def test_legacy_completed_fixed_recovery_rejects_archived_image_root(
+        self,
+    ):
+        source = self.make_fixed_source(
+            "44444444-4444-4444-8444-444444444444",
+            b"legacy-fixed",
+        )
+        orphan = self.source_root / "image" / "orphan.bin"
+        orphan.parent.mkdir()
+        orphan.write_bytes(b"orphan")
+        self.write_manifest((self.fixed_plan(1, source),))
+        archiver = self.archiver()
+        initial = archiver.prepare(has_media_image_directory=True)
+        archiver.converge(
+            initial,
+            syscall_adapter=RecordingRenameNoReplaceAdapter(),
+        )
+
+        self.assert_archive_error(
+            "archive_state_conflict",
+            lambda: archiver.prepare(recover_completed_fixed=True),
+        )
+
+    def test_legacy_completed_fixed_recovery_rejects_archived_direct_root(
+        self,
+    ):
+        source = self.make_fixed_source(
+            "55555555-5555-4555-8555-555555555555",
+            b"legacy-fixed",
+        )
+        self.write_manifest((self.fixed_plan(1, source),))
+        archiver = self.archiver()
+        initial = archiver.prepare()
+        archiver.converge(
+            initial,
+            syscall_adapter=RecordingRenameNoReplaceAdapter(),
+        )
+        (self.run_directory / "media" / "a").mkdir()
+
+        self.assert_archive_error(
+            "archive_state_conflict",
+            lambda: archiver.prepare(recover_completed_fixed=True),
+        )
+
+    def test_direct_manifest_without_root_authority_is_rejected(self):
+        source = "a/b/ab0123456789abcdef0123456789abcd/photo.png"
+        source_path = self.source_root / source
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"legacy")
+        plan = self.direct_md5_plan(1, source)
+        legacy_plan = replace(
+            plan,
+            files=tuple(
+                replace(
+                    file_plan,
+                    archive_root_device=None,
+                    archive_root_inode=None,
+                )
+                for file_plan in plan.files
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^invalid_auto_v2_manifest$",
+        ):
+            self.write_manifest((legacy_plan,))
+
+    def test_legacy_prefixed_manifest_rejects_mixed_root_authority(self):
+        first = (
+            "image/original/by-md5/a/b/"
+            "ab0123456789abcdef0123456789abcd/first.png"
+        )
+        second = (
+            "image/original/by-md5/c/d/"
+            "cd0123456789abcdef0123456789abcd/second.png"
+        )
+        for path, content in ((first, b"first"), (second, b"second")):
+            source = self.source_root / path
+            source.parent.mkdir(parents=True)
+            source.write_bytes(content)
+        self.write_legacy_manifest((
+            self.legacy_prefixed_md5_plan(1, first),
+            self.prefixed_md5_plan(2, second),
+        ))
+
+        with self.assertRaisesRegex(
+            CommandError,
+            "^manifest_plan_mismatch$",
+        ):
+            load_auto_v2_archive_authority(
+                str(self.run_directory),
+                AUTO_V2_MANIFEST_FILENAME,
+                RUN_ID,
+                self.uid,
+                self.gid,
+            )
+
+    def test_converge_rejects_direct_file_changed_after_intent(self):
+        source = "a/b/ab0123456789abcdef0123456789abcd/photo.png"
+        source_file = self.source_root / source
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(b"legacy")
+        self.write_manifest((self.direct_md5_plan(1, source),))
+        plan = self.prepare_plan()
+        original_inode = source_file.stat().st_ino
+        source_file.write_bytes(b"forged")
+        self.assertEqual(source_file.stat().st_ino, original_inode)
+
+        self.assert_archive_error(
+            "archive_manifest_mismatch",
+            lambda: self.archiver().converge(
+                plan,
+                syscall_adapter=RecordingRenameNoReplaceAdapter(),
+            ),
+        )
+
+    def test_resume_rejects_direct_root_created_after_intent(self):
+        source = "a/b/ab0123456789abcdef0123456789abcd/photo.png"
+        source_file = self.source_root / source
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(b"legacy")
+        self.write_manifest((self.direct_md5_plan(1, source),))
+        plan = self.prepare_plan()
+        late = (
+            self.source_root / "f" / "0"
+            / "f00123456789abcdef0123456789abcd" / "late.png"
+        )
+        late.parent.mkdir(parents=True)
+        late.write_bytes(b"late")
+
+        self.assert_archive_error(
+            "archive_state_conflict",
+            lambda: self.archiver().prepare(progress=plan.progress),
+        )
+
+    def test_resume_rejects_removed_orphan_direct_root_intent(self):
+        source = "a/b/ab0123456789abcdef0123456789abcd/photo.png"
+        source_file = self.source_root / source
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(b"legacy")
+        orphan = (
+            self.source_root / "f" / "0"
+            / "f00123456789abcdef0123456789abcd" / "orphan.png"
+        )
+        orphan.parent.mkdir(parents=True)
+        orphan.write_bytes(b"orphan")
+        self.write_manifest((self.direct_md5_plan(1, source),))
+        plan = self.prepare_plan()
+        shortened_progress = {"items": plan.progress["items"][:1]}
+
+        self.assert_archive_error(
+            "archive_state_conflict",
+            lambda: self.archiver().prepare(progress=shortened_progress),
+        )
+
+    def test_prepare_rejects_manifest_digest_other_than_frozen_state(self):
+        self.write_manifest((self.named_plan(1),))
+        summary = load_completed_auto_v2_summary(
+            str(self.run_directory),
+            AUTO_V2_MANIFEST_FILENAME,
+            RUN_ID,
+            self.uid,
+            self.gid,
+        )
+
+        self.assert_archive_error(
+            "archive_manifest_mismatch",
+            lambda: self.archiver().prepare(
+                expected_plan_sha256="0" * 64,
+                expected_manifest_sha256=summary.manifest_sha256,
+            ),
+        )
+
+    def test_prepare_rejects_replaced_pinry_direct_root(self):
+        source = "a/b/ab0123456789abcdef0123456789abcd/photo.png"
+        source_file = self.source_root / source
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(b"legacy")
+        self.write_manifest((self.direct_md5_plan(1, source),))
+        original_root = self.source_root / "a"
+        original_root.rename(self.source_root / "a-old")
+        original_root.mkdir()
+
+        self.assert_archive_error(
+            "archive_manifest_mismatch",
+            self.prepare,
+        )
+
+    def test_prepare_rejects_non_directory_pinry_direct_root(self):
+        source = "a/b/ab0123456789abcdef0123456789abcd/photo.png"
+        source_file = self.source_root / source
+        source_file.parent.mkdir(parents=True)
+        source_file.write_bytes(b"legacy")
+        plan = self.direct_md5_plan(1, source)
+        self.write_manifest((plan,))
+
+        for kind in ("file", "symlink"):
+            with self.subTest(kind=kind):
+                root_entry = self.source_root / "a"
+                if root_entry.is_symlink() or root_entry.is_file():
+                    root_entry.unlink()
+                elif root_entry.exists():
+                    shutil.rmtree(str(root_entry))
+                if kind == "file":
+                    root_entry.write_bytes(b"unsafe")
+                else:
+                    (self.source_root / "target").mkdir(exist_ok=True)
+                    root_entry.symlink_to("target")
+
+                self.assert_archive_error(
+                    "archive_manifest_mismatch", self.prepare
+                )
+
     def test_prepare_freezes_md5_first_then_sorted_fixed_slot_intents(self):
         later = self.make_fixed_source(
             "22222222-2222-4222-8222-222222222222", b"later"
@@ -1257,7 +2017,7 @@ class MediaArchiveGateTests(TestCase):
             "django_images.services.media_archive.open_archive_session"
         ) as session_opener, mock.patch(
             "django_images.services.media_archive."
-            "load_auto_v2_archive_sources"
+            "load_auto_v2_archive_authority"
         ) as manifest_loader, mock.patch(
             "django_images.services.media_archive."
             "validate_no_legacy_media_references"
@@ -1394,6 +2154,61 @@ class MediaArchiveGateTests(TestCase):
                 item["complete"] for item in outcome.progress["items"]
             ),
             (True, True),
+        )
+
+    def test_converge_rejects_completed_item_changed_by_callback(self):
+        first = self.make_fixed_source(
+            "11111111-1111-4111-8111-111111111111", b"first"
+        )
+        second = self.make_fixed_source(
+            "22222222-2222-4222-8222-222222222222", b"second"
+        )
+        self.write_manifest((
+            self.fixed_plan(1, first),
+            self.fixed_plan(2, second),
+        ))
+        plan = self.prepare_plan()
+        adapter = RecordingRenameNoReplaceAdapter()
+
+        def change_first_destination(_intent, progress, _result):
+            if tuple(
+                item["complete"] for item in progress["items"]
+            ) == (True, False):
+                (
+                    self.run_directory
+                    / fixed_slot_destination_path(first)
+                ).write_bytes(b"FORGE")
+
+        self.assert_archive_error(
+            "archive_manifest_mismatch",
+            lambda: self.archiver().converge(
+                plan,
+                syscall_adapter=adapter,
+                on_item_complete=change_first_destination,
+            ),
+        )
+        self.assertEqual(len(adapter.calls), 1)
+        self.assertTrue((self.source_root / second).exists())
+
+    def test_converge_rejects_manifest_changed_by_callback(self):
+        source = self.make_fixed_source(
+            "11111111-1111-4111-8111-111111111111", b"first"
+        )
+        self.write_manifest((self.fixed_plan(1, source),))
+        plan = self.prepare_plan()
+
+        def change_manifest(_intent, _progress, _result):
+            (
+                self.run_directory / AUTO_V2_MANIFEST_FILENAME
+            ).write_bytes(b"tampered-manifest")
+
+        self.assert_archive_error(
+            "media_manifest_torn_tail_requires_execute",
+            lambda: self.archiver().converge(
+                plan,
+                syscall_adapter=RecordingRenameNoReplaceAdapter(),
+                on_item_complete=change_manifest,
+            ),
         )
 
     def test_completed_progress_is_reverified_as_exact_recovery(self):

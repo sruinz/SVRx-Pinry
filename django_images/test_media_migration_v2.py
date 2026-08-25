@@ -31,6 +31,7 @@ from django_images.services.media_migration_v2 import (
     AutoV2MigrationPlan,
     AutoV2PlanSummary,
     _valid_staging_name,
+    load_auto_v2_archive_direct_roots,
     load_auto_v2_archive_sources,
     load_completed_auto_v2_summary,
     load_auto_v2_plan,
@@ -101,6 +102,10 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             original_path = "image/original/by-md5/a/b/{}/upload.jpg".format(
                 asset_uuid.hex
             )
+        elif generation == "pinry-md5":
+            original_path = (
+                "a/b/ab0123456789abcdef0123456789abcd/upload.jpg"
+            )
         elif generation == "fixed":
             original_path = "originals/{}/original.png".format(asset_uuid)
         elif generation == "named":
@@ -121,6 +126,15 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             if generation == "md5":
                 old_path = "image/thumbnail/by-md5/{}/{}/{}/{}.jpg".format(
                     size[0], size[-1], asset_uuid.hex, size
+                )
+            elif generation == "pinry-md5":
+                hash_value = {
+                    "thumbnail": "cd0123456789abcdef0123456789abcd",
+                    "standard": "ef0123456789abcdef0123456789abcd",
+                    "square": "010123456789abcdef0123456789abcd",
+                }[size]
+                old_path = "{}/{}/{}/{}.jpg".format(
+                    hash_value[0], hash_value[1], hash_value, size
                 )
             else:
                 old_path = target
@@ -287,6 +301,28 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             },
         )
         self.assertTrue(all(entry.image_format == "PNG" for entry in plan.files))
+        image_root_stat = os.stat(
+            str(Path(self.temporary_media.name, "image"))
+        )
+        self.assertEqual(
+            {
+                (entry.archive_root_device, entry.archive_root_inode)
+                for entry in plan.files
+            },
+            {(image_root_stat.st_dev, image_root_stat.st_ino)},
+        )
+
+    def test_pinry_direct_md5_closure_plans_named_targets(self):
+        image = self.make_image(generation="pinry-md5")
+
+        plan = AutoV2MigrationPlan.for_image(image, self.open_root())
+
+        self.assertEqual(plan.generation, "md5_legacy")
+        self.assertEqual(
+            plan.new_original,
+            canonical_original_path(image.asset_uuid, "사진.jpg", ".png"),
+        )
+        self.assertEqual({entry.operation for entry in plan.files}, {"copy"})
 
     def test_fixed_slot_copies_original_and_verifies_canonical_derivatives(self):
         image = self.make_image(generation="fixed")
@@ -763,6 +799,20 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertIsInstance(sources, tuple)
         self.assertEqual(sources, expected)
         self.assertEqual(strict_open.call_count, 1)
+
+    def test_archive_direct_root_loader_reports_every_manifest_root(self):
+        self.make_image(generation="pinry-md5")
+        self.migrator().run(execute=True)
+
+        roots = load_auto_v2_archive_direct_roots(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        )
+
+        self.assertEqual(roots, ("0", "a", "c", "e"))
 
     def test_archive_source_loader_rejects_a_live_canonical_original(self):
         asset_uuid = "11111111-1111-4111-8111-111111111111"

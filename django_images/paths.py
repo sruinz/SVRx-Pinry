@@ -23,10 +23,32 @@ _RESERVED_STEMS = frozenset(
     + tuple("LPT{}".format(index) for index in range(1, 10))
 )
 _CANONICAL_EXTENSIONS = frozenset(FORMAT_EXTENSIONS.values())
+PINRY_DIRECT_MD5_ROOTS = tuple("0123456789abcdef")
 
 
 class UnsupportedImageFormat(Exception):
     pass
+
+
+def pinry_direct_md5_root(relative_path):
+    if not isinstance(relative_path, str):
+        return None
+    components = relative_path.split("/")
+    if len(components) != 4:
+        return None
+    first, second, digest, leaf = components
+    if (
+        first not in PINRY_DIRECT_MD5_ROOTS
+        or second not in PINRY_DIRECT_MD5_ROOTS
+        or len(digest) != 32
+        or any(character not in PINRY_DIRECT_MD5_ROOTS for character in digest)
+        or digest[:2] != first + second
+        or leaf in ("", ".", "..")
+        or "\\" in leaf
+        or "\x00" in leaf
+    ):
+        return None
+    return first
 
 
 def sanitize_original_filename(filename: str) -> str:

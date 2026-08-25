@@ -14,12 +14,19 @@ from django.db.models import Q
 from django_images.file_ops import (
     MediaDirectory,
     MediaPathError,
+    open_verified_media_file,
     open_verified_media_root,
+    sha256_file_descriptor,
 )
 from django_images.models import Image, Thumbnail
-from django_images.paths import FORMAT_EXTENSIONS
+from django_images.paths import (
+    FORMAT_EXTENSIONS,
+    PINRY_DIRECT_MD5_ROOTS,
+    pinry_direct_md5_root,
+)
 from django_images.services.media_migration_v2 import (
-    load_auto_v2_archive_sources,
+    AutoV2ArchiveAuthority,
+    load_auto_v2_archive_authority,
 )
 
 
@@ -210,6 +217,7 @@ class ArchivePlan(object):
     intents: tuple
     progress: object
     schema_only: bool = False
+    authority: object = None
 
 
 class LinuxRenameNoReplaceAdapter(object):
@@ -709,6 +717,86 @@ def build_archive_intent(
             _close_archive_resources(*reversed(resources))
 
 
+def _build_completed_fixed_intent(
+    source_root,
+    source_relative,
+    destination_root,
+    destination_relative,
+):
+    """구 fixed-slot 완료 상태의 destination inode를 intent로 복구한다."""
+    source_parent_relative, source_name = _split_relative_path(
+        source_relative
+    )
+    destination_parent_relative, destination_name = _split_relative_path(
+        destination_relative
+    )
+    resources = None
+    try:
+        resources = _open_archive_resources(
+            source_root,
+            destination_root,
+            source_parent_relative,
+            source_name,
+            destination_parent_relative,
+            destination_name,
+            source_missing_ok=True,
+            destination_missing_ok=False,
+        )
+        (
+            source_root_directory,
+            destination_root_directory,
+            source_parent,
+            destination_parent,
+            source_leaf,
+            destination_leaf,
+        ) = resources
+        if source_leaf is not None or destination_leaf is None:
+            raise _archive_error("archive_state_conflict")
+        source_root_stat = os.fstat(source_root_directory.descriptor)
+        destination_root_stat = os.fstat(
+            destination_root_directory.descriptor
+        )
+        source_parent_stat = os.fstat(source_parent.descriptor)
+        destination_parent_stat = os.fstat(destination_parent.descriptor)
+        _same_filesystem(
+            source_root_stat,
+            destination_root_stat,
+            source_parent_stat,
+            destination_parent_stat,
+            destination_leaf.file_stat,
+        )
+        intent = ArchiveIntent(
+            source_root_device=source_root_stat.st_dev,
+            source_root_inode=source_root_stat.st_ino,
+            source_parent_relative=source_parent_relative,
+            source_parent_device=source_parent_stat.st_dev,
+            source_parent_inode=source_parent_stat.st_ino,
+            source_name=source_name,
+            source_device=destination_leaf.file_stat.st_dev,
+            source_inode=destination_leaf.file_stat.st_ino,
+            destination_root_device=destination_root_stat.st_dev,
+            destination_root_inode=destination_root_stat.st_ino,
+            destination_parent_relative=destination_parent_relative,
+            destination_parent_device=destination_parent_stat.st_dev,
+            destination_parent_inode=destination_parent_stat.st_ino,
+            destination_name=destination_name,
+        )
+        if destination_leaf.kind != "file":
+            raise _archive_error("archive_state_conflict")
+        return intent
+    except MediaArchiveError:
+        raise
+    except MediaPathError as error:
+        raise _archive_path_error(error)
+    except OSError as error:
+        raise _archive_io_error(error)
+    except (TypeError, ValueError) as error:
+        raise _archive_error("archive_state_conflict", error)
+    finally:
+        if resources is not None:
+            _close_archive_resources(*reversed(resources))
+
+
 def _ensure_archive_parent(root_path, relative_path):
     root_directory = None
     parent_directory = None
@@ -728,8 +816,18 @@ def _ensure_archive_parent(root_path, relative_path):
         _close_archive_resources(parent_directory, root_directory)
 
 
-def validate_no_legacy_media_references(using="default"):
+def validate_no_legacy_media_references(
+    using="default", fixed_slot_sources=()
+):
     legacy_filter = Q(image="image") | Q(image__startswith="image/")
+    for root_name in PINRY_DIRECT_MD5_ROOTS:
+        legacy_filter |= (
+            Q(image=root_name)
+            | Q(image__startswith="{}/".format(root_name))
+        )
+    for source in fixed_slot_sources:
+        fixed_slot_destination_path(source)
+        legacy_filter |= Q(image=source)
     try:
         has_references = (
             Image.objects.using(using).filter(legacy_filter).exists()
@@ -742,7 +840,7 @@ def validate_no_legacy_media_references(using="default"):
     return True
 
 
-def _load_fixed_slot_sources(
+def _load_archive_authority(
     run_directory,
     filename,
     run_id,
@@ -750,7 +848,7 @@ def _load_fixed_slot_sources(
     service_gid,
 ):
     try:
-        sources = load_auto_v2_archive_sources(
+        authority = load_auto_v2_archive_authority(
             run_directory,
             filename,
             run_id,
@@ -773,14 +871,383 @@ def _load_fixed_slot_sources(
         raise _archive_error(code, error)
     except OSError as error:
         raise _archive_error("archive_failed", error)
-    if (
-        not isinstance(sources, tuple)
-        or len(sources) != len(set(sources))
+    if not isinstance(authority, AutoV2ArchiveAuthority):
+        raise _archive_error("archive_manifest_mismatch")
+    sources = authority.fixed_slot_sources
+    if not isinstance(sources, tuple) or len(sources) != len(set(sources)):
+        raise _archive_error("archive_manifest_mismatch")
+    for source in authority.fixed_slot_sources:
+        fixed_slot_destination_path(source)
+    groups = (
+        authority.fixed_slot_files,
+        authority.prefixed_files,
+        authority.direct_files,
+    )
+    if any(
+        not isinstance(group, tuple)
+        or group != tuple(sorted(
+            group, key=lambda file_plan: file_plan.old_path
+        ))
+        or len(group)
+        != len(set(file_plan.old_path for file_plan in group))
+        for group in groups
     ):
         raise _archive_error("archive_manifest_mismatch")
-    for source in sources:
-        fixed_slot_destination_path(source)
-    return tuple(sorted(sources))
+    prefixed_root_identity = authority.prefixed_root_identity
+    if authority.prefixed_files:
+        if prefixed_root_identity is not None and (
+            not isinstance(prefixed_root_identity, tuple)
+            or len(prefixed_root_identity) != 2
+            or type(prefixed_root_identity[0]) is not int
+            or prefixed_root_identity[0] < 0
+            or type(prefixed_root_identity[1]) is not int
+            or prefixed_root_identity[1] <= 0
+        ):
+            raise _archive_error("archive_manifest_mismatch")
+    elif prefixed_root_identity is not None:
+        raise _archive_error("archive_manifest_mismatch")
+    if tuple(
+        file_plan.old_path for file_plan in authority.fixed_slot_files
+    ) != tuple(sorted(sources)):
+        raise _archive_error("archive_manifest_mismatch")
+    if any(
+        not file_plan.old_path.startswith("image/")
+        for file_plan in authority.prefixed_files
+    ) or any(
+        pinry_direct_md5_root(file_plan.old_path) is None
+        for file_plan in authority.direct_files
+    ):
+        raise _archive_error("archive_manifest_mismatch")
+    all_paths = tuple(
+        file_plan.old_path
+        for group in groups
+        for file_plan in group
+    )
+    if len(all_paths) != len(set(all_paths)):
+        raise _archive_error("archive_manifest_mismatch")
+    roots = authority.direct_root_identities
+    if (
+        not isinstance(roots, tuple)
+        or roots != tuple(sorted(roots))
+        or len(roots) != len(set(item[0] for item in roots))
+        or any(
+            not isinstance(item, tuple)
+            or len(item) != 3
+            or item[0] not in PINRY_DIRECT_MD5_ROOTS
+            or type(item[1]) is not int
+            or type(item[2]) is not int
+            or item[1] < 0
+            or item[2] <= 0
+            for item in roots
+        )
+    ):
+        raise _archive_error("archive_manifest_mismatch")
+    return authority
+
+
+def _existing_pinry_direct_roots(source_root, required_roots=()):
+    root_directory = None
+    child_directory = None
+    roots = []
+    try:
+        root_directory = _open_verified_root(source_root)
+        for name in PINRY_DIRECT_MD5_ROOTS:
+            try:
+                named_stat = os.stat(
+                    name,
+                    dir_fd=root_directory.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(named_stat.st_mode):
+                code = (
+                    "archive_manifest_mismatch"
+                    if name in required_roots
+                    else "archive_state_conflict"
+                )
+                raise _archive_error(code)
+            child_directory = _open_archive_directory(root_directory, name)
+            child_directory.verify_current()
+            opened_stat = os.fstat(child_directory.descriptor)
+            child_directory.close()
+            child_directory = None
+            roots.append((name, opened_stat.st_dev, opened_stat.st_ino))
+        root_directory.verify_current()
+        if not roots:
+            raise _archive_error("archive_state_conflict")
+        return tuple(roots)
+    except MediaArchiveError:
+        raise
+    except MediaPathError as error:
+        raise _archive_path_error(error)
+    except OSError as error:
+        raise _archive_io_error(error)
+    finally:
+        _close_archive_resources(child_directory, root_directory)
+
+
+def _archive_authority_file_entries(authority):
+    entries = []
+    entries.extend(
+        (file_plan, fixed_slot_destination_path(file_plan.old_path))
+        for file_plan in authority.fixed_slot_files
+    )
+    entries.extend(
+        (file_plan, "media/{}".format(file_plan.old_path))
+        for file_plan in authority.prefixed_files
+    )
+    entries.extend(
+        (file_plan, "media/{}".format(file_plan.old_path))
+        for file_plan in authority.direct_files
+    )
+    return tuple(entries)
+
+
+def _authority_intent_source(file_plan):
+    direct_root = pinry_direct_md5_root(file_plan.old_path)
+    if direct_root is not None:
+        return direct_root
+    if file_plan.old_path.startswith("image/"):
+        return "image"
+    return file_plan.old_path
+
+
+def _verify_archive_file_receipt(receipt, file_plan):
+    receipt.verify_current()
+    if (
+        (receipt.file_stat.st_dev, receipt.file_stat.st_ino)
+        != (file_plan.source_device, file_plan.source_inode)
+        or receipt.file_stat.st_size != file_plan.size
+        or sha256_file_descriptor(receipt.descriptor)
+        != file_plan.sha256
+    ):
+        raise _archive_error("archive_manifest_mismatch")
+    receipt.verify_current()
+
+
+def _verify_archive_manifest_files(
+    source_root,
+    destination_root,
+    authority,
+    intents,
+    only_intent=None,
+):
+    intent_sources = {
+        _relative_leaf_path(
+            intent.source_parent_relative, intent.source_name
+        )
+        for intent in intents
+    }
+    source_directory = None
+    destination_directory = None
+    source_receipt = None
+    destination_receipt = None
+    try:
+        source_directory = open_verified_media_root(source_root)
+        destination_directory = open_verified_media_root(destination_root)
+        for file_plan, destination_path in (
+            _archive_authority_file_entries(authority)
+        ):
+            authority_source = _authority_intent_source(file_plan)
+            if authority_source not in intent_sources:
+                raise _archive_error("archive_manifest_mismatch")
+            if only_intent is not None and authority_source != (
+                _relative_leaf_path(
+                    only_intent.source_parent_relative,
+                    only_intent.source_name,
+                )
+            ):
+                continue
+            source_receipt = open_verified_media_file(
+                source_directory,
+                file_plan.old_path,
+                missing_ok=True,
+            )
+            destination_receipt = open_verified_media_file(
+                destination_directory,
+                destination_path,
+                missing_ok=True,
+            )
+            if (source_receipt is None) == (destination_receipt is None):
+                raise _archive_error("archive_state_conflict")
+            receipt = (
+                source_receipt
+                if source_receipt is not None
+                else destination_receipt
+            )
+            _verify_archive_file_receipt(receipt, file_plan)
+            if source_receipt is not None:
+                source_receipt.close()
+                source_receipt = None
+            if destination_receipt is not None:
+                destination_receipt.close()
+                destination_receipt = None
+        source_directory.verify_current()
+        destination_directory.verify_current()
+    except MediaArchiveError:
+        raise
+    except (MediaPathError, OSError, TypeError, ValueError) as error:
+        raise _archive_error("archive_manifest_mismatch", error)
+    finally:
+        _close_archive_resources(
+            destination_receipt,
+            source_receipt,
+            destination_directory,
+            source_directory,
+        )
+
+
+def _validate_direct_root_authority(intents, root_identities):
+    direct_intents = {
+        intent.source_name: intent
+        for intent in intents
+        if (
+            intent.source_parent_relative == _ROOT_PARENT_SENTINEL
+            and intent.source_name in PINRY_DIRECT_MD5_ROOTS
+            and intent.destination_parent_relative == "media"
+            and intent.destination_name == intent.source_name
+        )
+    }
+    if len(direct_intents) != sum(
+        1
+        for intent in intents
+        if (
+            intent.source_parent_relative == _ROOT_PARENT_SENTINEL
+            and intent.source_name in PINRY_DIRECT_MD5_ROOTS
+        )
+    ):
+        raise _archive_error("archive_manifest_mismatch")
+    for root_name, device, inode in root_identities:
+        intent = direct_intents.get(root_name)
+        if (
+            intent is None
+            or (intent.source_device, intent.source_inode)
+            != (device, inode)
+        ):
+            raise _archive_error("archive_manifest_mismatch")
+
+
+def _validate_prefixed_root_authority(intents, root_identity):
+    if root_identity is None:
+        return
+    matching = tuple(
+        intent
+        for intent in intents
+        if (
+            intent.source_parent_relative == _ROOT_PARENT_SENTINEL
+            and intent.source_name == "image"
+            and intent.destination_parent_relative == "media"
+            and intent.destination_name == "image"
+        )
+    )
+    if (
+        len(matching) != 1
+        or (matching[0].source_device, matching[0].source_inode)
+        != root_identity
+    ):
+        raise _archive_error("archive_manifest_mismatch")
+
+
+def _scan_archive_root_identities(root_path, parent_relative):
+    root_directory = None
+    parent_directory = None
+    identities = {}
+    try:
+        root_directory = _open_verified_root(root_path)
+        if parent_relative == _ROOT_PARENT_SENTINEL:
+            parent_directory = root_directory
+        else:
+            try:
+                parent_stat = os.stat(
+                    parent_relative,
+                    dir_fd=root_directory.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return identities
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                raise _archive_error("archive_state_conflict")
+            parent_directory = _open_archive_directory(
+                root_directory, parent_relative
+            )
+        for name in ("image",) + PINRY_DIRECT_MD5_ROOTS:
+            try:
+                named_stat = os.stat(
+                    name,
+                    dir_fd=parent_directory.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(named_stat.st_mode):
+                raise _archive_error("archive_state_conflict")
+            identities[name] = _identity(named_stat)
+        parent_directory.verify_current()
+        if parent_directory is not root_directory:
+            root_directory.verify_current()
+        return identities
+    except MediaArchiveError:
+        raise
+    except (MediaPathError, OSError) as error:
+        raise _archive_error("archive_state_conflict", error)
+    finally:
+        if parent_directory is root_directory:
+            parent_directory = None
+        _close_archive_resources(parent_directory, root_directory)
+
+
+def _validate_archive_root_namespace(
+    source_root, destination_root, intents, requires_image_root=False
+):
+    root_intents = {
+        intent.source_name: intent
+        for intent in intents
+        if (
+            intent.source_parent_relative == _ROOT_PARENT_SENTINEL
+            and intent.destination_parent_relative == "media"
+            and (
+                intent.source_name == "image"
+                or intent.source_name in PINRY_DIRECT_MD5_ROOTS
+            )
+            and intent.destination_name == intent.source_name
+        )
+    }
+    if len(root_intents) != sum(
+        1
+        for intent in intents
+        if intent.source_parent_relative == _ROOT_PARENT_SENTINEL
+        and (
+            intent.source_name == "image"
+            or intent.source_name in PINRY_DIRECT_MD5_ROOTS
+        )
+    ):
+        raise _archive_error("archive_state_conflict")
+    if requires_image_root and "image" not in root_intents:
+        raise _archive_error("archive_manifest_mismatch")
+    source_identities = _scan_archive_root_identities(
+        source_root, _ROOT_PARENT_SENTINEL
+    )
+    destination_identities = _scan_archive_root_identities(
+        destination_root, "media"
+    )
+    for name in ("image",) + PINRY_DIRECT_MD5_ROOTS:
+        intent = root_intents.get(name)
+        source_identity = source_identities.get(name)
+        destination_identity = destination_identities.get(name)
+        if intent is None:
+            if source_identity is not None or destination_identity is not None:
+                raise _archive_error("archive_state_conflict")
+            continue
+        if (source_identity is None) == (destination_identity is None):
+            raise _archive_error("archive_state_conflict")
+        current_identity = (
+            source_identity
+            if source_identity is not None
+            else destination_identity
+        )
+        if current_identity != (intent.source_device, intent.source_inode):
+            raise _archive_error("archive_state_conflict")
 
 
 def _relative_leaf_path(parent_relative, name):
@@ -792,14 +1259,27 @@ def _relative_leaf_path(parent_relative, name):
 def _intent_leaf_kind(intent):
     md5_layout = (
         intent.source_parent_relative == _ROOT_PARENT_SENTINEL
-        and intent.source_name == "image"
         and intent.destination_parent_relative == "media"
-        and intent.destination_name == "image"
+        and (
+            (
+                intent.source_name == "image"
+                and intent.destination_name == "image"
+            )
+            or (
+                intent.source_name in PINRY_DIRECT_MD5_ROOTS
+                and intent.destination_name == intent.source_name
+            )
+        )
     )
     return "directory" if md5_layout else "file"
 
 
-def _validate_archive_intent_layout(intents, fixed_slot_sources):
+def _validate_archive_intent_layout(
+    intents,
+    fixed_slot_sources,
+    required_pinry_direct_roots,
+    requires_image_root=False,
+):
     if not isinstance(intents, tuple):
         raise _archive_error("archive_state_conflict")
     pairs = tuple(
@@ -819,9 +1299,38 @@ def _validate_archive_intent_layout(intents, fixed_slot_sources):
         (source, fixed_slot_destination_path(source))
         for source in sorted(fixed_slot_sources)
     )
-    expected_pairs = fixed_pairs
+    prefix_pairs = ()
     if pairs[:1] == (("image", "media/image"),):
-        expected_pairs = (("image", "media/image"),) + fixed_pairs
+        prefix_pairs = (("image", "media/image"),)
+    fixed_start = len(pairs) - len(fixed_pairs)
+    direct_pairs = (
+        pairs[len(prefix_pairs):fixed_start]
+        if fixed_start >= len(prefix_pairs)
+        else ()
+    )
+    direct_roots = tuple(pair[0] for pair in direct_pairs)
+    valid_required_roots = (
+        isinstance(required_pinry_direct_roots, tuple)
+        and required_pinry_direct_roots
+        == tuple(sorted(required_pinry_direct_roots))
+        and len(required_pinry_direct_roots)
+        == len(set(required_pinry_direct_roots))
+        and all(
+            root_name in PINRY_DIRECT_MD5_ROOTS
+            for root_name in required_pinry_direct_roots
+        )
+    )
+    valid_direct_pairs = (
+        direct_roots == tuple(sorted(direct_roots))
+        and len(direct_roots) == len(set(direct_roots))
+        and all(
+            root_name in PINRY_DIRECT_MD5_ROOTS
+            and destination == "media/{}".format(root_name)
+            for root_name, destination in direct_pairs
+        )
+        and set(required_pinry_direct_roots).issubset(direct_roots)
+    )
+    expected_pairs = prefix_pairs + direct_pairs + fixed_pairs
     root_pairs = {
         (
             (
@@ -839,6 +1348,9 @@ def _validate_archive_intent_layout(intents, fixed_slot_sources):
     if (
         len(pairs) != len(intents)
         or len(intents) != len(set(intents))
+        or not valid_required_roots
+        or not valid_direct_pairs
+        or (requires_image_root and not prefix_pairs)
         or pairs != expected_pairs
         or len(root_pairs) > 1
     ):
@@ -975,51 +1487,148 @@ class LegacyMediaArchive(object):
     def prepare(
         self,
         has_media_image_directory=False,
+        has_pinry_direct_md5_directory=False,
         schema_only=False,
         progress=None,
         previous_progress=None,
+        expected_plan_sha256=None,
+        expected_manifest_sha256=None,
+        recover_completed_fixed=False,
     ):
+        if (
+            type(recover_completed_fixed) is not bool
+            or type(has_media_image_directory) is not bool
+            or type(has_pinry_direct_md5_directory) is not bool
+        ):
+            raise _archive_error("archive_state_conflict")
         if schema_only:
+            if recover_completed_fixed:
+                raise _archive_error("archive_state_conflict")
             return ArchivePlan((), None, schema_only=True)
         _verify_configured_archive_roots(
             self.source_root,
             self.destination_root,
             self.run_directory,
         )
-        validate_no_legacy_media_references(using=self.using)
-        fixed_sources = _load_fixed_slot_sources(
+        authority = _load_archive_authority(
             self.run_directory,
             self.filename,
             self.run_id,
             self.service_uid,
             self.service_gid,
         )
-        if progress is None:
-            if type(has_media_image_directory) is not bool:
-                raise _archive_error("archive_state_conflict")
-            paths = (
-                [("image", "media/image")]
-                if has_media_image_directory
-                else []
-            )
-            paths.extend(
-                (source, fixed_slot_destination_path(source))
-                for source in fixed_sources
-            )
-            for _source, destination in paths:
-                parent, _name = _split_relative_path(destination)
-                _ensure_archive_parent(self.destination_root, parent)
-            intents = tuple(
-                build_archive_intent(
-                    self.source_root,
-                    source,
-                    self.destination_root,
-                    destination,
+        if (
+            (expected_plan_sha256 is None)
+            != (expected_manifest_sha256 is None)
+            or (
+                expected_plan_sha256 is not None
+                and (
+                    authority.summary.plan_sha256
+                    != expected_plan_sha256
+                    or authority.summary.manifest_sha256
+                    != expected_manifest_sha256
                 )
-                for source, destination in paths
             )
-            progress = _initial_progress(intents)
+        ):
+            raise _archive_error("archive_manifest_mismatch")
+        fixed_sources = tuple(sorted(authority.fixed_slot_sources))
+        required_pinry_direct_root_identities = (
+            authority.direct_root_identities
+        )
+        required_pinry_direct_roots = tuple(
+            item[0] for item in required_pinry_direct_root_identities
+        )
+        validate_no_legacy_media_references(
+            using=self.using,
+            fixed_slot_sources=fixed_sources,
+        )
+        has_pinry_direct_md5 = (
+            bool(required_pinry_direct_roots)
+            or has_pinry_direct_md5_directory
+        )
+        if progress is None:
+            if recover_completed_fixed:
+                if (
+                    has_media_image_directory
+                    or has_pinry_direct_md5_directory
+                    or authority.prefixed_files
+                    or authority.direct_files
+                    or required_pinry_direct_roots
+                    or not fixed_sources
+                ):
+                    raise _archive_error("archive_state_conflict")
+                source_roots = _scan_archive_root_identities(
+                    self.source_root, _ROOT_PARENT_SENTINEL
+                )
+                destination_roots = _scan_archive_root_identities(
+                    self.destination_root, "media"
+                )
+                if source_roots or destination_roots:
+                    raise _archive_error("archive_state_conflict")
+                intents = tuple(
+                    _build_completed_fixed_intent(
+                        self.source_root,
+                        source,
+                        self.destination_root,
+                        fixed_slot_destination_path(source),
+                    )
+                    for source in fixed_sources
+                )
+                progress = {
+                    "items": [
+                        {"intent": intent.as_dict(), "complete": True}
+                        for intent in intents
+                    ],
+                }
+            else:
+                if (
+                    authority.prefixed_files
+                    and authority.prefixed_root_identity is None
+                ):
+                    raise _archive_error("archive_manifest_mismatch")
+                paths = (
+                    [("image", "media/image")]
+                    if has_media_image_directory
+                    else []
+                )
+                observed_direct_roots = ()
+                if has_pinry_direct_md5:
+                    observed_direct_roots = _existing_pinry_direct_roots(
+                        self.source_root,
+                        required_roots=required_pinry_direct_roots,
+                    )
+                    paths.extend(
+                        (
+                            root_name,
+                            "media/{}".format(root_name),
+                        )
+                        for root_name, _device, _inode
+                        in observed_direct_roots
+                    )
+                paths.extend(
+                    (source, fixed_slot_destination_path(source))
+                    for source in fixed_sources
+                )
+                for _source, destination in paths:
+                    parent, _name = _split_relative_path(destination)
+                    _ensure_archive_parent(self.destination_root, parent)
+                intents = tuple(
+                    build_archive_intent(
+                        self.source_root,
+                        source,
+                        self.destination_root,
+                        destination,
+                    )
+                    for source, destination in paths
+                )
+                _validate_direct_root_authority(
+                    intents,
+                    observed_direct_roots,
+                )
+                progress = _initial_progress(intents)
         else:
+            if recover_completed_fixed:
+                raise _archive_error("archive_state_conflict")
             if not isinstance(progress, dict) or set(progress) != {"items"}:
                 raise _archive_error("archive_state_conflict")
             items = progress["items"]
@@ -1031,12 +1640,37 @@ class LegacyMediaArchive(object):
                 else ArchiveIntent.from_dict(None)
                 for item in items
             )
-        _validate_archive_intent_layout(intents, fixed_sources)
+        _validate_direct_root_authority(
+            intents,
+            required_pinry_direct_root_identities,
+        )
+        _validate_prefixed_root_authority(
+            intents,
+            authority.prefixed_root_identity,
+        )
+        _validate_archive_intent_layout(
+            intents,
+            fixed_sources,
+            required_pinry_direct_roots,
+            requires_image_root=bool(authority.prefixed_files),
+        )
         _validate_progress(intents, progress, previous_progress)
         _verify_intent_roots(
             self.source_root, self.destination_root, intents
         )
-        return ArchivePlan(intents, progress)
+        _validate_archive_root_namespace(
+            self.source_root,
+            self.destination_root,
+            intents,
+            requires_image_root=bool(authority.prefixed_files),
+        )
+        _verify_archive_manifest_files(
+            self.source_root,
+            self.destination_root,
+            authority,
+            intents,
+        )
+        return ArchivePlan(intents, progress, authority=authority)
 
     def converge(
         self,
@@ -1059,9 +1693,43 @@ class LegacyMediaArchive(object):
         _verify_intent_roots(
             self.source_root, self.destination_root, plan.intents
         )
+        authority = _load_archive_authority(
+            self.run_directory,
+            self.filename,
+            self.run_id,
+            self.service_uid,
+            self.service_gid,
+        )
+        if authority != plan.authority:
+            raise _archive_error("archive_manifest_mismatch")
+        _validate_archive_root_namespace(
+            self.source_root,
+            self.destination_root,
+            plan.intents,
+            requires_image_root=bool(authority.prefixed_files),
+        )
+        _verify_archive_manifest_files(
+            self.source_root,
+            self.destination_root,
+            authority,
+            plan.intents,
+        )
         progress = plan.progress
         results = []
         for index, intent in enumerate(plan.intents):
+            _validate_archive_root_namespace(
+                self.source_root,
+                self.destination_root,
+                plan.intents,
+                requires_image_root=bool(authority.prefixed_files),
+            )
+            _verify_archive_manifest_files(
+                self.source_root,
+                self.destination_root,
+                authority,
+                plan.intents,
+                only_intent=intent,
+            )
             with open_archive_session(
                 self.source_root,
                 self.destination_root,
@@ -1073,6 +1741,19 @@ class LegacyMediaArchive(object):
                     if flags[index]
                     else session._converge_archive(intent)
                 )
+            _validate_archive_root_namespace(
+                self.source_root,
+                self.destination_root,
+                plan.intents,
+                requires_image_root=bool(authority.prefixed_files),
+            )
+            _verify_archive_manifest_files(
+                self.source_root,
+                self.destination_root,
+                authority,
+                plan.intents,
+                only_intent=intent,
+            )
             results.append(result)
             if not flags[index]:
                 progress = _advance_progress(
@@ -1080,6 +1761,53 @@ class LegacyMediaArchive(object):
                 )
                 if on_item_complete is not None:
                     on_item_complete(intent, progress, result)
+                    authority = _load_archive_authority(
+                        self.run_directory,
+                        self.filename,
+                        self.run_id,
+                        self.service_uid,
+                        self.service_gid,
+                    )
+                    if authority != plan.authority:
+                        raise _archive_error(
+                            "archive_manifest_mismatch"
+                        )
+                    _validate_archive_root_namespace(
+                        self.source_root,
+                        self.destination_root,
+                        plan.intents,
+                        requires_image_root=bool(
+                            authority.prefixed_files
+                        ),
+                    )
+                    _verify_archive_manifest_files(
+                        self.source_root,
+                        self.destination_root,
+                        authority,
+                        plan.intents,
+                        only_intent=intent,
+                    )
+        authority = _load_archive_authority(
+            self.run_directory,
+            self.filename,
+            self.run_id,
+            self.service_uid,
+            self.service_gid,
+        )
+        if authority != plan.authority:
+            raise _archive_error("archive_manifest_mismatch")
+        _validate_archive_root_namespace(
+            self.source_root,
+            self.destination_root,
+            plan.intents,
+            requires_image_root=bool(authority.prefixed_files),
+        )
+        _verify_archive_manifest_files(
+            self.source_root,
+            self.destination_root,
+            authority,
+            plan.intents,
+        )
         return ArchiveConvergence(tuple(results), progress)
 
 

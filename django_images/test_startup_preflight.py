@@ -176,6 +176,21 @@ class LegacyEvidenceTests(SimpleTestCase):
             "inode": media_stat.st_ino,
         })
 
+    def test_fresh_runtime_directories_are_not_legacy_evidence(self):
+        for name in (
+            "originals",
+            "derivatives",
+            ".staging",
+            ".pinry-locks",
+        ):
+            (self.media_root / name).mkdir()
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertFalse(evidence.database_exists)
+        self.assertFalse(evidence.has_pinry_direct_md5_directory)
+        self.assertFalse(evidence.has_legacy_evidence)
+
     def test_pre_schema_md5_paths_and_pending_disk_node_are_detected(self):
         original = (
             "image/original/by-md5/a/b/"
@@ -210,6 +225,99 @@ class LegacyEvidenceTests(SimpleTestCase):
         self.assertTrue(evidence.pending_schema)
         self.assertEqual(evidence.distinct_legacy_bytes, 13)
         self.assertTrue(evidence.has_legacy_evidence)
+
+    def test_pinry_direct_md5_paths_are_detected_as_legacy_evidence(self):
+        original = (
+            "a/b/ab0123456789abcdef0123456789abcd/photo.jpg"
+        )
+        thumbnail = (
+            "c/d/cd0123456789abcdef0123456789abcd/thumbnail.jpg"
+        )
+        self._create_database(
+            image_paths=(original,),
+            thumbnail_paths=(thumbnail,),
+        )
+        self._write_media(original, b"original")
+        self._write_media(thumbnail, b"thumb")
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertTrue(evidence.has_md5_paths)
+        self.assertTrue(evidence.has_legacy_evidence)
+        self.assertFalse(evidence.has_media_image_directory)
+        self.assertEqual(evidence.distinct_legacy_bytes, 13)
+
+    def test_orphan_pinry_direct_root_is_independent_legacy_evidence(self):
+        direct_root = self.media_root / "a"
+        direct_root.mkdir()
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertFalse(evidence.database_exists)
+        self.assertTrue(evidence.has_pinry_direct_md5_directory)
+        self.assertTrue(evidence.has_legacy_evidence)
+
+    def test_pinry_direct_root_symlink_is_rejected_during_root_inspection(self):
+        outside = self.root_path / "outside"
+        outside.mkdir()
+        os.symlink(str(outside), str(self.media_root / "a"))
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._inspect(_DiskGraph())
+
+        self.assertEqual(caught.exception.code, "legacy_media_root_invalid")
+
+    def test_malformed_pinry_direct_row_is_rejected(self):
+        self._create_database(image_paths=(
+            "a/c/ab0123456789abcdef0123456789abcd/photo.jpg",
+        ))
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._inspect(_DiskGraph())
+
+        self.assertEqual(caught.exception.code, "legacy_media_rows_invalid")
+
+    def test_missing_pinry_direct_file_is_rejected(self):
+        self._create_database(image_paths=(
+            "a/b/ab0123456789abcdef0123456789abcd/photo.jpg",
+        ))
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._inspect(_DiskGraph())
+
+        self.assertEqual(caught.exception.code, "legacy_media_files_invalid")
+
+    def test_unknown_media_row_layouts_are_rejected(self):
+        for row_kind in ("image", "thumbnail"):
+            with self.subTest(row_kind=row_kind):
+                if self.database_path.exists():
+                    self.database_path.unlink()
+                kwargs = {
+                    "image_paths": ("uploads/photo.jpg",),
+                    "thumbnail_paths": (),
+                }
+                if row_kind == "thumbnail":
+                    kwargs = {
+                        "image_paths": (),
+                        "thumbnail_paths": ("uploads/thumb.jpg",),
+                    }
+                self._create_database(**kwargs)
+
+                with self.assertRaises(
+                    startup_preflight.StartupPreflightError
+                ) as caught:
+                    self._inspect(_DiskGraph())
+
+                self.assertEqual(
+                    caught.exception.code,
+                    "legacy_media_rows_invalid",
+                )
 
     def test_existing_canonical_image_is_explicit_media_row_evidence(self):
         self._create_database(
@@ -300,7 +408,7 @@ class LegacyEvidenceTests(SimpleTestCase):
                         self._inspect(_DiskGraph())
                     self.assertEqual(
                         caught.exception.code,
-                        "legacy_evidence_invalid",
+                        "legacy_media_rows_invalid",
                     )
 
     def test_old_schema_fixed_slot_requires_canonical_derivative_closure(self):
@@ -433,7 +541,7 @@ class LegacyEvidenceTests(SimpleTestCase):
             ) as caught:
                 self._inspect(_DiskGraph())
 
-        self.assertEqual(caught.exception.code, "legacy_evidence_invalid")
+        self.assertEqual(caught.exception.code, "legacy_database_invalid")
 
     def test_database_namespace_change_during_read_fails_closed(self):
         self._create_database()
@@ -463,7 +571,7 @@ class LegacyEvidenceTests(SimpleTestCase):
             ) as caught:
                 self._inspect(_DiskGraph())
 
-        self.assertEqual(caught.exception.code, "legacy_evidence_invalid")
+        self.assertEqual(caught.exception.code, "legacy_database_invalid")
 
     def test_database_symlink_hardlink_and_directory_are_rejected(self):
         outside = self.root_path / "outside.db"
@@ -494,8 +602,38 @@ class LegacyEvidenceTests(SimpleTestCase):
                 ) as caught:
                     self._inspect(_DiskGraph())
                 self.assertEqual(
-                    caught.exception.code, "legacy_evidence_invalid"
+                    caught.exception.code, "legacy_database_invalid"
                 )
+
+    def test_invalid_existing_volume_reports_the_failing_evidence_stage(self):
+        cases = ("media-root-file", "corrupt-database", "invalid-graph")
+        for case in cases:
+            with self.subTest(case=case):
+                if self.database_path.exists():
+                    self.database_path.unlink()
+                if self.media_root.is_file():
+                    self.media_root.unlink()
+                    self.media_root.mkdir()
+                if case == "media-root-file":
+                    self.media_root.rmdir()
+                    self.media_root.write_bytes(b"not-a-directory")
+                    expected = "legacy_media_root_invalid"
+                    graph = _DiskGraph()
+                elif case == "corrupt-database":
+                    self.database_path.write_bytes(b"not-sqlite")
+                    expected = "legacy_database_schema_invalid"
+                    graph = _DiskGraph()
+                else:
+                    self._create_database()
+                    expected = "legacy_migration_graph_invalid"
+                    graph = mock.Mock(nodes={"invalid": object()})
+
+                with self.assertRaises(
+                    startup_preflight.StartupPreflightError
+                ) as caught:
+                    self._inspect(graph)
+
+                self.assertEqual(caught.exception.code, expected)
 
     def test_database_budget_counts_main_file_not_wal_sidecar(self):
         self._create_database()

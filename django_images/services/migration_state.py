@@ -608,6 +608,8 @@ def transition_state(
             raise MigrationStateError("migration_state_invalid_transition")
         if next_phase not in PHASE_TRANSITIONS[expected_phase]:
             raise MigrationStateError("migration_state_invalid_transition")
+        if next_phase == "archive_complete" and progress is None:
+            raise MigrationStateError("migration_state_invalid_transition")
         state = copy.deepcopy(current.state)
         state["phase"] = next_phase
         if next_phase in ("snapshot_intent", "archive_intent"):
@@ -615,6 +617,9 @@ def transition_state(
                 state["intent"] = _json_value(intent)
             if progress is not None:
                 state["progress"] = _json_value(progress)
+        elif next_phase == "archive_complete":
+            state["intent"] = None
+            state["progress"] = _json_value(progress)
         else:
             state["intent"] = None
             state["progress"] = None
@@ -914,6 +919,17 @@ def _validate_state(state, run_id):
             value = values.get(name)
             if value is not None and not _is_sha256(value):
                 raise MigrationStateError("migration_state_missing_or_invalid")
+    if state["phase"] in (
+        "registry_complete",
+        "archive_intent",
+        "archive_complete",
+        "complete",
+    ) and any(
+        manifests[kind][name] is None
+        for kind in ("media", "backfill")
+        for name in ("plan_sha256", "manifest_sha256")
+    ):
+        raise MigrationStateError("migration_state_missing_or_invalid")
 
 
 def _validate_phase_state(state):
@@ -928,6 +944,12 @@ def _validate_phase_state(state):
     if phase == "archive_intent":
         _validate_archive_intent(intent)
         _validate_archive_progress(progress, intent)
+        return
+    if phase == "archive_complete":
+        if intent is not None:
+            raise MigrationStateError("migration_state_missing_or_invalid")
+        if progress is not None:
+            _validate_completed_archive_progress(progress)
         return
     if intent is not None or progress is not None:
         raise MigrationStateError("migration_state_missing_or_invalid")
@@ -972,6 +994,22 @@ def _validate_archive_progress(progress, current_intent):
             current_incomplete = True
     if not current_incomplete:
         raise MigrationStateError("migration_state_missing_or_invalid")
+
+
+def _validate_completed_archive_progress(progress):
+    if not isinstance(progress, dict) or set(progress) != {"items"}:
+        raise MigrationStateError("migration_state_missing_or_invalid")
+    items = progress["items"]
+    if not isinstance(items, list) or not items:
+        raise MigrationStateError("migration_state_missing_or_invalid")
+    intents = []
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"intent", "complete"}:
+            raise MigrationStateError("migration_state_missing_or_invalid")
+        _validate_archive_intent(item["intent"])
+        if item["complete"] is not True or item["intent"] in intents:
+            raise MigrationStateError("migration_state_missing_or_invalid")
+        intents.append(item["intent"])
 
 
 def _is_identity_number(value):

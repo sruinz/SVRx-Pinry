@@ -22,7 +22,12 @@ for required_path in \
     requirements.txt \
     manage.py \
     pinry \
-    docker/scripts/start.sh
+    docker/scripts/start.sh \
+    docker/scripts/startup.py \
+    docker/scripts/bootstrap.sh \
+    docker/scripts/gen_key.sh \
+    docker/scripts/normalize_persistent_file.py \
+    docker/scripts/_start_gunicorn.sh
 do
     if [ ! -e "${build_context}/${required_path}" ]; then
         echo "missing_build_input=${required_path}" >&2

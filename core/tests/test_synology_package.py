@@ -11,6 +11,13 @@ import unittest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+REQUIRED_STARTUP_PATHS = (
+    "docker/scripts/startup.py",
+    "docker/scripts/bootstrap.sh",
+    "docker/scripts/gen_key.sh",
+    "docker/scripts/normalize_persistent_file.py",
+    "docker/scripts/_start_gunicorn.sh",
+)
 TASK_PRODUCTION_PATHS = (
     ".github/workflows/node.js.yml",
     ".gitignore",
@@ -20,6 +27,7 @@ TASK_PRODUCTION_PATHS = (
     "NOTICE.md",
     "UPSTREAM.md",
     "docker/scripts/start.sh",
+    *REQUIRED_STARTUP_PATHS,
     "pinry-spa/package.json",
     "pinry-spa/pnpm-lock.yaml",
     "scripts/create_synology_output.sh",
@@ -683,6 +691,7 @@ class SynologyPackageTests(unittest.TestCase):
             "pinry-spa/src/main.js",
             "docker/nginx/nginx.conf",
             "docker/scripts/start.sh",
+            *REQUIRED_STARTUP_PATHS,
         )
         for relative_path in required_context:
             with self.subTest(relative_path=relative_path):
@@ -1236,6 +1245,39 @@ class SynologyPackageTests(unittest.TestCase):
                 self.assertFalse(output_root.exists())
                 self.assertFalse((output_root / self.package_name).exists())
 
+    def test_packager_rejects_source_missing_startup_runtime(self):
+        repository = self._clone_repository("missing-startup-runtime")
+        relative_path = "docker/scripts/startup.py"
+        (repository / relative_path).unlink()
+        completed = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Package Test",
+                "-c",
+                "user.email=package-test@example.invalid",
+                "commit",
+                "--quiet",
+                "-am",
+                "remove required startup runtime",
+            ],
+            cwd=str(repository),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        output_root = self.temporary_root / "missing-startup-output"
+
+        completed = self._run_packager_in(
+            repository, output_root, os.environ.copy()
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"package_layout_changed", completed.stderr)
+        self.assertFalse((output_root / self.package_name).exists())
+
     def test_packager_rejects_staged_only_control_before_output(self):
         repository = self._clone_repository("staged-control")
         relative_path = "deploy/synology/build-image.sh"
@@ -1669,6 +1711,40 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertIn(b"missing_build_input=Dockerfile.autobuild", completed.stderr)
         self.assertFalse(capture.exists())
         self.assertEqual(_docker_call_count(capture), 0)
+
+    def test_build_rejects_each_missing_startup_runtime_before_docker(self):
+        self._create_package()
+        environment, capture, _working_directory = (
+            self._docker_environment()
+        )
+
+        for relative_path in REQUIRED_STARTUP_PATHS:
+            with self.subTest(relative_path=relative_path):
+                required = self.context_directory / relative_path
+                hidden = required.with_name(required.name + ".missing")
+                required.rename(hidden)
+                try:
+                    completed = subprocess.run(
+                        [
+                            "sh",
+                            str(self.package_directory / "build-image.sh"),
+                        ],
+                        env=environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                finally:
+                    hidden.rename(required)
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(
+                    "missing_build_input={}".format(relative_path).encode(
+                        "ascii"
+                    ),
+                    completed.stderr,
+                )
+                self.assertFalse(capture.exists())
+                self.assertEqual(_docker_call_count(capture), 0)
 
     def test_generated_synology_output_is_ignored_by_git(self):
         completed = subprocess.run(

@@ -14,9 +14,11 @@ from django.utils.functional import LazyObject
 
 from django_images import file_ops
 from django_images.paths import (
+    PINRY_DIRECT_MD5_ROOTS,
     canonical_derivative_path,
     canonical_original_path,
     is_valid_original_leaf,
+    pinry_direct_md5_root,
 )
 
 
@@ -50,6 +52,14 @@ _ALLOWED_PROBE_RESULTS = frozenset((
 ))
 _PROBE_RESULT_DESCRIPTOR = 3
 _DESCRIPTOR_FALLBACK_LIMIT = 1 << 20
+_LEGACY_EVIDENCE_STAGE_CODES = {
+    "database": "legacy_database_invalid",
+    "database_schema": "legacy_database_schema_invalid",
+    "media_files": "legacy_media_files_invalid",
+    "media_root": "legacy_media_root_invalid",
+    "media_rows": "legacy_media_rows_invalid",
+    "migration_graph": "legacy_migration_graph_invalid",
+}
 
 
 class StartupPreflightError(Exception):
@@ -71,6 +81,7 @@ class LegacyEvidence(object):
     pending_migrations: tuple
     database_identity: object
     media_root_identity: object
+    has_pinry_direct_md5_directory: bool = False
 
     @property
     def pending_schema(self):
@@ -82,6 +93,7 @@ class LegacyEvidence(object):
             self.has_md5_paths
             or self.has_fixed_slot_paths
             or self.has_media_image_directory
+            or self.has_pinry_direct_md5_directory
         )
 
 
@@ -102,6 +114,7 @@ class PreflightResult(object):
 def inspect_legacy_evidence(
     database_path, disk_migration_graph, media_root
 ):
+    stage = "database"
     media_directory = None
     database_root = None
     database_receipt = None
@@ -110,10 +123,15 @@ def inspect_legacy_evidence(
         normalized_database_path = _configured_path(database_path)
         if normalized_database_path is None:
             raise StartupPreflightError("legacy_evidence_invalid")
+        stage = "media_root"
         media_directory, has_media_image_directory = _open_media_root(
             media_root
         )
+        has_pinry_direct_md5_directory = _has_pinry_direct_md5_directory(
+            media_directory
+        )
         media_root_identity = _directory_identity(media_directory)
+        stage = "database"
         database_root, database_receipt = _open_database(
             normalized_database_path
         )
@@ -130,6 +148,9 @@ def inspect_legacy_evidence(
                 pending_migrations=(),
                 database_identity=None,
                 media_root_identity=media_root_identity,
+                has_pinry_direct_md5_directory=(
+                    has_pinry_direct_md5_directory
+                ),
             )
 
         database_receipt.verify_current()
@@ -139,6 +160,7 @@ def inspect_legacy_evidence(
         connection = sqlite3.connect(database_uri, uri=True)
         database_receipt.verify_current()
         connection.execute("PRAGMA query_only = ON")
+        stage = "database_schema"
         tables = {
             row[0]
             for row in connection.execute(
@@ -163,15 +185,19 @@ def inspect_legacy_evidence(
             }
         database_receipt.verify_current()
 
+        stage = "migration_graph"
         if disk_migration_graph is None:
             disk_migration_graph = MigrationLoader(None).graph
         disk_nodes = _migration_nodes(disk_migration_graph)
         pending_migrations = tuple(sorted(disk_nodes - applied_migrations))
+        stage = "media_rows"
         classified = _classify_media_rows(image_rows, thumbnail_rows)
+        stage = "media_files"
         distinct_legacy_bytes = _distinct_legacy_bytes(
             media_directory,
             classified["copy_paths"],
         )
+        stage = "database"
         database_receipt.verify_current()
         database_bytes = database_receipt.file_stat.st_size
         evidence = LegacyEvidence(
@@ -188,17 +214,26 @@ def inspect_legacy_evidence(
             pending_migrations=pending_migrations,
             database_identity=_file_identity(database_receipt),
             media_root_identity=media_root_identity,
+            has_pinry_direct_md5_directory=(
+                has_pinry_direct_md5_directory
+            ),
         )
         connection.close()
         connection = None
         database_receipt.verify_current()
         return evidence
     except BaseException as error:
-        if isinstance(error, StartupPreflightError):
+        if (
+            isinstance(error, StartupPreflightError)
+            and error.code != "legacy_evidence_invalid"
+        ):
             raise
         if not isinstance(error, Exception):
             raise
-        raise StartupPreflightError("legacy_evidence_invalid") from error
+        code = _LEGACY_EVIDENCE_STAGE_CODES.get(
+            stage, "legacy_evidence_invalid"
+        )
+        raise StartupPreflightError(code) from error
     finally:
         if connection is not None:
             try:
@@ -775,6 +810,26 @@ def _open_media_root(media_root):
         raise
 
 
+def _has_pinry_direct_md5_directory(media_directory):
+    if media_directory is None:
+        return False
+    found = False
+    for root_name in PINRY_DIRECT_MD5_ROOTS:
+        try:
+            root_stat = os.stat(
+                root_name,
+                dir_fd=media_directory.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise StartupPreflightError("legacy_evidence_invalid")
+        found = True
+    media_directory.verify_current()
+    return found
+
+
 def _open_database(database_path):
     normalized = _configured_path(database_path)
     if normalized is None:
@@ -869,11 +924,15 @@ def _classify_media_rows(image_rows, thumbnail_rows):  # noqa: C901
         path = row["image"]
         if type(path) is not str or not path:
             raise StartupPreflightError("legacy_evidence_invalid")
-        if _MD5_PATH.fullmatch(path):
+        if _MD5_PATH.fullmatch(path) or pinry_direct_md5_root(path):
             has_md5_paths = True
             copy_paths.add(path)
+        elif _pinry_direct_md5_candidate(path):
+            raise StartupPreflightError("legacy_evidence_invalid")
         elif _CANONICAL_DERIVATIVE_PATH.fullmatch(path):
             has_named_canonical_paths = True
+        else:
+            raise StartupPreflightError("legacy_evidence_invalid")
         original_id = row.get("original_id")
         if type(original_id) is int:
             thumbnails_by_original.setdefault(original_id, []).append(row)
@@ -882,17 +941,19 @@ def _classify_media_rows(image_rows, thumbnail_rows):  # noqa: C901
         path = row["image"]
         if type(path) is not str or not path:
             raise StartupPreflightError("legacy_evidence_invalid")
-        if _MD5_PATH.fullmatch(path):
+        if _MD5_PATH.fullmatch(path) or pinry_direct_md5_root(path):
             has_md5_paths = True
             copy_paths.add(path)
             continue
+        if _pinry_direct_md5_candidate(path):
+            raise StartupPreflightError("legacy_evidence_invalid")
         match = _ORIGINAL_PATH.fullmatch(path)
         if match is None:
-            continue
+            raise StartupPreflightError("legacy_evidence_invalid")
         asset_uuid = match.group("asset_uuid")
         leaf = match.group("leaf")
         if not is_valid_original_leaf(asset_uuid, leaf):
-            continue
+            raise StartupPreflightError("legacy_evidence_invalid")
         extension = os.path.splitext(leaf)[1]
         derivative_rows = thumbnails_by_original.get(row["id"], ())
         if not _canonical_derivative_closure(
@@ -946,6 +1007,10 @@ def _classify_media_rows(image_rows, thumbnail_rows):  # noqa: C901
     }
 
 
+def _pinry_direct_md5_candidate(path):
+    return path.split("/", 1)[0] in PINRY_DIRECT_MD5_ROOTS
+
+
 def _canonical_database_uuid(value):
     if type(value) is not str:
         return None
@@ -986,16 +1051,13 @@ def _distinct_legacy_bytes(media_directory, copy_paths):
     if not copy_paths:
         return 0
     if media_directory is None:
-        return 0
+        raise StartupPreflightError("legacy_evidence_invalid")
     total = 0
     for relative_path in sorted(copy_paths):
         receipt = file_ops.open_verified_media_file(
             media_directory,
             relative_path,
-            missing_ok=True,
         )
-        if receipt is None:
-            continue
         try:
             receipt.verify_current()
             total += receipt.file_stat.st_size
