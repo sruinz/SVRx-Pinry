@@ -525,6 +525,31 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         self._assert_thumbnail_change_rejected(plans, before_signature)
 
+    def test_start_closure_rejects_thumbnail_path_before_prepare(self):
+        image = self.make_image(sizes=("thumbnail",))
+        self.migrator().run(execute=False)
+        thumbnail = image.thumbnail_set.get(size="thumbnail")
+        Thumbnail.objects.filter(pk=thumbnail.pk).update(
+            image="external/changed-before-execute.png"
+        )
+        migrator = self.migrator()
+
+        with mock.patch.object(
+            migrator,
+            "_prepare_path_files",
+            wraps=migrator._prepare_path_files,
+        ) as prepare, self.assertRaisesRegex(
+            CommandError, "^media_migration_database_changed$"
+        ):
+            migrator.run(execute=True)
+
+        self.assertEqual(prepare.call_count, 0)
+        self.assertEqual(self.destination_entries(), [])
+        self.assertFalse(any(
+            event["event"] == "batch_intent"
+            for event in self.journal_events()
+        ))
+
     def test_final_closure_rejects_committed_thumbnail_path_change(self):
         image = self.make_image(sizes=("thumbnail",))
         changed = []

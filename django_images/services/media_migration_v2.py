@@ -2531,7 +2531,13 @@ class AutoV2MediaMigrator(object):
                 datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
             )
             self._resume_attempt = len(journal.state.attempts) > 1
-            self._validate_image_plan_closure(plans)
+            self._validate_image_plan_closure(
+                plans,
+                committed_receipts=self._starting_closure_receipts(
+                    journal, plans
+                ),
+                allow_missing_receipts=True,
+            )
             if journal.is_phase_complete("paths"):
                 repaired = self._verify_committed_destinations(
                     journal, plans
@@ -2782,6 +2788,27 @@ class AutoV2MediaMigrator(object):
             "{}:{}".format(self.run_id, file_key),
         )
         return "auto-v2-{}.part".format(value)
+
+    def _starting_closure_receipts(self, journal, plans):
+        grouped = dict(journal.receipts_by_image("paths"))
+        committed = journal.committed_ids("paths")
+        for batch_id, intent in journal.state.intents.items():
+            if intent.phase != "paths" or batch_id in committed:
+                continue
+            batch = tuple(
+                plan
+                for plan in plans
+                if intent.first_pk <= plan.image_id <= intent.last_pk
+            )
+            current = self._current_batch_signature(batch)
+            recovery = journal.recover_batch(batch_id, current)
+            if recovery != "append_commit":
+                continue
+            for receipt in journal.effective_receipts(batch_id):
+                image_id = int(receipt.file_key.split(":")[1])
+                grouped.setdefault(image_id, ())
+                grouped[image_id] += (receipt,)
+        return grouped
 
     def _prepare_path_files(self, root, batch):
         prepared = []
@@ -4827,7 +4854,11 @@ class AutoV2MediaMigrator(object):
         return "changed"
 
     def _validate_image_plan_closure(
-        self, plans, lock=False, committed_receipts=None
+        self,
+        plans,
+        lock=False,
+        committed_receipts=None,
+        allow_missing_receipts=False,
     ):
         image_queryset = Image.objects.order_by("pk")
         thumbnail_queryset = Thumbnail.objects.order_by(
@@ -4843,11 +4874,10 @@ class AutoV2MediaMigrator(object):
         if current_image_ids != planned_image_ids:
             raise _command_error("media_migration_database_changed")
         thumbnail_fields = [
-            "pk", "original_id", "size", "width", "height"
+            "pk", "original_id", "size", "image", "width", "height"
         ]
         receipt_paths = None
         if committed_receipts is not None:
-            thumbnail_fields.insert(3, "image")
             receipt_paths = {
                 receipt.file_key: receipt.relative_path
                 for receipts in committed_receipts.values()
@@ -4859,14 +4889,18 @@ class AutoV2MediaMigrator(object):
 
         def planned_thumbnail(plan, row):
             values = [row[0], plan.image_id, row[1]]
-            if receipt_paths is not None:
+            if receipt_paths is None:
+                values.append(row[2])
+            else:
                 key = "thumbnail:{}:{}".format(plan.image_id, row[0])
                 try:
                     values.append(receipt_paths[key])
                 except KeyError as error:
-                    raise _command_error(
-                        "media_migration_database_changed", error
-                    )
+                    if not allow_missing_receipts:
+                        raise _command_error(
+                            "media_migration_database_changed", error
+                        )
+                    values.append(row[2])
             values.extend((row[3], row[4]))
             return tuple(values)
 
