@@ -13,13 +13,18 @@ import uuid
 
 from django.core.management import CommandError
 from django.test import SimpleTestCase, TestCase
+from django.utils.text import get_valid_filename
 
 from django_images.file_ops import (
     open_verified_media_file,
     open_verified_media_root,
 )
 from django_images.models import Image, Thumbnail
-from django_images.paths import canonical_original_path
+from django_images.paths import (
+    DERIVATIVE_NAMES,
+    canonical_derivative_path,
+    canonical_original_path,
+)
 from django_images.services.media_archive import (
     ArchiveIntent,
     LegacyMediaArchive,
@@ -1009,6 +1014,93 @@ class MediaArchiveGateTests(TestCase):
             copy_required_bytes=source_stat.st_size,
         )
 
+    def django_normalized_fixed_plan(self, image_id, asset_uuid):
+        original_filename = "스크린샷 2026-08-20 21.23.05.png"
+        new_path = canonical_original_path(
+            asset_uuid,
+            original_filename,
+            ".png",
+        )
+        parent, leaf = new_path.rsplit("/", 1)
+        old_path = "{}/{}".format(parent, get_valid_filename(leaf))
+        old_file = self.source_root / old_path
+        old_file.parent.mkdir(parents=True, exist_ok=True)
+        old_file.write_bytes(b"historical-django-normalized-original")
+        new_file = self.source_root / new_path
+        new_file.write_bytes(old_file.read_bytes())
+        old_stat = os.stat(str(old_file))
+        files = [AutoV2MigrationFile(
+            kind="original",
+            old_path=old_path,
+            new_path=new_path,
+            operation="copy",
+            size=old_stat.st_size,
+            sha256=hashlib.sha256(old_file.read_bytes()).hexdigest(),
+            image_format="PNG",
+            width=1,
+            height=1,
+            source_device=old_stat.st_dev,
+            source_inode=old_stat.st_ino,
+        )]
+        thumbnail_rows = []
+        image = Image.objects.create(
+            image=new_path,
+            asset_uuid=asset_uuid,
+            original_filename=original_filename,
+            width=1,
+            height=1,
+        )
+        for size in sorted(DERIVATIVE_NAMES):
+            derivative_path = canonical_derivative_path(
+                asset_uuid, size, ".png"
+            )
+            derivative_file = self.source_root / derivative_path
+            derivative_file.parent.mkdir(parents=True, exist_ok=True)
+            derivative_file.write_bytes(size.encode("ascii"))
+            derivative_stat = os.stat(str(derivative_file))
+            thumbnail = Thumbnail.objects.create(
+                original=image,
+                image=derivative_path,
+                size=size,
+                width=1,
+                height=1,
+            )
+            files.append(AutoV2MigrationFile(
+                kind="derivative",
+                old_path=derivative_path,
+                new_path=derivative_path,
+                operation="verify",
+                size=derivative_stat.st_size,
+                sha256=hashlib.sha256(
+                    derivative_file.read_bytes()
+                ).hexdigest(),
+                image_format="PNG",
+                width=1,
+                height=1,
+                source_device=derivative_stat.st_dev,
+                source_inode=derivative_stat.st_ino,
+                thumbnail_id=thumbnail.pk,
+                derivative_size=size,
+            ))
+            thumbnail_rows.append((
+                thumbnail.pk,
+                size,
+                derivative_path,
+                1,
+                1,
+            ))
+        return AutoV2MigrationPlan(
+            image_id=image_id,
+            asset_uuid=asset_uuid,
+            original_filename=original_filename,
+            image_width=1,
+            image_height=1,
+            generation="fixed_slot",
+            files=tuple(files),
+            thumbnail_rows=tuple(thumbnail_rows),
+            copy_required_bytes=old_stat.st_size,
+        )
+
     def named_plan(self, image_id, asset_uuid=None):
         asset_uuid = str(uuid.uuid4()) if asset_uuid is None else asset_uuid
         path = canonical_original_path(asset_uuid, "current.png", ".png")
@@ -1256,6 +1348,57 @@ class MediaArchiveGateTests(TestCase):
             ),
             (("a", "a"),),
         )
+
+    def test_django_normalized_source_is_prepared_archived_and_recovered(self):
+        asset_uuid = "11111111-1111-4111-8111-111111111111"
+        migration_plan = self.django_normalized_fixed_plan(1, asset_uuid)
+        source = migration_plan.files[0].old_path
+        canonical = migration_plan.files[0].new_path
+        destination = "media/fixed-slot-originals/{}".format(source)
+        self.write_manifest((migration_plan,))
+        archiver = self.archiver()
+
+        archive_plan = archiver.prepare()
+
+        self.assertEqual(len(archive_plan.intents), 1)
+        intent = archive_plan.intents[0]
+        self.assertEqual(
+            "{}/{}".format(
+                intent.source_parent_relative, intent.source_name
+            ),
+            source,
+        )
+        self.assertEqual(
+            "{}/{}".format(
+                intent.destination_parent_relative,
+                intent.destination_name,
+            ),
+            destination,
+        )
+
+        outcome = archiver.converge(
+            archive_plan,
+            syscall_adapter=RecordingRenameNoReplaceAdapter(),
+        )
+
+        self.assertEqual(outcome.results[0].status, "archived")
+        self.assertFalse((self.source_root / source).exists())
+        self.assertTrue((self.source_root / canonical).is_file())
+        self.assertEqual(
+            (self.run_directory / destination).read_bytes(),
+            b"historical-django-normalized-original",
+        )
+
+        resumed_plan = archiver.prepare(recover_completed_fixed=True)
+        resumed = archiver.converge(
+            resumed_plan,
+            syscall_adapter=RecordingRenameNoReplaceAdapter(),
+        )
+
+        self.assertTrue(all(
+            item["complete"] for item in resumed_plan.progress["items"]
+        ))
+        self.assertEqual(resumed.results[0].status, "recovered")
 
     def test_archive_rejects_source_root_other_than_effective_media_root(self):
         source = self.make_fixed_source(

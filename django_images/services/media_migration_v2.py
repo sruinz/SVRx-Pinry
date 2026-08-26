@@ -11,6 +11,7 @@ import warnings
 from django.conf import settings
 from django.core.management import CommandError
 from django.db import transaction
+from django.utils.text import get_valid_filename
 from PIL import Image as PILImage
 
 from django_images.file_ops import (
@@ -548,8 +549,13 @@ def _classify_generation_for_uuid(asset_uuid, files):
         asset_uuid,
         FORMAT_EXTENSIONS[original.image_format],
     )
+    named_parent, named_leaf = original.new_path.rsplit("/", 1)
+    django_normalized_path = "{}/{}".format(
+        named_parent,
+        get_valid_filename(named_leaf),
+    )
     if (
-        original.old_path == fixed_path
+        original.old_path in (fixed_path, django_normalized_path)
         and original.old_path != original.new_path
         and all(
             file_plan.old_path == file_plan.new_path

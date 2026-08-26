@@ -40,12 +40,12 @@ class SQLiteSnapshotTests(SimpleTestCase):
             },
         }
 
-    def create_run(self):
+    def create_run(self, database_identity=None):
         run = resolve_or_create_run(
             scan_run_inventory(self.backup_root),
             {
                 "present": True,
-                "database_identity": None,
+                "database_identity": database_identity,
                 "media_root_identity": None,
             },
             False,
@@ -72,6 +72,26 @@ class SQLiteSnapshotTests(SimpleTestCase):
                 intent=intent,
             )
         return run
+
+    def create_completed_snapshot_run(self, phase="snapshot_complete"):
+        if not os.path.exists(self.source_path):
+            sqlite3.connect(self.source_path).close()
+        source_stat = os.stat(self.source_path)
+        run = self.create_run(database_identity={
+            "device": source_stat.st_dev,
+            "inode": source_stat.st_ino,
+        })
+        with self.configured():
+            info = snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+        transition_state(run, "snapshot_intent", "snapshot_complete")
+        if phase == "schema_complete":
+            transition_state(run, "snapshot_complete", "schema_complete")
+        return run, info
 
     def make_wal_database(self):
         connection = sqlite3.connect(self.source_path)
@@ -128,6 +148,802 @@ class SQLiteSnapshotTests(SimpleTestCase):
                 hashlib.sha256(snapshot_file.read()).hexdigest(),
             )
         self.assertEqual(info.size, os.path.getsize(snapshot_path))
+        receipt_path = os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        )
+        self.assertTrue(os.path.isfile(receipt_path))
+        with open(receipt_path, "r", encoding="utf-8") as receipt_file:
+            self.assertEqual(json.load(receipt_file), {
+                "size": info.size,
+                "sha256": info.sha256,
+                "source_device": info.source_device,
+                "source_inode": info.source_inode,
+            })
+
+    def test_completed_snapshot_verifier_accepts_both_cleanup_phases(self):
+        connection = sqlite3.connect(self.source_path)
+        connection.execute("CREATE TABLE records (value TEXT)")
+        connection.execute("INSERT INTO records VALUES ('before-cleanup')")
+        connection.commit()
+        connection.close()
+        source_stat = os.stat(self.source_path)
+        run = self.create_run(database_identity={
+            "device": source_stat.st_dev,
+            "inode": source_stat.st_ino,
+        })
+
+        with self.configured():
+            expected = snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+        transition_state(run, "snapshot_intent", "snapshot_complete")
+        verifier = getattr(
+            sqlite_snapshot,
+            "verify_completed_sqlite_snapshot",
+            None,
+        )
+        self.assertIsNotNone(verifier)
+
+        self.assertEqual(
+            verifier(run, os.getuid(), os.getgid()),
+            expected,
+        )
+        transition_state(run, "snapshot_complete", "schema_complete")
+        self.assertEqual(
+            verifier(run, os.getuid(), os.getgid()),
+            expected,
+        )
+
+    def test_completed_snapshot_verifier_rejects_snapshot_intent_phase(self):
+        sqlite3.connect(self.source_path).close()
+        source_stat = os.stat(self.source_path)
+        run = self.create_run(database_identity={
+            "device": source_stat.st_dev,
+            "inode": source_stat.st_ino,
+        })
+        with self.configured():
+            snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_state_invalid$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_rejects_state_source_mismatch(self):
+        sqlite3.connect(self.source_path).close()
+        source_stat = os.stat(self.source_path)
+        run = self.create_run(database_identity={
+            "device": source_stat.st_dev,
+            "inode": source_stat.st_ino,
+        })
+        with self.configured():
+            snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+        transition_state(run, "snapshot_intent", "snapshot_complete")
+        with open(run.state_path, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+        state["database_identity"] = {
+            "device": source_stat.st_dev,
+            "inode": source_stat.st_ino + 1,
+        }
+        with open(run.state_path, "w", encoding="utf-8") as state_file:
+            json.dump(state, state_file)
+
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_rejects_final_temp_collision(self):
+        run, _info = self.create_completed_snapshot_run()
+        temp_path = os.path.join(
+            run.path,
+            ".production.db.before-migration.tmp",
+        )
+        with open(temp_path, "wb"):
+            pass
+        os.chmod(temp_path, 0o600)
+
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_requires_final_snapshot(self):
+        run, _info = self.create_completed_snapshot_run()
+        os.unlink(os.path.join(run.path, "production.db.before-migration"))
+
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_requires_durable_receipt(self):
+        run, _info = self.create_completed_snapshot_run()
+        os.unlink(os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        ))
+
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_rejects_wrong_service_owner(self):
+        run, _info = self.create_completed_snapshot_run()
+
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_state_invalid$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid() + 1,
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_rejects_non_private_snapshot(self):
+        run, _info = self.create_completed_snapshot_run()
+        snapshot_path = os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )
+        os.chmod(snapshot_path, 0o644)
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^unsafe_sqlite_snapshot$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+        os.chmod(snapshot_path, 0o600)
+        hardlink_path = os.path.join(run.path, "snapshot-hardlink")
+        os.link(snapshot_path, hardlink_path)
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^unsafe_sqlite_snapshot$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_rejects_non_private_receipt(self):
+        run, _info = self.create_completed_snapshot_run()
+        receipt_path = os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        )
+        os.chmod(receipt_path, 0o644)
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+        os.chmod(receipt_path, 0o600)
+        hardlink_path = os.path.join(run.path, "receipt-hardlink")
+        os.link(receipt_path, hardlink_path)
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_binds_receipt_size_and_hash(self):
+        run, info = self.create_completed_snapshot_run()
+        receipt_path = os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        )
+        with open(receipt_path, "r", encoding="utf-8") as receipt_file:
+            receipt = json.load(receipt_file)
+        for field_name, changed_value in (
+            ("size", info.size + 1),
+            ("sha256", "0" * 64),
+        ):
+            changed = dict(receipt)
+            changed[field_name] = changed_value
+            with open(receipt_path, "w", encoding="utf-8") as receipt_file:
+                json.dump(changed, receipt_file)
+            with self.subTest(field_name=field_name), self.assertRaisesRegex(
+                SQLiteSnapshotError,
+                "^sqlite_snapshot_conflict$",
+            ):
+                sqlite_snapshot.verify_completed_sqlite_snapshot(
+                    run,
+                    os.getuid(),
+                    os.getgid(),
+                )
+
+    def test_completed_snapshot_verifier_rejects_valid_sqlite_replacement(self):
+        run, _info = self.create_completed_snapshot_run()
+        snapshot_path = os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )
+        replacement_path = os.path.join(run.path, "replacement.db")
+        replacement = sqlite3.connect(replacement_path)
+        replacement.execute("CREATE TABLE replacement (value TEXT)")
+        replacement.commit()
+        replacement.close()
+        os.chmod(replacement_path, 0o600)
+        os.replace(replacement_path, snapshot_path)
+
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_rejects_replacement_during_quick_check(self):
+        run, _info = self.create_completed_snapshot_run()
+        snapshot_path = os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )
+        replacement_path = os.path.join(run.path, "replacement.db")
+        with open(snapshot_path, "rb") as snapshot_file:
+            snapshot_bytes = snapshot_file.read()
+        with open(replacement_path, "wb") as replacement_file:
+            replacement_file.write(snapshot_bytes)
+        os.chmod(replacement_path, 0o600)
+        real_connect = sqlite_snapshot.sqlite3.connect
+        replaced = []
+
+        def replace_before_connect(*arguments, **keyword_arguments):
+            if not replaced:
+                replaced.append(True)
+                os.replace(replacement_path, snapshot_path)
+            return real_connect(*arguments, **keyword_arguments)
+
+        with mock.patch(
+            "django_images.services.sqlite_snapshot.sqlite3.connect",
+            side_effect=replace_before_connect,
+        ), self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_rejects_replacement_during_hash(self):
+        run, _info = self.create_completed_snapshot_run()
+        snapshot_path = os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )
+        replacement_path = os.path.join(run.path, "replacement.db")
+        with open(snapshot_path, "rb") as snapshot_file:
+            snapshot_bytes = snapshot_file.read()
+        with open(replacement_path, "wb") as replacement_file:
+            replacement_file.write(snapshot_bytes)
+        os.chmod(replacement_path, 0o600)
+        real_hash_descriptor = sqlite_snapshot._hash_descriptor
+
+        def replace_before_hash(descriptor):
+            os.replace(replacement_path, snapshot_path)
+            return real_hash_descriptor(descriptor)
+
+        with mock.patch(
+            "django_images.services.sqlite_snapshot._hash_descriptor",
+            side_effect=replace_before_hash,
+        ), self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_rejects_receipt_replacement_during_read(self):
+        run, _info = self.create_completed_snapshot_run()
+        receipt_path = os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        )
+        replacement_path = os.path.join(run.path, "replacement.receipt")
+        with open(receipt_path, "rb") as receipt_file:
+            receipt_bytes = receipt_file.read()
+        with open(replacement_path, "wb") as replacement_file:
+            replacement_file.write(receipt_bytes)
+        os.chmod(replacement_path, 0o600)
+        real_read_descriptor = sqlite_snapshot._read_descriptor
+
+        def replace_before_read(descriptor):
+            os.replace(replacement_path, receipt_path)
+            return real_read_descriptor(descriptor)
+
+        with mock.patch(
+            "django_images.services.sqlite_snapshot._read_descriptor",
+            side_effect=replace_before_read,
+        ), self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_guard_rechecks_held_entries_before_commit(self):
+        run, expected = self.create_completed_snapshot_run()
+        guard_factory = getattr(
+            sqlite_snapshot,
+            "open_verified_completed_sqlite_snapshot",
+            None,
+        )
+        self.assertIsNotNone(guard_factory)
+        snapshot_path = os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )
+
+        with guard_factory(
+            run,
+            os.getuid(),
+            os.getgid(),
+        ) as guard:
+            self.assertEqual(guard.info, expected)
+            os.unlink(snapshot_path)
+            with self.assertRaisesRegex(
+                SQLiteSnapshotError,
+                "^sqlite_snapshot_conflict$",
+            ):
+                guard.verify_current()
+
+    def test_completed_snapshot_guard_rechecks_receipt_before_commit(self):
+        run, expected = self.create_completed_snapshot_run()
+        receipt_path = os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        )
+
+        with sqlite_snapshot.open_verified_completed_sqlite_snapshot(
+            run,
+            os.getuid(),
+            os.getgid(),
+        ) as guard:
+            self.assertEqual(guard.info, expected)
+            os.unlink(receipt_path)
+            with self.assertRaisesRegex(
+                SQLiteSnapshotError,
+                "^sqlite_snapshot_conflict$",
+            ):
+                guard.verify_current()
+
+    def test_completed_snapshot_guard_rechecks_temp_before_commit(self):
+        run, expected = self.create_completed_snapshot_run()
+        temp_path = os.path.join(
+            run.path,
+            ".production.db.before-migration.tmp",
+        )
+
+        with sqlite_snapshot.open_verified_completed_sqlite_snapshot(
+            run,
+            os.getuid(),
+            os.getgid(),
+        ) as guard:
+            self.assertEqual(guard.info, expected)
+            with open(temp_path, "wb"):
+                pass
+            os.chmod(temp_path, 0o600)
+            with self.assertRaisesRegex(
+                SQLiteSnapshotError,
+                "^sqlite_snapshot_conflict$",
+            ):
+                guard.verify_current()
+
+    def test_completed_snapshot_guard_supports_explicit_private_filenames(self):
+        run, expected = self.create_completed_snapshot_run()
+        snapshot_name = "production.db.before-orphan-cleanup"
+        receipt_name = ".production.db.before-orphan-cleanup.receipt"
+        for source_name, destination_name in (
+            ("production.db.before-migration", snapshot_name),
+            (
+                ".production.db.before-migration.receipt",
+                receipt_name,
+            ),
+        ):
+            with open(
+                os.path.join(run.path, source_name),
+                "rb",
+            ) as source_file:
+                content = source_file.read()
+            destination_path = os.path.join(run.path, destination_name)
+            with open(destination_path, "wb") as destination_file:
+                destination_file.write(content)
+            os.chmod(destination_path, 0o600)
+
+        with sqlite_snapshot.open_verified_completed_sqlite_snapshot(
+            run,
+            os.getuid(),
+            os.getgid(),
+            snapshot_filename=snapshot_name,
+            receipt_filename=receipt_name,
+        ) as guard:
+            self.assertEqual(guard.info, expected)
+            self.assertEqual(guard.verify_current(), expected)
+
+    def test_descriptor_file_path_opens_linux_magic_link_then_binds_inode(self):
+        sqlite3.connect(self.source_path).close()
+        descriptor = os.open(self.source_path, os.O_RDONLY)
+        self.addCleanup(os.close, descriptor)
+        real_open = sqlite_snapshot.os.open
+        proc_path = "/proc/self/fd/{}".format(descriptor)
+
+        def open_linux_magic_link(path, flags, *arguments, **keywords):
+            if path == proc_path:
+                self.assertFalse(flags & sqlite_snapshot._NOFOLLOW)
+                return os.dup(descriptor)
+            return real_open(path, flags, *arguments, **keywords)
+
+        with mock.patch(
+            "django_images.services.sqlite_snapshot.os.open",
+            side_effect=open_linux_magic_link,
+        ):
+            self.assertEqual(
+                sqlite_snapshot._descriptor_file_path(descriptor),
+                proc_path,
+            )
+
+    def test_orphan_cleanup_fallback_preserves_unreceipted_original(self):
+        connection = sqlite3.connect(self.source_path)
+        connection.execute("CREATE TABLE records (value TEXT)")
+        connection.execute("INSERT INTO records VALUES ('before-cleanup')")
+        connection.commit()
+        connection.close()
+        source_stat = os.stat(self.source_path)
+        run = self.create_run(database_identity={
+            "device": source_stat.st_dev,
+            "inode": source_stat.st_ino,
+        })
+        with self.configured():
+            expected = snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+        original_path = os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )
+        original_stat = os.stat(original_path)
+        with open(original_path, "rb") as original_file:
+            original_bytes = original_file.read()
+        os.unlink(os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        ))
+        checked_sizes = []
+
+        with self.configured(), sqlite_snapshot.protect_orphan_cleanup(
+            self.source_path,
+            run,
+            os.getuid(),
+            os.getgid(),
+            before_fallback_create=checked_sizes.append,
+        ) as guard:
+            self.assertEqual(guard.info, expected)
+            self.assertEqual(guard.verify_current(), expected)
+
+        self.assertEqual(checked_sizes, [os.path.getsize(self.source_path)])
+        self.assertEqual(os.stat(original_path).st_ino, original_stat.st_ino)
+        with open(original_path, "rb") as original_file:
+            self.assertEqual(original_file.read(), original_bytes)
+        self.assertFalse(os.path.exists(os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        )))
+        cleanup_path = os.path.join(
+            run.path,
+            "production.db.before-orphan-cleanup",
+        )
+        self.assertTrue(os.path.isfile(cleanup_path))
+        cleanup_stat = os.stat(cleanup_path)
+        self.assertFalse(os.path.exists(os.path.join(
+            run.path,
+            ".production.db.before-orphan-cleanup.tmp",
+        )))
+        with open(os.path.join(
+            run.path,
+            ".production.db.before-orphan-cleanup.receipt",
+        ), "r", encoding="utf-8") as receipt_file:
+            self.assertEqual(json.load(receipt_file), {
+                "format_version": 1,
+                "kind": "missing_unreferenced_image_cleanup",
+                "run_id": run.run_id,
+                "sha256": expected.sha256,
+                "size": expected.size,
+                "source_device": expected.source_device,
+                "source_inode": expected.source_inode,
+            })
+        reuse_checks = []
+        with self.configured(), sqlite_snapshot.protect_orphan_cleanup(
+            self.source_path,
+            run,
+            os.getuid(),
+            os.getgid(),
+            before_fallback_create=reuse_checks.append,
+        ) as guard:
+            self.assertEqual(guard.info, expected)
+        self.assertEqual(reuse_checks, [])
+        self.assertEqual(os.stat(cleanup_path).st_ino, cleanup_stat.st_ino)
+
+    def test_orphan_cleanup_fallback_recovers_receipted_temp(self):
+        connection = sqlite3.connect(self.source_path)
+        connection.execute("CREATE TABLE records (value TEXT)")
+        connection.commit()
+        connection.close()
+        run, expected = self.create_completed_snapshot_run()
+        os.unlink(os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        ))
+        first_checks = []
+        with self.configured(), mock.patch(
+            "django_images.services.sqlite_snapshot._promote_snapshot",
+            side_effect=SQLiteSnapshotError(
+                "simulated_cleanup_promotion_crash"
+            ),
+        ), self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^simulated_cleanup_promotion_crash$",
+        ):
+            with sqlite_snapshot.protect_orphan_cleanup(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+                before_fallback_create=first_checks.append,
+            ):
+                pass
+
+        self.assertEqual(first_checks, [os.path.getsize(self.source_path)])
+        self.assertTrue(os.path.isfile(os.path.join(
+            run.path,
+            ".production.db.before-orphan-cleanup.tmp",
+        )))
+        self.assertTrue(os.path.isfile(os.path.join(
+            run.path,
+            ".production.db.before-orphan-cleanup.receipt",
+        )))
+        retry_checks = []
+        with self.configured(), sqlite_snapshot.protect_orphan_cleanup(
+            self.source_path,
+            run,
+            os.getuid(),
+            os.getgid(),
+            before_fallback_create=retry_checks.append,
+        ) as guard:
+            self.assertEqual(guard.info, expected)
+
+        self.assertEqual(retry_checks, [])
+        self.assertTrue(os.path.isfile(os.path.join(
+            run.path,
+            "production.db.before-orphan-cleanup",
+        )))
+        self.assertFalse(os.path.exists(os.path.join(
+            run.path,
+            ".production.db.before-orphan-cleanup.tmp",
+        )))
+
+    def test_orphan_cleanup_fallback_recreates_unreceipted_temp(self):
+        sqlite3.connect(self.source_path).close()
+        run, expected = self.create_completed_snapshot_run()
+        os.unlink(os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        ))
+        temp_path = os.path.join(
+            run.path,
+            ".production.db.before-orphan-cleanup.tmp",
+        )
+        with open(temp_path, "wb") as temp_file:
+            temp_file.write(b"interrupted")
+        os.chmod(temp_path, 0o600)
+        stale_inode = os.stat(temp_path).st_ino
+
+        with self.configured(), sqlite_snapshot.protect_orphan_cleanup(
+            self.source_path,
+            run,
+            os.getuid(),
+            os.getgid(),
+        ) as guard:
+            self.assertEqual(guard.info, expected)
+
+        self.assertFalse(os.path.exists(temp_path))
+        final_path = os.path.join(
+            run.path,
+            "production.db.before-orphan-cleanup",
+        )
+        self.assertNotEqual(os.stat(final_path).st_ino, stale_inode)
+
+    def test_orphan_cleanup_fallback_rejects_other_artifact_combinations(self):
+        sqlite3.connect(self.source_path).close()
+        run, info = self.create_completed_snapshot_run()
+        original_path = os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )
+        with open(original_path, "rb") as original_file:
+            snapshot_bytes = original_file.read()
+        os.unlink(os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        ))
+        cleanup_names = (
+            "production.db.before-orphan-cleanup",
+            ".production.db.before-orphan-cleanup.tmp",
+            ".production.db.before-orphan-cleanup.receipt",
+        )
+        receipt = {
+            "format_version": 1,
+            "kind": "missing_unreferenced_image_cleanup",
+            "run_id": run.run_id,
+            "sha256": info.sha256,
+            "size": info.size,
+            "source_device": info.source_device,
+            "source_inode": info.source_inode,
+        }
+        for combination in (
+            (True, False, False),
+            (False, False, True),
+            (True, True, False),
+            (True, True, True),
+        ):
+            for filename in cleanup_names:
+                try:
+                    os.unlink(os.path.join(run.path, filename))
+                except FileNotFoundError:
+                    pass
+            for present, filename in zip(combination, cleanup_names):
+                if not present:
+                    continue
+                path = os.path.join(run.path, filename)
+                if filename.endswith(".receipt"):
+                    with open(path, "w", encoding="utf-8") as artifact:
+                        json.dump(receipt, artifact)
+                else:
+                    with open(path, "wb") as artifact:
+                        artifact.write(snapshot_bytes)
+                os.chmod(path, 0o600)
+            with self.subTest(combination=combination), self.configured(), self.assertRaisesRegex(
+                SQLiteSnapshotError,
+                "^sqlite_snapshot_conflict$",
+            ):
+                with sqlite_snapshot.protect_orphan_cleanup(
+                    self.source_path,
+                    run,
+                    os.getuid(),
+                    os.getgid(),
+                ):
+                    pass
+
+    def test_orphan_cleanup_invalid_original_receipt_forbids_fallback(self):
+        sqlite3.connect(self.source_path).close()
+        run, _info = self.create_completed_snapshot_run()
+        receipt_path = os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        )
+        with open(receipt_path, "w", encoding="utf-8") as receipt_file:
+            receipt_file.write("{}")
+
+        with self.configured(), self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            with sqlite_snapshot.protect_orphan_cleanup(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            ):
+                pass
+
+        self.assertFalse(os.path.exists(os.path.join(
+            run.path,
+            "production.db.before-orphan-cleanup",
+        )))
+
+    def test_completed_snapshot_verifier_runs_quick_check(self):
+        run, _info = self.create_completed_snapshot_run()
+        snapshot_path = os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )
+        with open(snapshot_path, "wb") as snapshot_file:
+            snapshot_file.write(b"not-sqlite")
+
+        with self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^corrupt_sqlite_snapshot$",
+        ):
+            sqlite_snapshot.verify_completed_sqlite_snapshot(
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_completed_snapshot_verifier_rejects_run_path_replacement(self):
+        run, _info = self.create_completed_snapshot_run()
+        moved_path = "{}.moved".format(run.path)
+        os.rename(run.path, moved_path)
+        os.mkdir(run.path, 0o700)
+        try:
+            with self.assertRaisesRegex(
+                SQLiteSnapshotError,
+                "^sqlite_snapshot_state_invalid$",
+            ):
+                sqlite_snapshot.verify_completed_sqlite_snapshot(
+                    run,
+                    os.getuid(),
+                    os.getgid(),
+                )
+        finally:
+            os.rmdir(run.path)
+            os.rename(moved_path, run.path)
 
     def test_missing_database_is_a_noop(self):
         run = self.create_run()
@@ -364,6 +1180,41 @@ class SQLiteSnapshotTests(SimpleTestCase):
             "production.db.before-migration",
         )))
 
+    def test_unreceipted_final_is_left_for_separate_cleanup_snapshot(self):
+        connection = sqlite3.connect(self.source_path)
+        connection.execute("CREATE TABLE records (value TEXT)")
+        connection.commit()
+        connection.close()
+        run = self.create_run()
+        final_path = os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )
+        source = sqlite3.connect(
+            "file:{}?mode=ro".format(self.source_path),
+            uri=True,
+        )
+        destination = sqlite3.connect(final_path)
+        source.backup(destination)
+        destination.close()
+        source.close()
+        os.chmod(final_path, 0o600)
+
+        with self.configured():
+            info = snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+        receipt_path = os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        )
+        self.assertFalse(os.path.exists(receipt_path))
+        self.assertEqual(info.size, os.path.getsize(final_path))
+
     def test_interrupted_zero_byte_temp_without_receipt_is_recreated(self):
         connection = sqlite3.connect(self.source_path)
         connection.execute("CREATE TABLE records (value TEXT)")
@@ -528,7 +1379,9 @@ class SQLiteSnapshotTests(SimpleTestCase):
         copy_database.assert_not_called()
         self.assertEqual(info.size, len(snapshot_bytes))
         self.assertEqual(info.sha256, hashlib.sha256(snapshot_bytes).hexdigest())
-        self.assertFalse(os.path.exists(receipt_path))
+        self.assertTrue(os.path.isfile(receipt_path))
+        with open(receipt_path, "r", encoding="utf-8") as receipt_file:
+            self.assertEqual(json.load(receipt_file), receipt)
         self.assertTrue(os.path.isfile(os.path.join(
             run.path,
             "production.db.before-migration",
@@ -584,9 +1437,11 @@ class SQLiteSnapshotTests(SimpleTestCase):
         receipt_opens = [
             event for event in events if event[0] == "receipt-open"
         ]
-        self.assertEqual(len(receipt_opens), 1)
-        receipt_open = receipt_opens[0]
-        self.assertTrue(receipt_open[1] & os.O_EXCL)
+        exclusive_receipt_opens = [
+            event for event in receipt_opens if event[1] & os.O_EXCL
+        ]
+        self.assertEqual(len(exclusive_receipt_opens), 1)
+        receipt_open = exclusive_receipt_opens[0]
         self.assertEqual(receipt_open[2], 0o600)
         event_names = [event[0] for event in events]
         receipt_fsync_index = event_names.index("receipt-fsync")
@@ -596,7 +1451,7 @@ class SQLiteSnapshotTests(SimpleTestCase):
         self.assertEqual(receipt_stat.st_uid, os.getuid())
         self.assertEqual(receipt_stat.st_gid, os.getgid())
 
-    def test_receipted_final_is_verified_then_receipt_is_cleaned(self):
+    def test_receipted_final_is_reverified_and_receipt_is_retained(self):
         connection = sqlite3.connect(self.source_path)
         connection.execute("CREATE TABLE records (value TEXT)")
         connection.commit()
@@ -607,16 +1462,8 @@ class SQLiteSnapshotTests(SimpleTestCase):
             ".production.db.before-migration.receipt",
         )
 
-        with self.configured(), mock.patch.object(
-            sqlite_snapshot,
-            "_remove_snapshot_receipt",
-            side_effect=SQLiteSnapshotError("simulated_cleanup_crash"),
-            create=True,
-        ), self.assertRaisesRegex(
-            SQLiteSnapshotError,
-            "^simulated_cleanup_crash$",
-        ):
-            snapshot_sqlite(
+        with self.configured():
+            first = snapshot_sqlite(
                 self.source_path,
                 run,
                 os.getuid(),
@@ -628,10 +1475,12 @@ class SQLiteSnapshotTests(SimpleTestCase):
             "production.db.before-migration",
         )))
         self.assertTrue(os.path.isfile(receipt_path))
+        with open(receipt_path, "rb") as receipt_file:
+            original_receipt = receipt_file.read()
         with self.configured(), mock.patch(
             "django_images.services.sqlite_snapshot._copy_database",
         ) as copy_database:
-            snapshot_sqlite(
+            second = snapshot_sqlite(
                 self.source_path,
                 run,
                 os.getuid(),
@@ -639,7 +1488,97 @@ class SQLiteSnapshotTests(SimpleTestCase):
             )
 
         copy_database.assert_not_called()
-        self.assertFalse(os.path.exists(receipt_path))
+        self.assertEqual(second, first)
+        with open(receipt_path, "rb") as receipt_file:
+            self.assertEqual(receipt_file.read(), original_receipt)
+
+    def test_receipted_final_resume_rejects_snapshot_replacement_after_check(self):
+        sqlite3.connect(self.source_path).close()
+        run = self.create_run()
+        with self.configured():
+            snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+        snapshot_path = os.path.join(
+            run.path,
+            "production.db.before-migration",
+        )
+        replacement_path = os.path.join(run.path, "replacement.db")
+        with open(snapshot_path, "rb") as snapshot_file:
+            snapshot_bytes = snapshot_file.read()
+        with open(replacement_path, "wb") as replacement_file:
+            replacement_file.write(snapshot_bytes)
+        os.chmod(replacement_path, 0o600)
+        real_verify_run = sqlite_snapshot._verify_named_run_identity
+        replaced = []
+
+        def replace_after_run_check(*arguments, **keywords):
+            result = real_verify_run(*arguments, **keywords)
+            if not replaced:
+                replaced.append(True)
+                os.replace(replacement_path, snapshot_path)
+            return result
+
+        with self.configured(), mock.patch(
+            "django_images.services.sqlite_snapshot._verify_named_run_identity",
+            side_effect=replace_after_run_check,
+        ), self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+
+    def test_receipted_final_resume_rejects_receipt_replacement_after_check(self):
+        sqlite3.connect(self.source_path).close()
+        run = self.create_run()
+        with self.configured():
+            snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
+        receipt_path = os.path.join(
+            run.path,
+            ".production.db.before-migration.receipt",
+        )
+        replacement_path = os.path.join(run.path, "replacement.receipt")
+        with open(receipt_path, "rb") as receipt_file:
+            receipt_bytes = receipt_file.read()
+        with open(replacement_path, "wb") as replacement_file:
+            replacement_file.write(receipt_bytes)
+        os.chmod(replacement_path, 0o600)
+        real_verify_run = sqlite_snapshot._verify_named_run_identity
+        replaced = []
+
+        def replace_after_run_check(*arguments, **keywords):
+            result = real_verify_run(*arguments, **keywords)
+            if not replaced:
+                replaced.append(True)
+                os.replace(replacement_path, receipt_path)
+            return result
+
+        with self.configured(), mock.patch(
+            "django_images.services.sqlite_snapshot._verify_named_run_identity",
+            side_effect=replace_after_run_check,
+        ), self.assertRaisesRegex(
+            SQLiteSnapshotError,
+            "^sqlite_snapshot_conflict$",
+        ):
+            snapshot_sqlite(
+                self.source_path,
+                run,
+                os.getuid(),
+                os.getgid(),
+            )
 
     def test_receipt_metadata_mismatch_fails_closed(self):
         connection = sqlite3.connect(self.source_path)

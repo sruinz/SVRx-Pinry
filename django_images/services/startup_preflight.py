@@ -11,15 +11,18 @@ import uuid
 from django.core.files.storage import FileSystemStorage
 from django.db.migrations.loader import MigrationLoader
 from django.utils.functional import LazyObject
+from django.utils.text import get_valid_filename
 
 from django_images import file_ops
 from django_images.paths import (
+    FORMAT_EXTENSIONS,
     PINRY_DIRECT_MD5_ROOTS,
     canonical_derivative_path,
     canonical_original_path,
     is_valid_original_leaf,
     pinry_direct_md5_root,
 )
+from django_images.services import sqlite_snapshot
 
 
 MIB = 1024 * 1024
@@ -69,6 +72,15 @@ class StartupPreflightError(Exception):
 
 
 @dataclass(frozen=True)
+class MissingUnreferencedImage(object):
+    image_id: int
+    image_path: str
+    thumbnail_rows: tuple
+    image_signature: tuple = ()
+    thumbnail_signatures: tuple = ()
+
+
+@dataclass(frozen=True)
 class LegacyEvidence(object):
     database_exists: bool
     database_bytes: int
@@ -82,6 +94,7 @@ class LegacyEvidence(object):
     database_identity: object
     media_root_identity: object
     has_pinry_direct_md5_directory: bool = False
+    missing_unreferenced_images: tuple = ()
 
     @property
     def pending_schema(self):
@@ -94,6 +107,7 @@ class LegacyEvidence(object):
             or self.has_fixed_slot_paths
             or self.has_media_image_directory
             or self.has_pinry_direct_md5_directory
+            or bool(self.missing_unreferenced_images)
         )
 
 
@@ -118,6 +132,7 @@ def inspect_legacy_evidence(
     media_directory = None
     database_root = None
     database_receipt = None
+    database_guard = None
     connection = None
     try:
         normalized_database_path = _configured_path(database_path)
@@ -154,11 +169,12 @@ def inspect_legacy_evidence(
             )
 
         database_receipt.verify_current()
-        database_uri = "file:{}?mode=ro".format(
-            quote(normalized_database_path, safe="/")
+        database_guard = sqlite_snapshot._SourceMutationGuard(
+            database_receipt.descriptor
         )
+        database_uri = _database_receipt_uri(database_receipt, "ro")
         connection = sqlite3.connect(database_uri, uri=True)
-        database_receipt.verify_current()
+        _verify_read_database(database_receipt, database_guard)
         connection.execute("PRAGMA query_only = ON")
         stage = "database_schema"
         tables = {
@@ -183,7 +199,7 @@ def inspect_legacy_evidence(
                     "SELECT app, name FROM django_migrations"
                 )
             }
-        database_receipt.verify_current()
+        _verify_read_database(database_receipt, database_guard)
 
         stage = "migration_graph"
         if disk_migration_graph is None:
@@ -193,12 +209,36 @@ def inspect_legacy_evidence(
         stage = "media_rows"
         classified = _classify_media_rows(image_rows, thumbnail_rows)
         stage = "media_files"
+        missing_unreferenced_images = _missing_unreferenced_images(
+            connection,
+            tables,
+            image_rows,
+            thumbnail_rows,
+            media_directory,
+        )
+        if missing_unreferenced_images:
+            missing_ids = {
+                candidate.image_id
+                for candidate in missing_unreferenced_images
+            }
+            image_rows = tuple(
+                row for row in image_rows if row["id"] not in missing_ids
+            )
+            thumbnail_rows = tuple(
+                row for row in thumbnail_rows
+                if row.get("original_id") not in missing_ids
+            )
+            classified = _classify_media_rows(
+                image_rows,
+                thumbnail_rows,
+            )
+        stage = "media_files"
         distinct_legacy_bytes = _distinct_legacy_bytes(
             media_directory,
             classified["copy_paths"],
         )
         stage = "database"
-        database_receipt.verify_current()
+        _verify_read_database(database_receipt, database_guard)
         database_bytes = database_receipt.file_stat.st_size
         evidence = LegacyEvidence(
             database_exists=True,
@@ -217,10 +257,13 @@ def inspect_legacy_evidence(
             has_pinry_direct_md5_directory=(
                 has_pinry_direct_md5_directory
             ),
+            missing_unreferenced_images=missing_unreferenced_images,
         )
         connection.close()
         connection = None
-        database_receipt.verify_current()
+        _verify_read_database(database_receipt, database_guard)
+        database_guard.close()
+        database_guard = None
         return evidence
     except BaseException as error:
         if (
@@ -242,9 +285,20 @@ def inspect_legacy_evidence(
                 pass
             if database_receipt is not None:
                 try:
-                    database_receipt.verify_current()
+                    if database_guard is not None:
+                        _verify_read_database(
+                            database_receipt,
+                            database_guard,
+                        )
+                    else:
+                        database_receipt.verify_current()
                 except BaseException:
                     pass
+        if database_guard is not None:
+            try:
+                database_guard.close()
+            except BaseException:
+                pass
         if database_receipt is not None:
             try:
                 database_receipt.close()
@@ -260,6 +314,380 @@ def inspect_legacy_evidence(
                 media_directory.close()
             except BaseException:
                 pass
+
+
+def remove_confirmed_missing_unreferenced_images(
+    database_path,
+    media_root,
+    candidates,
+    expected_database_identity,
+    expected_media_root_identity,
+    backup_verifier,
+):
+    _require_cleanup_candidates(candidates)
+    _require_cleanup_identity(
+        expected_database_identity,
+        "legacy_database_invalid",
+    )
+    _require_cleanup_identity(
+        expected_media_root_identity,
+        "legacy_media_root_invalid",
+    )
+    if not candidates:
+        return 0
+    _verify_cleanup_backup(backup_verifier)
+
+    normalized_database_path = _configured_path(database_path)
+    normalized_media_root = _configured_path(media_root)
+    if normalized_database_path is None or normalized_media_root is None:
+        raise StartupPreflightError("legacy_evidence_invalid")
+
+    media_directory = None
+    database_root = None
+    database_receipt = None
+    database_guard = None
+    connection = None
+    try:
+        media_directory = file_ops.open_verified_media_root(
+            normalized_media_root
+        )
+        database_root, database_receipt = _open_database(
+            normalized_database_path
+        )
+        if database_receipt is None:
+            raise StartupPreflightError("legacy_database_invalid")
+        _verify_media_root_identity(
+            media_directory,
+            expected_media_root_identity,
+        )
+        _verify_database_identity(
+            database_receipt,
+            expected_database_identity,
+        )
+        with file_ops.media_lifecycle_lock(
+            media_directory,
+            exclusive=True,
+        ):
+            _verify_media_root_identity(
+                media_directory,
+                expected_media_root_identity,
+            )
+            _verify_database_identity(
+                database_receipt,
+                expected_database_identity,
+            )
+            database_guard = sqlite_snapshot._SourceMutationGuard(
+                database_receipt.descriptor
+            )
+            try:
+                _verify_cleanup_backup(backup_verifier)
+                connection = _open_cleanup_connection(database_receipt)
+                _verify_cleanup_identities(
+                    database_receipt,
+                    database_guard,
+                    expected_database_identity,
+                    media_directory,
+                    expected_media_root_identity,
+                )
+                removed = _remove_cleanup_candidates(
+                    connection,
+                    media_directory,
+                    database_receipt,
+                    candidates,
+                )
+                _verify_cleanup_identities(
+                    database_receipt,
+                    database_guard,
+                    expected_database_identity,
+                    media_directory,
+                    expected_media_root_identity,
+                    database_mutated=True,
+                )
+                _verify_cleanup_backup(backup_verifier)
+                connection.commit()
+                _verify_cleanup_identities(
+                    database_receipt,
+                    database_guard,
+                    expected_database_identity,
+                    media_directory,
+                    expected_media_root_identity,
+                    database_mutated=True,
+                )
+                connection.close()
+                connection = None
+                _verify_cleanup_identities(
+                    database_receipt,
+                    database_guard,
+                    expected_database_identity,
+                    media_directory,
+                    expected_media_root_identity,
+                    database_mutated=True,
+                )
+            except BaseException:
+                _rollback_cleanup(connection)
+                raise
+            finally:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except BaseException:
+                        pass
+                    connection = None
+                if database_guard is not None:
+                    database_guard.close()
+                    database_guard = None
+        return removed
+    except StartupPreflightError:
+        raise
+    except sqlite_snapshot.SQLiteSnapshotError as error:
+        raise StartupPreflightError("legacy_database_invalid") from error
+    except file_ops.MediaPathError as error:
+        raise StartupPreflightError(
+            "legacy_media_files_invalid"
+        ) from error
+    except (OSError, sqlite3.Error) as error:
+        raise StartupPreflightError("legacy_database_invalid") from error
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except BaseException:
+                pass
+        if database_guard is not None:
+            try:
+                database_guard.close()
+            except BaseException:
+                pass
+        if database_receipt is not None:
+            try:
+                database_receipt.close()
+            except BaseException:
+                pass
+        if database_root is not None:
+            try:
+                database_root.close()
+            except BaseException:
+                pass
+        if media_directory is not None:
+            try:
+                media_directory.close()
+            except BaseException:
+                pass
+
+
+def _verify_cleanup_backup(backup_verifier):
+    verify_current = getattr(backup_verifier, "verify_current", None)
+    if not callable(verify_current):
+        raise StartupPreflightError("legacy_database_invalid")
+    try:
+        verify_current()
+    except StartupPreflightError:
+        raise
+    except sqlite_snapshot.SQLiteSnapshotError as error:
+        raise StartupPreflightError("legacy_database_invalid") from error
+    except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+        raise StartupPreflightError("legacy_database_invalid") from error
+
+
+def _require_cleanup_candidates(candidates):
+    if (
+        not isinstance(candidates, tuple)
+        or any(
+            not isinstance(candidate, MissingUnreferencedImage)
+            for candidate in candidates
+        )
+        or candidates != tuple(sorted(
+            candidates,
+            key=lambda candidate: candidate.image_id,
+        ))
+        or len(candidates)
+        != len(set(candidate.image_id for candidate in candidates))
+    ):
+        raise StartupPreflightError("legacy_media_rows_invalid")
+
+
+def _require_cleanup_identity(identity, error_code):
+    if (
+        not isinstance(identity, dict)
+        or set(identity) != {"device", "inode"}
+        or any(
+            type(identity[field]) is not int or identity[field] < 0
+            for field in ("device", "inode")
+        )
+    ):
+        raise StartupPreflightError(error_code)
+
+
+def _verify_read_database(database_receipt, database_guard):
+    database_guard.verify_unchanged()
+    database_receipt.verify_current()
+    database_guard.verify_unchanged()
+
+
+def _verify_media_root_identity(media_directory, expected_identity):
+    try:
+        media_directory.verify_current()
+        current_identity = _directory_identity(media_directory)
+    except (OSError, file_ops.MediaPathError) as error:
+        raise StartupPreflightError(
+            "legacy_media_root_invalid"
+        ) from error
+    if current_identity != expected_identity:
+        raise StartupPreflightError("legacy_media_root_invalid")
+
+
+def _verify_database_identity(
+    database_receipt,
+    expected_identity,
+    mutated=False,
+):
+    try:
+        if mutated:
+            _verify_mutated_database_identity(database_receipt)
+        else:
+            database_receipt.verify_current()
+        current_stat = os.fstat(database_receipt.descriptor)
+    except (OSError, file_ops.MediaPathError) as error:
+        raise StartupPreflightError("legacy_database_invalid") from error
+    current_identity = {
+        "device": current_stat.st_dev,
+        "inode": current_stat.st_ino,
+    }
+    if current_identity != expected_identity:
+        raise StartupPreflightError("legacy_database_invalid")
+
+
+def _verify_cleanup_identities(
+    database_receipt,
+    database_guard,
+    expected_database_identity,
+    media_directory,
+    expected_media_root_identity,
+    database_mutated=False,
+):
+    database_guard.verify_unchanged()
+    _verify_database_identity(
+        database_receipt,
+        expected_database_identity,
+        mutated=database_mutated,
+    )
+    database_guard.verify_unchanged()
+    _verify_media_root_identity(
+        media_directory,
+        expected_media_root_identity,
+    )
+    database_guard.verify_unchanged()
+
+
+def _database_receipt_uri(database_receipt, mode):
+    connection_path = os.path.join(
+        sqlite_snapshot._directory_descriptor_path(
+            database_receipt.parent_directory.descriptor
+        ),
+        database_receipt.name,
+    )
+    return "file:{}?mode={}".format(
+        quote(connection_path, safe="/"),
+        mode,
+    )
+
+
+def _open_cleanup_connection(database_receipt):
+    database_uri = _database_receipt_uri(database_receipt, "rw")
+    connection = None
+    try:
+        connection = sqlite3.connect(database_uri, uri=True)
+        connection.execute("PRAGMA foreign_keys = ON")
+        if connection.execute("PRAGMA foreign_keys").fetchone() != (1,):
+            raise StartupPreflightError("legacy_database_invalid")
+        connection.execute("BEGIN IMMEDIATE")
+        return connection
+    except BaseException:
+        if connection is not None:
+            connection.close()
+        raise
+
+
+def _remove_cleanup_candidates(
+    connection,
+    media_directory,
+    database_receipt,
+    candidates,
+):
+    database_receipt.verify_current()
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    image_rows, thumbnail_rows = _read_media_rows(connection, tables)
+    _classify_media_rows(image_rows, thumbnail_rows)
+    _validate_image_foreign_keys(connection, tables)
+    _validate_media_delete_triggers(connection)
+    _validate_cleanup_candidates(
+        connection,
+        tables,
+        image_rows,
+        thumbnail_rows,
+        media_directory,
+        candidates,
+    )
+    for candidate in candidates:
+        _delete_cleanup_candidate(connection, candidate)
+    database_receipt.verify_current()
+    return len(candidates)
+
+
+def _delete_cleanup_candidate(connection, candidate):
+    for thumbnail_id, thumbnail_path in candidate.thumbnail_rows:
+        deleted = connection.execute(
+            "DELETE FROM django_images_thumbnail "
+            "WHERE id = ? AND original_id = ? AND image = ?",
+            (thumbnail_id, candidate.image_id, thumbnail_path),
+        )
+        if deleted.rowcount != 1:
+            raise StartupPreflightError("legacy_media_rows_invalid")
+    deleted = connection.execute(
+        "DELETE FROM django_images_image "
+        "WHERE id = ? AND image = ?",
+        (candidate.image_id, candidate.image_path),
+    )
+    if deleted.rowcount != 1:
+        raise StartupPreflightError("legacy_media_rows_invalid")
+
+
+def _rollback_cleanup(connection):
+    if connection is None:
+        return
+    try:
+        connection.rollback()
+    except BaseException:
+        pass
+
+
+def _verify_mutated_database_identity(receipt):
+    try:
+        receipt.root_directory.verify_current()
+        receipt.parent_directory.verify_current()
+        descriptor_stat = os.fstat(receipt.descriptor)
+        named_stat = os.stat(
+            receipt.name,
+            dir_fd=receipt.parent_directory.descriptor,
+            follow_symlinks=False,
+        )
+    except (OSError, file_ops.MediaPathError) as error:
+        raise file_ops.MediaPathError("unsafe_media_file") from error
+    expected_identity = _stat_identity(receipt.file_stat)
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or not stat.S_ISREG(named_stat.st_mode)
+        or descriptor_stat.st_nlink != 1
+        or named_stat.st_nlink != 1
+        or _stat_identity(descriptor_stat) != expected_identity
+        or _stat_identity(named_stat) != expected_identity
+    ):
+        raise file_ops.MediaPathError("unsafe_media_file")
 
 
 def calculate_initial_space(database_bytes, distinct_legacy_bytes):
@@ -876,14 +1304,14 @@ def _read_media_rows(connection, tables):
             connection,
             "django_images_image",
             ("id", "image"),
-            ("asset_uuid", "original_filename"),
+            ("asset_uuid", "original_filename", "width", "height"),
         )
     if "django_images_thumbnail" in tables:
         thumbnail_rows = _read_table_rows(
             connection,
             "django_images_thumbnail",
             ("id", "image"),
-            ("original_id", "size"),
+            ("original_id", "size", "width", "height"),
         )
     return image_rows, thumbnail_rows
 
@@ -912,6 +1340,353 @@ def _table_has_rows(connection, tables, table_name):
     return connection.execute(
         "SELECT 1 FROM {} LIMIT 1".format(table_name)
     ).fetchone() is not None
+
+
+def _missing_unreferenced_images(
+    connection,
+    tables,
+    image_rows,
+    thumbnail_rows,
+    media_directory,
+):
+    if "core_pin" not in tables or media_directory is None:
+        return ()
+    pin_image_ids = _read_reference_image_ids(
+        connection,
+        tables,
+        "core_pin",
+        required=True,
+    )
+    asset_image_ids = _read_reference_image_ids(
+        connection,
+        tables,
+        "core_mediaasset",
+        required=False,
+    )
+    referenced_ids = pin_image_ids | asset_image_ids
+    image_ids = tuple(row.get("id") for row in image_rows)
+    if (
+        any(type(image_id) is not int or image_id <= 0 for image_id in image_ids)
+        or len(image_ids) != len(set(image_ids))
+    ):
+        raise StartupPreflightError("legacy_media_rows_invalid")
+
+    thumbnails_by_original = {}
+    for row in thumbnail_rows:
+        original_id = row.get("original_id")
+        if type(original_id) is int:
+            thumbnails_by_original.setdefault(original_id, []).append(row)
+    path_counts = {}
+    for row in tuple(image_rows) + tuple(thumbnail_rows):
+        path = row.get("image")
+        path_counts[path] = path_counts.get(path, 0) + 1
+
+    candidates = []
+    for row in image_rows:
+        image_id = row["id"]
+        if image_id in referenced_ids:
+            continue
+        related = tuple(sorted(
+            thumbnails_by_original.get(image_id, ()),
+            key=lambda item: item["id"],
+        ))
+        if any(
+            type(item.get("id")) is not int or item["id"] <= 0
+            for item in related
+        ):
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        paths = (row["image"],) + tuple(
+            item["image"] for item in related
+        )
+        if any(path_counts.get(path) != 1 for path in paths):
+            continue
+        checked_paths = _missing_candidate_checked_paths(row, related)
+        if checked_paths is None:
+            continue
+        if any(
+            path_counts.get(path, 0) > (1 if path in paths else 0)
+            for path in checked_paths
+        ):
+            continue
+        if not all(
+            _verified_media_file_missing(media_directory, path)
+            for path in checked_paths
+        ):
+            continue
+        candidates.append(MissingUnreferencedImage(
+            image_id=image_id,
+            image_path=row["image"],
+            thumbnail_rows=tuple(
+                (item["id"], item["image"])
+                for item in related
+            ),
+            image_signature=_row_signature(row),
+            thumbnail_signatures=tuple(
+                _row_signature(item) for item in related
+            ),
+        ))
+    candidates = tuple(sorted(
+        candidates,
+        key=lambda candidate: candidate.image_id,
+    ))
+    checked_path_owners = {}
+    rows_by_id = {row["id"]: row for row in image_rows}
+    related_by_id = {
+        image_id: tuple(sorted(rows, key=lambda item: item["id"]))
+        for image_id, rows in thumbnails_by_original.items()
+    }
+    for candidate in candidates:
+        for path in _missing_candidate_checked_paths(
+            rows_by_id[candidate.image_id],
+            related_by_id.get(candidate.image_id, ()),
+        ):
+            checked_path_owners.setdefault(path, set()).add(
+                candidate.image_id
+            )
+    return tuple(
+        candidate
+        for candidate in candidates
+        if all(
+            len(checked_path_owners[path]) == 1
+            for path in _missing_candidate_checked_paths(
+                rows_by_id[candidate.image_id],
+                related_by_id.get(candidate.image_id, ()),
+            )
+        )
+    )
+
+
+def _validate_cleanup_candidates(
+    connection,
+    tables,
+    image_rows,
+    thumbnail_rows,
+    media_directory,
+    candidates,
+):
+    pin_image_ids = _read_reference_image_ids(
+        connection,
+        tables,
+        "core_pin",
+        required=True,
+    )
+    asset_image_ids = _read_reference_image_ids(
+        connection,
+        tables,
+        "core_mediaasset",
+        required=False,
+    )
+    referenced_ids = pin_image_ids | asset_image_ids
+    rows_by_id = {row.get("id"): row for row in image_rows}
+    thumbnails_by_original = {}
+    path_counts = {}
+    for row in tuple(image_rows) + tuple(thumbnail_rows):
+        path = row.get("image")
+        path_counts[path] = path_counts.get(path, 0) + 1
+    for row in thumbnail_rows:
+        original_id = row.get("original_id")
+        if type(original_id) is int:
+            thumbnails_by_original.setdefault(original_id, []).append(row)
+
+    checked_path_owners = {}
+    checked_paths_by_id = {}
+    for candidate in candidates:
+        row = rows_by_id.get(candidate.image_id)
+        if row is None or row.get("image") != candidate.image_path:
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        if _row_signature(row) != candidate.image_signature:
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        if candidate.image_id in referenced_ids:
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        related = tuple(sorted(
+            thumbnails_by_original.get(candidate.image_id, ()),
+            key=lambda item: item.get("id"),
+        ))
+        signature = tuple(
+            (item.get("id"), item.get("image"))
+            for item in related
+        )
+        if signature != candidate.thumbnail_rows:
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        if tuple(
+            _row_signature(item) for item in related
+        ) != candidate.thumbnail_signatures:
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        paths = (candidate.image_path,) + tuple(
+            path for _thumbnail_id, path in candidate.thumbnail_rows
+        )
+        if any(path_counts.get(path) != 1 for path in paths):
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        checked_paths = _missing_candidate_checked_paths(row, related)
+        if checked_paths is None:
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        if any(
+            path_counts.get(path, 0) > (1 if path in paths else 0)
+            for path in checked_paths
+        ):
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        checked_paths_by_id[candidate.image_id] = checked_paths
+        for path in checked_paths:
+            checked_path_owners.setdefault(path, set()).add(
+                candidate.image_id
+            )
+
+    if any(
+        len(owners) != 1 for owners in checked_path_owners.values()
+    ):
+        raise StartupPreflightError("legacy_media_rows_invalid")
+    for checked_paths in checked_paths_by_id.values():
+        if not all(
+            _verified_media_file_missing(media_directory, path)
+            for path in checked_paths
+        ):
+            raise StartupPreflightError("legacy_media_files_invalid")
+
+
+def _missing_candidate_checked_paths(image_row, thumbnail_rows):
+    asset_uuid = _canonical_database_uuid(image_row.get("asset_uuid"))
+    original_filename = image_row.get("original_filename")
+    image_path = image_row.get("image")
+    if (
+        asset_uuid is None
+        or type(original_filename) is not str
+        or type(image_path) is not str
+        or not image_path
+    ):
+        return None
+    try:
+        target_paths = [
+            canonical_original_path(
+                asset_uuid,
+                original_filename,
+                extension,
+            )
+            for extension in sorted(set(FORMAT_EXTENSIONS.values()))
+        ]
+        for row in thumbnail_rows:
+            thumbnail_path = row.get("image")
+            if (
+                type(thumbnail_path) is not str
+                or not thumbnail_path
+            ):
+                return None
+        for size in sorted(_REQUIRED_IMAGE_SIZES):
+            target_paths.extend(
+                canonical_derivative_path(asset_uuid, size, extension)
+                for extension in sorted(set(FORMAT_EXTENSIONS.values()))
+            )
+    except ValueError:
+        return None
+    source_paths = [image_path] + [
+        row["image"] for row in thumbnail_rows
+    ]
+    return tuple(sorted(set(source_paths + target_paths)))
+
+
+def _row_signature(row):
+    return tuple(sorted(row.items()))
+
+
+def _validate_image_foreign_keys(connection, tables):
+    allowed = frozenset((
+        ("core_mediaasset", "image_id", "id"),
+        ("core_pin", "image_id", "id"),
+        ("django_images_thumbnail", "original_id", "id"),
+    ))
+    references = set()
+    for table_name in tables:
+        if type(table_name) is not str or not table_name:
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        escaped_name = table_name.replace('"', '""')
+        for row in connection.execute(
+            'PRAGMA foreign_key_list("{}")'.format(escaped_name)
+        ):
+            if len(row) < 5:
+                raise StartupPreflightError("legacy_media_rows_invalid")
+            target_table, source_column, target_column = row[2:5]
+            if any(
+                type(value) is not str or not value
+                for value in (
+                    target_table,
+                    source_column,
+                    target_column,
+                )
+            ):
+                raise StartupPreflightError("legacy_media_rows_invalid")
+            target_table = target_table.lower()
+            if target_table == "django_images_thumbnail":
+                raise StartupPreflightError("legacy_media_rows_invalid")
+            if target_table == "django_images_image":
+                references.add((
+                    table_name.lower(),
+                    source_column.lower(),
+                    target_column.lower(),
+                ))
+    if not references.issubset(allowed):
+        raise StartupPreflightError("legacy_media_rows_invalid")
+
+
+def _validate_media_delete_triggers(connection):
+    protected_tables = frozenset((
+        "django_images_image",
+        "django_images_thumbnail",
+    ))
+    for name, table_name in connection.execute(
+        "SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger'"
+    ):
+        if (
+            type(name) is not str
+            or not name
+            or type(table_name) is not str
+            or not table_name
+        ):
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        if table_name.lower() in protected_tables:
+            raise StartupPreflightError("legacy_media_rows_invalid")
+
+
+def _read_reference_image_ids(
+    connection,
+    tables,
+    table_name,
+    required,
+):
+    if table_name not in tables:
+        if required:
+            raise StartupPreflightError("legacy_media_rows_invalid")
+        return set()
+    columns = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info({})".format(table_name)
+        )
+    }
+    if "image_id" not in columns:
+        raise StartupPreflightError("legacy_media_rows_invalid")
+    values = tuple(
+        row[0]
+        for row in connection.execute(
+            "SELECT image_id FROM {}".format(table_name)
+        )
+    )
+    if any(type(value) is not int or value <= 0 for value in values):
+        raise StartupPreflightError("legacy_media_rows_invalid")
+    return set(values)
+
+
+def _verified_media_file_missing(media_directory, relative_path):
+    receipt = file_ops.open_verified_media_file(
+        media_directory,
+        relative_path,
+        missing_ok=True,
+    )
+    if receipt is None:
+        return True
+    try:
+        receipt.verify_current()
+        return False
+    finally:
+        receipt.close()
 
 
 def _classify_media_rows(image_rows, thumbnail_rows):  # noqa: C901
@@ -952,8 +1727,7 @@ def _classify_media_rows(image_rows, thumbnail_rows):  # noqa: C901
             raise StartupPreflightError("legacy_evidence_invalid")
         asset_uuid = match.group("asset_uuid")
         leaf = match.group("leaf")
-        if not is_valid_original_leaf(asset_uuid, leaf):
-            raise StartupPreflightError("legacy_evidence_invalid")
+        valid_original_leaf = is_valid_original_leaf(asset_uuid, leaf)
         extension = os.path.splitext(leaf)[1]
         derivative_rows = thumbnails_by_original.get(row["id"], ())
         if not _canonical_derivative_closure(
@@ -972,7 +1746,6 @@ def _classify_media_rows(image_rows, thumbnail_rows):  # noqa: C901
             if (
                 database_asset_uuid != asset_uuid
                 or type(original_filename) is not str
-                or not original_filename
             ):
                 raise StartupPreflightError("legacy_evidence_invalid")
             try:
@@ -988,8 +1761,23 @@ def _classify_media_rows(image_rows, thumbnail_rows):  # noqa: C901
             if path == expected_path:
                 has_named_canonical_paths = True
                 continue
-            if leaf != "original{}".format(extension):
+            expected_parent, expected_leaf = expected_path.rsplit("/", 1)
+            legacy_storage_path = "{}/{}".format(
+                expected_parent,
+                get_valid_filename(expected_leaf),
+            )
+            if path == legacy_storage_path:
+                has_fixed_slot_paths = True
+                has_named_canonical_paths = True
+                copy_paths.add(path)
+                continue
+            if (
+                not valid_original_leaf
+                or leaf != "original{}".format(extension)
+            ):
                 raise StartupPreflightError("legacy_evidence_invalid")
+        elif not valid_original_leaf:
+            raise StartupPreflightError("legacy_evidence_invalid")
         elif leaf != "original{}".format(extension):
             has_named_canonical_paths = True
             continue

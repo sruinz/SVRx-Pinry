@@ -11,6 +11,7 @@ from unittest import mock
 
 from django.core.management import CommandError, call_command
 from django.test import TransactionTestCase, override_settings
+from django.utils.text import get_valid_filename
 from PIL import Image as PILImage
 
 from django_images.file_ops import (
@@ -108,6 +109,11 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             )
         elif generation == "fixed":
             original_path = "originals/{}/original.png".format(asset_uuid)
+        elif generation == "django-normalized":
+            parent, leaf = original_target.rsplit("/", 1)
+            original_path = "{}/{}".format(
+                parent, get_valid_filename(leaf)
+            )
         elif generation == "named":
             original_path = original_target
         else:
@@ -335,6 +341,43 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             {entry.operation for entry in plan.files[1:]}, {"verify"}
         )
         self.assertEqual(plan.fixed_slot_archive_sources, (plan.old_original,))
+
+    def test_django_normalized_original_is_migrated_and_archived(self):
+        image = self.make_image(
+            generation="django-normalized",
+            original_name="스크린샷 2026-08-20 21.23.05.png",
+        )
+        old_path = image.image.name
+        expected_path = canonical_original_path(
+            image.asset_uuid,
+            image.original_filename,
+            ".png",
+        )
+
+        plan = AutoV2MigrationPlan.for_image(image, self.open_root())
+
+        self.assertEqual(plan.generation, "fixed_slot")
+        self.assertEqual(plan.files[0].operation, "copy")
+        self.assertEqual(
+            {entry.operation for entry in plan.files[1:]}, {"verify"}
+        )
+        self.assertEqual(plan.fixed_slot_archive_sources, (old_path,))
+
+        self.migrator().run(execute=True)
+
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, expected_path)
+        self.assertTrue(Path(self.temporary_media.name, old_path).is_file())
+        self.assertEqual(
+            load_auto_v2_archive_sources(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+            ),
+            (old_path,),
+        )
 
     def test_original_named_original_is_current_not_fixed_slot(self):
         image = self.make_image(generation="named", original_name="original.png")

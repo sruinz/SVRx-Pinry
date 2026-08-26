@@ -5,6 +5,7 @@ import stat
 from types import SimpleNamespace
 import tempfile
 from unittest import mock
+from contextlib import nullcontext
 
 from django.core.management import CommandError
 from django.test import SimpleTestCase
@@ -19,6 +20,7 @@ from django_images.services.legacy_startup import (
 from django_images.services.media_migration_v2 import AutoV2PlanSummary
 from django_images.services.startup_preflight import (
     LegacyEvidence,
+    MissingUnreferencedImage,
     PreflightResult,
     SpaceBudget,
 )
@@ -275,7 +277,17 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
 
     def test_full_run_uses_exact_phase_and_service_order(self):
         events = []
-        evidence = self.evidence()
+        candidate = MissingUnreferencedImage(
+            image_id=1,
+            image_path="originals/asset/old.png",
+            thumbnail_rows=(),
+        )
+        evidence = LegacyEvidence(
+            **dict(
+                self.evidence().__dict__,
+                missing_unreferenced_images=(candidate,),
+            )
+        )
         media_dry = AutoV2PlanSummary(
             run_id=RUN_ID,
             plan_sha256="1" * 64,
@@ -369,6 +381,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             return real_seal(run, current_evidence)
 
         coordinator = self.coordinator()
+        backup_guard = mock.Mock()
         archive_evidence = LegacyEvidence(
             **dict(
                 evidence.__dict__,
@@ -407,7 +420,11 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                 "snapshot_sqlite",
                 side_effect=lambda *args: (
                     events.append("snapshot")
-                    or SimpleNamespace(sha256="7" * 64)
+                    or SimpleNamespace(
+                        sha256="7" * 64,
+                        source_device=1,
+                        source_inode=2,
+                    )
                 ),
             ),
             mock.patch(
@@ -454,10 +471,22 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                 "load_completed_media_asset_backfill_summary",
                 return_value=backfill_execute,
             ),
+            mock.patch(
+                "django_images.services.legacy_startup."
+                "protect_orphan_cleanup",
+                return_value=nullcontext(backup_guard),
+            ),
+            mock.patch(
+                "django_images.services.legacy_startup."
+                "startup_preflight."
+                "remove_confirmed_missing_unreferenced_images",
+                side_effect=lambda *args: events.append("orphan_cleanup") or 1,
+            ),
         )
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
                 patches[5], patches[6], patches[7], patches[8], patches[9], \
-                patches[10], patches[11], patches[12], patches[13]:
+                patches[10], patches[11], patches[12], patches[13], \
+                patches[14], patches[15]:
             run = coordinator.prepare_before_schema()
             events.extend(("collectstatic", "migrate"))
             coordinator.converge_after_schema(run)
@@ -467,6 +496,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "space",
             "state:snapshot_intent",
             "snapshot",
+            "orphan_cleanup",
             "state:snapshot_complete",
             "collectstatic",
             "migrate",
@@ -989,6 +1019,144 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         self.assertFalse(coordinator.schema_required(resumed))
         available.assert_not_called()
         snapshot.assert_not_called()
+
+    def test_schema_complete_resume_cleans_orphan_before_media_plan(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run,
+            "initialized",
+            "schema_complete",
+        )
+        candidate = MissingUnreferencedImage(
+            image_id=1,
+            image_path="originals/asset/old.png",
+            thumbnail_rows=(),
+        )
+        evidence = LegacyEvidence(
+            **dict(
+                self.evidence().__dict__,
+                missing_unreferenced_images=(candidate,),
+            )
+        )
+        coordinator = self.coordinator()
+        backup_guard = mock.Mock()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "protect_orphan_cleanup",
+            return_value=nullcontext(backup_guard),
+        ) as protect_cleanup, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.remove_confirmed_missing_unreferenced_images",
+            return_value=1,
+        ) as cleanup:
+            resumed = coordinator.prepare_before_schema()
+
+        self.assertEqual(resumed.run_id, run.run_id)
+        protect_cleanup.assert_called_once_with(
+            str(self.database_path),
+            run,
+            self.uid,
+            self.gid,
+            before_fallback_create=(
+                coordinator._require_cleanup_snapshot_space
+            ),
+        )
+        cleanup.assert_called_once_with(
+            str(self.database_path),
+            str(self.media_root),
+            (candidate,),
+            {"device": 1, "inode": 2},
+            {"device": 3, "inode": 4},
+            backup_guard,
+        )
+
+    def test_schema_complete_resume_never_cleans_after_manifest_event(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run,
+            "initialized",
+            "schema_complete",
+        )
+        Path(run.path, "media-migration.jsonl").write_bytes(b"event\n")
+        candidate = MissingUnreferencedImage(
+            image_id=1,
+            image_path="originals/asset/old.png",
+            thumbnail_rows=(),
+        )
+        evidence = LegacyEvidence(
+            **dict(
+                self.evidence().__dict__,
+                missing_unreferenced_images=(candidate,),
+            )
+        )
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight."
+            "remove_confirmed_missing_unreferenced_images",
+        ) as cleanup:
+            resumed = coordinator.prepare_before_schema()
+
+        self.assertEqual(resumed.run_id, run.run_id)
+        cleanup.assert_not_called()
+
+    def test_snapshot_complete_resume_never_cleans_after_manifest_creation(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run,
+            "initialized",
+            "snapshot_intent",
+            intent={
+                "kind": "sqlite_snapshot",
+                "source_device": 1,
+                "source_inode": 2,
+            },
+        )
+        migration_state.transition_state(
+            run,
+            "snapshot_intent",
+            "snapshot_complete",
+        )
+        Path(run.path, "media-migration.jsonl").write_bytes(b"")
+        candidate = MissingUnreferencedImage(
+            image_id=1,
+            image_path="originals/asset/old.png",
+            thumbnail_rows=(),
+        )
+        evidence = LegacyEvidence(
+            **dict(
+                self.evidence().__dict__,
+                missing_unreferenced_images=(candidate,),
+            )
+        )
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "protect_orphan_cleanup",
+        ) as protect_cleanup, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.remove_confirmed_missing_unreferenced_images",
+        ) as cleanup:
+            resumed = coordinator.prepare_before_schema()
+
+        self.assertEqual(resumed.run_id, run.run_id)
+        protect_cleanup.assert_not_called()
+        cleanup.assert_not_called()
 
     def test_media_root_identity_change_before_backfill_fails_closed(self):
         run = self._summary_run()

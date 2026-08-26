@@ -26,7 +26,10 @@ from django_images.services.media_migration_v2 import (
     load_completed_auto_v2_summary,
     recover_incomplete_auto_v2_plan,
 )
-from django_images.services.sqlite_snapshot import snapshot_sqlite
+from django_images.services.sqlite_snapshot import (
+    protect_orphan_cleanup,
+    snapshot_sqlite,
+)
 
 
 SUMMARY_FILENAME = "migration-summary.json"
@@ -157,13 +160,93 @@ class LegacyStartupCoordinator(object):
             if snapshot is None:
                 raise LegacyStartupError("sqlite_snapshot_failed")
             self._fault("after_snapshot")
+            self._cleanup_missing_unreferenced_images(
+                run,
+                status,
+                evidence,
+            )
             self._transition(
                 run,
                 "snapshot_intent",
                 "snapshot_complete",
             )
             self._fault("after_snapshot_complete")
+            status = migration_state.read_run_status(run)
+        elif status.phase in ("snapshot_complete", "schema_complete"):
+            self._cleanup_missing_unreferenced_images(
+                run,
+                status,
+                evidence,
+            )
         return run
+
+    def _cleanup_missing_unreferenced_images(
+        self,
+        run,
+        status,
+        evidence,
+    ):
+        candidates = evidence.missing_unreferenced_images
+        if not candidates or not self._media_plan_not_started(run, status):
+            return 0
+        expected_database = status.database_identity
+        expected_media_root = status.media_root_identity
+        if expected_database is None or expected_media_root is None:
+            raise LegacyStartupError("migration_state_identity_changed")
+        with protect_orphan_cleanup(
+            self._database_path(),
+            run,
+            self.service_uid,
+            self.service_gid,
+            before_fallback_create=self._require_cleanup_snapshot_space,
+        ) as backup_guard:
+            cleanup = (
+                startup_preflight.remove_confirmed_missing_unreferenced_images
+            )
+            removed = cleanup(
+                self._database_path(),
+                settings.MEDIA_ROOT,
+                candidates,
+                expected_database,
+                expected_media_root,
+                backup_guard,
+            )
+        self._fault("after_missing_unreferenced_image_cleanup")
+        return removed
+
+    def _require_cleanup_snapshot_space(self, database_bytes):
+        budget = startup_preflight.calculate_initial_space(
+            database_bytes,
+            0,
+        )
+        self._require_space(budget.required_bytes)
+
+    def _media_plan_not_started(self, run, status):
+        if (
+            status.media_plan_sha256 is not None
+            or status.media_manifest_sha256 is not None
+        ):
+            return False
+        run_directory = None
+        receipt = None
+        try:
+            run_directory = file_ops.open_verified_media_root(run.path)
+            receipt = file_ops.open_verified_media_file(
+                run_directory,
+                AUTO_V2_MANIFEST_FILENAME,
+                missing_ok=True,
+            )
+            if receipt is None:
+                return True
+            receipt.verify_current()
+            return False
+        except (OSError, file_ops.MediaPathError) as error:
+            raise LegacyStartupError("unsafe_auto_v2_manifest") from error
+        finally:
+            if receipt is not None:
+                receipt.close()
+            if run_directory is not None:
+                run_directory.close()
 
     def schema_required(self, run):
         if run is None:

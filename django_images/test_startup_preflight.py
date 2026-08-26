@@ -141,6 +141,35 @@ class LegacyEvidenceTests(SimpleTestCase):
         finally:
             connection.close()
 
+    def _add_reference_tables(
+        self,
+        pin_image_ids=(),
+        media_asset_image_ids=(),
+    ):
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            connection.executescript("""
+                CREATE TABLE core_pin (
+                    id INTEGER PRIMARY KEY,
+                    image_id INTEGER NOT NULL
+                );
+                CREATE TABLE core_mediaasset (
+                    id INTEGER PRIMARY KEY,
+                    image_id INTEGER NOT NULL
+                );
+            """)
+            connection.executemany(
+                "INSERT INTO core_pin (image_id) VALUES (?)",
+                [(image_id,) for image_id in pin_image_ids],
+            )
+            connection.executemany(
+                "INSERT INTO core_mediaasset (image_id) VALUES (?)",
+                [(image_id,) for image_id in media_asset_image_ids],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
     def _write_media(self, relative_path, content):
         path = self.media_root / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,6 +182,26 @@ class LegacyEvidenceTests(SimpleTestCase):
             graph,
             str(self.media_root),
         )
+
+    def _cleanup(self, evidence):
+        backup_verifier = mock.Mock()
+        return startup_preflight.remove_confirmed_missing_unreferenced_images(
+            str(self.database_path),
+            str(self.media_root),
+            evidence.missing_unreferenced_images,
+            evidence.database_identity,
+            evidence.media_root_identity,
+            backup_verifier,
+        )
+
+    def _copy_database(self, destination):
+        source = sqlite3.connect(str(self.database_path))
+        copied = sqlite3.connect(str(destination))
+        try:
+            source.backup(copied)
+        finally:
+            copied.close()
+            source.close()
 
     def test_missing_database_never_connects_or_marks_schema_pending(self):
         graph = _DiskGraph(("django_images", "0001_initial"))
@@ -411,6 +460,770 @@ class LegacyEvidenceTests(SimpleTestCase):
                         "legacy_media_rows_invalid",
                     )
 
+    def test_named_canonical_fallback_accepts_empty_source_filename(self):
+        relative_path = (
+            "originals/{}/image-123456781234.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives("")
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertFalse(evidence.has_fixed_slot_paths)
+        self.assertTrue(evidence.has_named_canonical_paths)
+
+    def test_django_normalized_named_path_is_legacy_evidence(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._write_media(relative_path, b"django-normalized")
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertTrue(evidence.has_fixed_slot_paths)
+        self.assertTrue(evidence.has_named_canonical_paths)
+        self.assertTrue(evidence.has_legacy_evidence)
+        self.assertEqual(
+            evidence.distinct_legacy_bytes,
+            len(b"django-normalized"),
+        )
+
+    def test_missing_unreferenced_image_is_recorded_for_safe_cleanup(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertTrue(evidence.has_media_rows)
+        self.assertTrue(evidence.has_legacy_evidence)
+        self.assertFalse(evidence.has_fixed_slot_paths)
+        self.assertFalse(evidence.has_named_canonical_paths)
+        self.assertEqual(evidence.distinct_legacy_bytes, 0)
+        self.assertEqual(len(evidence.missing_unreferenced_images), 1)
+        candidate = evidence.missing_unreferenced_images[0]
+        self.assertEqual(candidate.image_id, 1)
+        self.assertEqual(candidate.image_path, relative_path)
+        self.assertEqual(
+            candidate.thumbnail_rows,
+            tuple(
+                (
+                    index,
+                    "derivatives/{}/{}.png".format(ASSET_UUID, size),
+                )
+                for index, size in enumerate(
+                    ("thumbnail", "standard", "square"),
+                    1,
+                )
+            ),
+        )
+
+    def test_missing_image_referenced_by_pin_is_not_cleanup_candidate(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables(pin_image_ids=(1,))
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._inspect(_DiskGraph())
+
+        self.assertEqual(caught.exception.code, "legacy_media_files_invalid")
+
+    def test_missing_image_referenced_by_media_asset_is_not_cleanup_candidate(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables(media_asset_image_ids=(1,))
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._inspect(_DiskGraph())
+
+        self.assertEqual(caught.exception.code, "legacy_media_files_invalid")
+
+    def test_partially_missing_unreferenced_image_is_not_cleanup_candidate(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        self._write_media(relative_path, b"still-present")
+
+        evidence = self._inspect(_DiskGraph())
+
+        self.assertEqual(evidence.missing_unreferenced_images, ())
+        self.assertTrue(evidence.has_fixed_slot_paths)
+        self.assertEqual(
+            evidence.distinct_legacy_bytes,
+            len(b"still-present"),
+        )
+
+    def test_confirmed_missing_unreferenced_image_rows_are_removed(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+
+        removed = self._cleanup(evidence)
+
+        self.assertEqual(removed, 1)
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_image"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_thumbnail"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_requires_expected_database_and_media_identities(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+
+        cases = (
+            (None, evidence.media_root_identity, "legacy_database_invalid"),
+            (evidence.database_identity, None, "legacy_media_root_invalid"),
+        )
+        for database_identity, media_identity, expected_code in cases:
+            with self.subTest(expected_code=expected_code), self.assertRaises(
+                startup_preflight.StartupPreflightError
+            ) as caught:
+                startup_preflight.remove_confirmed_missing_unreferenced_images(
+                    str(self.database_path),
+                    str(self.media_root),
+                    evidence.missing_unreferenced_images,
+                    database_identity,
+                    media_identity,
+                    mock.Mock(),
+                )
+            self.assertEqual(caught.exception.code, expected_code)
+
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_image"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_requires_live_backup_verifier(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+
+        with self.assertRaisesRegex(
+            startup_preflight.StartupPreflightError,
+            "^legacy_database_invalid$",
+        ):
+            startup_preflight.remove_confirmed_missing_unreferenced_images(
+                str(self.database_path),
+                str(self.media_root),
+                evidence.missing_unreferenced_images,
+                evidence.database_identity,
+                evidence.media_root_identity,
+                None,
+            )
+
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_image"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_rolls_back_when_backup_changes_before_commit(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        backup_verifier = mock.Mock()
+        backup_verifier.verify_current.side_effect = (
+            None,
+            None,
+            startup_preflight.StartupPreflightError(
+                "legacy_database_invalid"
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            startup_preflight.StartupPreflightError,
+            "^legacy_database_invalid$",
+        ):
+            startup_preflight.remove_confirmed_missing_unreferenced_images(
+                str(self.database_path),
+                str(self.media_root),
+                evidence.missing_unreferenced_images,
+                evidence.database_identity,
+                evidence.media_root_identity,
+                backup_verifier,
+            )
+
+        self.assertGreaterEqual(backup_verifier.verify_current.call_count, 3)
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_image"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_thumbnail"
+                ).fetchone()[0],
+                3,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_rejects_canonical_target_created_after_inspection(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        canonical_path = (
+            "originals/{}/"
+            "스크린샷 2026-08-20 21.23.05.jpg".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        self._write_media(canonical_path, b"migration-copy")
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._cleanup(evidence)
+
+        self.assertEqual(
+            caught.exception.code,
+            "legacy_media_files_invalid",
+        )
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_image"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_rejects_unregistered_derivative_target(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        self._write_media(
+            "derivatives/{}/standard.webp".format(ASSET_UUID),
+            b"migration-copy",
+        )
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._cleanup(evidence)
+
+        self.assertEqual(
+            caught.exception.code,
+            "legacy_media_files_invalid",
+        )
+
+    def test_cleanup_rejects_reference_created_after_inspection(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            connection.execute(
+                "INSERT INTO core_pin (image_id) VALUES (1)"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._cleanup(evidence)
+
+        self.assertEqual(
+            caught.exception.code,
+            "legacy_media_rows_invalid",
+        )
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_image"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_rejects_unknown_image_foreign_key(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            connection.execute("""
+                CREATE TABLE unexpected_image_reference (
+                    id INTEGER PRIMARY KEY,
+                    image_id INTEGER REFERENCES django_images_image(id)
+                )
+            """)
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._cleanup(evidence)
+
+        self.assertEqual(
+            caught.exception.code,
+            "legacy_media_rows_invalid",
+        )
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_image"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_rejects_cascading_thumbnail_foreign_key(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.executescript("""
+                CREATE TABLE unexpected_thumbnail_reference (
+                    id INTEGER PRIMARY KEY,
+                    thumbnail_id INTEGER REFERENCES
+                        django_images_thumbnail(id) ON DELETE CASCADE
+                );
+                INSERT INTO unexpected_thumbnail_reference
+                    (thumbnail_id) VALUES (1);
+            """)
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._cleanup(evidence)
+
+        self.assertEqual(caught.exception.code, "legacy_media_rows_invalid")
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_thumbnail"
+                ).fetchone()[0],
+                3,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM unexpected_thumbnail_reference"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_rejects_trigger_on_deleted_media_table(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            connection.executescript("""
+                CREATE TABLE cleanup_audit (value INTEGER NOT NULL);
+                INSERT INTO cleanup_audit (value) VALUES (1);
+                CREATE TRIGGER unexpected_thumbnail_delete
+                AFTER DELETE ON django_images_thumbnail
+                BEGIN
+                    DELETE FROM cleanup_audit;
+                END;
+            """)
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._cleanup(evidence)
+
+        self.assertEqual(caught.exception.code, "legacy_media_rows_invalid")
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_thumbnail"
+                ).fetchone()[0],
+                3,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM cleanup_audit"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_rejects_database_replaced_after_evidence(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        replacement_path = self.root_path / "replacement.db"
+        original_path = self.root_path / "original.db"
+        self._copy_database(replacement_path)
+        self.database_path.rename(original_path)
+        replacement_path.rename(self.database_path)
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._cleanup(evidence)
+
+        self.assertEqual(caught.exception.code, "legacy_database_invalid")
+        for path in (self.database_path, original_path):
+            connection = sqlite3.connect(str(path))
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM django_images_image"
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                connection.close()
+
+    def test_cleanup_rejects_media_root_replaced_after_evidence(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        original_root = self.root_path / "original-media"
+        self.media_root.rename(original_root)
+        self.media_root.mkdir()
+
+        with self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._cleanup(evidence)
+
+        self.assertEqual(caught.exception.code, "legacy_media_root_invalid")
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_image"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_rolls_back_if_media_root_is_replaced_during_delete(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        original_root = self.root_path / "original-media"
+        real_delete = startup_preflight._delete_cleanup_candidate
+
+        def replace_media_root(connection, candidate):
+            result = real_delete(connection, candidate)
+            self.media_root.rename(original_root)
+            self.media_root.mkdir()
+            return result
+
+        with mock.patch.object(
+            startup_preflight,
+            "_delete_cleanup_candidate",
+            side_effect=replace_media_root,
+        ), self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._cleanup(evidence)
+
+        self.assertEqual(caught.exception.code, "legacy_media_root_invalid")
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM django_images_image"
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            connection.close()
+
+    def test_cleanup_rejects_database_aba_during_connection_open(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        replacement_path = self.root_path / "replacement.db"
+        held_path = self.root_path / "held.db"
+        self._copy_database(replacement_path)
+        real_connect = sqlite3.connect
+        swapped = []
+
+        class RestoreAfterBegin(object):
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+
+            def restore(self):
+                if self.held_path.exists():
+                    self.database_path.rename(self.replacement_path)
+                    self.held_path.rename(self.database_path)
+
+            def execute(self, statement, *arguments):
+                result = self.wrapped.execute(statement, *arguments)
+                if statement == "BEGIN IMMEDIATE":
+                    self.restore()
+                return result
+
+            def close(self):
+                try:
+                    return self.wrapped.close()
+                finally:
+                    self.restore()
+
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+        def swap_around_write_connect(*arguments, **keywords):
+            uri = arguments[0] if arguments else keywords.get("database", "")
+            if not swapped and "mode=rw" in uri:
+                swapped.append(True)
+                self.database_path.rename(held_path)
+                replacement_path.rename(self.database_path)
+                replacement_connection = real_connect(
+                    *arguments,
+                    **keywords
+                )
+                replacement_connection.execute(
+                    "PRAGMA journal_mode = OFF"
+                )
+                wrapped = RestoreAfterBegin(
+                    replacement_connection
+                )
+                wrapped.database_path = self.database_path
+                wrapped.replacement_path = replacement_path
+                wrapped.held_path = held_path
+                return wrapped
+            return real_connect(*arguments, **keywords)
+
+        with mock.patch.object(
+            startup_preflight.sqlite3,
+            "connect",
+            side_effect=swap_around_write_connect,
+        ), self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._cleanup(evidence)
+
+        self.assertEqual(swapped, [True])
+        self.assertEqual(caught.exception.code, "legacy_database_invalid")
+        for path in (self.database_path, replacement_path):
+            connection = sqlite3.connect(str(path))
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM django_images_image"
+                    ).fetchone()[0],
+                    1,
+                )
+            finally:
+                connection.close()
+
+    def test_cleanup_holds_exclusive_lifecycle_lock_through_delete(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        canonical_path = (
+            "originals/{}/"
+            "스크린샷 2026-08-20 21.23.05.jpg".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        real_delete = startup_preflight._delete_cleanup_candidate
+
+        def attempt_competing_publish(connection, candidate):
+            root = file_ops.open_verified_media_root(str(self.media_root))
+            try:
+                try:
+                    with file_ops.media_lifecycle_lock(root):
+                        self._write_media(canonical_path, b"raced-publish")
+                except file_ops.MediaLifecycleLockError as error:
+                    self.assertEqual(error.code, "media_lifecycle_busy")
+            finally:
+                root.close()
+            return real_delete(connection, candidate)
+
+        with mock.patch.object(
+            startup_preflight,
+            "_delete_cleanup_candidate",
+            side_effect=attempt_competing_publish,
+        ):
+            removed = self._cleanup(evidence)
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(self.media_root.joinpath(canonical_path).exists())
+
     def test_old_schema_fixed_slot_requires_canonical_derivative_closure(self):
         relative_path = "originals/{}/original.png".format(ASSET_UUID)
         self._create_database(image_paths=(relative_path,))
@@ -571,6 +1384,39 @@ class LegacyEvidenceTests(SimpleTestCase):
             ) as caught:
                 self._inspect(_DiskGraph())
 
+        self.assertEqual(caught.exception.code, "legacy_database_invalid")
+
+    def test_database_aba_during_evidence_connection_fails_closed(self):
+        self._create_database()
+        replacement_path = self.root_path / "replacement.db"
+        held_path = self.root_path / "held.db"
+        self._copy_database(replacement_path)
+        real_connect = sqlite3.connect
+        swapped = []
+
+        def swap_around_read_connect(*arguments, **keywords):
+            uri = arguments[0] if arguments else keywords.get("database", "")
+            if not swapped and "mode=ro" in uri:
+                swapped.append(True)
+                self.database_path.rename(held_path)
+                replacement_path.rename(self.database_path)
+                try:
+                    return real_connect(*arguments, **keywords)
+                finally:
+                    self.database_path.rename(replacement_path)
+                    held_path.rename(self.database_path)
+            return real_connect(*arguments, **keywords)
+
+        with mock.patch.object(
+            startup_preflight.sqlite3,
+            "connect",
+            side_effect=swap_around_read_connect,
+        ), self.assertRaises(
+            startup_preflight.StartupPreflightError
+        ) as caught:
+            self._inspect(_DiskGraph())
+
+        self.assertEqual(swapped, [True])
         self.assertEqual(caught.exception.code, "legacy_database_invalid")
 
     def test_database_symlink_hardlink_and_directory_are_rejected(self):

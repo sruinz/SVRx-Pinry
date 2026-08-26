@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from contextlib import contextmanager
 import ctypes
 import errno
 import fcntl
@@ -29,11 +30,20 @@ from django_images.services.migration_state import (
 SNAPSHOT_FILENAME = "production.db.before-migration"
 SNAPSHOT_TEMP_FILENAME = ".production.db.before-migration.tmp"
 SNAPSHOT_RECEIPT_FILENAME = ".production.db.before-migration.receipt"
+CLEANUP_SNAPSHOT_FILENAME = "production.db.before-orphan-cleanup"
+CLEANUP_TEMP_FILENAME = ".production.db.before-orphan-cleanup.tmp"
+CLEANUP_RECEIPT_FILENAME = ".production.db.before-orphan-cleanup.receipt"
+CLEANUP_RECEIPT_KIND = "missing_unreferenced_image_cleanup"
 _SNAPSHOT_RECEIPT_KEYS = frozenset((
     "size",
     "sha256",
     "source_device",
     "source_inode",
+))
+_CLEANUP_RECEIPT_KEYS = _SNAPSHOT_RECEIPT_KEYS | frozenset((
+    "format_version",
+    "kind",
+    "run_id",
 ))
 
 
@@ -49,6 +59,12 @@ class SnapshotInfo(object):
     sha256: str
     source_device: int
     source_inode: int
+
+
+@dataclass(frozen=True)
+class _SnapshotSourceStat(object):
+    st_dev: int
+    st_ino: int
 
 
 class _SQLiteSource(object):
@@ -194,6 +210,239 @@ class _SourceMutationGuard(object):
             os.close(descriptor)
 
 
+class _HeldPrivateEntry(object):
+    def __init__(
+        self,
+        run_descriptor,
+        filename,
+        descriptor,
+        file_stat,
+        mutation_guard,
+        service_uid,
+        service_gid,
+        identity_error,
+    ):
+        self.run_descriptor = run_descriptor
+        self.filename = filename
+        self.descriptor = descriptor
+        self.file_stat = file_stat
+        self.mutation_guard = mutation_guard
+        self.service_uid = service_uid
+        self.service_gid = service_gid
+        self.identity_error = identity_error
+
+    @classmethod
+    def open(
+        cls,
+        run_descriptor,
+        filename,
+        service_uid,
+        service_gid,
+        unsafe_error,
+        identity_error="sqlite_snapshot_conflict",
+    ):
+        descriptor = _open_private_entry(
+            run_descriptor,
+            filename,
+            service_uid,
+            service_gid,
+            unsafe_error,
+        )
+        mutation_guard = None
+        try:
+            file_stat = os.fstat(descriptor)
+            mutation_guard = _SourceMutationGuard(descriptor)
+            entry = cls(
+                run_descriptor=run_descriptor,
+                filename=filename,
+                descriptor=descriptor,
+                file_stat=file_stat,
+                mutation_guard=mutation_guard,
+                service_uid=service_uid,
+                service_gid=service_gid,
+                identity_error=identity_error,
+            )
+            entry.verify_current()
+            descriptor = None
+            mutation_guard = None
+            return entry
+        except SQLiteSnapshotError as error:
+            if error.code == "sqlite_source_identity_changed":
+                raise SQLiteSnapshotError(identity_error) from None
+            raise
+        except OSError:
+            raise SQLiteSnapshotError(identity_error) from None
+        finally:
+            if mutation_guard is not None:
+                mutation_guard.close()
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def verify_current(self):
+        if self.descriptor is None or self.mutation_guard is None:
+            raise SQLiteSnapshotError(self.identity_error)
+        try:
+            self.mutation_guard.verify_unchanged()
+            descriptor_stat = os.fstat(self.descriptor)
+            named_stat = os.stat(
+                self.filename,
+                dir_fd=self.run_descriptor,
+                follow_symlinks=False,
+            )
+        except (OSError, SQLiteSnapshotError):
+            raise SQLiteSnapshotError(self.identity_error) from None
+        for current in (descriptor_stat, named_stat):
+            if (
+                not _is_private_regular_file(
+                    current,
+                    self.service_uid,
+                    self.service_gid,
+                )
+                or current.st_dev != self.file_stat.st_dev
+                or current.st_ino != self.file_stat.st_ino
+                or current.st_size != self.file_stat.st_size
+            ):
+                raise SQLiteSnapshotError(self.identity_error)
+
+    def rebind_after_rename(self, filename):
+        _require_private_leaf_name(filename)
+        if self.descriptor is None or self.mutation_guard is None:
+            raise SQLiteSnapshotError(self.identity_error)
+        replacement_guard = None
+        try:
+            replacement_guard = _SourceMutationGuard(self.descriptor)
+            descriptor_stat = os.fstat(self.descriptor)
+            named_stat = os.stat(
+                filename,
+                dir_fd=self.run_descriptor,
+                follow_symlinks=False,
+            )
+            for current in (descriptor_stat, named_stat):
+                if (
+                    not _is_private_regular_file(
+                        current,
+                        self.service_uid,
+                        self.service_gid,
+                    )
+                    or current.st_dev != self.file_stat.st_dev
+                    or current.st_ino != self.file_stat.st_ino
+                    or current.st_size != self.file_stat.st_size
+                ):
+                    raise SQLiteSnapshotError(self.identity_error)
+            replacement_guard.verify_unchanged()
+        except (OSError, SQLiteSnapshotError):
+            if replacement_guard is not None:
+                replacement_guard.close()
+            raise SQLiteSnapshotError(self.identity_error) from None
+        previous_guard = self.mutation_guard
+        self.mutation_guard = replacement_guard
+        self.filename = filename
+        previous_guard.close()
+        self.verify_current()
+
+    def close(self):
+        if self.mutation_guard is not None:
+            mutation_guard = self.mutation_guard
+            self.mutation_guard = None
+            mutation_guard.close()
+        if self.descriptor is not None:
+            descriptor = self.descriptor
+            self.descriptor = None
+            os.close(descriptor)
+
+
+class VerifiedCompletedSQLiteSnapshot(object):
+    """cleanup commit 직전까지 snapshot 근거를 잠그는 가드."""
+
+    def __init__(
+        self,
+        run,
+        root_descriptor,
+        run_descriptor,
+        snapshot_entry,
+        receipt_entry,
+        service_uid,
+        service_gid,
+        source_stat,
+        temp_filename,
+        receipt_kind,
+        allowed_phases,
+    ):
+        self.run = run
+        self.root_descriptor = root_descriptor
+        self.run_descriptor = run_descriptor
+        self.snapshot_entry = snapshot_entry
+        self.receipt_entry = receipt_entry
+        self.service_uid = service_uid
+        self.service_gid = service_gid
+        self.source_stat = source_stat
+        self.temp_filename = temp_filename
+        self.receipt_kind = receipt_kind
+        self.allowed_phases = allowed_phases
+        self.info = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, exception, traceback):
+        self.close()
+
+    def verify_current(self):
+        if self.run_descriptor is None or self.root_descriptor is None:
+            raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+        _verify_completed_snapshot_state(
+            self.run,
+            self.root_descriptor,
+            self.service_uid,
+            self.service_gid,
+            self.source_stat,
+            self.allowed_phases,
+        )
+        if self.temp_filename is not None and _entry_exists(
+            self.run_descriptor,
+            self.temp_filename,
+        ):
+            raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+        receipt = _read_held_snapshot_receipt(
+            self.receipt_entry,
+            receipt_kind=self.receipt_kind,
+            run_id=self.run.run_id,
+        )
+        info = _verified_held_snapshot(
+            self.snapshot_entry,
+            self.source_stat,
+        )
+        _verify_snapshot_receipt(
+            receipt,
+            info,
+            receipt_kind=self.receipt_kind,
+            run_id=self.run.run_id,
+        )
+        self.receipt_entry.verify_current()
+        self.snapshot_entry.verify_current()
+        _verify_named_run_identity(self.run, self.run_descriptor)
+        self.info = info
+        return info
+
+    def close(self):
+        if self.receipt_entry is not None:
+            receipt_entry = self.receipt_entry
+            self.receipt_entry = None
+            receipt_entry.close()
+        if self.snapshot_entry is not None:
+            snapshot_entry = self.snapshot_entry
+            self.snapshot_entry = None
+            snapshot_entry.close()
+        if self.run_descriptor is not None:
+            run_descriptor = self.run_descriptor
+            self.run_descriptor = None
+            os.close(run_descriptor)
+        if self.root_descriptor is not None:
+            root_descriptor = self.root_descriptor
+            self.root_descriptor = None
+            os.close(root_descriptor)
+
+
 def snapshot_sqlite(source_path, run, service_uid, service_gid):
     """mode=ro source를 online backup하고 quick_check·fsync한다."""
     configured = settings.DATABASES["default"]
@@ -237,27 +486,13 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
         if receipt_exists:
             if not final_exists and not temp_exists:
                 raise SQLiteSnapshotError("sqlite_snapshot_conflict")
-            receipt = _read_snapshot_receipt(
-                run_descriptor,
-                service_uid,
-                service_gid,
-            )
             snapshot_name = (
                 SNAPSHOT_FILENAME if final_exists else SNAPSHOT_TEMP_FILENAME
-            )
-            info = _verified_snapshot(
-                run_descriptor,
-                snapshot_name,
-                service_uid,
-                service_gid,
-                source.file_stat,
             )
             return _finish_receipted_snapshot(
                 run,
                 run_descriptor,
                 source,
-                receipt,
-                info,
                 snapshot_name,
                 service_uid,
                 service_gid,
@@ -300,7 +535,7 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
         )
         _verify_named_run_identity(run, run_descriptor)
         source.verify_current()
-        receipt = _create_snapshot_receipt(
+        _create_snapshot_receipt(
             run_descriptor,
             info,
             service_uid,
@@ -310,8 +545,6 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
             run,
             run_descriptor,
             source,
-            receipt,
-            info,
             SNAPSHOT_TEMP_FILENAME,
             service_uid,
             service_gid,
@@ -328,6 +561,464 @@ def snapshot_sqlite(source_path, run, service_uid, service_gid):
         if root_descriptor is not None:
             os.close(root_descriptor)
         source.close()
+
+
+def verify_completed_sqlite_snapshot(run, service_uid, service_gid):
+    """cleanup 직전의 완료 snapshot과 영수증을 재검증한다."""
+    with open_verified_completed_sqlite_snapshot(
+        run,
+        service_uid,
+        service_gid,
+    ) as guard:
+        return guard.info
+
+
+@contextmanager
+def protect_orphan_cleanup(
+    source_path,
+    run,
+    service_uid,
+    service_gid,
+    before_fallback_create=None,
+):
+    """orphan cleanup이 commit할 때까지 복구 가능한 snapshot을 유지한다."""
+    allowed_phases = (
+        "snapshot_intent",
+        "snapshot_complete",
+        "schema_complete",
+    )
+    final_exists, temp_exists, receipt_exists = _snapshot_inventory(
+        run,
+        service_uid,
+        service_gid,
+        allowed_phases,
+        SNAPSHOT_FILENAME,
+        SNAPSHOT_TEMP_FILENAME,
+        SNAPSHOT_RECEIPT_FILENAME,
+    )
+    if final_exists and not temp_exists and receipt_exists:
+        guard = open_verified_completed_sqlite_snapshot(
+            run,
+            service_uid,
+            service_gid,
+            allowed_phases=allowed_phases,
+        )
+    elif final_exists and not temp_exists and not receipt_exists:
+        _ensure_cleanup_snapshot(
+            source_path,
+            run,
+            service_uid,
+            service_gid,
+            allowed_phases,
+            before_fallback_create,
+        )
+        guard = open_verified_completed_sqlite_snapshot(
+            run,
+            service_uid,
+            service_gid,
+            snapshot_filename=CLEANUP_SNAPSHOT_FILENAME,
+            receipt_filename=CLEANUP_RECEIPT_FILENAME,
+            temp_filename=CLEANUP_TEMP_FILENAME,
+            receipt_kind=CLEANUP_RECEIPT_KIND,
+            allowed_phases=allowed_phases,
+        )
+    else:
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+    try:
+        with guard:
+            yield guard
+    finally:
+        guard.close()
+
+
+def _snapshot_inventory(
+    run,
+    service_uid,
+    service_gid,
+    allowed_phases,
+    snapshot_filename,
+    temp_filename,
+    receipt_filename,
+):
+    root_descriptor = None
+    run_descriptor = None
+    try:
+        root_descriptor, run_descriptor = _open_verified_run(run)
+        _completed_snapshot_source_stat(
+            run,
+            root_descriptor,
+            service_uid,
+            service_gid,
+            allowed_phases,
+        )
+        inventory = tuple(
+            _entry_exists(run_descriptor, filename)
+            for filename in (
+                snapshot_filename,
+                temp_filename,
+                receipt_filename,
+            )
+        )
+        _verify_named_run_identity(run, run_descriptor)
+        return inventory
+    except SQLiteSnapshotError:
+        raise
+    except (MigrationStateError, OSError, TypeError, ValueError):
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict") from None
+    finally:
+        if run_descriptor is not None:
+            os.close(run_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+
+
+def _ensure_cleanup_snapshot(
+    source_path,
+    run,
+    service_uid,
+    service_gid,
+    allowed_phases,
+    before_fallback_create,
+):
+    configured = settings.DATABASES["default"]
+    if configured.get("ENGINE") != "django.db.backends.sqlite3":
+        raise SQLiteSnapshotError("unsupported_legacy_database_backend")
+    source_absolute = _configured_source_path(source_path, configured)
+    _require_contained_source(source_absolute, settings.PINRY_DATA_ROOT)
+    source = _open_sqlite_source(source_absolute)
+    if source is None:
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+    root_descriptor = None
+    run_descriptor = None
+    try:
+        root_descriptor, run_descriptor = _open_verified_run(run)
+        expected_source = _completed_snapshot_source_stat(
+            run,
+            root_descriptor,
+            service_uid,
+            service_gid,
+            allowed_phases,
+        )
+        if (
+            source.file_stat.st_dev != expected_source.st_dev
+            or source.file_stat.st_ino != expected_source.st_ino
+        ):
+            raise SQLiteSnapshotError("sqlite_source_identity_changed")
+        original_inventory = tuple(
+            _entry_exists(run_descriptor, filename)
+            for filename in (
+                SNAPSHOT_FILENAME,
+                SNAPSHOT_TEMP_FILENAME,
+                SNAPSHOT_RECEIPT_FILENAME,
+            )
+        )
+        if original_inventory != (True, False, False):
+            raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+        _verified_snapshot(
+            run_descriptor,
+            SNAPSHOT_FILENAME,
+            service_uid,
+            service_gid,
+            source.file_stat,
+        )
+        source.verify_current()
+        inventory = tuple(
+            _entry_exists(run_descriptor, filename)
+            for filename in (
+                CLEANUP_SNAPSHOT_FILENAME,
+                CLEANUP_TEMP_FILENAME,
+                CLEANUP_RECEIPT_FILENAME,
+            )
+        )
+        if inventory == (True, False, True):
+            _verify_cleanup_snapshot_pair(
+                run_descriptor,
+                CLEANUP_SNAPSHOT_FILENAME,
+                source,
+                run.run_id,
+                service_uid,
+                service_gid,
+            )
+            return
+        if inventory == (False, True, True):
+            _verify_cleanup_snapshot_pair(
+                run_descriptor,
+                CLEANUP_TEMP_FILENAME,
+                source,
+                run.run_id,
+                service_uid,
+                service_gid,
+            )
+            source.verify_current()
+            _promote_snapshot(
+                run_descriptor,
+                CLEANUP_TEMP_FILENAME,
+                CLEANUP_SNAPSHOT_FILENAME,
+            )
+            _verify_cleanup_snapshot_pair(
+                run_descriptor,
+                CLEANUP_SNAPSHOT_FILENAME,
+                source,
+                run.run_id,
+                service_uid,
+                service_gid,
+            )
+            return
+        if inventory not in ((False, False, False), (False, True, False)):
+            raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+        if before_fallback_create is not None:
+            if not callable(before_fallback_create):
+                raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
+            before_fallback_create(source.file_stat.st_size)
+        source.verify_current()
+        if inventory == (False, True, False):
+            _remove_private_entry(
+                run_descriptor,
+                CLEANUP_TEMP_FILENAME,
+                service_uid,
+                service_gid,
+                "unsafe_sqlite_snapshot",
+            )
+            source.verify_current()
+        _create_snapshot_temp(
+            run_descriptor,
+            source,
+            service_uid,
+            service_gid,
+            temp_filename=CLEANUP_TEMP_FILENAME,
+        )
+        info = _verified_snapshot(
+            run_descriptor,
+            CLEANUP_TEMP_FILENAME,
+            service_uid,
+            service_gid,
+            source.file_stat,
+        )
+        receipt = _receipt_for_snapshot(info)
+        receipt.update({
+            "format_version": 1,
+            "kind": CLEANUP_RECEIPT_KIND,
+            "run_id": run.run_id,
+        })
+        _create_private_receipt(
+            run_descriptor,
+            CLEANUP_RECEIPT_FILENAME,
+            receipt,
+            service_uid,
+            service_gid,
+        )
+        source.verify_current()
+        _promote_snapshot(
+            run_descriptor,
+            CLEANUP_TEMP_FILENAME,
+            CLEANUP_SNAPSHOT_FILENAME,
+        )
+        _verify_cleanup_snapshot_pair(
+            run_descriptor,
+            CLEANUP_SNAPSHOT_FILENAME,
+            source,
+            run.run_id,
+            service_uid,
+            service_gid,
+        )
+    except SQLiteSnapshotError:
+        raise
+    except (MigrationStateError, OSError, sqlite3.Error, TypeError, ValueError):
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict") from None
+    finally:
+        if run_descriptor is not None:
+            os.close(run_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+        source.close()
+
+
+def _verify_cleanup_snapshot_pair(
+    run_descriptor,
+    snapshot_filename,
+    source,
+    run_id,
+    service_uid,
+    service_gid,
+):
+    receipt = _read_snapshot_receipt(
+        run_descriptor,
+        service_uid,
+        service_gid,
+        filename=CLEANUP_RECEIPT_FILENAME,
+        receipt_kind=CLEANUP_RECEIPT_KIND,
+        run_id=run_id,
+    )
+    info = _verified_snapshot(
+        run_descriptor,
+        snapshot_filename,
+        service_uid,
+        service_gid,
+        source.file_stat,
+    )
+    _verify_snapshot_receipt(
+        receipt,
+        info,
+        receipt_kind=CLEANUP_RECEIPT_KIND,
+        run_id=run_id,
+    )
+    source.verify_current()
+
+
+def open_verified_completed_sqlite_snapshot(
+    run,
+    service_uid,
+    service_gid,
+    snapshot_filename=SNAPSHOT_FILENAME,
+    receipt_filename=SNAPSHOT_RECEIPT_FILENAME,
+    temp_filename=SNAPSHOT_TEMP_FILENAME,
+    receipt_kind=None,
+    allowed_phases=("snapshot_complete", "schema_complete"),
+):
+    """snapshot과 영수증을 열어둔 채 commit 직전 재검증할 가드를 반환한다."""
+    _require_private_leaf_name(snapshot_filename)
+    _require_private_leaf_name(receipt_filename)
+    if temp_filename is not None:
+        _require_private_leaf_name(temp_filename)
+    if (
+        not isinstance(allowed_phases, tuple)
+        or not allowed_phases
+        or any(not isinstance(phase, str) for phase in allowed_phases)
+    ):
+        raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
+    root_descriptor = None
+    run_descriptor = None
+    snapshot_entry = None
+    receipt_entry = None
+    try:
+        root_descriptor, run_descriptor = _open_verified_run(run)
+        source_stat = _completed_snapshot_source_stat(
+            run,
+            root_descriptor,
+            service_uid,
+            service_gid,
+            allowed_phases,
+        )
+        if (
+            not _entry_exists(run_descriptor, snapshot_filename)
+            or not _entry_exists(run_descriptor, receipt_filename)
+            or (
+                temp_filename is not None
+                and _entry_exists(run_descriptor, temp_filename)
+            )
+        ):
+            raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+        snapshot_entry = _HeldPrivateEntry.open(
+            run_descriptor,
+            snapshot_filename,
+            service_uid,
+            service_gid,
+            "unsafe_sqlite_snapshot",
+        )
+        receipt_entry = _HeldPrivateEntry.open(
+            run_descriptor,
+            receipt_filename,
+            service_uid,
+            service_gid,
+            "sqlite_snapshot_conflict",
+        )
+        guard = VerifiedCompletedSQLiteSnapshot(
+            run=run,
+            root_descriptor=root_descriptor,
+            run_descriptor=run_descriptor,
+            snapshot_entry=snapshot_entry,
+            receipt_entry=receipt_entry,
+            service_uid=service_uid,
+            service_gid=service_gid,
+            source_stat=source_stat,
+            temp_filename=temp_filename,
+            receipt_kind=receipt_kind,
+            allowed_phases=allowed_phases,
+        )
+        root_descriptor = None
+        run_descriptor = None
+        snapshot_entry = None
+        receipt_entry = None
+        guard.verify_current()
+        return guard
+    except SQLiteSnapshotError:
+        raise
+    except MigrationStateError:
+        raise SQLiteSnapshotError("sqlite_snapshot_state_invalid") from None
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict") from None
+    finally:
+        if receipt_entry is not None:
+            receipt_entry.close()
+        if snapshot_entry is not None:
+            snapshot_entry.close()
+        if run_descriptor is not None:
+            os.close(run_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+
+
+def _completed_snapshot_source_stat(
+    run,
+    root_descriptor,
+    service_uid,
+    service_gid,
+    allowed_phases,
+):
+    current = _load_run(
+        run.backup_root,
+        root_descriptor,
+        run.run_id,
+        run.run_id,
+    )
+    if (
+        current.service_uid != service_uid
+        or current.service_gid != service_gid
+        or current.state["phase"]
+        not in allowed_phases
+    ):
+        raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
+    source_identity = current.state["database_identity"]
+    if (
+        not isinstance(source_identity, dict)
+        or set(source_identity) != {"device", "inode"}
+        or not _is_identity_number(source_identity["device"])
+        or not _is_identity_number(source_identity["inode"])
+    ):
+        raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
+    return _SnapshotSourceStat(
+        st_dev=source_identity["device"],
+        st_ino=source_identity["inode"],
+    )
+
+
+def _verify_completed_snapshot_state(
+    run,
+    root_descriptor,
+    service_uid,
+    service_gid,
+    expected_source_stat,
+    allowed_phases,
+):
+    current_source_stat = _completed_snapshot_source_stat(
+        run,
+        root_descriptor,
+        service_uid,
+        service_gid,
+        allowed_phases,
+    )
+    if current_source_stat != expected_source_stat:
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+
+
+def _require_private_leaf_name(filename):
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or filename in (".", "..")
+        or os.path.basename(filename) != filename
+    ):
+        raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
 
 
 def _configured_source_path(source_path, configured):
@@ -485,12 +1176,13 @@ def _create_snapshot_temp(
     source,
     service_uid,
     service_gid,
+    temp_filename=SNAPSHOT_TEMP_FILENAME,
 ):
     descriptor = None
     ownership_set = False
     try:
         descriptor = os.open(
-            SNAPSHOT_TEMP_FILENAME,
+            temp_filename,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
             0o600,
             dir_fd=run_descriptor,
@@ -501,7 +1193,7 @@ def _create_snapshot_temp(
         _copy_database(
             source,
             run_descriptor,
-            SNAPSHOT_TEMP_FILENAME,
+            temp_filename,
         )
         os.fsync(descriptor)
         source.verify_current()
@@ -511,7 +1203,7 @@ def _create_snapshot_temp(
                 os.close(descriptor)
                 descriptor = None
             try:
-                os.unlink(SNAPSHOT_TEMP_FILENAME, dir_fd=run_descriptor)
+                os.unlink(temp_filename, dir_fd=run_descriptor)
                 os.fsync(run_descriptor)
             except OSError:
                 raise SQLiteSnapshotError("sqlite_snapshot_failed") from None
@@ -522,7 +1214,7 @@ def _create_snapshot_temp(
             descriptor = None
         if not ownership_set:
             try:
-                os.unlink(SNAPSHOT_TEMP_FILENAME, dir_fd=run_descriptor)
+                os.unlink(temp_filename, dir_fd=run_descriptor)
             except OSError:
                 pass
         raise SQLiteSnapshotError("sqlite_snapshot_failed") from None
@@ -553,30 +1245,35 @@ def _verified_snapshot(
     service_gid,
     source_stat,
 ):
-    descriptor = None
+    entry = None
+    try:
+        entry = _HeldPrivateEntry.open(
+            run_descriptor,
+            filename,
+            service_uid,
+            service_gid,
+            "unsafe_sqlite_snapshot",
+        )
+        return _verified_held_snapshot(entry, source_stat)
+    except SQLiteSnapshotError:
+        raise
+    except OSError:
+        raise SQLiteSnapshotError("unsafe_sqlite_snapshot") from None
+    finally:
+        if entry is not None:
+            entry.close()
+
+
+def _verified_held_snapshot(entry, source_stat):
     connection = None
     try:
-        descriptor = os.open(
-            filename,
-            os.O_RDONLY | _NOFOLLOW,
-            dir_fd=run_descriptor,
-        )
-        snapshot_stat = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(snapshot_stat.st_mode)
-            or snapshot_stat.st_nlink != 1
-            or stat.S_IMODE(snapshot_stat.st_mode) != 0o600
-            or snapshot_stat.st_uid != service_uid
-            or snapshot_stat.st_gid != service_gid
-        ):
-            raise SQLiteSnapshotError("unsafe_sqlite_snapshot")
-        os.fsync(descriptor)
+        entry.verify_current()
+        os.fsync(entry.descriptor)
+        entry.verify_current()
+        connection_path = _descriptor_file_path(entry.descriptor)
         connection = sqlite3.connect(
-            "file:{}?mode=ro".format(quote(
-                os.path.join(
-                    _directory_descriptor_path(run_descriptor),
-                    filename,
-                ),
+            "file:{}?mode=ro&immutable=1".format(quote(
+                connection_path,
                 safe="/",
             )),
             uri=True,
@@ -586,9 +1283,11 @@ def _verified_snapshot(
             raise SQLiteSnapshotError("corrupt_sqlite_snapshot")
         connection.close()
         connection = None
-        digest = _hash_descriptor(descriptor)
+        entry.verify_current()
+        digest = _hash_descriptor(entry.descriptor)
+        entry.verify_current()
         return SnapshotInfo(
-            size=snapshot_stat.st_size,
+            size=entry.file_stat.st_size,
             sha256=digest,
             source_device=source_stat.st_dev,
             source_inode=source_stat.st_ino,
@@ -598,47 +1297,71 @@ def _verified_snapshot(
     except sqlite3.Error:
         raise SQLiteSnapshotError("corrupt_sqlite_snapshot") from None
     except OSError:
-        raise SQLiteSnapshotError("unsafe_sqlite_snapshot") from None
+        raise SQLiteSnapshotError(entry.identity_error) from None
     finally:
         if connection is not None:
             connection.close()
-        if descriptor is not None:
-            os.close(descriptor)
 
 
 def _finish_receipted_snapshot(
     run,
     run_descriptor,
     source,
-    receipt,
-    info,
     snapshot_name,
     service_uid,
     service_gid,
 ):
-    _verify_snapshot_receipt(receipt, info)
-    _verify_named_run_identity(run, run_descriptor)
-    source.verify_current()
-    if snapshot_name == SNAPSHOT_TEMP_FILENAME:
-        _promote_snapshot(run_descriptor)
-        _verify_named_run_identity(run, run_descriptor)
-        info = _verified_snapshot(
+    snapshot_entry = None
+    receipt_entry = None
+    try:
+        snapshot_entry = _HeldPrivateEntry.open(
             run_descriptor,
-            SNAPSHOT_FILENAME,
+            snapshot_name,
             service_uid,
             service_gid,
+            "unsafe_sqlite_snapshot",
+        )
+        receipt_entry = _HeldPrivateEntry.open(
+            run_descriptor,
+            SNAPSHOT_RECEIPT_FILENAME,
+            service_uid,
+            service_gid,
+            "sqlite_snapshot_conflict",
+        )
+        _verify_held_snapshot_pair(
+            snapshot_entry,
+            receipt_entry,
             source.file_stat,
         )
-        _verify_snapshot_receipt(receipt, info)
         source.verify_current()
-    _remove_snapshot_receipt(
-        run_descriptor,
-        receipt,
-        service_uid,
-        service_gid,
-    )
-    _verify_named_run_identity(run, run_descriptor)
-    source.verify_current()
+        if snapshot_name == SNAPSHOT_TEMP_FILENAME:
+            _promote_snapshot(run_descriptor)
+            snapshot_entry.rebind_after_rename(SNAPSHOT_FILENAME)
+        _verify_held_snapshot_pair(
+            snapshot_entry,
+            receipt_entry,
+            source.file_stat,
+        )
+        _verify_named_run_identity(run, run_descriptor)
+        source.verify_current()
+        return _verify_held_snapshot_pair(
+            snapshot_entry,
+            receipt_entry,
+            source.file_stat,
+        )
+    finally:
+        if receipt_entry is not None:
+            receipt_entry.close()
+        if snapshot_entry is not None:
+            snapshot_entry.close()
+
+
+def _verify_held_snapshot_pair(snapshot_entry, receipt_entry, source_stat):
+    receipt = _read_held_snapshot_receipt(receipt_entry)
+    info = _verified_held_snapshot(snapshot_entry, source_stat)
+    _verify_snapshot_receipt(receipt, info)
+    receipt_entry.verify_current()
+    snapshot_entry.verify_current()
     return info
 
 
@@ -649,13 +1372,29 @@ def _create_snapshot_receipt(
     service_gid,
 ):
     receipt = _receipt_for_snapshot(info)
+    return _create_private_receipt(
+        run_descriptor,
+        SNAPSHOT_RECEIPT_FILENAME,
+        receipt,
+        service_uid,
+        service_gid,
+    )
+
+
+def _create_private_receipt(
+    run_descriptor,
+    receipt_filename,
+    receipt,
+    service_uid,
+    service_gid,
+):
     content = (
         json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
     descriptor = None
     try:
         descriptor = os.open(
-            SNAPSHOT_RECEIPT_FILENAME,
+            receipt_filename,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
             0o600,
             dir_fd=run_descriptor,
@@ -672,7 +1411,7 @@ def _create_snapshot_receipt(
             descriptor = None
             try:
                 os.unlink(
-                    SNAPSHOT_RECEIPT_FILENAME,
+                    receipt_filename,
                     dir_fd=run_descriptor,
                 )
                 os.fsync(run_descriptor)
@@ -690,17 +1429,43 @@ def _read_snapshot_receipt(
     run_descriptor,
     service_uid,
     service_gid,
+    filename=SNAPSHOT_RECEIPT_FILENAME,
+    receipt_kind=None,
+    run_id=None,
 ):
-    descriptor = _open_private_entry(
-        run_descriptor,
-        SNAPSHOT_RECEIPT_FILENAME,
-        service_uid,
-        service_gid,
-        "sqlite_snapshot_conflict",
-    )
+    entry = None
     try:
-        raw_receipt = _read_descriptor(descriptor)
+        entry = _HeldPrivateEntry.open(
+            run_descriptor,
+            filename,
+            service_uid,
+            service_gid,
+            "sqlite_snapshot_conflict",
+        )
+        return _read_held_snapshot_receipt(
+            entry,
+            receipt_kind=receipt_kind,
+            run_id=run_id,
+        )
+    except SQLiteSnapshotError:
+        raise
+    finally:
+        if entry is not None:
+            entry.close()
+
+
+def _read_held_snapshot_receipt(
+    entry,
+    receipt_kind=None,
+    run_id=None,
+):
+    try:
+        entry.verify_current()
+        os.lseek(entry.descriptor, 0, os.SEEK_SET)
+        raw_receipt = _read_descriptor(entry.descriptor)
+        entry.verify_current()
         receipt = json.loads(raw_receipt.decode("utf-8"))
+        entry.verify_current()
     except SQLiteSnapshotError:
         raise
     except (
@@ -711,45 +1476,44 @@ def _read_snapshot_receipt(
         ValueError,
     ):
         raise SQLiteSnapshotError("sqlite_snapshot_conflict") from None
-    finally:
-        os.close(descriptor)
+    expected_keys = (
+        _CLEANUP_RECEIPT_KEYS
+        if receipt_kind is not None
+        else _SNAPSHOT_RECEIPT_KEYS
+    )
     if (
         not isinstance(receipt, dict)
-        or set(receipt) != _SNAPSHOT_RECEIPT_KEYS
+        or set(receipt) != expected_keys
         or not _is_identity_number(receipt["size"])
         or not _is_sha256(receipt["sha256"])
         or not _is_identity_number(receipt["source_device"])
         or not _is_identity_number(receipt["source_inode"])
     ):
         raise SQLiteSnapshotError("sqlite_snapshot_conflict")
+    if receipt_kind is not None and (
+        receipt["format_version"] != 1
+        or receipt["kind"] != receipt_kind
+        or receipt["run_id"] != run_id
+    ):
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict")
     return receipt
 
 
-def _verify_snapshot_receipt(receipt, info):
-    if receipt != _receipt_for_snapshot(info):
-        raise SQLiteSnapshotError("sqlite_snapshot_conflict")
-
-
-def _remove_snapshot_receipt(
-    run_descriptor,
-    expected_receipt,
-    service_uid,
-    service_gid,
+def _verify_snapshot_receipt(
+    receipt,
+    info,
+    receipt_kind=None,
+    run_id=None,
 ):
-    receipt = _read_snapshot_receipt(
-        run_descriptor,
-        service_uid,
-        service_gid,
-    )
-    if receipt != expected_receipt:
+    expected = _receipt_for_snapshot(info)
+    if receipt_kind is not None:
+        expected.update({
+            "format_version": 1,
+            "kind": receipt_kind,
+            "run_id": run_id,
+        })
+    if receipt != expected:
         raise SQLiteSnapshotError("sqlite_snapshot_conflict")
-    _remove_private_entry(
-        run_descriptor,
-        SNAPSHOT_RECEIPT_FILENAME,
-        service_uid,
-        service_gid,
-        "sqlite_snapshot_conflict",
-    )
 
 
 def _receipt_for_snapshot(info):
@@ -834,13 +1598,17 @@ def _is_private_regular_file(file_stat, service_uid, service_gid):
     )
 
 
-def _promote_snapshot(run_descriptor):
+def _promote_snapshot(
+    run_descriptor,
+    temp_filename=SNAPSHOT_TEMP_FILENAME,
+    snapshot_filename=SNAPSHOT_FILENAME,
+):
     try:
-        if _entry_exists(run_descriptor, SNAPSHOT_FILENAME):
+        if _entry_exists(run_descriptor, snapshot_filename):
             raise SQLiteSnapshotError("sqlite_snapshot_conflict")
         os.rename(
-            SNAPSHOT_TEMP_FILENAME,
-            SNAPSHOT_FILENAME,
+            temp_filename,
+            snapshot_filename,
             src_dir_fd=run_descriptor,
             dst_dir_fd=run_descriptor,
         )
@@ -916,6 +1684,33 @@ def _directory_descriptor_path(descriptor):
     if not path:
         raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
     return path
+
+
+def _descriptor_file_path(descriptor):
+    try:
+        descriptor_stat = os.fstat(descriptor)
+    except OSError:
+        raise SQLiteSnapshotError("sqlite_snapshot_conflict") from None
+    for directory in ("/proc/self/fd", "/dev/fd"):
+        candidate = os.path.join(directory, str(descriptor))
+        candidate_descriptor = None
+        try:
+            candidate_descriptor = os.open(
+                candidate,
+                os.O_RDONLY,
+            )
+            candidate_stat = os.fstat(candidate_descriptor)
+        except OSError:
+            continue
+        finally:
+            if candidate_descriptor is not None:
+                os.close(candidate_descriptor)
+        if (
+            candidate_stat.st_dev == descriptor_stat.st_dev
+            and candidate_stat.st_ino == descriptor_stat.st_ino
+        ):
+            return candidate
+    raise SQLiteSnapshotError("sqlite_snapshot_state_invalid")
 
 
 def _hash_descriptor(descriptor):

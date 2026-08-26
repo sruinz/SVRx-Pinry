@@ -10,6 +10,7 @@ import uuid
 from django.conf import settings
 from django.core.management import CommandError
 from django.db.models import Q
+from django.utils.text import get_valid_filename
 
 from django_images.file_ops import (
     MediaDirectory,
@@ -22,6 +23,7 @@ from django_images.models import Image, Thumbnail
 from django_images.paths import (
     FORMAT_EXTENSIONS,
     PINRY_DIRECT_MD5_ROOTS,
+    is_valid_original_leaf,
     pinry_direct_md5_root,
 )
 from django_images.services.media_migration_v2 import (
@@ -62,6 +64,13 @@ _FIXED_SLOT_PATTERN = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12})/"
     r"original(?P<extension>\.[a-z0-9]+)\Z"
+)
+_NAMED_ORIGINAL_PATTERN = re.compile(
+    r"^originals/"
+    r"(?P<asset_uuid>"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})/"
+    r"(?P<leaf>[^/]+)\Z"
 )
 
 
@@ -638,6 +647,65 @@ def fixed_slot_destination_path(source_relative):
     return "media/fixed-slot-originals/{}".format(source_relative)
 
 
+def _fixed_slot_authority_destination_path(file_plan):
+    old_path = getattr(file_plan, "old_path", None)
+    new_path = getattr(file_plan, "new_path", None)
+    old_match = (
+        _NAMED_ORIGINAL_PATTERN.match(old_path)
+        if isinstance(old_path, str)
+        else None
+    )
+    new_match = (
+        _NAMED_ORIGINAL_PATTERN.match(new_path)
+        if isinstance(new_path, str)
+        else None
+    )
+    extension = FORMAT_EXTENSIONS.get(
+        getattr(file_plan, "image_format", None)
+    )
+    if (
+        old_match is None
+        or new_match is None
+        or getattr(file_plan, "kind", None) != "original"
+        or getattr(file_plan, "thumbnail_id", None) is not None
+        or getattr(file_plan, "operation", None) != "copy"
+        or old_path == new_path
+        or extension is None
+        or old_match.group("asset_uuid")
+        != new_match.group("asset_uuid")
+    ):
+        raise _archive_error("archive_manifest_mismatch")
+    asset_uuid = new_match.group("asset_uuid")
+    try:
+        canonical_uuid = str(uuid.UUID(asset_uuid))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise _archive_error("archive_manifest_mismatch", error)
+    new_leaf = new_match.group("leaf")
+    old_leaf = old_match.group("leaf")
+    if (
+        canonical_uuid != asset_uuid
+        or not is_valid_original_leaf(asset_uuid, new_leaf)
+        or not new_leaf.endswith(extension)
+        or old_leaf
+        not in (
+            "original{}".format(extension),
+            get_valid_filename(new_leaf),
+        )
+    ):
+        raise _archive_error("archive_manifest_mismatch")
+    return "media/fixed-slot-originals/{}".format(old_path)
+
+
+def _fixed_slot_authority_pairs(file_plans):
+    if not isinstance(file_plans, tuple):
+        raise _archive_error("archive_manifest_mismatch")
+    pairs = []
+    for file_plan in file_plans:
+        destination = _fixed_slot_authority_destination_path(file_plan)
+        pairs.append((file_plan.old_path, destination))
+    return tuple(pairs)
+
+
 def build_archive_intent(
     source_root,
     source_relative,
@@ -817,7 +885,7 @@ def _ensure_archive_parent(root_path, relative_path):
 
 
 def validate_no_legacy_media_references(
-    using="default", fixed_slot_sources=()
+    using="default", fixed_slot_sources=(), fixed_slot_files=None
 ):
     legacy_filter = Q(image="image") | Q(image__startswith="image/")
     for root_name in PINRY_DIRECT_MD5_ROOTS:
@@ -825,8 +893,16 @@ def validate_no_legacy_media_references(
             Q(image=root_name)
             | Q(image__startswith="{}/".format(root_name))
         )
-    for source in fixed_slot_sources:
-        fixed_slot_destination_path(source)
+    if fixed_slot_files is None:
+        sources = fixed_slot_sources
+        for source in sources:
+            fixed_slot_destination_path(source)
+    else:
+        pairs = _fixed_slot_authority_pairs(fixed_slot_files)
+        sources = tuple(pair[0] for pair in pairs)
+        if fixed_slot_sources and tuple(sorted(fixed_slot_sources)) != sources:
+            raise _archive_error("archive_manifest_mismatch")
+    for source in sources:
         legacy_filter |= Q(image=source)
     try:
         has_references = (
@@ -876,8 +952,7 @@ def _load_archive_authority(
     sources = authority.fixed_slot_sources
     if not isinstance(sources, tuple) or len(sources) != len(set(sources)):
         raise _archive_error("archive_manifest_mismatch")
-    for source in authority.fixed_slot_sources:
-        fixed_slot_destination_path(source)
+    _fixed_slot_authority_pairs(authority.fixed_slot_files)
     groups = (
         authority.fixed_slot_files,
         authority.prefixed_files,
@@ -990,7 +1065,10 @@ def _existing_pinry_direct_roots(source_root, required_roots=()):
 def _archive_authority_file_entries(authority):
     entries = []
     entries.extend(
-        (file_plan, fixed_slot_destination_path(file_plan.old_path))
+        (
+            file_plan,
+            _fixed_slot_authority_destination_path(file_plan),
+        )
         for file_plan in authority.fixed_slot_files
     )
     entries.extend(
@@ -1279,6 +1357,7 @@ def _validate_archive_intent_layout(
     fixed_slot_sources,
     required_pinry_direct_roots,
     requires_image_root=False,
+    fixed_slot_pairs=None,
 ):
     if not isinstance(intents, tuple):
         raise _archive_error("archive_state_conflict")
@@ -1295,10 +1374,33 @@ def _validate_archive_intent_layout(
         for intent in intents
         if isinstance(intent, ArchiveIntent)
     )
-    fixed_pairs = tuple(
-        (source, fixed_slot_destination_path(source))
-        for source in sorted(fixed_slot_sources)
-    )
+    if fixed_slot_pairs is None:
+        fixed_pairs = tuple(
+            (source, fixed_slot_destination_path(source))
+            for source in sorted(fixed_slot_sources)
+        )
+    else:
+        fixed_pairs = fixed_slot_pairs
+        pair_shapes_valid = (
+            isinstance(fixed_pairs, tuple)
+            and all(
+                isinstance(pair, tuple) and len(pair) == 2
+                for pair in fixed_pairs
+            )
+        )
+        valid_fixed_pairs = (
+            pair_shapes_valid
+            and tuple(pair[0] for pair in fixed_pairs)
+            == tuple(sorted(fixed_slot_sources))
+            and len(fixed_pairs) == len(set(fixed_pairs))
+            and all(
+                pair[1]
+                == "media/fixed-slot-originals/{}".format(pair[0])
+                for pair in fixed_pairs
+            )
+        )
+        if not valid_fixed_pairs:
+            raise _archive_error("archive_state_conflict")
     prefix_pairs = ()
     if pairs[:1] == (("image", "media/image"),):
         prefix_pairs = (("image", "media/image"),)
@@ -1531,7 +1633,10 @@ class LegacyMediaArchive(object):
             )
         ):
             raise _archive_error("archive_manifest_mismatch")
-        fixed_sources = tuple(sorted(authority.fixed_slot_sources))
+        fixed_pairs = _fixed_slot_authority_pairs(
+            authority.fixed_slot_files
+        )
+        fixed_sources = tuple(pair[0] for pair in fixed_pairs)
         required_pinry_direct_root_identities = (
             authority.direct_root_identities
         )
@@ -1541,6 +1646,7 @@ class LegacyMediaArchive(object):
         validate_no_legacy_media_references(
             using=self.using,
             fixed_slot_sources=fixed_sources,
+            fixed_slot_files=authority.fixed_slot_files,
         )
         has_pinry_direct_md5 = (
             bool(required_pinry_direct_roots)
@@ -1570,9 +1676,9 @@ class LegacyMediaArchive(object):
                         self.source_root,
                         source,
                         self.destination_root,
-                        fixed_slot_destination_path(source),
+                        destination,
                     )
-                    for source in fixed_sources
+                    for source, destination in fixed_pairs
                 )
                 progress = {
                     "items": [
@@ -1605,10 +1711,7 @@ class LegacyMediaArchive(object):
                         for root_name, _device, _inode
                         in observed_direct_roots
                     )
-                paths.extend(
-                    (source, fixed_slot_destination_path(source))
-                    for source in fixed_sources
-                )
+                paths.extend(fixed_pairs)
                 for _source, destination in paths:
                     parent, _name = _split_relative_path(destination)
                     _ensure_archive_parent(self.destination_root, parent)
@@ -1653,6 +1756,7 @@ class LegacyMediaArchive(object):
             fixed_sources,
             required_pinry_direct_roots,
             requires_image_root=bool(authority.prefixed_files),
+            fixed_slot_pairs=fixed_pairs,
         )
         _validate_progress(intents, progress, previous_progress)
         _verify_intent_roots(
@@ -1702,6 +1806,20 @@ class LegacyMediaArchive(object):
         )
         if authority != plan.authority:
             raise _archive_error("archive_manifest_mismatch")
+        fixed_pairs = _fixed_slot_authority_pairs(
+            authority.fixed_slot_files
+        )
+        fixed_sources = tuple(pair[0] for pair in fixed_pairs)
+        required_pinry_direct_roots = tuple(
+            item[0] for item in authority.direct_root_identities
+        )
+        _validate_archive_intent_layout(
+            plan.intents,
+            fixed_sources,
+            required_pinry_direct_roots,
+            requires_image_root=bool(authority.prefixed_files),
+            fixed_slot_pairs=fixed_pairs,
+        )
         _validate_archive_root_namespace(
             self.source_root,
             self.destination_root,
