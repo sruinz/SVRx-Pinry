@@ -28,6 +28,7 @@ from django_images.paths import (
 )
 from django_images.services.media_migration_v2 import (
     AutoV2ArchiveAuthority,
+    AutoV2CompletionAuthority,
     load_auto_v2_archive_authority,
 )
 
@@ -922,15 +923,27 @@ def _load_archive_authority(
     run_id,
     service_uid,
     service_gid,
+    batch_journal=None,
+    completion_authority=None,
 ):
+    if completion_authority is not None:
+        if not isinstance(
+            completion_authority, AutoV2CompletionAuthority
+        ):
+            raise _archive_error("archive_manifest_mismatch")
+        authority = completion_authority.archive_authority
+    else:
+        authority = None
     try:
-        authority = load_auto_v2_archive_authority(
-            run_directory,
-            filename,
-            run_id,
-            service_uid,
-            service_gid,
-        )
+        if authority is None:
+            authority = load_auto_v2_archive_authority(
+                run_directory,
+                filename,
+                run_id,
+                service_uid,
+                service_gid,
+                batch_journal=batch_journal,
+            )
     except CommandError as error:
         code = str(error)
         allowed_codes = frozenset((
@@ -1576,6 +1589,8 @@ class LegacyMediaArchive(object):
         service_uid,
         service_gid,
         using="default",
+        batch_journal=None,
+        completion_authority=None,
     ):
         self.source_root = source_root
         self.destination_root = destination_root
@@ -1585,6 +1600,8 @@ class LegacyMediaArchive(object):
         self.service_uid = service_uid
         self.service_gid = service_gid
         self.using = using
+        self.batch_journal = batch_journal
+        self.completion_authority = completion_authority
 
     def prepare(
         self,
@@ -1618,6 +1635,8 @@ class LegacyMediaArchive(object):
             self.run_id,
             self.service_uid,
             self.service_gid,
+            batch_journal=self.batch_journal,
+            completion_authority=self.completion_authority,
         )
         if (
             (expected_plan_sha256 is None)
@@ -1797,14 +1816,8 @@ class LegacyMediaArchive(object):
         _verify_intent_roots(
             self.source_root, self.destination_root, plan.intents
         )
-        authority = _load_archive_authority(
-            self.run_directory,
-            self.filename,
-            self.run_id,
-            self.service_uid,
-            self.service_gid,
-        )
-        if authority != plan.authority:
+        authority = plan.authority
+        if not isinstance(authority, AutoV2ArchiveAuthority):
             raise _archive_error("archive_manifest_mismatch")
         fixed_pairs = _fixed_slot_authority_pairs(
             authority.fixed_slot_files
@@ -1879,17 +1892,6 @@ class LegacyMediaArchive(object):
                 )
                 if on_item_complete is not None:
                     on_item_complete(intent, progress, result)
-                    authority = _load_archive_authority(
-                        self.run_directory,
-                        self.filename,
-                        self.run_id,
-                        self.service_uid,
-                        self.service_gid,
-                    )
-                    if authority != plan.authority:
-                        raise _archive_error(
-                            "archive_manifest_mismatch"
-                        )
                     _validate_archive_root_namespace(
                         self.source_root,
                         self.destination_root,
@@ -1905,15 +1907,6 @@ class LegacyMediaArchive(object):
                         plan.intents,
                         only_intent=intent,
                     )
-        authority = _load_archive_authority(
-            self.run_directory,
-            self.filename,
-            self.run_id,
-            self.service_uid,
-            self.service_gid,
-        )
-        if authority != plan.authority:
-            raise _archive_error("archive_manifest_mismatch")
         _validate_archive_root_namespace(
             self.source_root,
             self.destination_root,

@@ -49,6 +49,25 @@ class PublishResult(object):
         self.destination_stat = destination_stat
 
 
+class PreverifiedPublishResult(object):
+    def __init__(
+        self,
+        operation,
+        destination_stat,
+        mutated_directories,
+    ):
+        self.operation = operation
+        self.destination_stat = destination_stat
+        by_identity = {}
+        for directory in mutated_directories:
+            directory_stat = os.fstat(directory.descriptor)
+            by_identity[_identity(directory_stat)] = directory
+        self.mutated_directories = tuple(
+            by_identity[identity] for identity in sorted(by_identity)
+        )
+        self.mutated_directory_identities = tuple(sorted(by_identity))
+
+
 class PublishFailure(Exception):
     def __init__(self, result, cause):
         super(PublishFailure, self).__init__("publish_failed")
@@ -2184,6 +2203,127 @@ def publish_owned_noreplace(
         destination_directory,
         destination_name,
         expected_sha256,
+    )
+
+
+def _preverified_staging_stat(staging_file, expected_identity):
+    if not isinstance(staging_file, OwnedStagingFile):
+        raise TypeError("staging_file must be an OwnedStagingFile")
+    if staging_file._closed:
+        raise MediaPathError("unsafe_staging_file")
+    if hasattr(expected_identity, "st_dev"):
+        expected = (
+            expected_identity.st_dev,
+            expected_identity.st_ino,
+            expected_identity.st_size,
+        )
+    else:
+        expected = tuple(expected_identity)
+    if len(expected) not in (2, 3):
+        raise MediaPathError("unsafe_staging_file")
+    staging_file.directory.verify_current()
+    current = os.fstat(staging_file.descriptor)
+    _require_owned_name(
+        staging_file.directory.descriptor,
+        staging_file.name,
+        current,
+    )
+    current_identity = (current.st_dev, current.st_ino)
+    if current_identity != expected[:2] or (
+        len(expected) == 3 and current.st_size != expected[2]
+    ):
+        raise MediaPathError("unsafe_staging_file")
+    return current
+
+
+def _verify_preverified_destination(
+    staging_file,
+    destination_directory,
+    destination_name,
+    expected_stat,
+):
+    destination_directory.verify_current()
+    current = os.stat(
+        destination_name,
+        dir_fd=destination_directory.descriptor,
+        follow_symlinks=False,
+    )
+    descriptor_stat = os.fstat(staging_file.descriptor)
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or not stat.S_ISREG(descriptor_stat.st_mode)
+        or _identity(current) != _identity(expected_stat)
+        or _identity(descriptor_stat) != _identity(expected_stat)
+        or current.st_size != expected_stat.st_size
+        or descriptor_stat.st_size != expected_stat.st_size
+    ):
+        raise MediaPathError("media_path_conflict")
+    return current
+
+
+def publish_preverified_noreplace(
+    staging_file,
+    destination_directory,
+    destination_name,
+    expected_identity,
+):
+    if not isinstance(destination_directory, MediaDirectory):
+        raise TypeError("destination_directory must be a MediaDirectory")
+    if len(_relative_components(destination_name)) != 1:
+        raise MediaPathError("media_path_escape")
+    expected_stat = _preverified_staging_stat(
+        staging_file, expected_identity
+    )
+    destination_directory.verify_current()
+    rename_media_noreplace(
+        staging_file.directory,
+        staging_file.name,
+        destination_directory,
+        destination_name,
+    )
+    destination_stat = _verify_preverified_destination(
+        staging_file,
+        destination_directory,
+        destination_name,
+        expected_stat,
+    )
+    return PreverifiedPublishResult(
+        "published",
+        destination_stat,
+        (staging_file.directory, destination_directory),
+    )
+
+
+def replace_preverified_destination(
+    staging_file,
+    destination_directory,
+    destination_name,
+    expected_identity,
+):
+    if not isinstance(destination_directory, MediaDirectory):
+        raise TypeError("destination_directory must be a MediaDirectory")
+    if len(_relative_components(destination_name)) != 1:
+        raise MediaPathError("media_path_escape")
+    expected_stat = _preverified_staging_stat(
+        staging_file, expected_identity
+    )
+    destination_directory.verify_current()
+    os.rename(
+        staging_file.name,
+        destination_name,
+        src_dir_fd=staging_file.directory.descriptor,
+        dst_dir_fd=destination_directory.descriptor,
+    )
+    destination_stat = _verify_preverified_destination(
+        staging_file,
+        destination_directory,
+        destination_name,
+        expected_stat,
+    )
+    return PreverifiedPublishResult(
+        "replaced",
+        destination_stat,
+        (staging_file.directory, destination_directory),
     )
 
 

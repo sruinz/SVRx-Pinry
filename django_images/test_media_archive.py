@@ -40,6 +40,7 @@ from django_images.services.media_migration_v2 import (
     AUTO_V2_MANIFEST_FILENAME,
     AUTO_V2_TARGET_SIGNATURE,
     AutoV2ManifestLog,
+    AutoV2CompletionAuthority,
     AutoV2MigrationFile,
     AutoV2MigrationPlan,
     load_auto_v2_archive_authority,
@@ -1315,6 +1316,42 @@ class MediaArchiveGateTests(TestCase):
             self.gid,
         )
 
+    def test_injected_completion_authority_survives_loader_unavailability(self):
+        migration_plan = self.named_plan(1)
+        self.write_manifest((migration_plan,))
+        archive_authority = load_auto_v2_archive_authority(
+            str(self.run_directory),
+            AUTO_V2_MANIFEST_FILENAME,
+            RUN_ID,
+            self.uid,
+            self.gid,
+        )
+        completion = AutoV2CompletionAuthority(
+            archive_authority.summary,
+            (migration_plan,),
+            archive_authority,
+        )
+        archiver = LegacyMediaArchive(
+            str(self.source_root),
+            str(self.run_directory),
+            str(self.run_directory),
+            AUTO_V2_MANIFEST_FILENAME,
+            RUN_ID,
+            self.uid,
+            self.gid,
+            completion_authority=completion,
+        )
+
+        with mock.patch(
+            "django_images.services.media_archive.load_auto_v2_archive_authority",
+            side_effect=AssertionError("frozen authority must be reused"),
+        ):
+            plan = archiver.prepare()
+            result = archiver.converge(plan)
+
+        self.assertEqual(plan.authority, archive_authority)
+        self.assertEqual(result.results, ())
+
     def prepare_plan(
         self, has_md5=False, has_direct=False, schema_only=False, **kwargs
     ):
@@ -2333,7 +2370,7 @@ class MediaArchiveGateTests(TestCase):
         self.assertEqual(len(adapter.calls), 1)
         self.assertTrue((self.source_root / second).exists())
 
-    def test_converge_rejects_manifest_changed_by_callback(self):
+    def test_converge_uses_frozen_authority_after_manifest_changes(self):
         source = self.make_fixed_source(
             "11111111-1111-4111-8111-111111111111", b"first"
         )
@@ -2345,14 +2382,14 @@ class MediaArchiveGateTests(TestCase):
                 self.run_directory / AUTO_V2_MANIFEST_FILENAME
             ).write_bytes(b"tampered-manifest")
 
-        self.assert_archive_error(
-            "media_manifest_torn_tail_requires_execute",
-            lambda: self.archiver().converge(
-                plan,
-                syscall_adapter=RecordingRenameNoReplaceAdapter(),
-                on_item_complete=change_manifest,
-            ),
+        result = self.archiver().converge(
+            plan,
+            syscall_adapter=RecordingRenameNoReplaceAdapter(),
+            on_item_complete=change_manifest,
         )
+
+        self.assertTrue(result.progress["items"][0]["complete"])
+        self.assertFalse((self.source_root / source).exists())
 
     def test_completed_progress_is_reverified_as_exact_recovery(self):
         source = self.make_fixed_source(

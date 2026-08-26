@@ -1,5 +1,7 @@
 from io import BytesIO, StringIO
+from dataclasses import replace
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,9 +12,12 @@ import uuid
 from unittest import mock
 
 from django.core.management import CommandError, call_command
+from django.db import connection
 from django.test import TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils.text import get_valid_filename
 from PIL import Image as PILImage
+from PIL import ImageFile
 from PIL import WebPImagePlugin
 
 from django_images.file_ops import (
@@ -28,17 +33,22 @@ from django_images.paths import (
 )
 from django_images.services.media_migration_v2 import (
     AutoV2ManifestLog,
+    AutoV2CompletionAuthority,
     AutoV2MediaMigrator,
     AutoV2MigrationFile,
     AutoV2MigrationPlan,
     AutoV2PlanSummary,
-    _verify_staging,
     _valid_staging_name,
+    load_auto_v2_archive_authority,
     load_auto_v2_archive_direct_roots,
     load_auto_v2_archive_sources,
     load_completed_auto_v2_summary,
     load_auto_v2_plan,
     recover_incomplete_auto_v2_plan,
+)
+from django_images.services.migration_batch_log import (
+    JOURNAL_FILENAME,
+    MigrationBatchJournal,
 )
 
 
@@ -88,6 +98,12 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         )
         self.settings_override.enable()
         self.addCleanup(self.settings_override.disable)
+        self.syncfs_patch = mock.patch(
+            "django_images.services.media_migration_v2._durable_syncfs",
+            side_effect=lambda descriptor, reason: os.fsync(descriptor),
+        )
+        self.syncfs_patch.start()
+        self.addCleanup(self.syncfs_patch.stop)
 
     def write_media(self, relative_path, content):
         target = Path(self.temporary_media.name, relative_path)
@@ -172,6 +188,517 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             fault_injector=fault_injector,
         )
 
+    def test_freeze_uses_keyset_and_prefetches_derivatives_by_batch(self):
+        for _index in range(120):
+            self.make_image(generation="named")
+
+        with CaptureQueriesContext(connection) as queries:
+            plans = self.migrator(batch_size=50)._freeze_all_plans()
+
+        self.assertEqual(len(plans), 120)
+        self.assertLessEqual(len(queries), 12)
+        self.assertFalse(
+            any(" OFFSET " in query["sql"].upper() for query in queries)
+        )
+
+    def test_planner_reads_no_media_bytes_and_never_calls_legacy_inspector(self):
+        self.make_image()
+
+        with mock.patch(
+            "django_images.services.media_migration_v2._inspect_receipt",
+            side_effect=AssertionError("legacy inspector must not run"),
+        ), mock.patch(
+            "django_images.services.media_migration_v2.PILImage.open",
+            side_effect=AssertionError("planner must not decode"),
+        ):
+            plans = self.migrator()._freeze_all_plans()
+
+        self.assertTrue(plans)
+
+    @mock.patch(
+        "django_images.services.media_migration_v2._durable_fsync"
+    )
+    def test_fresh_plan_is_written_with_one_group_fsync(
+        self, durable_fsync
+    ):
+        self.make_image()
+        plans = self.migrator()._freeze_all_plans()
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ) as manifest:
+            durable_fsync.reset_mock()
+            manifest.write_frozen_plan(plans)
+
+        self.assertEqual(
+            [call.args[1] for call in durable_fsync.call_args_list],
+            ["plan_manifest"],
+        )
+
+    def test_fresh_execute_uses_sidecar_and_keeps_plan_immutable(self):
+        image = self.make_image(sizes=())
+
+        before_plan = self.migrator().run(execute=False)
+        frozen_bytes = self.manifest_path.read_bytes()
+        completed = self.migrator().run(execute=True)
+
+        image.refresh_from_db()
+        self.assertEqual(before_plan.plan_sha256, completed.plan_sha256)
+        self.assertEqual(self.manifest_path.read_bytes(), frozen_bytes)
+        self.assertTrue(Path(self.run_directory, JOURNAL_FILENAME).exists())
+        self.assertEqual(
+            [event["event"] for event in self.manifest_events()],
+            ["planned_skeleton", "plan_complete"],
+        )
+        self.assertEqual(
+            image.image.name,
+            canonical_original_path(
+                image.asset_uuid, image.original_filename, ".png"
+            ),
+        )
+
+    def test_normal_run_streams_each_source_once_without_legacy_rehash(self):
+        self.make_image(sizes=())
+        migrator = self.migrator()
+
+        with mock.patch.object(
+            migrator,
+            "_iter_source_chunks",
+            wraps=migrator._iter_source_chunks,
+        ) as source_chunks, mock.patch.object(
+            migrator,
+            "_rehash_resume_candidate",
+            side_effect=AssertionError("normal run must not rehash"),
+        ), mock.patch(
+            "django_images.services.media_migration_v2._inspect_receipt",
+            side_effect=AssertionError("normal run must not inspect twice"),
+        ):
+            migrator.run(execute=True)
+
+        self.assertEqual(source_chunks.call_count, 1)
+
+    def test_each_source_uses_one_parser_close(self):
+        self.make_image(sizes=())
+        parser = ImageFile.Parser()
+
+        with mock.patch(
+            "django_images.services.media_migration_v2.ImageFile.Parser",
+            return_value=parser,
+        ), mock.patch.object(
+            parser, "close", wraps=parser.close
+        ) as close:
+            self.migrator().run(execute=True)
+
+        self.assertEqual(close.call_count, 1)
+
+    def test_batch_durability_precedes_intent_database_and_commit(self):
+        from django_images.services import media_migration_v2 as service
+
+        self.make_image(sizes=())
+        migrator = self.migrator()
+        events = []
+        real_publish = service.publish_preverified_noreplace
+        real_intent = MigrationBatchJournal.append_intent
+        real_commit = MigrationBatchJournal.append_commit
+        real_database = migrator._apply_database_batch
+
+        def syncfs(descriptor, reason):
+            events.append(reason)
+            os.fsync(descriptor)
+
+        def durable_fsync(descriptor, reason):
+            if reason == "publication_directory":
+                events.append(reason)
+            os.fsync(descriptor)
+
+        def publish(*args, **kwargs):
+            events.append("publish")
+            return real_publish(*args, **kwargs)
+
+        def append_intent(journal, intent):
+            events.append("intent")
+            return real_intent(journal, intent)
+
+        def apply_database(*args, **kwargs):
+            events.append("database")
+            return real_database(*args, **kwargs)
+
+        def append_commit(journal, batch_id, database_signature):
+            events.append("commit")
+            return real_commit(journal, batch_id, database_signature)
+
+        with mock.patch(
+            "django_images.services.media_migration_v2._durable_syncfs",
+            side_effect=syncfs,
+        ), mock.patch(
+            "django_images.services.media_migration_v2._durable_fsync",
+            side_effect=durable_fsync,
+        ), mock.patch(
+            "django_images.services.media_migration_v2."
+            "publish_preverified_noreplace",
+            side_effect=publish,
+        ), mock.patch.object(
+            MigrationBatchJournal,
+            "append_intent",
+            autospec=True,
+            side_effect=append_intent,
+        ), mock.patch.object(
+            migrator,
+            "_apply_database_batch",
+            side_effect=apply_database,
+        ), mock.patch.object(
+            MigrationBatchJournal,
+            "append_commit",
+            autospec=True,
+            side_effect=append_commit,
+        ):
+            migrator.run(execute=True)
+
+        order = [
+            "batch_file_data",
+            "publish",
+            "publication_directory",
+            "intent",
+            "database",
+            "commit",
+        ]
+        self.assertEqual(
+            sorted(events.index(value) for value in order),
+            [events.index(value) for value in order],
+        )
+
+    def test_syncfs_failure_records_no_batch_intent(self):
+        self.make_image(sizes=())
+        self.migrator().run(execute=False)
+
+        with mock.patch(
+            "django_images.services.media_migration_v2._durable_syncfs",
+            side_effect=OSError("injected syncfs failure"),
+        ), self.assertRaises(OSError):
+            self.migrator().run(execute=True)
+
+        self.assertFalse(any(
+            event["event"] == "batch_intent"
+            for event in self.journal_events()
+        ))
+
+    def test_global_plan_closure_runs_exactly_before_and_after_batches(self):
+        self.make_image(sizes=())
+        self.make_image(sizes=())
+        migrator = self.migrator(batch_size=1)
+
+        with mock.patch.object(
+            migrator,
+            "_validate_image_plan_closure",
+            wraps=migrator._validate_image_plan_closure,
+        ) as closure:
+            migrator.run(execute=True)
+
+        self.assertEqual(closure.call_count, 2)
+
+    def test_batch_closes_at_first_resource_limit(self):
+        for _index in range(3):
+            self.make_image(generation="named", sizes=())
+        plans = self.migrator()._freeze_all_plans()
+        plans = [
+            replace(
+                plan,
+                files=(replace(plan.files[0], size=10, width=20000,
+                               height=10000),),
+                image_width=20000,
+                image_height=10000,
+            )
+            for plan in plans
+        ]
+
+        batches = list(self.migrator()._build_batches(plans))
+
+        self.assertEqual([len(batch) for batch in batches], [2, 1])
+
+    def test_sidecar_only_loads_summary_and_archive_authority(self):
+        image = self.make_image(sizes=())
+        completed = self.migrator().run(execute=True)
+        frozen_bytes = self.manifest_path.read_bytes()
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            create=False,
+        ) as manifest:
+            journal = MigrationBatchJournal.open(
+                manifest.run_directory,
+                JOURNAL_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+                completed.plan_sha256,
+                completed.manifest_sha256,
+                create=False,
+            )
+            self.addCleanup(journal.close)
+            summary = load_completed_auto_v2_summary(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+                batch_journal=journal,
+            )
+            authority = load_auto_v2_archive_authority(
+                str(self.run_directory),
+                MANIFEST_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+                batch_journal=journal,
+            )
+
+        self.assertEqual(summary.image_count, 1)
+        self.assertEqual(authority.summary, summary)
+        self.assertEqual(authority.prefixed_files[0].old_path, image.image.name)
+        self.assertEqual(self.manifest_path.read_bytes(), frozen_bytes)
+
+    def test_restart_after_database_commit_appends_commit_without_recopy(self):
+        image = self.make_image(sizes=())
+
+        def crash(point):
+            if point == "after_database_commit":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+        image.refresh_from_db()
+        migrated_path = image.image.name
+        resumed = self.migrator()
+        with mock.patch.object(
+            resumed,
+            "_stream_source_to_staging_and_inspect",
+            side_effect=AssertionError("committed database must not recopy"),
+        ):
+            resumed.run(execute=True)
+
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, migrated_path)
+        self.assertEqual(
+            [
+                event["event"]
+                for event in self.journal_events()
+                if event["event"] in ("batch_intent", "batch_commit")
+            ],
+            ["batch_intent", "batch_commit"],
+        )
+
+    def test_restart_after_destination_rename_reuses_durable_orphan(self):
+        image = self.make_image(sizes=())
+
+        def crash(point):
+            if point == "after_destination_rename":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+        image.refresh_from_db()
+        self.assertTrue(image.image.name.startswith("image/"))
+        resumed = self.migrator()
+        with mock.patch.object(
+            resumed,
+            "_rehash_resume_candidate",
+            wraps=resumed._rehash_resume_candidate,
+        ) as rehash:
+            resumed.run(execute=True)
+
+        image.refresh_from_db()
+        self.assertTrue(image.image.name.startswith("originals/"))
+        self.assertEqual(rehash.call_count, 1)
+
+    def test_committed_destination_corruption_repairs_from_source(self):
+        image = self.make_image(sizes=())
+        source = Path(self.temporary_media.name, image.image.name)
+        expected = source.read_bytes()
+        self.migrator().run(execute=True)
+        image.refresh_from_db()
+        destination = Path(self.temporary_media.name, image.image.name)
+        before_inode = destination.stat().st_ino
+        destination.write_bytes(b"corrupt")
+
+        self.migrator().run(execute=True)
+
+        self.assertEqual(destination.read_bytes(), expected)
+        self.assertNotEqual(destination.stat().st_ino, before_inode)
+        self.assertEqual(
+            sum(
+                event["event"] == "batch_repair"
+                for event in self.journal_events()
+            ),
+            1,
+        )
+
+    def test_committed_missing_destination_repairs_from_source(self):
+        image = self.make_image(sizes=())
+        source = Path(self.temporary_media.name, image.image.name)
+        expected = source.read_bytes()
+        self.migrator().run(execute=True)
+        image.refresh_from_db()
+        destination = Path(self.temporary_media.name, image.image.name)
+        destination.unlink()
+
+        self.migrator().run(execute=True)
+
+        self.assertEqual(destination.read_bytes(), expected)
+        self.assertEqual(
+            sum(
+                event["event"] == "batch_repair"
+                for event in self.journal_events()
+            ),
+            1,
+        )
+
+    def test_completion_authority_rejects_ambiguous_receipts(self):
+        self.make_image(sizes=())
+        summary = self.migrator().run(execute=True)
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            create=False,
+        ) as manifest:
+            journal = MigrationBatchJournal.open(
+                manifest.run_directory,
+                JOURNAL_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+                summary.plan_sha256,
+                summary.manifest_sha256,
+                create=False,
+            )
+            self.addCleanup(journal.close)
+            receipts = journal.receipts_by_image("paths")
+            image_id = next(iter(receipts))
+            receipt = receipts[image_id][0]
+            mutations = (
+                {},
+                {image_id: (receipt, receipt)},
+                {image_id: (replace(
+                    receipt, source_inode=receipt.source_inode + 1
+                ),)},
+            )
+            for mutation in mutations:
+                with self.subTest(mutation=mutation):
+                    with mock.patch.object(
+                        journal,
+                        "receipts_by_image",
+                        return_value=mutation,
+                    ), self.assertRaises(CommandError):
+                        AutoV2CompletionAuthority.load(manifest, journal)
+
+    def test_committed_destination_corruption_rejects_changed_source(self):
+        image = self.make_image(sizes=())
+        source = Path(self.temporary_media.name, image.image.name)
+        self.migrator().run(execute=True)
+        image.refresh_from_db()
+        destination = Path(self.temporary_media.name, image.image.name)
+        destination.write_bytes(b"corrupt")
+        source.write_bytes(make_image_bytes("purple"))
+
+        with self.assertRaisesRegex(
+            CommandError, "linear_committed_source_changed"
+        ):
+            self.migrator().run(execute=True)
+
+    def test_complete_v2_is_noop_without_creating_sidecar(self):
+        image = self.make_image(sizes=())
+        self.write_v2_original_plan(image, terminal=True)
+        original = self.manifest_path.read_bytes()
+
+        summary = self.migrator().run(execute=True)
+
+        self.assertEqual(summary.image_count, 1)
+        self.assertEqual(self.manifest_path.read_bytes(), original)
+        self.assertFalse(Path(self.run_directory, JOURNAL_FILENAME).exists())
+
+    def test_partial_v2_manifest_is_immutable_while_sidecar_resumes(self):
+        image = self.make_image(sizes=())
+        self.write_v2_original_plan(image, terminal=False)
+        original = self.manifest_path.read_bytes()
+
+        summary = self.migrator().run(execute=True)
+
+        image.refresh_from_db()
+        self.assertEqual(summary.image_count, 1)
+        self.assertTrue(image.image.name.startswith("originals/"))
+        self.assertEqual(self.manifest_path.read_bytes(), original)
+        self.assertTrue(Path(self.run_directory, JOURNAL_FILENAME).exists())
+
+    def test_copying_v2_imports_terminal_prefix_then_resumes_pending(self):
+        first = self.make_image(sizes=())
+        second = self.make_image(sizes=())
+        self.write_v2_plans((first, second), completed=1)
+        original = self.manifest_path.read_bytes()
+        migrator = self.migrator(batch_size=1)
+
+        with mock.patch.object(
+            migrator,
+            "_stream_source_to_staging_and_inspect",
+            wraps=migrator._stream_source_to_staging_and_inspect,
+        ) as stream:
+            migrator.run(execute=True)
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertTrue(first.image.name.startswith("originals/"))
+        self.assertTrue(second.image.name.startswith("originals/"))
+        self.assertEqual(stream.call_count, 1)
+        self.assertEqual(self.manifest_path.read_bytes(), original)
+        self.assertEqual(
+            [
+                event["intent"]["batch_id"]
+                for event in self.journal_events()
+                if event["event"] == "batch_intent"
+            ],
+            [
+                "upgrade-paths:{}-{}".format(first.pk, first.pk),
+                "paths:{}-{}".format(second.pk, second.pk),
+            ],
+        )
+
+    def test_v2_upgrade_rejects_changed_old_manifest_hash(self):
+        image = self.make_image(sizes=())
+        plan = self.write_v2_original_plan(image, terminal=False)
+
+        def crash(point):
+            if point == "after_destination_rename":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+        original = self.manifest_path.read_bytes()
+        old_value = str(plan.files[0].source_inode).encode("ascii")
+        replacement = str(plan.files[0].source_inode + 1).encode("ascii")
+        if len(old_value) != len(replacement):
+            replacement = str(plan.files[0].source_inode - 1).encode(
+                "ascii"
+            )
+        changed = original.replace(
+            b'"source_inode":' + old_value,
+            b'"source_inode":' + replacement,
+            1,
+        )
+        self.assertNotEqual(changed, original)
+        self.manifest_path.write_bytes(changed)
+
+        with self.assertRaisesRegex(
+            CommandError, "linear_journal_source_changed"
+        ):
+            self.migrator().run(execute=True)
+
     def alternate_service_gid(self):
         for group_id in os.getgroups():
             if group_id != self.service_gid:
@@ -213,6 +740,104 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
     def manifest_events(self):
         with self.manifest_path.open(encoding="utf-8") as manifest:
             return [json.loads(line) for line in manifest]
+
+    def journal_events(self):
+        path = Path(self.run_directory, JOURNAL_FILENAME)
+        return [
+            json.loads(line)["payload"]
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+
+    def completed_authority(self):
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            create=False,
+        ) as manifest:
+            summary = manifest.summary()
+            journal = MigrationBatchJournal.open(
+                manifest.run_directory,
+                JOURNAL_FILENAME,
+                RUN_ID,
+                self.service_uid,
+                self.service_gid,
+                summary.plan_sha256,
+                summary.manifest_sha256,
+                create=False,
+            )
+            try:
+                return AutoV2CompletionAuthority.load(manifest, journal)
+            finally:
+                journal.close()
+
+    def make_v2_original_plan(self, image):
+        old_path = image.image.name
+        source = Path(self.temporary_media.name, old_path)
+        content = source.read_bytes()
+        source_stat = source.stat()
+        image_root_stat = Path(
+            self.temporary_media.name, "image"
+        ).stat()
+        new_path = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        file_plan = AutoV2MigrationFile(
+            kind="original",
+            old_path=old_path,
+            new_path=new_path,
+            operation="copy",
+            size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            image_format="PNG",
+            width=32,
+            height=32,
+            source_device=source_stat.st_dev,
+            source_inode=source_stat.st_ino,
+            archive_root_device=image_root_stat.st_dev,
+            archive_root_inode=image_root_stat.st_ino,
+        )
+        plan = AutoV2MigrationPlan(
+            image_id=image.pk,
+            asset_uuid=str(image.asset_uuid),
+            original_filename=image.original_filename,
+            image_width=32,
+            image_height=32,
+            generation="md5_legacy",
+            files=(file_plan,),
+            thumbnail_rows=(),
+            copy_required_bytes=len(content),
+        )
+        return plan, content, new_path
+
+    def write_v2_plans(self, images, completed=0):
+        values = tuple(
+            self.make_v2_original_plan(image) for image in images
+        )
+        plans = tuple(value[0] for value in values)
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ) as manifest:
+            for plan in plans:
+                manifest.record_plan(plan)
+            manifest.record_plan_complete(plans)
+            for image, value in zip(images[:completed], values[:completed]):
+                plan, content, new_path = value
+                self.write_media(new_path, content)
+                Image.objects.filter(pk=image.pk).update(image=new_path)
+                manifest.record_result("committed", image.pk)
+        return plans
+
+    def write_v2_original_plan(self, image, terminal=False):
+        return self.write_v2_plans(
+            (image,), completed=1 if terminal else 0
+        )[0]
 
     def primitive_window_staging_swap(self):
         swapped_names = []
@@ -310,20 +935,13 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         plan = AutoV2MigrationPlan.for_image(image, self.open_root())
 
-        self.assertEqual(plan.generation, "md5_legacy")
-        self.assertEqual(
-            plan.new_original,
-            canonical_original_path(image.asset_uuid, "사진.jpg", ".png"),
+        self.assertIsNone(plan.generation)
+        self.assertIsNone(plan.new_original)
+        self.assertEqual({entry.operation for entry in plan.files}, {None})
+        self.assertEqual({entry.new_path for entry in plan.files}, {None})
+        self.assertTrue(
+            all(entry.image_format is None for entry in plan.files)
         )
-        self.assertEqual({entry.operation for entry in plan.files}, {"copy"})
-        self.assertEqual(
-            {entry.new_path for entry in plan.files[1:]},
-            {
-                canonical_derivative_path(image.asset_uuid, size, ".png")
-                for size in ("thumbnail", "standard", "square")
-            },
-        )
-        self.assertTrue(all(entry.image_format == "PNG" for entry in plan.files))
         image_root_stat = os.stat(
             str(Path(self.temporary_media.name, "image"))
         )
@@ -340,24 +958,21 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         plan = AutoV2MigrationPlan.for_image(image, self.open_root())
 
-        self.assertEqual(plan.generation, "md5_legacy")
-        self.assertEqual(
-            plan.new_original,
-            canonical_original_path(image.asset_uuid, "사진.jpg", ".png"),
-        )
-        self.assertEqual({entry.operation for entry in plan.files}, {"copy"})
+        self.assertIsNone(plan.generation)
+        self.assertIsNone(plan.new_original)
+        self.assertEqual({entry.operation for entry in plan.files}, {None})
 
     def test_fixed_slot_copies_original_and_verifies_canonical_derivatives(self):
         image = self.make_image(generation="fixed")
 
         plan = AutoV2MigrationPlan.for_image(image, self.open_root())
 
-        self.assertEqual(plan.generation, "fixed_slot")
-        self.assertEqual(plan.files[0].operation, "copy")
-        self.assertEqual(
-            {entry.operation for entry in plan.files[1:]}, {"verify"}
-        )
-        self.assertEqual(plan.fixed_slot_archive_sources, (plan.old_original,))
+        self.assertIsNone(plan.generation)
+        self.assertTrue(all(
+            entry.operation is None and entry.new_path is None
+            for entry in plan.files
+        ))
+        self.assertEqual(plan.fixed_slot_archive_sources, ())
 
     def test_django_normalized_original_is_migrated_and_archived(self):
         image = self.make_image(
@@ -373,12 +988,11 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         plan = AutoV2MigrationPlan.for_image(image, self.open_root())
 
-        self.assertEqual(plan.generation, "fixed_slot")
-        self.assertEqual(plan.files[0].operation, "copy")
-        self.assertEqual(
-            {entry.operation for entry in plan.files[1:]}, {"verify"}
-        )
-        self.assertEqual(plan.fixed_slot_archive_sources, (old_path,))
+        self.assertIsNone(plan.generation)
+        self.assertTrue(all(
+            entry.operation is None and entry.new_path is None
+            for entry in plan.files
+        ))
 
         self.migrator().run(execute=True)
 
@@ -386,13 +1000,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertEqual(image.image.name, expected_path)
         self.assertTrue(Path(self.temporary_media.name, old_path).is_file())
         self.assertEqual(
-            load_auto_v2_archive_sources(
-                str(self.run_directory),
-                MANIFEST_FILENAME,
-                RUN_ID,
-                self.service_uid,
-                self.service_gid,
-            ),
+            self.completed_authority().archive_authority.fixed_slot_sources,
             (old_path,),
         )
 
@@ -401,8 +1009,8 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         plan = AutoV2MigrationPlan.for_image(image, self.open_root())
 
-        self.assertEqual(plan.generation, "named_canonical")
-        self.assertTrue(plan.already_current)
+        self.assertIsNone(plan.generation)
+        self.assertFalse(plan.already_current)
         self.assertEqual(plan.fixed_slot_archive_sources, ())
 
     def test_named_closure_is_identity_verified_and_already_current(self):
@@ -410,8 +1018,8 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         plan = AutoV2MigrationPlan.for_image(image, self.open_root())
 
-        self.assertTrue(plan.already_current)
-        self.assertEqual({entry.operation for entry in plan.files}, {"verify"})
+        self.assertFalse(plan.already_current)
+        self.assertEqual({entry.operation for entry in plan.files}, {None})
         self.assertTrue(all(entry.source_inode > 0 for entry in plan.files))
 
     def test_existing_valid_image_above_pillow_warning_limit_is_migrated(self):
@@ -430,9 +1038,12 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             with mock.patch.object(
                 WebPImagePlugin.WebPImageFile,
                 "load",
-                side_effect=AssertionError("legacy migration decoded pixels"),
-            ):
+                wraps=WebPImagePlugin.WebPImageFile.load,
+                autospec=True,
+            ) as load:
                 self.migrator().run(execute=True)
+
+        self.assertEqual(load.call_count, 1)
 
         image.refresh_from_db()
         self.assertEqual(image.image.name, expected_path)
@@ -441,14 +1052,14 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         )
 
     def test_existing_image_above_pillow_hard_limit_is_rejected_safely(self):
-        image = self.make_image(generation="pinry-md5", sizes=())
+        self.make_image(generation="pinry-md5", sizes=())
 
         with mock.patch.object(PILImage, "MAX_IMAGE_PIXELS", 500):
             with self.assertRaisesRegex(
                 CommandError,
                 "invalid_legacy_media",
             ):
-                AutoV2MigrationPlan.for_image(image, self.open_root())
+                self.migrator().run(execute=True)
 
     def test_missing_derivative_is_allowed_but_not_backfill_eligible(self):
         image = self.make_image(sizes=("thumbnail", "square"))
@@ -692,15 +1303,9 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         executed = self.migrator().run(execute=True)
 
         self.assertEqual(executed.plan_sha256, planned.plan_sha256)
-        self.assertNotEqual(executed.manifest_sha256, planned.manifest_sha256)
+        self.assertEqual(executed.manifest_sha256, planned.manifest_sha256)
         self.assertEqual(
-            load_completed_auto_v2_summary(
-                str(self.run_directory),
-                MANIFEST_FILENAME,
-                RUN_ID,
-                self.service_uid,
-                self.service_gid,
-            ),
+            self.completed_authority().summary,
             executed,
         )
 
@@ -739,7 +1344,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertEqual(planned.image_count, 1)
         self.assertEqual(
             [event["event"] for event in self.manifest_events()],
-            ["planned", "plan_complete"],
+            ["planned_skeleton", "plan_complete"],
         )
 
         with self.assertRaisesRegex(
@@ -755,24 +1360,17 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             )
 
     def test_incomplete_plan_prefix_is_reset_for_same_run_replanning(self):
+        first = self.make_image()
         self.make_image()
-        self.make_image()
-        original_record = AutoV2ManifestLog.record_plan
-        recorded = {"value": False}
-
-        def record_then_crash(manifest, plan):
-            original_record(manifest, plan)
-            if not recorded["value"]:
-                recorded["value"] = True
-                raise SimulatedProcessCrash()
-
-        with mock.patch.object(
-            AutoV2ManifestLog,
-            "record_plan",
-            new=record_then_crash,
-        ):
-            with self.assertRaises(SimulatedProcessCrash):
-                self.migrator().run(execute=False)
+        plan = self.make_v2_original_plan(first)[0]
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ) as manifest:
+            manifest.record_plan(plan)
 
         self.assertEqual(len(self.manifest_events()), 1)
         self.assertTrue(recover_incomplete_auto_v2_plan(
@@ -789,20 +1387,16 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertEqual(summary.image_count, 2)
 
     def test_incomplete_torn_plan_prefix_is_quarantined_then_reset(self):
-        self.make_image()
-        original_record = AutoV2ManifestLog.record_plan
-
-        def record_then_crash(manifest, plan):
-            original_record(manifest, plan)
-            raise SimulatedProcessCrash()
-
-        with mock.patch.object(
-            AutoV2ManifestLog,
-            "record_plan",
-            new=record_then_crash,
-        ):
-            with self.assertRaises(SimulatedProcessCrash):
-                self.migrator().run(execute=False)
+        image = self.make_image()
+        plan = self.make_v2_original_plan(image)[0]
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ) as manifest:
+            manifest.record_plan(plan)
         with self.manifest_path.open("ab") as manifest:
             manifest.write(b'{"format_version":2')
 
@@ -879,6 +1473,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             )
 
         self.migrator().run(execute=True)
+        completion = self.completed_authority()
         with mock.patch.object(
             AutoV2ManifestLog,
             "open",
@@ -890,15 +1485,17 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 RUN_ID,
                 self.service_uid,
                 self.service_gid,
+                completion_authority=completion,
             )
 
         self.assertIsInstance(sources, tuple)
         self.assertEqual(sources, expected)
-        self.assertEqual(strict_open.call_count, 1)
+        self.assertEqual(strict_open.call_count, 0)
 
     def test_archive_direct_root_loader_reports_every_manifest_root(self):
         self.make_image(generation="pinry-md5")
         self.migrator().run(execute=True)
+        completion = self.completed_authority()
 
         roots = load_auto_v2_archive_direct_roots(
             str(self.run_directory),
@@ -906,6 +1503,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             RUN_ID,
             self.service_uid,
             self.service_gid,
+            completion_authority=completion,
         )
 
         self.assertEqual(roots, ("0", "a", "c", "e"))
@@ -998,20 +1596,25 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.migrator().run(execute=False)
         self.write_media(new_path, original_path.read_bytes())
 
-        with self.assertRaisesRegex(CommandError, "destination_collision"):
+        with self.assertRaisesRegex(CommandError, "media_path_conflict"):
             self.migrator().run(execute=True)
 
         image.refresh_from_db()
         self.assertNotEqual(image.image.name, new_path)
 
         self.manifest_path.unlink()
+        Path(self.run_directory, JOURNAL_FILENAME).unlink()
+        for staging in Path(
+            self.temporary_media.name, ".staging"
+        ).glob("auto-v2-*.part"):
+            staging.unlink()
         destination_path = Path(self.temporary_media.name, new_path)
         self.migrator().run(execute=False)
         replacement_path = destination_path.with_name("replacement.png")
         replacement_path.write_bytes(destination_path.read_bytes())
         os.replace(str(replacement_path), str(destination_path))
 
-        with self.assertRaisesRegex(CommandError, "destination_collision"):
+        with self.assertRaisesRegex(CommandError, "media_path_conflict"):
             self.migrator().run(execute=True)
 
         image.refresh_from_db()
@@ -1049,7 +1652,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
     def test_manifest_append_updates_state_without_full_replay(self):
         image = self.make_image(sizes=())
-        plan = AutoV2MigrationPlan.for_image(image, self.open_root())
+        plan = self.make_v2_original_plan(image)[0]
 
         with AutoV2ManifestLog.open(
             str(self.run_directory),
@@ -1089,7 +1692,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
     def test_incremental_manifest_state_matches_full_replay(self):
         image = self.make_image(sizes=())
-        plan = AutoV2MigrationPlan.for_image(image, self.open_root())
+        plan = self.make_v2_original_plan(image)[0]
         file_key = plan.files[0].kind_key
         staging_name = "auto-v2-{}.part".format(uuid.uuid4())
 
@@ -1131,7 +1734,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
     def test_manifest_state_is_read_only_between_appends(self):
         image = self.make_image(sizes=())
-        plan = AutoV2MigrationPlan.for_image(image, self.open_root())
+        plan = self.make_v2_original_plan(image)[0]
 
         with AutoV2ManifestLog.open(
             str(self.run_directory),
@@ -1220,11 +1823,6 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             progress,
             [
                 {
-                    "phase": "planning",
-                    "images_total": 1,
-                    "files_total": 4,
-                },
-                {
                     "phase": "copying",
                     "images_done": 1,
                     "images_total": 1,
@@ -1236,6 +1834,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                     "images_done": 1,
                     "images_total": 1,
                 },
+                {"phase": "finalizing"},
             ],
         )
 
@@ -1272,25 +1871,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertEqual(summary.image_count, 0)
         self.assertEqual(
             progress,
-            [
-                {
-                    "phase": "planning",
-                    "images_total": 0,
-                    "files_total": 0,
-                },
-                {
-                    "phase": "copying",
-                    "images_done": 0,
-                    "images_total": 0,
-                    "files_done": 0,
-                    "files_total": 0,
-                },
-                {
-                    "phase": "database",
-                    "images_done": 0,
-                    "images_total": 0,
-                },
-            ],
+            [{"phase": "finalizing"}],
         )
 
     def test_execute_uses_one_shared_media_root_descriptor_for_named_closure(self):
@@ -1307,7 +1888,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             for call in strict_root.call_args_list
             if call.args[0] == self.temporary_media.name
         ]
-        self.assertEqual(len(media_root_calls), 2)
+        self.assertEqual(len(media_root_calls), 3)
 
     def test_execute_detects_media_root_replacement_during_shared_stage(self):
         self.make_image()
@@ -1401,12 +1982,12 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             self.migrator(fault_injector=add_image).run(execute=True)
 
         planned.refresh_from_db()
-        self.assertEqual(planned.image.name, old_path)
-        self.assertFalse(Image.objects.filter(pk=added[0]).exists())
-        self.assertNotIn(
-            "committed",
-            {event["event"] for event in self.manifest_events()},
-        )
+        self.assertNotEqual(planned.image.name, old_path)
+        self.assertTrue(Image.objects.filter(pk=added[0]).exists())
+        self.assertFalse(any(
+            event["event"] == "phase_complete"
+            for event in self.journal_events()
+        ))
 
     def test_publish_and_database_commit_crashes_resume_same_plan(self):
         for crash_point in ("after_publish", "after_database_commit"):
@@ -1414,6 +1995,16 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 Image.objects.all().delete()
                 if self.manifest_path.exists():
                     self.manifest_path.unlink()
+                journal_path = Path(
+                    self.run_directory, JOURNAL_FILENAME
+                )
+                if journal_path.exists():
+                    journal_path.unlink()
+                checkpoint = Path(
+                    self.run_directory, "migration-checkpoint.json"
+                )
+                if checkpoint.exists():
+                    checkpoint.unlink()
                 image = self.make_image()
 
                 def crash(point):
@@ -1432,13 +2023,15 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                     ),
                 )
                 self.assertEqual(recovered.image_count, 1)
-                expected_event = (
-                    "recovered_commit"
-                    if crash_point == "after_database_commit"
-                    else "committed"
+                events = self.journal_events()
+                self.assertEqual(
+                    sum(event["event"] == "batch_commit"
+                        for event in events),
+                    1,
                 )
                 self.assertEqual(
-                    self.manifest_events()[-1]["event"], expected_event
+                    [event["event"] for event in self.manifest_events()],
+                    ["planned_skeleton", "plan_complete"],
                 )
 
     def test_publish_before_published_event_crash_resumes_from_intent(self):
@@ -1451,16 +2044,9 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         with self.assertRaises(SimulatedProcessCrash):
             self.migrator(fault_injector=crash).run(execute=True)
 
-        events = self.manifest_events()
-        self.assertIn("publish_intent", {event["event"] for event in events})
-        self.assertNotIn("published", {event["event"] for event in events})
-        intent = next(
-            event for event in events if event["event"] == "publish_intent"
-        )
-        staging = Path(
-            self.temporary_media.name,
-            ".staging",
-            intent["staging_name"],
+        events = self.journal_events()
+        self.assertNotIn(
+            "batch_intent", {event["event"] for event in events}
         )
         destination_relative = canonical_original_path(
             image.asset_uuid, image.original_filename, ".png"
@@ -1468,13 +2054,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         destination = Path(
             self.temporary_media.name, destination_relative
         )
-        self.assertFalse(staging.exists())
-        destination_stat = os.stat(str(destination))
-        self.assertEqual(
-            (destination_stat.st_dev, destination_stat.st_ino),
-            (intent["staging_device"], intent["staging_inode"]),
-        )
-        self.assertEqual(destination_stat.st_nlink, 1)
+        self.assertEqual(os.stat(str(destination)).st_nlink, 1)
 
         self.migrator().run(execute=True)
 
@@ -1485,7 +2065,13 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 image.asset_uuid, image.original_filename, ".png"
             ),
         )
-        self.assertEqual(self.manifest_events()[-1]["event"], "committed")
+        self.assertEqual(
+            sum(
+                event["event"] == "batch_intent"
+                for event in self.journal_events()
+            ),
+            1,
+        )
 
     def test_publish_intent_before_atomic_publish_resumes_from_staging(self):
         image = self.make_image(sizes=())
@@ -1503,43 +2089,34 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         destination = Path(
             self.temporary_media.name, destination_relative
         )
-        self.assertFalse(destination.exists())
+        self.assertTrue(destination.exists())
         intent = next(
-            event
-            for event in self.manifest_events()
-            if event["event"] == "publish_intent"
+            event["intent"]
+            for event in self.journal_events()
+            if event["event"] == "batch_intent"
         )
-        staging = Path(
-            self.temporary_media.name,
-            ".staging",
-            intent["staging_name"],
-        )
-        staging_stat = os.stat(str(staging))
+        receipt = intent["receipts"][0]
+        destination_stat = os.stat(str(destination))
         self.assertEqual(
-            (staging_stat.st_dev, staging_stat.st_ino),
-            (intent["staging_device"], intent["staging_inode"]),
+            (destination_stat.st_dev, destination_stat.st_ino),
+            (
+                receipt["destination_device"],
+                receipt["destination_inode"],
+            ),
         )
-        self.assertEqual(staging_stat.st_nlink, 1)
-        self.assertEqual(staging_stat.st_uid, self.service_uid)
-        self.assertEqual(stat.S_IMODE(staging_stat.st_mode), 0o600)
+        self.assertEqual(destination_stat.st_nlink, 1)
+        self.assertEqual(destination_stat.st_uid, self.service_uid)
+        self.assertEqual(stat.S_IMODE(destination_stat.st_mode), 0o600)
 
         self.migrator().run(execute=True)
 
         image.refresh_from_db()
-        self.assertRegex(
-            intent["staging_name"],
-            r"^auto-v2-[0-9a-f-]{36}\.part$",
-        )
-        self.assertFalse(
-            Path(
-                self.temporary_media.name,
-                ".staging",
-                intent["staging_name"],
-            ).exists()
-        )
         self.assertEqual(image.image.name, destination_relative)
         self.assertEqual(os.stat(str(destination)).st_nlink, 1)
-        self.assertEqual(self.manifest_events()[-1]["event"], "committed")
+        self.assertIn(
+            "phase_complete",
+            {event["event"] for event in self.journal_events()},
+        )
 
     def test_new_staging_uses_service_identity_before_publish_intent(self):
         image = self.make_image(sizes=())
@@ -1563,17 +2140,14 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         with self.assertRaises(SimulatedProcessCrash):
             migrator.run(execute=True)
 
-        intent = next(
-            event
-            for event in self.manifest_events()
-            if event["event"] == "publish_intent"
-        )
-        staging = Path(
+        image.refresh_from_db()
+        destination = Path(
             self.temporary_media.name,
-            ".staging",
-            intent["staging_name"],
+            canonical_original_path(
+                image.asset_uuid, image.original_filename, ".png"
+            ),
         )
-        staging_stat = os.stat(str(staging))
+        staging_stat = os.stat(str(destination))
         self.assertEqual(
             (staging_stat.st_uid, staging_stat.st_gid),
             (self.service_uid, service_gid),
@@ -1587,7 +2161,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             ),
         )
 
-    def test_resume_rejects_service_owner_with_wrong_group(self):
+    def test_resume_does_not_reown_published_destination(self):
         image = self.make_image(sizes=())
 
         def crash(point):
@@ -1597,39 +2171,31 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         with self.assertRaises(SimulatedProcessCrash):
             self.migrator(fault_injector=crash).run(execute=True)
 
-        intent = next(
-            event
-            for event in self.manifest_events()
-            if event["event"] == "publish_intent"
-        )
-        staging = Path(
+        destination = Path(
             self.temporary_media.name,
-            ".staging",
-            intent["staging_name"],
+            canonical_original_path(
+                image.asset_uuid, image.original_filename, ".png"
+            ),
         )
-        original_group = os.stat(str(staging)).st_gid
+        original_group = os.stat(str(destination)).st_gid
         service_gid = self.alternate_service_gid()
         self.assertNotEqual(original_group, service_gid)
-        os.chown(str(staging), self.service_uid, service_gid)
+        os.chown(str(destination), self.service_uid, service_gid)
 
-        with self.assertRaisesRegex(
-            CommandError, "^media_verification_failed$"
-        ):
-            self.migrator().run(execute=True)
+        self.migrator().run(execute=True)
 
-        staging_stat = os.stat(str(staging))
-        self.assertEqual(staging_stat.st_uid, self.service_uid)
-        self.assertEqual(staging_stat.st_gid, service_gid)
+        destination_stat = os.stat(str(destination))
+        self.assertEqual(destination_stat.st_uid, self.service_uid)
+        self.assertEqual(destination_stat.st_gid, service_gid)
         image.refresh_from_db()
-        self.assertNotEqual(
+        self.assertEqual(
             image.image.name,
             canonical_original_path(
                 image.asset_uuid, image.original_filename, ".png"
             ),
         )
-        events = {event["event"] for event in self.manifest_events()}
-        self.assertNotIn("published", events)
-        self.assertNotIn("committed", events)
+        events = {event["event"] for event in self.journal_events()}
+        self.assertIn("batch_commit", events)
 
     def test_resume_does_not_reown_root_with_service_group(self):
         migrator = self.migrator()
@@ -1674,9 +2240,10 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         reown.assert_not_called()
 
-    def test_resume_rechecks_destination_before_root_reownership(self):
+    def test_resume_repairs_destination_before_database_commit(self):
         image = self.make_image(sizes=())
-        old_path = image.image.name
+        source = Path(self.temporary_media.name, image.image.name)
+        expected = source.read_bytes()
 
         def crash(point):
             if point == "after_publish_intent":
@@ -1692,54 +2259,15 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             self.temporary_media.name, destination_relative
         )
         migrator = self.migrator()
-        verify_named = migrator._verify_named_staging_object
-        named_calls = []
-        sha_calls = []
+        replacement = destination.with_name("external.png")
+        replacement.write_bytes(b"external destination")
+        os.replace(str(replacement), str(destination))
 
-        def verify_then_create_destination(descriptor, file_plan):
-            result = _verify_staging(descriptor, file_plan)
-            if not sha_calls:
-                destination.write_bytes(b"external destination")
-                sha_calls.append(True)
-            return result
+        migrator.run(execute=True)
 
-        def report_root_on_recovery(*args, **kwargs):
-            named_stat, descriptor_stat = verify_named(*args, **kwargs)
-            named_calls.append(True)
-            if len(named_calls) != 3:
-                return named_stat, descriptor_stat
-            migrator.service_uid = 1000
-            migrator.service_gid = 1000
-            root_stat = mock.Mock(
-                st_uid=0,
-                st_gid=0,
-                st_mode=stat.S_IFREG | 0o600,
-            )
-            return root_stat, root_stat
-
-        with mock.patch(
-            "django_images.services.media_migration_v2._verify_staging",
-            side_effect=verify_then_create_destination,
-        ), mock.patch.object(
-            migrator,
-            "_verify_named_staging_object",
-            side_effect=report_root_on_recovery,
-        ), mock.patch(
-            "django_images.services.media_migration_v2.os.geteuid",
-            return_value=0,
-        ), mock.patch(
-            "django_images.services.media_migration_v2.os.fchown"
-        ) as reown:
-            with self.assertRaisesRegex(
-                CommandError, "^destination_collision$"
-            ):
-                migrator.run(execute=True)
-
-        self.assertEqual(len(sha_calls), 1)
-        self.assertEqual(destination.read_bytes(), b"external destination")
-        reown.assert_not_called()
+        self.assertEqual(destination.read_bytes(), expected)
         image.refresh_from_db()
-        self.assertEqual(image.image.name, old_path)
+        self.assertEqual(image.image.name, destination_relative)
 
     def test_resume_reowns_manifest_bound_root_staging_for_service(self):
         self.use_distinct_root_service_identity()
@@ -1845,71 +2373,45 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             self.migrator(fault_injector=fault).run(execute=True)
 
         self.assertEqual(len(swapped), 1)
-        intent = next(
-            event
-            for event in self.manifest_events()
-            if event["event"] == "publish_intent"
-        )
-        staging = Path(
-            self.temporary_media.name, ".staging", intent["staging_name"]
-        )
+        staging = Path(self.temporary_media.name, ".staging", swapped[0])
         destination = Path(self.temporary_media.name, destination_relative)
-        self.assertFalse(staging.exists())
-        self.assertEqual(destination.read_bytes(), replacement_bytes)
+        self.assertEqual(staging.read_bytes(), replacement_bytes)
+        self.assertFalse(destination.exists())
         image.refresh_from_db()
         self.assertEqual(image.image.name, old_path)
-        events = {event["event"] for event in self.manifest_events()}
-        self.assertNotIn("published", events)
-        self.assertNotIn("committed", events)
+        events = {event["event"] for event in self.journal_events()}
+        self.assertNotIn("batch_intent", events)
 
-    def test_resume_rejects_swap_in_exact_detach_primitive_window(self):
+    def test_resume_rejects_changed_preintent_orphan(self):
         image = self.make_image(sizes=())
         old_path = image.image.name
 
-        def crash_after_intent(point):
-            if point == "after_publish_intent":
+        def crash_after_publish(point):
+            if point == "after_publish":
                 raise SimulatedProcessCrash()
 
         with self.assertRaises(SimulatedProcessCrash):
             self.migrator(
-                fault_injector=crash_after_intent
+                fault_injector=crash_after_publish
             ).run(execute=True)
 
-        intent = next(
-            event
-            for event in self.manifest_events()
-            if event["event"] == "publish_intent"
-        )
-        staging_directory = Path(self.temporary_media.name, ".staging")
         destination_relative = canonical_original_path(
             image.asset_uuid, image.original_filename, ".png"
         )
         destination = Path(self.temporary_media.name, destination_relative)
-        self.assertFalse(destination.exists())
-        self.assertEqual(
-            os.stat(
-                str(staging_directory / intent["staging_name"])
-            ).st_nlink,
-            1,
-        )
-        fault, swapped, replacement_bytes = (
-            self.primitive_window_staging_swap()
-        )
+        replacement_bytes = b"changed durable orphan"
+        destination.write_bytes(replacement_bytes)
 
         with self.assertRaisesRegex(
-            CommandError, "media_verification_failed"
+            CommandError, "media_path_conflict"
         ):
-            self.migrator(fault_injector=fault).run(execute=True)
+            self.migrator().run(execute=True)
 
-        self.assertEqual(len(swapped), 1)
-        staging = staging_directory / intent["staging_name"]
-        self.assertFalse(staging.exists())
         self.assertEqual(destination.read_bytes(), replacement_bytes)
         image.refresh_from_db()
         self.assertEqual(image.image.name, old_path)
-        events = {event["event"] for event in self.manifest_events()}
-        self.assertNotIn("published", events)
-        self.assertNotIn("committed", events)
+        events = {event["event"] for event in self.journal_events()}
+        self.assertNotIn("batch_intent", events)
 
     def test_initial_publish_does_not_reverse_external_destination_replacement(self):
         image = self.make_image(sizes=())
@@ -1923,7 +2425,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         )
 
         with mock.patch(
-            "django_images.services.media_migration_v2."
+            "django_images.file_ops."
             "rename_media_noreplace",
             side_effect=rename,
         ):
@@ -1939,25 +2441,12 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             (destination_stat.st_dev, destination_stat.st_ino),
             replacement_identity[0],
         )
-        intent = next(
-            event
-            for event in self.manifest_events()
-            if event["event"] == "publish_intent"
-        )
-        self.assertFalse(
-            Path(
-                self.temporary_media.name,
-                ".staging",
-                intent["staging_name"],
-            ).exists()
-        )
         image.refresh_from_db()
         self.assertEqual(image.image.name, old_path)
-        events = {event["event"] for event in self.manifest_events()}
-        self.assertNotIn("published", events)
-        self.assertNotIn("committed", events)
+        events = {event["event"] for event in self.journal_events()}
+        self.assertNotIn("batch_intent", events)
 
-        with self.assertRaisesRegex(CommandError, "^destination_collision$"):
+        with self.assertRaisesRegex(CommandError, "^media_path_conflict$"):
             self.migrator().run(execute=True)
         self.assertEqual(destination.read_bytes(), replacement_bytes)
         destination_stat = os.stat(str(destination))
@@ -1966,9 +2455,10 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             replacement_identity[0],
         )
 
-    def test_resume_publish_does_not_reverse_external_destination_replacement(self):
+    def test_resume_repairs_external_destination_replacement(self):
         image = self.make_image(sizes=())
-        old_path = image.image.name
+        source = Path(self.temporary_media.name, image.image.name)
+        expected = source.read_bytes()
         destination_relative = canonical_original_path(
             image.asset_uuid, image.original_filename, ".png"
         )
@@ -1983,51 +2473,21 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 fault_injector=crash_after_intent
             ).run(execute=True)
 
-        rename, replacement_identity, replacement_bytes = (
-            self.destination_replacement_after_atomic_publish()
-        )
-        with mock.patch(
-            "django_images.services.media_migration_v2."
-            "rename_media_noreplace",
-            side_effect=rename,
-        ):
-            with self.assertRaisesRegex(
-                CommandError, "^media_verification_failed$"
-            ):
-                self.migrator().run(execute=True)
+        replacement = destination.with_name("replacement.png")
+        replacement.write_bytes(b"external replacement")
+        os.replace(str(replacement), str(destination))
 
-        self.assertTrue(destination.exists())
-        self.assertEqual(destination.read_bytes(), replacement_bytes)
-        destination_stat = os.stat(str(destination))
-        self.assertEqual(
-            (destination_stat.st_dev, destination_stat.st_ino),
-            replacement_identity[0],
-        )
-        intent = next(
-            event
-            for event in self.manifest_events()
-            if event["event"] == "publish_intent"
-        )
-        self.assertFalse(
-            Path(
-                self.temporary_media.name,
-                ".staging",
-                intent["staging_name"],
-            ).exists()
-        )
+        self.migrator().run(execute=True)
+
+        self.assertEqual(destination.read_bytes(), expected)
         image.refresh_from_db()
-        self.assertEqual(image.image.name, old_path)
-        events = {event["event"] for event in self.manifest_events()}
-        self.assertNotIn("published", events)
-        self.assertNotIn("committed", events)
-
-        with self.assertRaisesRegex(CommandError, "^destination_collision$"):
-            self.migrator().run(execute=True)
-        self.assertEqual(destination.read_bytes(), replacement_bytes)
-        destination_stat = os.stat(str(destination))
+        self.assertEqual(image.image.name, destination_relative)
         self.assertEqual(
-            (destination_stat.st_dev, destination_stat.st_ino),
-            replacement_identity[0],
+            sum(
+                event["event"] == "batch_repair"
+                for event in self.journal_events()
+            ),
+            1,
         )
 
     def test_initial_publish_fails_closed_without_atomic_rename_support(self):
@@ -2038,7 +2498,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         )
 
         with mock.patch(
-            "django_images.services.media_migration_v2."
+            "django_images.file_ops."
             "rename_media_noreplace",
             side_effect=MediaPathError("atomic_rename_unsupported"),
         ):
@@ -2064,7 +2524,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         )
 
         with mock.patch(
-            "django_images.services.media_migration_v2."
+            "django_images.file_ops."
             "rename_media_noreplace",
             side_effect=OSError(errno.EXDEV, os.strerror(errno.EXDEV)),
         ):
@@ -2095,10 +2555,13 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         def create_external_destination(point):
             if point != "after_publish_intent":
                 return
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(source.read_bytes())
+            replacement = destination.with_name("external.png")
+            replacement.write_bytes(source.read_bytes())
+            os.replace(str(replacement), str(destination))
 
-        with self.assertRaisesRegex(CommandError, "destination_collision"):
+        with self.assertRaisesRegex(
+            CommandError, "media_verification_failed"
+        ):
             self.migrator(
                 fault_injector=create_external_destination
             ).run(execute=True)
@@ -2106,8 +2569,9 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         image.refresh_from_db()
         self.assertNotEqual(image.image.name, destination_relative)
 
-    def test_recovered_commit_rejects_destination_identity_swap(self):
+    def test_recovered_commit_repairs_destination_identity_swap(self):
         image = self.make_image(sizes=())
+        source = Path(self.temporary_media.name, image.image.name)
 
         def crash(point):
             if point == "after_database_commit":
@@ -2122,10 +2586,16 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         replacement.write_bytes(destination.read_bytes())
         os.replace(str(replacement), str(destination))
 
-        with self.assertRaisesRegex(
-            CommandError, "media_verification_failed"
-        ):
-            self.migrator().run(execute=True)
+        self.migrator().run(execute=True)
+
+        self.assertEqual(destination.read_bytes(), source.read_bytes())
+        self.assertEqual(
+            sum(
+                event["event"] == "batch_repair"
+                for event in self.journal_events()
+            ),
+            1,
+        )
 
     def test_torn_tail_is_quarantined_only_during_execute(self):
         self.make_image()

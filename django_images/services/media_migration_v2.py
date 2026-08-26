@@ -1,3 +1,4 @@
+import collections
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -14,6 +15,7 @@ from django.core.management import CommandError
 from django.db import transaction
 from django.utils.text import get_valid_filename
 from PIL import Image as PILImage
+from PIL import ImageFile
 
 from django_images.file_ops import (
     MediaPathError,
@@ -22,6 +24,8 @@ from django_images.file_ops import (
     open_or_create_media_directory_from,
     open_verified_media_file,
     open_verified_media_root,
+    publish_preverified_noreplace,
+    replace_preverified_destination,
     rename_media_noreplace,
     sha256_file_descriptor,
 )
@@ -32,6 +36,16 @@ from django_images.paths import (
     canonical_derivative_path,
     canonical_original_path,
     pinry_direct_md5_root,
+)
+from django_images.services.migration_batch_log import (
+    BatchIntent,
+    BatchLimits,
+    FileReceipt,
+    JOURNAL_FILENAME,
+    MigrationBatchJournal,
+    MigrationBatchLogError,
+    _durable_fsync,
+    _durable_syncfs,
 )
 
 
@@ -139,6 +153,24 @@ class AutoV2MigrationFile(object):
             value["archive_root_inode"] = self.archive_root_inode
         return value
 
+    def as_skeleton_dict(self):
+        value = {
+            "kind": self.kind,
+            "old_path": self.old_path,
+            "size": self.size,
+            "source_device": self.source_device,
+            "source_inode": self.source_inode,
+            "width": self.width,
+            "height": self.height,
+        }
+        if self.thumbnail_id is not None:
+            value["thumbnail_id"] = self.thumbnail_id
+            value["derivative_size"] = self.derivative_size
+        if self.archive_root_device is not None:
+            value["archive_root_device"] = self.archive_root_device
+            value["archive_root_inode"] = self.archive_root_inode
+        return value
+
     @classmethod
     def from_dict(cls, value):
         required = {
@@ -164,6 +196,47 @@ class AutoV2MigrationFile(object):
             size=value["size"],
             sha256=value["sha256"],
             image_format=value["image_format"],
+            width=value["width"],
+            height=value["height"],
+            source_device=value["source_device"],
+            source_inode=value["source_inode"],
+            thumbnail_id=value.get("thumbnail_id"),
+            derivative_size=value.get("derivative_size"),
+            archive_root_device=value.get("archive_root_device"),
+            archive_root_inode=value.get("archive_root_inode"),
+        )
+
+    @classmethod
+    def from_skeleton_dict(cls, value):
+        required = {
+            "kind",
+            "old_path",
+            "size",
+            "source_device",
+            "source_inode",
+            "width",
+            "height",
+        }
+        allowed = required | {
+            "thumbnail_id",
+            "derivative_size",
+            "archive_root_device",
+            "archive_root_inode",
+        }
+        if (
+            type(value) is not dict
+            or not required.issubset(value)
+            or not set(value).issubset(allowed)
+        ):
+            raise _command_error("invalid_auto_v2_manifest")
+        return cls(
+            kind=value["kind"],
+            old_path=value["old_path"],
+            new_path=None,
+            operation=None,
+            size=value["size"],
+            sha256=None,
+            image_format=None,
             width=value["width"],
             height=value["height"],
             source_device=value["source_device"],
@@ -237,25 +310,16 @@ class AutoV2MigrationPlan(object):
                 receipt = open_verified_media_file(
                     root_directory, record.image.name
                 )
-                details = _inspect_receipt(receipt)
                 archive_root_identity = _archive_root_identity(
                     receipt,
                     record.image.name,
                 )
-                database_width = record.width
-                database_height = record.height
-                if (
-                    database_width != details[3]
-                    or database_height != details[4]
-                ):
-                    raise _command_error("invalid_legacy_media")
                 inspected.append(
                     (
                         kind,
                         record,
                         thumbnail,
                         receipt.file_stat,
-                        details,
                         archive_root_identity,
                     )
                 )
@@ -272,75 +336,25 @@ class AutoV2MigrationPlan(object):
                     receipt.close()
 
         files = []
-        reusable_destination_identities = []
         for (
             kind,
             record,
             thumbnail,
             source_stat,
-            details,
             archive_root_identity,
         ) in inspected:
-            image_format, extension, digest, width, height, file_size = details
-            if kind == "original":
-                try:
-                    new_path = canonical_original_path(
-                        image.asset_uuid,
-                        image.original_filename,
-                        extension,
-                    )
-                except ValueError as error:
-                    raise _command_error("invalid_legacy_media", error)
-            else:
-                try:
-                    new_path = canonical_derivative_path(
-                        image.asset_uuid,
-                        thumbnail.size,
-                        extension,
-                    )
-                except ValueError as error:
-                    raise _command_error("invalid_legacy_media", error)
             old_path = record.image.name
-            operation = "verify" if old_path == new_path else "copy"
-            if operation == "copy":
-                destination = None
-                try:
-                    destination = open_verified_media_file(
-                        root_directory, new_path, missing_ok=True
-                    )
-                    if destination is not None:
-                        _verify_receipt_details(
-                            destination,
-                            file_size,
-                            digest,
-                            image_format,
-                            width,
-                            height,
-                            "destination_collision",
-                        )
-                        reusable_destination_identities.append(
-                            (
-                                new_path,
-                                destination.file_stat.st_dev,
-                                destination.file_stat.st_ino,
-                            )
-                        )
-                except (MediaPathError, OSError) as error:
-                    raise _command_error("destination_collision", error)
-                finally:
-                    if destination is not None:
-                        destination.close()
             files.append(
                 AutoV2MigrationFile(
                     kind=kind,
                     old_path=old_path,
-                    new_path=new_path,
-                    operation=operation,
-                    size=file_size,
-                    sha256=digest,
-                    image_format=image_format,
-                    width=width,
-                    height=height,
+                    new_path=None,
+                    operation=None,
+                    size=source_stat.st_size,
+                    sha256=None,
+                    image_format=None,
+                    width=record.width,
+                    height=record.height,
                     source_device=source_stat.st_dev,
                     source_inode=source_stat.st_ino,
                     thumbnail_id=thumbnail.pk if thumbnail else None,
@@ -358,19 +372,6 @@ class AutoV2MigrationPlan(object):
                 )
             )
 
-        generation = _classify_generation_for_uuid(
-            str(image.asset_uuid), files
-        )
-        copy_required_bytes = sum(
-            file_plan.size
-            for file_plan in files
-            if file_plan.operation == "copy"
-            and file_plan.new_path
-            not in {
-                identity[0]
-                for identity in reusable_destination_identities
-            }
-        )
         thumbnail_rows = tuple(
             (
                 record.pk,
@@ -387,13 +388,11 @@ class AutoV2MigrationPlan(object):
             original_filename=image.original_filename,
             image_width=image.width,
             image_height=image.height,
-            generation=generation,
+            generation=None,
             files=tuple(files),
             thumbnail_rows=thumbnail_rows,
-            copy_required_bytes=copy_required_bytes,
-            reusable_destination_identities=tuple(
-                reusable_destination_identities
-            ),
+            copy_required_bytes=0,
+            reusable_destination_identities=(),
         )
 
     def as_dict(self):
@@ -411,6 +410,19 @@ class AutoV2MigrationPlan(object):
                 list(identity)
                 for identity in self.reusable_destination_identities
             ],
+        }
+
+    def as_skeleton_dict(self):
+        return {
+            "image_id": self.image_id,
+            "asset_uuid": self.asset_uuid,
+            "original_filename": self.original_filename,
+            "image_width": self.image_width,
+            "image_height": self.image_height,
+            "files": [
+                file_plan.as_skeleton_dict() for file_plan in self.files
+            ],
+            "thumbnail_rows": [list(row) for row in self.thumbnail_rows],
         }
 
     @classmethod
@@ -451,6 +463,37 @@ class AutoV2MigrationPlan(object):
             ),
         )
         _validate_plan(plan)
+        return plan
+
+    @classmethod
+    def from_skeleton_dict(cls, value):
+        required = {
+            "image_id",
+            "asset_uuid",
+            "original_filename",
+            "image_width",
+            "image_height",
+            "files",
+            "thumbnail_rows",
+        }
+        if type(value) is not dict or set(value) != required:
+            raise _command_error("invalid_auto_v2_manifest")
+        plan = cls(
+            image_id=value["image_id"],
+            asset_uuid=value["asset_uuid"],
+            original_filename=value["original_filename"],
+            image_width=value["image_width"],
+            image_height=value["image_height"],
+            generation=None,
+            files=tuple(
+                AutoV2MigrationFile.from_skeleton_dict(file_info)
+                for file_info in value["files"]
+            ),
+            thumbnail_rows=tuple(tuple(row) for row in value["thumbnail_rows"]),
+            copy_required_bytes=0,
+            reusable_destination_identities=(),
+        )
+        _validate_plan_skeleton(plan)
         return plan
 
 
@@ -585,6 +628,98 @@ def _classify_generation_for_uuid(asset_uuid, files):
     ):
         return "md5_legacy"
     raise _command_error("mixed_media_state")
+
+
+def _validate_plan_skeleton(plan):  # noqa: C901
+    try:
+        canonical_uuid = str(uuid.UUID(plan.asset_uuid)) == plan.asset_uuid
+    except (AttributeError, TypeError, ValueError):
+        canonical_uuid = False
+    if (
+        type(plan.image_id) is not int
+        or plan.image_id <= 0
+        or not canonical_uuid
+        or type(plan.original_filename) is not str
+        or type(plan.image_width) is not int
+        or type(plan.image_height) is not int
+        or plan.image_width <= 0
+        or plan.image_height <= 0
+        or plan.generation is not None
+        or not plan.files
+        or plan.files[0].kind != "original"
+        or plan.files[0].thumbnail_id is not None
+        or plan.files[0].width != plan.image_width
+        or plan.files[0].height != plan.image_height
+        or plan.copy_required_bytes != 0
+        or plan.reusable_destination_identities
+    ):
+        raise _command_error("invalid_auto_v2_manifest")
+    derivative_ids = set()
+    derivative_sizes = set()
+    for file_plan in plan.files:
+        archive_identity = (
+            file_plan.archive_root_device,
+            file_plan.archive_root_inode,
+        )
+        has_archive_root = (
+            pinry_direct_md5_root(file_plan.old_path) is not None
+            or file_plan.old_path.startswith("image/")
+        )
+        if (
+            not _safe_relative_path(file_plan.old_path)
+            or file_plan.new_path is not None
+            or file_plan.operation is not None
+            or file_plan.sha256 is not None
+            or file_plan.image_format is not None
+            or type(file_plan.size) is not int
+            or file_plan.size < 0
+            or type(file_plan.width) is not int
+            or type(file_plan.height) is not int
+            or file_plan.width <= 0
+            or file_plan.height <= 0
+            or type(file_plan.source_device) is not int
+            or file_plan.source_device < 0
+            or type(file_plan.source_inode) is not int
+            or file_plan.source_inode <= 0
+            or (
+                has_archive_root
+                and (
+                    type(archive_identity[0]) is not int
+                    or archive_identity[0] < 0
+                    or type(archive_identity[1]) is not int
+                    or archive_identity[1] <= 0
+                )
+            )
+            or (not has_archive_root and archive_identity != (None, None))
+        ):
+            raise _command_error("invalid_auto_v2_manifest")
+        if file_plan.kind == "original":
+            if file_plan is not plan.files[0]:
+                raise _command_error("invalid_auto_v2_manifest")
+            continue
+        if (
+            file_plan.kind != "derivative"
+            or type(file_plan.thumbnail_id) is not int
+            or file_plan.thumbnail_id <= 0
+            or file_plan.thumbnail_id in derivative_ids
+            or file_plan.derivative_size not in DERIVATIVE_NAMES
+            or file_plan.derivative_size in derivative_sizes
+        ):
+            raise _command_error("invalid_auto_v2_manifest")
+        derivative_ids.add(file_plan.thumbnail_id)
+        derivative_sizes.add(file_plan.derivative_size)
+    expected_rows = tuple(
+        (
+            file_plan.thumbnail_id,
+            file_plan.derivative_size,
+            file_plan.old_path,
+            file_plan.width,
+            file_plan.height,
+        )
+        for file_plan in plan.files[1:]
+    )
+    if plan.thumbnail_rows != expected_rows:
+        raise _command_error("manifest_plan_mismatch")
 
 
 def _validate_plan(plan):  # noqa: C901
@@ -819,6 +954,155 @@ class AutoV2ArchiveAuthority(object):
     direct_root_identities: tuple
 
 
+@dataclass(frozen=True)
+class AutoV2CompletionAuthority(object):
+    summary: AutoV2PlanSummary
+    plans: tuple
+    archive_authority: AutoV2ArchiveAuthority
+
+    @classmethod
+    def load(cls, plan_manifest, batch_journal):
+        if not isinstance(plan_manifest, AutoV2ManifestLog):
+            raise _command_error("invalid_auto_v2_manifest")
+        if not isinstance(batch_journal, MigrationBatchJournal):
+            raise _command_error("linear_journal_invalid")
+        base = plan_manifest.summary()
+        try:
+            batch_journal.state.require_source(
+                "paths", base.plan_sha256, base.manifest_sha256
+            )
+        except MigrationBatchLogError as error:
+            raise _command_error(error.code, error)
+        if not batch_journal.is_phase_complete("paths"):
+            raise _command_error("auto_v2_plan_incomplete")
+        receipts_by_image = batch_journal.receipts_by_image("paths")
+        plans = tuple(
+            _join_plan_and_receipts(
+                plan, receipts_by_image.get(plan.image_id, ())
+            )
+            for plan in plan_manifest.state.plans
+        )
+        planned_ids = {plan.image_id for plan in plans}
+        if set(receipts_by_image) != planned_ids:
+            raise _command_error("auto_v2_plan_incomplete")
+        phase = batch_journal.state.phase_summaries["paths"]
+        counts = _plan_counts(plans)
+        copy_required_bytes = _copy_required_bytes(plans)
+        if phase != {
+            "image_count": len(plans),
+            "md5_legacy": counts["md5_legacy"],
+            "fixed_slot": counts["fixed_slot"],
+            "named_canonical": counts["named_canonical"],
+            "copy_required_bytes": copy_required_bytes,
+        }:
+            raise _command_error("manifest_plan_mismatch")
+        for batch_id in batch_journal.committed_ids("paths"):
+            intent = batch_journal.intent_for(batch_id)
+            if any(
+                receipt.database_signature != intent.post_signature
+                for receipt in batch_journal.effective_receipts(batch_id)
+            ):
+                raise _command_error("linear_journal_batch_conflict")
+        summary = AutoV2PlanSummary(
+            run_id=base.run_id,
+            plan_sha256=base.plan_sha256,
+            manifest_sha256=base.manifest_sha256,
+            image_count=len(plans),
+            md5_legacy=counts["md5_legacy"],
+            fixed_slot=counts["fixed_slot"],
+            named_canonical=counts["named_canonical"],
+            copy_required_bytes=copy_required_bytes,
+        )
+        archive_authority = _archive_authority_from_plans(summary, plans)
+        return cls(summary, plans, archive_authority)
+
+
+def _file_key_for_plan(plan, file_plan):
+    if file_plan.thumbnail_id is None:
+        return "original:{}".format(plan.image_id)
+    return "thumbnail:{}:{}".format(
+        plan.image_id, file_plan.thumbnail_id
+    )
+
+
+def _join_plan_and_receipts(plan, receipts):
+    by_key = {}
+    for receipt in receipts:
+        if receipt.file_key in by_key:
+            raise _command_error("linear_journal_batch_conflict")
+        by_key[receipt.file_key] = receipt
+    expected_keys = {
+        _file_key_for_plan(plan, file_plan) for file_plan in plan.files
+    }
+    if set(by_key) != expected_keys:
+        raise _command_error("auto_v2_plan_incomplete")
+    files = []
+    for file_plan in plan.files:
+        receipt = by_key[_file_key_for_plan(plan, file_plan)]
+        if (
+            receipt.source_device != file_plan.source_device
+            or receipt.source_inode != file_plan.source_inode
+            or receipt.width != file_plan.width
+            or receipt.height != file_plan.height
+            or receipt.size != file_plan.size
+        ):
+            raise _command_error("manifest_plan_mismatch")
+        files.append(AutoV2MigrationFile(
+            kind=file_plan.kind,
+            old_path=file_plan.old_path,
+            new_path=receipt.relative_path,
+            operation=receipt.operation,
+            size=receipt.size,
+            sha256=receipt.sha256,
+            image_format=receipt.image_format,
+            width=receipt.width,
+            height=receipt.height,
+            source_device=receipt.source_device,
+            source_inode=receipt.source_inode,
+            thumbnail_id=file_plan.thumbnail_id,
+            derivative_size=file_plan.derivative_size,
+            archive_root_device=file_plan.archive_root_device,
+            archive_root_inode=file_plan.archive_root_inode,
+        ))
+    generation = _classify_generation_for_uuid(plan.asset_uuid, files)
+    joined = AutoV2MigrationPlan(
+        image_id=plan.image_id,
+        asset_uuid=plan.asset_uuid,
+        original_filename=plan.original_filename,
+        image_width=plan.image_width,
+        image_height=plan.image_height,
+        generation=generation,
+        files=tuple(files),
+        thumbnail_rows=plan.thumbnail_rows,
+        copy_required_bytes=sum(
+            file_plan.size
+            for file_plan in files
+            if file_plan.operation == "copy"
+        ),
+    )
+    _validate_plan(joined)
+    return joined
+
+
+@dataclass
+class _PreparedFile(object):
+    plan: object
+    file_plan: object
+    file_key: str
+    staging: object
+    destination: str
+    operation: str
+    size: int
+    sha256: str
+    image_format: str
+    width: int
+    height: int
+    source_device: int
+    source_inode: int
+    destination_device: int = None
+    destination_inode: int = None
+
+
 class _AutoV2ManifestState(object):
     def __init__(self):
         self._frozen = False
@@ -833,6 +1117,7 @@ class _AutoV2ManifestState(object):
         self.torn_tail = None
         self.torn_offset = None
         self.raw_bytes = b""
+        self.format_version = None
 
     def __setattr__(self, name, value):
         if getattr(self, "_frozen", False):
@@ -888,6 +1173,7 @@ def _copy_manifest_state(state):
     copied.torn_tail = state.torn_tail
     copied.torn_offset = state.torn_offset
     copied.raw_bytes = state.raw_bytes
+    copied.format_version = state.format_version
     return copied
 
 
@@ -900,10 +1186,19 @@ def _apply_manifest_event(  # noqa: C901
 ):
     _validate_manifest_event(event, expected_run_id)
     event_name = event["event"]
-    if event_name == "planned":
+    format_version = event["format_version"]
+    if state.format_version is None:
+        state.format_version = format_version
+    elif state.format_version != format_version:
+        raise _command_error("manifest_plan_mismatch")
+    if event_name in ("planned", "planned_skeleton"):
         if state.plan_complete:
             raise _command_error("invalid_auto_v2_manifest")
-        plan = AutoV2MigrationPlan.from_dict(event.get("plan"))
+        plan = (
+            AutoV2MigrationPlan.from_dict(event.get("plan"))
+            if event_name == "planned"
+            else AutoV2MigrationPlan.from_skeleton_dict(event.get("plan"))
+        )
         if plan.image_id in state.plan_by_image:
             raise _command_error("manifest_plan_mismatch")
         state.plans.append(plan)
@@ -1327,6 +1622,49 @@ class AutoV2ManifestLog(object):
         candidate.raw_bytes = current
         self.state = candidate.freeze()
 
+    def write_frozen_plan(self, plans):
+        if self.state.raw_bytes or self.state.events:
+            raise _command_error("auto_v2_plan_reset_forbidden")
+        plans = tuple(plans)
+        for plan in plans:
+            _validate_plan_skeleton(plan)
+        common = {
+            "format_version": 3,
+            "target_signature": AUTO_V2_TARGET_SIGNATURE,
+            "run_id": self.run_id,
+        }
+        digest = hashlib.sha256()
+        self._verify_current()
+        os.lseek(self.descriptor, 0, os.SEEK_END)
+
+        def write_event(event):
+            line = _json_line(event)
+            digest.update(line)
+            view = memoryview(line)
+            while view:
+                written = os.write(self.descriptor, view)
+                if written <= 0:
+                    raise _command_error("unsafe_auto_v2_manifest")
+                view = view[written:]
+
+        for plan in plans:
+            write_event(dict(
+                common,
+                event="planned_skeleton",
+                plan=plan.as_skeleton_dict(),
+            ))
+        write_event(dict(
+            common,
+            event="plan_complete",
+            image_count=len(plans),
+            files_total=sum(len(plan.files) for plan in plans),
+        ))
+        _durable_fsync(self.descriptor, "plan_manifest")
+        self.state = self._load_state()
+        if hashlib.sha256(self.state.raw_bytes).digest() != digest.digest():
+            raise _command_error("unsafe_auto_v2_manifest")
+        return digest.hexdigest()
+
     def record_plan(self, plan):
         _validate_new_plan_archive_authority(plan)
         self.append({"event": "planned", "plan": plan.as_dict()})
@@ -1471,6 +1809,16 @@ class AutoV2ManifestLog(object):
             for event in self.state.events
             if event["event"] == "plan_complete"
         )
+        if self.state.format_version == 3:
+            counts = {
+                "md5_legacy": 0,
+                "fixed_slot": 0,
+                "named_canonical": 0,
+            }
+            copy_required_bytes = 0
+        else:
+            counts = marker
+            copy_required_bytes = marker["copy_required_bytes"]
         return AutoV2PlanSummary(
             run_id=self.run_id,
             plan_sha256=self._plan_sha256(),
@@ -1478,10 +1826,10 @@ class AutoV2ManifestLog(object):
                 self.state.raw_bytes
             ).hexdigest(),
             image_count=marker["image_count"],
-            md5_legacy=marker["md5_legacy"],
-            fixed_slot=marker["fixed_slot"],
-            named_canonical=marker["named_canonical"],
-            copy_required_bytes=marker["copy_required_bytes"],
+            md5_legacy=counts["md5_legacy"],
+            fixed_slot=counts["fixed_slot"],
+            named_canonical=counts["named_canonical"],
+            copy_required_bytes=copy_required_bytes,
         )
 
     def _plan_sha256(self):
@@ -1504,26 +1852,49 @@ class AutoV2ManifestLog(object):
 def _validate_manifest_event(event, run_id):
     if not isinstance(event, dict):
         raise _command_error("invalid_auto_v2_manifest")
+    format_version = event.get("format_version")
     if (
-        event.get("format_version") != 2
+        format_version not in (2, 3)
         or event.get("target_signature") != AUTO_V2_TARGET_SIGNATURE
     ):
         raise _command_error("manifest_plan_mismatch")
     if event.get("run_id") != run_id:
         raise _command_error("manifest_run_id_mismatch")
-    if event.get("event") not in (
-        "planned",
-        "plan_complete",
-        "publish_intent",
-        "published",
-        "committed",
-        "recovered_commit",
-        "already_current",
-    ):
+    allowed = (
+        (
+            "planned",
+            "plan_complete",
+            "publish_intent",
+            "published",
+            "committed",
+            "recovered_commit",
+            "already_current",
+        )
+        if format_version == 2
+        else ("planned_skeleton", "plan_complete")
+    )
+    if event.get("event") not in allowed:
         raise _command_error("invalid_auto_v2_manifest")
 
 
 def _validate_plan_marker(event, plans):
+    if event.get("format_version") == 3:
+        if (
+            set(event)
+            != {
+                "event",
+                "format_version",
+                "target_signature",
+                "run_id",
+                "image_count",
+                "files_total",
+            }
+            or event.get("image_count") != len(plans)
+            or event.get("files_total")
+            != sum(len(plan.files) for plan in plans)
+        ):
+            raise _command_error("manifest_plan_mismatch")
+        return
     counts = _plan_counts(plans)
     if (
         event.get("image_count") != len(plans)
@@ -1569,9 +1940,21 @@ def load_auto_v2_plan(
 
 
 def load_completed_auto_v2_summary(
-    run_directory, filename, run_id, service_uid, service_gid
+    run_directory,
+    filename,
+    run_id,
+    service_uid,
+    service_gid,
+    batch_journal=None,
+    completion_authority=None,
 ):
     """execute terminal이 전체 완결된 auto-v2 typed 요약만 읽는다."""
+    if completion_authority is not None:
+        if not isinstance(
+            completion_authority, AutoV2CompletionAuthority
+        ):
+            raise _command_error("invalid_auto_v2_manifest")
+        return completion_authority.summary
     with AutoV2ManifestLog.open(
         run_directory,
         filename,
@@ -1580,10 +1963,16 @@ def load_completed_auto_v2_summary(
         service_gid,
         create=False,
     ) as manifest:
+        if batch_journal is not None:
+            return AutoV2CompletionAuthority.load(
+                manifest, batch_journal
+            ).summary
         return _completed_auto_v2_summary(manifest)
 
 
 def _completed_auto_v2_summary(manifest):
+    if manifest.state.format_version != 2:
+        raise _command_error("auto_v2_plan_incomplete")
     summary = manifest.summary()
     expected_terminal = {
         "md5_legacy": frozenset(("committed", "recovered_commit")),
@@ -1615,18 +2004,42 @@ def recover_incomplete_auto_v2_plan(
 
 
 def load_auto_v2_archive_sources(
-    run_directory, filename, run_id, service_uid, service_gid
+    run_directory,
+    filename,
+    run_id,
+    service_uid,
+    service_gid,
+    batch_journal=None,
+    completion_authority=None,
 ):
     """완료된 auto-v2 계획에서 fixed-slot 구 원본만 반환한다."""
     return load_auto_v2_archive_authority(
-        run_directory, filename, run_id, service_uid, service_gid
+        run_directory,
+        filename,
+        run_id,
+        service_uid,
+        service_gid,
+        batch_journal=batch_journal,
+        completion_authority=completion_authority,
     ).fixed_slot_sources
 
 
 def load_auto_v2_archive_authority(
-    run_directory, filename, run_id, service_uid, service_gid
+    run_directory,
+    filename,
+    run_id,
+    service_uid,
+    service_gid,
+    batch_journal=None,
+    completion_authority=None,
 ):
     """단일 manifest snapshot에서 archive 권위 전체를 반환한다."""
+    if completion_authority is not None:
+        if not isinstance(
+            completion_authority, AutoV2CompletionAuthority
+        ):
+            raise _command_error("invalid_auto_v2_manifest")
+        return completion_authority.archive_authority
     with AutoV2ManifestLog.open(
         run_directory,
         filename,
@@ -1635,6 +2048,10 @@ def load_auto_v2_archive_authority(
         service_gid,
         create=False,
     ) as manifest:
+        if batch_journal is not None:
+            return AutoV2CompletionAuthority.load(
+                manifest, batch_journal
+            ).archive_authority
         summary = _completed_auto_v2_summary(manifest)
         plans = tuple(manifest.state.plans)
         canonical_originals = frozenset(
@@ -1758,14 +2175,133 @@ def load_auto_v2_archive_authority(
 
 
 def load_auto_v2_archive_direct_roots(
-    run_directory, filename, run_id, service_uid, service_gid
+    run_directory,
+    filename,
+    run_id,
+    service_uid,
+    service_gid,
+    batch_journal=None,
+    completion_authority=None,
 ):
     """완료된 계획이 참조하는 실제 Pinry MD5 최상위 root를 반환한다."""
     authority = load_auto_v2_archive_authority(
-        run_directory, filename, run_id, service_uid, service_gid
+        run_directory,
+        filename,
+        run_id,
+        service_uid,
+        service_gid,
+        batch_journal=batch_journal,
+        completion_authority=completion_authority,
     )
     return tuple(
         item[0] for item in authority.direct_root_identities
+    )
+
+
+def _archive_authority_from_plans(summary, plans):
+    canonical_originals = frozenset(plan.new_original for plan in plans)
+    sources = []
+    fixed_slot_files = []
+    prefixed_files = []
+    prefixed_root_identity = None
+    prefixed_root_identity_missing = False
+    direct_files = []
+    direct_root_identities = {}
+    for plan in plans:
+        if plan.generation == "fixed_slot":
+            original = plan.files[0]
+            if (
+                original.kind != "original"
+                or original.thumbnail_id is not None
+                or original.operation != "copy"
+                or original.old_path == original.new_path
+                or original.old_path in canonical_originals
+                or original.old_path in sources
+            ):
+                raise _command_error("manifest_plan_mismatch")
+            sources.append(original.old_path)
+            fixed_slot_files.append(original)
+        if plan.generation != "md5_legacy":
+            continue
+        roots = tuple(
+            pinry_direct_md5_root(file_plan.old_path)
+            for file_plan in plan.files
+        )
+        if plan.files and all(root is not None for root in roots):
+            for file_plan, root_name in zip(plan.files, roots):
+                identity = (
+                    file_plan.archive_root_device,
+                    file_plan.archive_root_inode,
+                )
+                if (
+                    type(identity[0]) is not int
+                    or identity[0] < 0
+                    or type(identity[1]) is not int
+                    or identity[1] <= 0
+                    or (
+                        root_name in direct_root_identities
+                        and direct_root_identities[root_name] != identity
+                    )
+                ):
+                    raise _command_error("manifest_plan_mismatch")
+                direct_root_identities[root_name] = identity
+                direct_files.append(file_plan)
+            continue
+        paths = tuple(file_plan.old_path for file_plan in plan.files)
+        if not (
+            paths
+            and paths[0].startswith("image/original/by-md5/")
+            and all(
+                path.startswith("image/thumbnail/by-md5/")
+                for path in paths[1:]
+            )
+        ):
+            raise _command_error("manifest_plan_mismatch")
+        for file_plan in plan.files:
+            identity = (
+                file_plan.archive_root_device,
+                file_plan.archive_root_inode,
+            )
+            if identity == (None, None):
+                if prefixed_root_identity is not None:
+                    raise _command_error("manifest_plan_mismatch")
+                prefixed_root_identity_missing = True
+                continue
+            if (
+                prefixed_root_identity_missing
+                or type(identity[0]) is not int
+                or identity[0] < 0
+                or type(identity[1]) is not int
+                or identity[1] <= 0
+                or (
+                    prefixed_root_identity is not None
+                    and prefixed_root_identity != identity
+                )
+            ):
+                raise _command_error("manifest_plan_mismatch")
+            prefixed_root_identity = identity
+        prefixed_files.extend(plan.files)
+    archive_files = fixed_slot_files + prefixed_files + direct_files
+    archive_paths = tuple(file_plan.old_path for file_plan in archive_files)
+    if len(archive_paths) != len(set(archive_paths)):
+        raise _command_error("manifest_plan_mismatch")
+    return AutoV2ArchiveAuthority(
+        summary=summary,
+        fixed_slot_sources=tuple(sources),
+        fixed_slot_files=tuple(sorted(
+            fixed_slot_files, key=lambda value: value.old_path
+        )),
+        prefixed_files=tuple(sorted(
+            prefixed_files, key=lambda value: value.old_path
+        )),
+        prefixed_root_identity=prefixed_root_identity,
+        direct_files=tuple(sorted(
+            direct_files, key=lambda value: value.old_path
+        )),
+        direct_root_identities=tuple(sorted(
+            (root_name, identity[0], identity[1])
+            for root_name, identity in direct_root_identities.items()
+        )),
     )
 
 
@@ -1777,14 +2313,24 @@ class AutoV2MediaMigrator(object):
         run_id,
         service_uid,
         service_gid,
-        batch_size=100,
+        batch_size=50,
         fault_injector=None,
         progress_reporter=None,
+        batch_limits=None,
+        batch_journal=None,
     ):
         if type(batch_size) is not int or batch_size <= 0:
             raise _command_error("batch_size_must_be_positive")
         if progress_reporter is not None and not callable(progress_reporter):
             raise _command_error("invalid_progress_reporter")
+        if batch_limits is not None and not isinstance(
+            batch_limits, BatchLimits
+        ):
+            raise _command_error("linear_journal_limits_invalid")
+        if batch_journal is not None and not isinstance(
+            batch_journal, MigrationBatchJournal
+        ):
+            raise _command_error("linear_journal_invalid")
         self.run_directory = run_directory
         self.filename = filename
         self.run_id = run_id
@@ -1793,7 +2339,11 @@ class AutoV2MediaMigrator(object):
         self.batch_size = batch_size
         self.fault_injector = fault_injector
         self.progress_reporter = progress_reporter
+        self.batch_journal = batch_journal
         self._planning_reported = False
+        self.batch_limits = batch_limits or BatchLimits(max_images=batch_size)
+        self._frozen_plans = None
+        self._resume_attempt = False
 
     def recover_execution_tail(self):
         """완료된 계획 뒤 torn execute event만 복구한다."""
@@ -1824,33 +2374,45 @@ class AutoV2MediaMigrator(object):
                         "media_manifest_torn_tail_requires_execute"
                     )
                 manifest.repair_torn_tail()
+            if manifest.state.format_version == 2:
+                try:
+                    completed_v2 = _completed_auto_v2_summary(manifest)
+                except CommandError as error:
+                    if str(error) != "auto_v2_plan_incomplete":
+                        raise
+                else:
+                    return completed_v2
             if not manifest.state.events:
-                plans = self._freeze_all_plans()
-                for plan in plans:
-                    manifest.record_plan(plan)
-                manifest.record_plan_complete(plans)
+                plans = (
+                    self._freeze_all_plans()
+                    if self._frozen_plans is None
+                    else self._frozen_plans
+                )
+                self._frozen_plans = tuple(plans)
+                manifest.write_frozen_plan(plans)
                 self._inject_fault("after_plan_complete")
             elif not manifest.state.plan_complete:
                 raise _command_error("auto_v2_plan_incomplete")
             plans = list(manifest.state.plans)
-            self._report_planning(plans)
             summary = manifest.summary()
             if not execute:
                 return summary
-            self._execute(manifest, plans, summary.plan_sha256)
-            return manifest.summary()
+            return self._execute_linear(manifest, plans, summary)
 
     def _freeze_all_plans(self):
         root_directory = None
         try:
             root_directory = open_verified_media_root(settings.MEDIA_ROOT)
             plans = []
-            for image in Image.objects.order_by("pk"):
-                plans.append(
-                    AutoV2MigrationPlan.for_image(image, root_directory)
-                )
-                self._inject_fault("after_plan_image")
-                root_directory.verify_current()
+            for images, by_image in self._iter_image_batches():
+                for image in images:
+                    plans.append(AutoV2MigrationPlan.for_image(
+                        image,
+                        root_directory,
+                        derivative_records=by_image[image.pk],
+                    ))
+                    self._inject_fault("after_plan_image")
+                    root_directory.verify_current()
             root_directory.verify_current()
             return plans
         except CommandError:
@@ -1860,6 +2422,1170 @@ class AutoV2MediaMigrator(object):
         finally:
             if root_directory is not None:
                 root_directory.close()
+
+    def _iter_image_batches(self):
+        last_pk = 0
+        initial_max_pk = Image.objects.order_by("-pk").values_list(
+            "pk", flat=True
+        ).first() or 0
+        while last_pk < initial_max_pk:
+            images = list(
+                Image.objects.filter(
+                    pk__gt=last_pk,
+                    pk__lte=initial_max_pk,
+                ).order_by("pk")[:self.batch_limits.max_images]
+            )
+            if not images:
+                return
+            image_ids = [image.pk for image in images]
+            derivatives = Thumbnail.objects.filter(
+                original_id__in=image_ids
+            ).order_by("original_id", "size", "pk")
+            by_image = collections.defaultdict(list)
+            for derivative in derivatives:
+                by_image[derivative.original_id].append(derivative)
+            yield images, by_image
+            last_pk = images[-1].pk
+
+    def _execute_linear(self, manifest, plans, summary):  # noqa: C901
+        owned_journal = self.batch_journal is None
+        journal = self.batch_journal
+        try:
+            if journal is None:
+                journal = MigrationBatchJournal.open(
+                    manifest.run_directory,
+                    JOURNAL_FILENAME,
+                    self.run_id,
+                    self.service_uid,
+                    self.service_gid,
+                    summary.plan_sha256,
+                    summary.manifest_sha256,
+                )
+            journal.freeze_work_totals(
+                len(plans),
+                sum(len(plan.files) for plan in plans),
+                0,
+            )
+            if (
+                manifest.state.format_version == 2
+                and not journal.state.intents
+            ):
+                self._upgrade_v2_terminal_prefix(
+                    manifest, journal, plans
+                )
+            journal.record_attempt(
+                datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+            self._resume_attempt = len(journal.state.attempts) > 1
+            self._validate_image_plan_closure(plans)
+            if journal.is_phase_complete("paths"):
+                repaired = self._verify_committed_destinations(
+                    journal, plans
+                )
+                if repaired:
+                    journal.write_checkpoint()
+                self._validate_image_plan_closure(plans)
+                return self._summary_from_journal(summary, journal)
+
+            committed = journal.committed_ids("paths")
+            self._verify_committed_destinations(journal, plans)
+            root = open_verified_media_root(settings.MEDIA_ROOT)
+            try:
+                completed_images = set(
+                    journal.receipts_by_image("paths")
+                )
+                pending_plans = [
+                    plan
+                    for plan in plans
+                    if plan.image_id not in completed_images
+                ]
+                first_batch_number = (
+                    journal.last_committed_batch_for_phase("paths") + 1
+                )
+                for batch_number, batch in enumerate(
+                    self._build_batches(pending_plans),
+                    first_batch_number,
+                ):
+                    batch_id = self._batch_id(batch)
+                    if batch_id in committed:
+                        continue
+                    existing = journal.intent_for(batch_id)
+                    if existing is not None:
+                        self._resume_intent_batch(
+                            root, journal, existing, batch
+                        )
+                        continue
+                    prepared = self._prepare_path_files(root, batch)
+                    self._sync_staging_devices(prepared)
+                    self._publish_batch_and_sync_directories(prepared)
+                    self._report_linear_copy_progress(
+                        journal, batch, prepared
+                    )
+                    self._verify_published_identities(root, prepared)
+                    pre_signature = self._expected_batch_signature(
+                        batch, prepared, use_new=False
+                    )
+                    post_signature = self._expected_batch_signature(
+                        batch, prepared, use_new=True
+                    )
+                    current = self._current_batch_signature(batch)
+                    if current != pre_signature:
+                        raise _command_error(
+                            "media_migration_database_changed"
+                        )
+                    receipts = tuple(
+                        self._receipt_for_published(
+                            item, post_signature
+                        )
+                        for item in prepared
+                    )
+                    intent = BatchIntent.for_values(
+                        batch_id=batch_id,
+                        batch_number=batch_number,
+                        phase="paths",
+                        first_pk=batch[0].image_id,
+                        last_pk=batch[-1].image_id,
+                        receipts=receipts,
+                        pre_signature=pre_signature,
+                        post_signature=post_signature,
+                        images=len(batch),
+                        files=len(receipts),
+                        total_bytes=sum(item.size for item in prepared),
+                        total_pixels=sum(
+                            item.width * item.height for item in prepared
+                        ),
+                    )
+                    journal.append_intent(intent)
+                    self._inject_fault("after_batch_intent")
+                    self._inject_fault("after_publish_intent")
+                    self._apply_database_batch(
+                        batch, prepared, post_signature
+                    )
+                    self._inject_fault("after_database_commit")
+                    journal.append_commit(batch_id, post_signature)
+                    self._inject_fault("after_batch_commit")
+                    self._report_linear_batch_progress(journal)
+            finally:
+                root.close()
+            self._validate_image_plan_closure(plans)
+            phase_summary = self._paths_phase_summary(journal, plans)
+            journal.append_phase_complete("paths", phase_summary)
+            journal.write_checkpoint()
+            self._report_progress({"phase": "finalizing"})
+            return self._summary_from_journal(summary, journal)
+        except MigrationBatchLogError as error:
+            raise _command_error(error.code, error)
+        finally:
+            if owned_journal and journal is not None:
+                journal.close()
+
+    def _upgrade_v2_terminal_prefix(self, manifest, journal, plans):
+        terminal = frozenset((
+            "committed",
+            "recovered_commit",
+            "already_current",
+        ))
+        completed = []
+        seen_pending = False
+        for plan in plans:
+            is_complete = (
+                manifest.state.latest_by_image.get(plan.image_id) in terminal
+            )
+            if is_complete and seen_pending:
+                raise _command_error("manifest_plan_mismatch")
+            if is_complete:
+                completed.append(plan)
+            else:
+                seen_pending = True
+        if not completed:
+            return
+        self._report_progress({
+            "phase": "upgrade_v2",
+            "images_done": 0,
+            "images_total": len(completed),
+        })
+        for batch_number, batch in enumerate(
+            self._build_batches(completed), 1
+        ):
+            prepared = []
+            for plan in batch:
+                for file_plan in plan.files:
+                    file_key = self._file_key(plan, file_plan)
+                    candidate = self._rehash_resume_candidate(
+                        file_plan.new_path, file_key
+                    )
+                    if (
+                        candidate is None
+                        or candidate[0] != file_plan.sha256
+                        or candidate[1] != file_plan.size
+                    ):
+                        raise _command_error(
+                            "media_verification_failed"
+                        )
+                    prepared.append(_PreparedFile(
+                        plan=plan,
+                        file_plan=file_plan,
+                        file_key=file_key,
+                        staging=None,
+                        destination=file_plan.new_path,
+                        operation=file_plan.operation,
+                        size=file_plan.size,
+                        sha256=file_plan.sha256,
+                        image_format=file_plan.image_format,
+                        width=file_plan.width,
+                        height=file_plan.height,
+                        source_device=file_plan.source_device,
+                        source_inode=file_plan.source_inode,
+                        destination_device=candidate[2],
+                        destination_inode=candidate[3],
+                    ))
+            pre_signature = self._expected_batch_signature(
+                batch, prepared, use_new=False
+            )
+            post_signature = self._expected_batch_signature(
+                batch, prepared, use_new=True
+            )
+            if self._current_batch_signature(batch) != post_signature:
+                raise _command_error("media_migration_database_changed")
+            receipts = tuple(
+                self._receipt_for_published(item, post_signature)
+                for item in prepared
+            )
+            intent = BatchIntent.for_values(
+                batch_id="upgrade-paths:{}-{}".format(
+                    batch[0].image_id, batch[-1].image_id
+                ),
+                batch_number=batch_number,
+                phase="paths",
+                first_pk=batch[0].image_id,
+                last_pk=batch[-1].image_id,
+                receipts=receipts,
+                pre_signature=pre_signature,
+                post_signature=post_signature,
+                images=len(batch),
+                files=len(receipts),
+                total_bytes=sum(item.size for item in prepared),
+                total_pixels=sum(
+                    item.width * item.height for item in prepared
+                ),
+            )
+            journal.import_v2_batch(intent, committed=True)
+        self._report_progress({
+            "phase": "upgrade_v2",
+            "images_done": len(completed),
+            "images_total": len(completed),
+        })
+
+    def _build_batches(self, plans):
+        batch = []
+        total_bytes = 0
+        total_pixels = 0
+        for plan in plans:
+            plan_bytes = sum(file_plan.size for file_plan in plan.files)
+            plan_pixels = sum(
+                file_plan.width * file_plan.height
+                for file_plan in plan.files
+            )
+            exceeds = batch and (
+                len(batch) + 1 > self.batch_limits.max_images
+                or total_bytes + plan_bytes > self.batch_limits.max_bytes
+                or total_pixels + plan_pixels > self.batch_limits.max_pixels
+            )
+            if exceeds:
+                yield tuple(batch)
+                batch = []
+                total_bytes = 0
+                total_pixels = 0
+            batch.append(plan)
+            total_bytes += plan_bytes
+            total_pixels += plan_pixels
+        if batch:
+            yield tuple(batch)
+
+    def _batch_id(self, batch):
+        return "paths:{}-{}".format(
+            batch[0].image_id, batch[-1].image_id
+        )
+
+    def _file_key(self, plan, file_plan):
+        if file_plan.thumbnail_id is None:
+            return "original:{}".format(plan.image_id)
+        return "thumbnail:{}:{}".format(
+            plan.image_id, file_plan.thumbnail_id
+        )
+
+    def _staging_name(self, file_key):
+        value = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            "{}:{}".format(self.run_id, file_key),
+        )
+        return "auto-v2-{}.part".format(value)
+
+    def _prepare_path_files(self, root, batch):
+        prepared = []
+        try:
+            for plan in batch:
+                for file_plan in plan.files:
+                    file_key = self._file_key(plan, file_plan)
+                    prepared.append(self._prepare_linear_file(
+                        root, plan, file_plan, file_key
+                    ))
+            return prepared
+        except BaseException:
+            for item in prepared:
+                self._discard_prepared(item)
+            raise
+
+    def _prepare_linear_file(self, root, plan, file_plan, file_key):
+        source = None
+        staging_directory = None
+        staging = None
+        try:
+            source = open_verified_media_file(root, file_plan.old_path)
+            source_stat = source.file_stat
+            expected_identity = (
+                file_plan.source_device,
+                file_plan.source_inode,
+            )
+            if (
+                (source_stat.st_dev, source_stat.st_ino)
+                != expected_identity
+                or source_stat.st_size != file_plan.size
+            ):
+                raise _command_error("media_verification_failed")
+            staging_directory = open_or_create_media_directory_from(
+                root, ".staging"
+            )
+            staging = create_owned_staging_file(
+                staging_directory, self._staging_name(file_key)
+            )
+            prepared = self._stream_source_to_staging_and_inspect(
+                source, staging, file_key
+            )
+            if (
+                prepared[1] != file_plan.size
+                or prepared[3] != file_plan.width
+                or prepared[4] != file_plan.height
+            ):
+                raise _command_error("invalid_legacy_media")
+            extension = FORMAT_EXTENSIONS.get(prepared[2])
+            if extension is None:
+                raise _command_error("invalid_legacy_media")
+            destination = (
+                canonical_original_path(
+                    plan.asset_uuid,
+                    plan.original_filename,
+                    extension,
+                )
+                if file_plan.thumbnail_id is None
+                else canonical_derivative_path(
+                    plan.asset_uuid,
+                    file_plan.derivative_size,
+                    extension,
+                )
+            )
+            source.verify_current()
+            self._inject_fault("after_source_revalidation")
+            root.verify_current()
+            current_source = os.fstat(source.descriptor)
+            if (
+                current_source.st_dev,
+                current_source.st_ino,
+                current_source.st_size,
+            ) != (
+                source_stat.st_dev,
+                source_stat.st_ino,
+                source_stat.st_size,
+            ):
+                raise _command_error("media_verification_failed")
+            item = _PreparedFile(
+                plan=plan,
+                file_plan=file_plan,
+                file_key=file_key,
+                staging=staging,
+                destination=destination,
+                operation=(
+                    "verify"
+                    if file_plan.old_path == destination
+                    else "copy"
+                ),
+                size=prepared[1],
+                sha256=prepared[0],
+                image_format=prepared[2],
+                width=prepared[3],
+                height=prepared[4],
+                source_device=source_stat.st_dev,
+                source_inode=source_stat.st_ino,
+            )
+            staging = None
+            staging_directory = None
+            return item
+        except (MediaPathError, OSError) as error:
+            raise _command_error("media_verification_failed", error)
+        finally:
+            if source is not None:
+                source.close()
+            if staging is not None:
+                try:
+                    staging.cleanup()
+                finally:
+                    staging.close()
+            if staging_directory is not None:
+                staging_directory.close()
+
+    def _open_source_descriptor(self, source, file_key):
+        del file_key
+        source.verify_current()
+        return os.dup(source.descriptor)
+
+    def _iter_source_chunks(self, source_fd, file_key):
+        del file_key
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(source_fd, 64 * 1024)
+            if not chunk:
+                return
+            yield chunk
+
+    def _stream_source_to_staging_and_inspect(
+        self, source, staging, file_key
+    ):
+        source_fd = self._open_source_descriptor(source, file_key)
+        parser = ImageFile.Parser()
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            os.ftruncate(staging.descriptor, 0)
+            os.lseek(staging.descriptor, 0, os.SEEK_SET)
+            for chunk in self._iter_source_chunks(source_fd, file_key):
+                digest.update(chunk)
+                parser.feed(chunk)
+                size += len(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(staging.descriptor, view)
+                    if written <= 0:
+                        raise OSError("short staging write")
+                    view = view[written:]
+            with warnings.catch_warnings():
+                warnings.simplefilter(
+                    "ignore", PILImage.DecompressionBombWarning
+                )
+                image = parser.close()
+            try:
+                image_format = image.format
+                width, height = image.size
+            finally:
+                image.close()
+            try:
+                os.fchmod(staging.descriptor, 0o600)
+                os.fchown(
+                    staging.descriptor,
+                    self.service_uid,
+                    self.service_gid,
+                )
+            except PermissionError:
+                if (
+                    os.geteuid() != self.service_uid
+                    or os.getegid() != self.service_gid
+                ):
+                    raise
+            staging.file_stat = os.fstat(staging.descriptor)
+            return digest.hexdigest(), size, image_format, width, height
+        except (
+            PILImage.DecompressionBombError,
+            PILImage.UnidentifiedImageError,
+            OSError,
+            Warning,
+        ) as error:
+            raise _command_error("invalid_legacy_media", error)
+        finally:
+            os.close(source_fd)
+
+    def _sync_staging_devices(self, prepared):
+        by_device = {}
+        for item in prepared:
+            current = os.fstat(item.staging.descriptor)
+            by_device.setdefault(current.st_dev, item.staging.descriptor)
+        for device in sorted(by_device):
+            _durable_syncfs(by_device[device], "batch_file_data")
+
+    def _publish_batch_and_sync_directories(self, prepared):
+        mutated = {}
+        opened_destinations = []
+        try:
+            for item in prepared:
+                staging_stat = os.fstat(item.staging.descriptor)
+                expected = (
+                    staging_stat.st_dev,
+                    staging_stat.st_ino,
+                    staging_stat.st_size,
+                )
+                if item.operation == "verify":
+                    current = os.stat(
+                        item.staging.name,
+                        dir_fd=item.staging.directory.descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        current.st_dev,
+                        current.st_ino,
+                        current.st_size,
+                    ) != expected:
+                        raise _command_error("media_verification_failed")
+                    os.unlink(
+                        item.staging.name,
+                        dir_fd=item.staging.directory.descriptor,
+                    )
+                    item.destination_device = item.source_device
+                    item.destination_inode = item.source_inode
+                    directory_stat = os.fstat(
+                        item.staging.directory.descriptor
+                    )
+                    mutated[
+                        (directory_stat.st_dev, directory_stat.st_ino)
+                    ] = item.staging.directory
+                else:
+                    relative_directory, destination_name = (
+                        item.destination.rsplit("/", 1)
+                    )
+                    destination_directory = (
+                        open_or_create_media_directory_from(
+                            item.staging.directory.anchor_directory,
+                            relative_directory,
+                        )
+                    )
+                    opened_destinations.append(destination_directory)
+                    try:
+                        self._inject_fault("before_atomic_publish")
+                        result = publish_preverified_noreplace(
+                            item.staging,
+                            destination_directory,
+                            destination_name,
+                            expected,
+                        )
+                    except FileExistsError as error:
+                        if not self._resume_attempt:
+                            raise _command_error(
+                                "media_path_conflict", error
+                            )
+                        candidate = self._rehash_resume_candidate(
+                            item.destination, item.file_key
+                        )
+                        if (
+                            candidate is None
+                            or candidate[0] != item.sha256
+                            or candidate[1] != item.size
+                        ):
+                            raise _command_error(
+                                "media_path_conflict", error
+                            )
+                        current = os.stat(
+                            item.staging.name,
+                            dir_fd=item.staging.directory.descriptor,
+                            follow_symlinks=False,
+                        )
+                        if (
+                            current.st_dev,
+                            current.st_ino,
+                            current.st_size,
+                        ) != expected:
+                            raise _command_error(
+                                "media_verification_failed"
+                            )
+                        os.unlink(
+                            item.staging.name,
+                            dir_fd=item.staging.directory.descriptor,
+                        )
+                        item.destination_device = candidate[2]
+                        item.destination_inode = candidate[3]
+                        directory_stat = os.fstat(
+                            item.staging.directory.descriptor
+                        )
+                        mutated[
+                            (
+                                directory_stat.st_dev,
+                                directory_stat.st_ino,
+                            )
+                        ] = item.staging.directory
+                        continue
+                    except (MediaPathError, OSError) as error:
+                        raise _command_error(
+                            "media_verification_failed", error
+                        )
+                    item.destination_device = (
+                        result.destination_stat.st_dev
+                    )
+                    item.destination_inode = (
+                        result.destination_stat.st_ino
+                    )
+                    for directory in result.mutated_directories:
+                        directory_stat = os.fstat(directory.descriptor)
+                        mutated[
+                            (directory_stat.st_dev, directory_stat.st_ino)
+                        ] = directory
+            for identity in sorted(mutated):
+                _durable_fsync(
+                    mutated[identity].descriptor,
+                    "publication_directory",
+                )
+            self._inject_fault("after_destination_rename")
+            self._inject_fault("after_publish")
+            self._inject_fault("after_publish_before_event")
+            return prepared
+        finally:
+            for item in prepared:
+                item.staging.close()
+            for directory in opened_destinations:
+                directory.close()
+            closed = set()
+            for item in prepared:
+                directory = item.staging.directory
+                if id(directory) not in closed:
+                    closed.add(id(directory))
+                    directory.close()
+
+    def _discard_prepared(self, item):
+        staging = item.staging
+        try:
+            if not staging._closed:
+                staging.cleanup()
+                staging.close()
+        except BaseException:
+            pass
+        try:
+            staging.directory.close()
+        except BaseException:
+            pass
+
+    def _receipt_for_published(self, prepared, database_signature):
+        return FileReceipt.for_values(
+            prepared.file_key,
+            prepared.destination,
+            prepared.operation,
+            prepared.size,
+            prepared.image_format,
+            prepared.width,
+            prepared.height,
+            prepared.source_device,
+            prepared.source_inode,
+            prepared.destination_device,
+            prepared.destination_inode,
+            prepared.sha256,
+            database_signature,
+        )
+
+    def _signature_rows(self, batch, path_by_key):
+        rows = []
+        for plan in batch:
+            rows.append((
+                "image",
+                plan.image_id,
+                plan.asset_uuid,
+                plan.original_filename,
+                plan.image_width,
+                plan.image_height,
+                path_by_key["original:{}".format(plan.image_id)],
+            ))
+            for file_plan in plan.files[1:]:
+                rows.append((
+                    "thumbnail",
+                    file_plan.thumbnail_id,
+                    plan.image_id,
+                    file_plan.derivative_size,
+                    file_plan.width,
+                    file_plan.height,
+                    path_by_key[self._file_key(plan, file_plan)],
+                ))
+        return rows
+
+    def _hash_signature_rows(self, rows):
+        return hashlib.sha256(json.dumps(
+            rows,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    def _expected_batch_signature(self, batch, prepared, use_new):
+        by_key = {
+            item.file_key: (
+                item.destination if use_new else item.file_plan.old_path
+            )
+            for item in prepared
+        }
+        return self._hash_signature_rows(
+            self._signature_rows(batch, by_key)
+        )
+
+    def _current_batch_signature(self, batch, lock=False):
+        image_ids = [plan.image_id for plan in batch]
+        images = Image.objects.filter(pk__in=image_ids).order_by("pk")
+        thumbnails = Thumbnail.objects.filter(
+            original_id__in=image_ids
+        ).order_by("original_id", "size", "pk")
+        if lock:
+            images = images.select_for_update()
+            thumbnails = thumbnails.select_for_update()
+        path_by_key = {}
+        current_images = list(images)
+        current_thumbnails = list(thumbnails)
+        if [image.pk for image in current_images] != image_ids:
+            return "changed"
+        for image in current_images:
+            path_by_key["original:{}".format(image.pk)] = image.image.name
+        for record in current_thumbnails:
+            path_by_key["thumbnail:{}:{}".format(
+                record.original_id, record.pk
+            )] = record.image.name
+        try:
+            rows = self._signature_rows(batch, path_by_key)
+        except KeyError:
+            return "changed"
+        metadata_rows = []
+        by_image = {image.pk: image for image in current_images}
+        by_thumbnail = {
+            thumbnail.pk: thumbnail for thumbnail in current_thumbnails
+        }
+        for row in rows:
+            if row[0] == "image":
+                image = by_image[row[1]]
+                metadata_rows.append((
+                    "image", image.pk, str(image.asset_uuid),
+                    image.original_filename, image.width, image.height,
+                    image.image.name,
+                ))
+            else:
+                thumbnail = by_thumbnail[row[1]]
+                metadata_rows.append((
+                    "thumbnail", thumbnail.pk, thumbnail.original_id,
+                    thumbnail.size, thumbnail.width, thumbnail.height,
+                    thumbnail.image.name,
+                ))
+        return self._hash_signature_rows(metadata_rows)
+
+    def _apply_database_batch(self, batch, prepared, post_signature):
+        destinations = {
+            item.file_key: item.destination for item in prepared
+        }
+        with transaction.atomic():
+            if self._current_batch_signature(batch, lock=True) != (
+                self._expected_batch_signature(
+                    batch, prepared, use_new=False
+                )
+            ):
+                raise _command_error("media_migration_database_changed")
+            self._inject_fault("before_database_update")
+            root = None
+            try:
+                root = open_verified_media_root(settings.MEDIA_ROOT)
+                self._verify_published_identities(root, prepared)
+            finally:
+                if root is not None:
+                    root.close()
+            for plan in batch:
+                Image.objects.filter(pk=plan.image_id).update(
+                    image=destinations[
+                        "original:{}".format(plan.image_id)
+                    ]
+                )
+                for file_plan in plan.files[1:]:
+                    Thumbnail.objects.filter(
+                        pk=file_plan.thumbnail_id,
+                        original_id=plan.image_id,
+                    ).update(
+                        image=destinations[
+                            self._file_key(plan, file_plan)
+                        ]
+                    )
+            if self._current_batch_signature(batch, lock=True) != (
+                post_signature
+            ):
+                raise _command_error("media_migration_database_changed")
+
+    def _verify_published_identities(self, root, prepared):
+        for item in prepared:
+            destination = None
+            try:
+                destination = open_verified_media_file(
+                    root, item.destination
+                )
+                current = destination.file_stat
+                if (
+                    current.st_dev != item.destination_device
+                    or current.st_ino != item.destination_inode
+                    or current.st_size != item.size
+                ):
+                    raise _command_error("media_verification_failed")
+                destination.verify_current()
+            except CommandError:
+                raise
+            except (MediaPathError, OSError) as error:
+                raise _command_error("media_verification_failed", error)
+            finally:
+                if destination is not None:
+                    destination.close()
+
+    def _resume_intent_batch(self, root, journal, intent, batch):
+        self._verify_and_repair_batch(
+            root, journal, intent.batch_id, batch
+        )
+        receipts = journal.effective_receipts(intent.batch_id)
+        recovery = journal.recover_batch(
+            intent.batch_id, self._current_batch_signature(batch)
+        )
+        if recovery == "append_commit":
+            journal.append_commit(intent.batch_id, intent.post_signature)
+            return
+        if recovery == "committed":
+            return
+        prepared = [
+            self._prepared_from_receipt(batch, receipt)
+            for receipt in receipts
+        ]
+        self._apply_database_batch(batch, prepared, intent.post_signature)
+        self._inject_fault("after_database_commit")
+        journal.append_commit(intent.batch_id, intent.post_signature)
+
+    def _prepared_from_receipt(self, batch, receipt):
+        by_key = {
+            self._file_key(plan, file_plan): (plan, file_plan)
+            for plan in batch
+            for file_plan in plan.files
+        }
+        try:
+            plan, file_plan = by_key[receipt.file_key]
+        except KeyError:
+            raise _command_error("linear_journal_batch_conflict")
+        return _PreparedFile(
+            plan=plan,
+            file_plan=file_plan,
+            file_key=receipt.file_key,
+            staging=None,
+            destination=receipt.relative_path,
+            operation=receipt.operation,
+            size=receipt.size,
+            sha256=receipt.sha256,
+            image_format=receipt.image_format,
+            width=receipt.width,
+            height=receipt.height,
+            source_device=receipt.source_device,
+            source_inode=receipt.source_inode,
+            destination_device=receipt.destination_device,
+            destination_inode=receipt.destination_inode,
+        )
+
+    def _verify_committed_destinations(self, journal, plans):
+        by_id = {plan.image_id: plan for plan in plans}
+        repaired = False
+        root = None
+        try:
+            if journal.committed_ids("paths"):
+                root = open_verified_media_root(settings.MEDIA_ROOT)
+            for batch_id in journal.committed_ids("paths"):
+                intent = journal.intent_for(batch_id)
+                batch = tuple(
+                    by_id[image_id]
+                    for image_id in range(
+                        intent.first_pk, intent.last_pk + 1
+                    )
+                    if image_id in by_id
+                )
+                repaired = self._verify_and_repair_batch(
+                    root, journal, batch_id, batch
+                ) or repaired
+            return repaired
+        finally:
+            if root is not None:
+                root.close()
+
+    def _verify_and_repair_batch(self, root, journal, batch_id, batch):
+        receipts = journal.effective_receipts(batch_id)
+        by_key = {
+            self._file_key(plan, file_plan): (plan, file_plan)
+            for plan in batch
+            for file_plan in plan.files
+        }
+        repaired = []
+        changed = False
+        for receipt in receipts:
+            planned = by_key.get(receipt.file_key)
+            if planned is None:
+                raise _command_error("linear_journal_batch_conflict")
+            candidate = self._rehash_resume_candidate(
+                receipt.relative_path, receipt.file_key
+            )
+            if (
+                candidate is not None
+                and candidate[0] == receipt.sha256
+                and candidate[1] == receipt.size
+            ):
+                if candidate[2:] == (
+                    receipt.destination_device,
+                    receipt.destination_inode,
+                ):
+                    repaired.append(receipt)
+                    continue
+                self._require_unchanged_source(
+                    root, planned[1], receipt
+                )
+                repaired.append(self._receipt_with_destination_identity(
+                    receipt, candidate[2], candidate[3]
+                ))
+                changed = True
+                continue
+            repaired.append(self._repair_destination_from_source(
+                root, planned[0], planned[1], receipt
+            ))
+            changed = True
+        if changed:
+            try:
+                journal.append_repair(batch_id, tuple(repaired))
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    raise
+                raise _command_error(
+                    "linear_committed_repair_failed", error
+                )
+        return changed
+
+    def _require_unchanged_source(self, root, file_plan, receipt):
+        source = None
+        try:
+            source = open_verified_media_file(root, file_plan.old_path)
+            current = source.file_stat
+            if (
+                current.st_dev != receipt.source_device
+                or current.st_ino != receipt.source_inode
+                or current.st_size != receipt.size
+            ):
+                raise _command_error("linear_committed_source_changed")
+            source.verify_current()
+        except CommandError:
+            raise
+        except (MediaPathError, OSError) as error:
+            raise _command_error("linear_committed_source_changed", error)
+        finally:
+            if source is not None:
+                source.close()
+
+    def _repair_destination_from_source(
+        self, root, plan, file_plan, receipt
+    ):
+        prepared = None
+        destination_directory = None
+        try:
+            self._require_unchanged_source(root, file_plan, receipt)
+            prepared = self._prepare_linear_file(
+                root, plan, file_plan, receipt.file_key
+            )
+            if (
+                prepared.destination != receipt.relative_path
+                or prepared.operation != receipt.operation
+                or prepared.size != receipt.size
+                or prepared.sha256 != receipt.sha256
+                or prepared.image_format != receipt.image_format
+                or prepared.width != receipt.width
+                or prepared.height != receipt.height
+            ):
+                raise _command_error("linear_committed_source_changed")
+            self._sync_staging_devices((prepared,))
+            relative_directory, destination_name = (
+                receipt.relative_path.rsplit("/", 1)
+            )
+            destination_directory = open_or_create_media_directory_from(
+                root, relative_directory
+            )
+            staging_stat = os.fstat(prepared.staging.descriptor)
+            result = replace_preverified_destination(
+                prepared.staging,
+                destination_directory,
+                destination_name,
+                (
+                    staging_stat.st_dev,
+                    staging_stat.st_ino,
+                    staging_stat.st_size,
+                ),
+            )
+            directories = {
+                identity: directory
+                for identity, directory in zip(
+                    result.mutated_directory_identities,
+                    result.mutated_directories,
+                )
+            }
+            for identity in sorted(directories):
+                _durable_fsync(
+                    directories[identity].descriptor,
+                    "publication_directory",
+                )
+            self._inject_fault("after_repair_destination_fsync")
+            return self._receipt_with_destination_identity(
+                receipt,
+                result.destination_stat.st_dev,
+                result.destination_stat.st_ino,
+            )
+        except CommandError:
+            raise
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                raise
+            raise _command_error("linear_committed_repair_failed", error)
+        finally:
+            if prepared is not None:
+                prepared.staging.close()
+                prepared.staging.directory.close()
+            if destination_directory is not None:
+                destination_directory.close()
+
+    def _receipt_with_destination_identity(
+        self, receipt, destination_device, destination_inode
+    ):
+        return FileReceipt.for_values(
+            receipt.file_key,
+            receipt.relative_path,
+            receipt.operation,
+            receipt.size,
+            receipt.image_format,
+            receipt.width,
+            receipt.height,
+            receipt.source_device,
+            receipt.source_inode,
+            destination_device,
+            destination_inode,
+            receipt.sha256,
+            receipt.database_signature,
+        )
+
+    def _rehash_resume_candidate(self, path, file_key):
+        root = open_verified_media_root(settings.MEDIA_ROOT)
+        receipt = None
+        try:
+            receipt = open_verified_media_file(root, path, missing_ok=True)
+            if receipt is None:
+                return None
+            descriptor = os.dup(receipt.descriptor)
+            try:
+                digest = hashlib.sha256()
+                size = 0
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                while True:
+                    chunk = os.read(descriptor, 64 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size += len(chunk)
+            finally:
+                os.close(descriptor)
+            receipt.verify_current()
+            return (
+                digest.hexdigest(),
+                size,
+                receipt.file_stat.st_dev,
+                receipt.file_stat.st_ino,
+            )
+        except (MediaPathError, OSError) as error:
+            raise _command_error("linear_committed_repair_failed", error)
+        finally:
+            if receipt is not None:
+                receipt.close()
+            root.close()
+
+    def _paths_phase_summary(self, journal, plans):
+        counts = {
+            "md5_legacy": 0,
+            "fixed_slot": 0,
+            "named_canonical": 0,
+        }
+        copy_required_bytes = 0
+        receipts_by_image = journal.receipts_by_image("paths")
+        for plan in plans:
+            completed = self._completed_plan_from_receipts(
+                plan, receipts_by_image.get(plan.image_id, ())
+            )
+            counts[completed.generation] += 1
+            copy_required_bytes += completed.copy_required_bytes
+        return {
+            "image_count": len(plans),
+            "md5_legacy": counts["md5_legacy"],
+            "fixed_slot": counts["fixed_slot"],
+            "named_canonical": counts["named_canonical"],
+            "copy_required_bytes": copy_required_bytes,
+        }
+
+    def _completed_plan_from_receipts(self, plan, receipts):
+        by_key = {receipt.file_key: receipt for receipt in receipts}
+        files = []
+        for file_plan in plan.files:
+            file_key = self._file_key(plan, file_plan)
+            receipt = by_key.get(file_key)
+            if receipt is None:
+                raise _command_error("auto_v2_plan_incomplete")
+            files.append(AutoV2MigrationFile(
+                kind=file_plan.kind,
+                old_path=file_plan.old_path,
+                new_path=receipt.relative_path,
+                operation=receipt.operation,
+                size=receipt.size,
+                sha256=receipt.sha256,
+                image_format=receipt.image_format,
+                width=receipt.width,
+                height=receipt.height,
+                source_device=receipt.source_device,
+                source_inode=receipt.source_inode,
+                thumbnail_id=file_plan.thumbnail_id,
+                derivative_size=file_plan.derivative_size,
+                archive_root_device=file_plan.archive_root_device,
+                archive_root_inode=file_plan.archive_root_inode,
+            ))
+        generation = _classify_generation_for_uuid(plan.asset_uuid, files)
+        return AutoV2MigrationPlan(
+            image_id=plan.image_id,
+            asset_uuid=plan.asset_uuid,
+            original_filename=plan.original_filename,
+            image_width=plan.image_width,
+            image_height=plan.image_height,
+            generation=generation,
+            files=tuple(files),
+            thumbnail_rows=plan.thumbnail_rows,
+            copy_required_bytes=sum(
+                file_plan.size
+                for file_plan in files
+                if file_plan.operation == "copy"
+            ),
+        )
+
+    def _summary_from_journal(self, summary, journal):
+        phase = journal.state.phase_summaries.get("paths")
+        if phase is None:
+            return summary
+        return AutoV2PlanSummary(
+            run_id=summary.run_id,
+            plan_sha256=summary.plan_sha256,
+            manifest_sha256=summary.manifest_sha256,
+            image_count=phase["image_count"],
+            md5_legacy=phase["md5_legacy"],
+            fixed_slot=phase["fixed_slot"],
+            named_canonical=phase["named_canonical"],
+            copy_required_bytes=phase["copy_required_bytes"],
+        )
+
+    def _report_linear_batch_progress(self, journal):
+        snapshot = journal.recovery_snapshot()
+        self._report_progress({
+            "phase": "database",
+            "images_done": snapshot["images_done"],
+            "images_total": snapshot["images_total"],
+        })
+
+    def _report_linear_copy_progress(self, journal, batch, prepared):
+        snapshot = journal.recovery_snapshot()
+        self._report_progress({
+            "phase": "copying",
+            "images_done": snapshot["images_done"] + len(batch),
+            "images_total": snapshot["images_total"],
+            "files_done": snapshot["files_done"] + len(prepared),
+            "files_total": snapshot["files_total"],
+        })
 
     def _execute(self, manifest, plans, plan_sha256):  # noqa: C901
         if manifest.summary().plan_sha256 != plan_sha256:
