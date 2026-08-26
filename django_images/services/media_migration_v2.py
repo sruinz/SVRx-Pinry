@@ -2414,7 +2414,7 @@ class AutoV2MediaMigrator(object):
                 manifest.repair_torn_tail()
             return manifest.summary()
 
-    def run(self, execute=False):
+    def run(self, execute=False, upgrade_v2=False):
         with AutoV2ManifestLog.open(
             self.run_directory,
             self.filename,
@@ -2451,7 +2451,12 @@ class AutoV2MediaMigrator(object):
             summary = manifest.summary()
             if not execute:
                 return summary
-            return self._execute_linear(manifest, plans, summary)
+            return self._execute_linear(
+                manifest,
+                plans,
+                summary,
+                upgrade_v2=upgrade_v2,
+            )
 
     def _freeze_all_plans(self):
         root_directory = None
@@ -2501,7 +2506,13 @@ class AutoV2MediaMigrator(object):
             yield images, by_image
             last_pk = images[-1].pk
 
-    def _execute_linear(self, manifest, plans, summary):  # noqa: C901
+    def _execute_linear(
+        self,
+        manifest,
+        plans,
+        summary,
+        upgrade_v2=False,
+    ):  # noqa: C901
         owned_journal = self.batch_journal is None
         journal = self.batch_journal
         try:
@@ -2515,21 +2526,32 @@ class AutoV2MediaMigrator(object):
                     summary.plan_sha256,
                     summary.manifest_sha256,
                 )
-            journal.freeze_work_totals(
-                len(plans),
-                sum(len(plan.files) for plan in plans),
-                0,
-            )
-            if (
-                manifest.state.format_version == 2
-                and not journal.state.intents
-            ):
-                self._upgrade_v2_terminal_prefix(
-                    manifest, journal, plans
+            if owned_journal:
+                journal.freeze_work_totals(
+                    len(plans),
+                    sum(len(plan.files) for plan in plans),
+                    0,
                 )
-            journal.record_attempt(
-                datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            )
+                if (
+                    manifest.state.format_version == 2
+                    and not journal.state.intents
+                ):
+                    self._upgrade_v2_terminal_prefix(
+                        manifest, journal, plans
+                    )
+                journal.record_attempt(
+                    datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                )
+            else:
+                self._validate_injected_journal(journal, plans)
+                if (
+                    upgrade_v2
+                    and manifest.state.format_version == 2
+                    and not journal.state.intents
+                ):
+                    self._upgrade_v2_terminal_prefix(
+                        manifest, journal, plans
+                    )
             self._resume_attempt = len(journal.state.attempts) > 1
             self._validate_image_plan_closure(
                 plans,
@@ -2646,6 +2668,19 @@ class AutoV2MediaMigrator(object):
         finally:
             if owned_journal and journal is not None:
                 journal.close()
+
+    def _validate_injected_journal(self, journal, plans):
+        totals = journal.state.work_totals
+        if (
+            totals is None
+            or totals["images_total"] != len(plans)
+            or totals["files_total"] != sum(
+                len(plan.files) for plan in plans
+            )
+        ):
+            raise _command_error("linear_work_totals_changed")
+        if not journal.state.attempts:
+            raise _command_error("linear_journal_invalid")
 
     def _upgrade_v2_terminal_prefix(self, manifest, journal, plans):
         terminal = frozenset((

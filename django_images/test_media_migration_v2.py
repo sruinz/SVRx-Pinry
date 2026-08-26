@@ -177,7 +177,12 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.addCleanup(root.close)
         return root
 
-    def migrator(self, fault_injector=None, batch_size=100):
+    def migrator(
+        self,
+        fault_injector=None,
+        batch_size=100,
+        batch_journal=None,
+    ):
         return AutoV2MediaMigrator(
             str(self.run_directory),
             MANIFEST_FILENAME,
@@ -186,7 +191,35 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             self.service_gid,
             batch_size=batch_size,
             fault_injector=fault_injector,
+            batch_journal=batch_journal,
         )
+
+    def injected_journal(
+        self,
+        summary,
+        images_total,
+        files_total,
+        backfill_total,
+    ):
+        run_directory = open_verified_media_root(str(self.run_directory))
+        self.addCleanup(run_directory.close)
+        journal = MigrationBatchJournal.open(
+            run_directory,
+            JOURNAL_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            summary.plan_sha256,
+            summary.manifest_sha256,
+        )
+        self.addCleanup(journal.close)
+        journal.record_attempt("2026-08-27T00:00:00Z")
+        journal.freeze_work_totals(
+            images_total,
+            files_total,
+            backfill_total,
+        )
+        return journal
 
     def test_freeze_uses_keyset_and_prefetches_derivatives_by_batch(self):
         for _index in range(120):
@@ -287,6 +320,85 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 image.asset_uuid, image.original_filename, ".png"
             ),
         )
+
+    def test_injected_journal_preserves_nonzero_backfill_total(self):
+        image = self.make_image(sizes=())
+        summary = self.migrator().run(execute=False)
+        journal = self.injected_journal(summary, 1, 1, 7)
+
+        self.migrator(batch_journal=journal).run(execute=True)
+
+        image.refresh_from_db()
+        self.assertTrue(image.image.name.startswith("originals/"))
+        self.assertEqual(journal.state.work_totals, {
+            "images_total": 1,
+            "files_total": 1,
+            "backfill_total": 7,
+        })
+
+    def test_injected_journal_does_not_record_attempt_twice(self):
+        self.make_image(sizes=())
+        summary = self.migrator().run(execute=False)
+        journal = self.injected_journal(summary, 1, 1, 0)
+
+        self.migrator(batch_journal=journal).run(execute=True)
+
+        self.assertEqual(len(journal.state.attempts), 1)
+
+    def test_injected_journal_rejects_changed_image_total_before_work(self):
+        self.make_image(sizes=())
+        summary = self.migrator().run(execute=False)
+        journal = self.injected_journal(summary, 2, 1, 3)
+        migrator = self.migrator(batch_journal=journal)
+
+        with mock.patch.object(
+            migrator,
+            "_prepare_path_files",
+            side_effect=AssertionError("mismatched totals must reject early"),
+        ), self.assertRaisesRegex(
+            CommandError, "^linear_work_totals_changed$"
+        ):
+            migrator.run(execute=True)
+
+        self.assertEqual(len(journal.state.attempts), 1)
+        self.assertFalse(journal.state.intents)
+        self.assertEqual(self.destination_entries(), [])
+
+    def test_injected_journal_rejects_changed_file_total_before_work(self):
+        self.make_image(sizes=())
+        summary = self.migrator().run(execute=False)
+        journal = self.injected_journal(summary, 1, 2, 3)
+        migrator = self.migrator(batch_journal=journal)
+
+        with mock.patch.object(
+            migrator,
+            "_prepare_path_files",
+            side_effect=AssertionError("mismatched totals must reject early"),
+        ), self.assertRaisesRegex(
+            CommandError, "^linear_work_totals_changed$"
+        ):
+            migrator.run(execute=True)
+
+        self.assertEqual(len(journal.state.attempts), 1)
+        self.assertFalse(journal.state.intents)
+        self.assertEqual(self.destination_entries(), [])
+
+    def test_owned_journal_freezes_path_totals_with_zero_backfill(self):
+        self.make_image(sizes=())
+
+        self.migrator().run(execute=True)
+
+        totals = [
+            event
+            for event in self.journal_events()
+            if event["event"] == "work_totals"
+        ]
+        self.assertEqual(totals, [{
+            "event": "work_totals",
+            "images_total": 1,
+            "files_total": 1,
+            "backfill_total": 0,
+        }])
 
     def test_normal_run_streams_each_source_once_without_legacy_rehash(self):
         self.make_image(sizes=())
@@ -813,6 +925,65 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertTrue(image.image.name.startswith("originals/"))
         self.assertEqual(self.manifest_path.read_bytes(), original)
         self.assertTrue(Path(self.run_directory, JOURNAL_FILENAME).exists())
+
+    def test_injected_partial_v2_waits_for_explicit_upgrade_boundary(self):
+        first = self.make_image(sizes=())
+        second = self.make_image(sizes=())
+        self.write_v2_plans((first, second), completed=1)
+        summary = self.migrator(batch_size=1).run(execute=False)
+        journal = self.injected_journal(summary, 2, 2, 0)
+        migrator = self.migrator(
+            batch_size=1,
+            batch_journal=journal,
+        )
+
+        with mock.patch.object(
+            migrator,
+            "_validate_image_plan_closure",
+            side_effect=SimulatedProcessCrash(),
+        ), self.assertRaises(SimulatedProcessCrash):
+            migrator.run(execute=True)
+
+        self.assertFalse(journal.state.intents)
+        self.assertEqual(len(journal.state.attempts), 1)
+
+    def test_injected_partial_v2_upgrades_after_explicit_recovery(self):
+        first = self.make_image(sizes=())
+        second = self.make_image(sizes=())
+        self.write_v2_plans((first, second), completed=1)
+        summary = self.migrator(batch_size=1).run(execute=False)
+        journal = self.injected_journal(summary, 2, 2, 5)
+        migrator = self.migrator(
+            batch_size=1,
+            batch_journal=journal,
+        )
+        events = ["recovery"]
+        real_import = journal.import_v2_batch
+
+        def import_after_recovery(intent, committed=True):
+            events.append("upgrade_v2")
+            return real_import(intent, committed=committed)
+
+        with mock.patch.object(
+            journal,
+            "import_v2_batch",
+            side_effect=import_after_recovery,
+        ):
+            migrator.run(execute=True, upgrade_v2=True)
+
+        self.assertEqual(events[:2], ["recovery", "upgrade_v2"])
+        self.assertEqual(len(journal.state.attempts), 1)
+        self.assertEqual(journal.state.work_totals["backfill_total"], 5)
+        self.assertEqual(
+            [
+                intent.batch_id
+                for intent in journal.state.intents.values()
+            ],
+            [
+                "upgrade-paths:{}-{}".format(first.pk, first.pk),
+                "paths:{}-{}".format(second.pk, second.pk),
+            ],
+        )
 
     def test_copying_v2_imports_terminal_prefix_then_resumes_pending(self):
         first = self.make_image(sizes=())
