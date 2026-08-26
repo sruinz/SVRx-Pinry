@@ -764,8 +764,6 @@ class MediaStorage(object):
         expected_receipts,
         database_signature,
     ):
-        root_directory = None
-        directories = []
         try:
             self._validate_storage_configuration()
             manifest = self._reusable_manifest(image, thumbnails)
@@ -812,9 +810,7 @@ class MediaStorage(object):
                 or set(by_key) != set(expected_keys)
             ):
                 raise _media_conflict()
-            root_directory = open_verified_media_root(self.media_root)
-            directory_by_path = {}
-            files = []
+            ordered_receipts = []
             for file_key, kind in sorted(expected_keys.items()):
                 receipt = by_key[file_key]
                 entry = manifest[kind]
@@ -825,6 +821,65 @@ class MediaStorage(object):
                     or receipt.height != entry["height"]
                     or extension is None
                     or not receipt.relative_path.endswith(extension)
+                ):
+                    raise _media_conflict()
+                ordered_receipts.append(receipt)
+            return self._prepare_receipt_stat_resource(ordered_receipts)
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                raise
+            if isinstance(error, MediaStorageError):
+                raise
+            raise _media_conflict() from None
+
+    def verify_receipts_current(self, expected_receipts):
+        resource = None
+        try:
+            self._validate_storage_configuration()
+            receipts = tuple(expected_receipts)
+            if (
+                not receipts
+                or not all(
+                    isinstance(receipt, FileReceipt)
+                    for receipt in receipts
+                )
+                or len({receipt.file_key for receipt in receipts})
+                != len(receipts)
+                or len({receipt.relative_path for receipt in receipts})
+                != len(receipts)
+            ):
+                raise _media_conflict()
+            resource = self._prepare_receipt_stat_resource(receipts)
+            return resource.verify_current()
+        finally:
+            if resource is not None:
+                resource.close()
+
+    def _prepare_receipt_stat_resource(self, receipts):
+        root_directory = None
+        directories = []
+        try:
+            root_directory = open_verified_media_root(self.media_root)
+            directory_by_path = {}
+            files = []
+            for receipt in receipts:
+                path = PurePosixPath(receipt.relative_path)
+                parts = path.parts
+                expected_parent = (
+                    "originals"
+                    if receipt.file_key.startswith("original:")
+                    else "derivatives"
+                )
+                try:
+                    canonical_uuid = str(uuid.UUID(parts[1]))
+                except (IndexError, TypeError, ValueError):
+                    raise _media_conflict() from None
+                if (
+                    len(parts) != 3
+                    or str(path) != receipt.relative_path
+                    or parts[0] != expected_parent
+                    or parts[1] != canonical_uuid
+                    or not parts[2]
                 ):
                     raise _media_conflict()
                 relative_directory, name = receipt.relative_path.rsplit(

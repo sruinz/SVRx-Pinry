@@ -1302,7 +1302,7 @@ class MediaAssetBackfiller(object):
                 self._fault("after_plan_complete")
             elif not manifest.state.plan_complete:
                 raise _command_error("media_asset_plan_incomplete")
-            plans = list(manifest.state.plans)
+            plans = manifest.state.plans
             decisions = self._decisions(plans)
             self._validate_terminal_events(manifest, plans, decisions)
             self._report_planning(plans)
@@ -1354,7 +1354,6 @@ class MediaAssetBackfiller(object):
         )
         try:
             root_directory = open_verified_media_root(settings.MEDIA_ROOT)
-            plans = []
             for context in self._plan_batches():
                 batch_plans = []
                 for image_id in sorted(context.images):
@@ -1380,13 +1379,13 @@ class MediaAssetBackfiller(object):
                     if remaining_receipt_ids is not None:
                         remaining_receipt_ids.remove(image_id)
                     root_directory.verify_current()
-                plans.extend(
-                    self._attach_key_registry_signatures(batch_plans)
-                )
+                for plan in self._attach_key_registry_signatures(
+                    batch_plans
+                ):
+                    yield plan
             if remaining_receipt_ids:
                 raise _command_error("linear_journal_batch_conflict")
             root_directory.verify_current()
-            return plans
         except CommandError:
             raise
         except (MediaPathError, OSError) as error:
@@ -2025,12 +2024,16 @@ class MediaAssetBackfiller(object):
                 database_signature,
             )
         except MediaStorageError as error:
-            raise _CandidateSkip("file_identity_mismatch") from error
+            if error.code == "media_configuration_error":
+                raise _command_error(error.code, error)
+            raise _command_error(
+                "registry_plan_identity_changed", error
+            )
         by_key = {receipt.file_key: receipt for receipt in receipts}
         original = by_key.get("original:{}".format(image.pk))
         if original is None:
             resource.close()
-            raise _CandidateSkip("file_identity_mismatch")
+            raise _command_error("registry_plan_identity_changed")
         ordered = [original]
         thumbnail_by_size = {
             thumbnail.size: thumbnail for thumbnail in thumbnails
@@ -2039,13 +2042,13 @@ class MediaAssetBackfiller(object):
             thumbnail = thumbnail_by_size.get(kind)
             if thumbnail is None:
                 resource.close()
-                raise _CandidateSkip("file_identity_mismatch")
+                raise _command_error("registry_plan_identity_changed")
             receipt = by_key.get("thumbnail:{}:{}".format(
                 image.pk, thumbnail.pk
             ))
             if receipt is None:
                 resource.close()
-                raise _CandidateSkip("file_identity_mismatch")
+                raise _command_error("registry_plan_identity_changed")
             ordered.append(receipt)
         file_identities = tuple(
             (
@@ -2075,17 +2078,29 @@ class MediaAssetBackfiller(object):
     def _require_receipts_match_database_signature(
         receipts, database_signature
     ):
-        expected_paths = {database_signature[3]}
-        expected_paths.update(
-            thumbnail[2] for thumbnail in database_signature[6]
-        )
+        image_id = database_signature[0]
+        expected_by_key = {
+            "original:{}".format(image_id): database_signature[3]
+        }
+        expected_by_key.update({
+            "thumbnail:{}:{}".format(image_id, thumbnail[0]): (
+                thumbnail[2]
+            )
+            for thumbnail in database_signature[6]
+        })
+        receipt_by_key = {
+            receipt.file_key: receipt for receipt in receipts
+        }
         if (
-            len(receipts) != 4
-            or len({receipt.file_key for receipt in receipts}) != 4
-            or {receipt.relative_path for receipt in receipts}
-            != expected_paths
+            len(receipts) != len(expected_by_key)
+            or len(receipt_by_key) != len(receipts)
+            or set(receipt_by_key) != set(expected_by_key)
+            or any(
+                receipt_by_key[file_key].relative_path != relative_path
+                for file_key, relative_path in expected_by_key.items()
+            )
         ):
-            raise _CandidateSkip("file_identity_mismatch")
+            raise _command_error("registry_plan_identity_changed")
 
     @staticmethod
     def _raise_skip_or_identity(
@@ -2233,6 +2248,30 @@ class MediaAssetBackfiller(object):
         except MigrationBatchLogError as error:
             raise _command_error(error.code, error)
 
+    def _verify_receipt_plan_closure(
+        self, plans, receipts_by_image
+    ):
+        remaining_image_ids = set(receipts_by_image)
+        for plan in plans:
+            if plan.image_id not in remaining_image_ids:
+                raise _command_error("linear_journal_batch_conflict")
+            receipts = receipts_by_image[plan.image_id]
+            self._require_receipts_match_database_signature(
+                receipts, plan.database_signature
+            )
+            try:
+                self.media_storage.verify_receipts_current(receipts)
+            except MediaStorageError as error:
+                if error.code == "media_configuration_error":
+                    raise _command_error(error.code, error)
+                raise _command_error(
+                    "registry_plan_identity_changed", error
+                )
+            remaining_image_ids.remove(plan.image_id)
+        if remaining_image_ids:
+            raise _command_error("linear_journal_batch_conflict")
+        return True
+
     def _execute_linear(
         self,
         manifest,
@@ -2268,6 +2307,9 @@ class MediaAssetBackfiller(object):
             if old_manifest_complete:
                 self._verify_database_plan_closure(
                     plans, require_registered=True
+                )
+                self._verify_receipt_plan_closure(
+                    plans, receipts_by_image
                 )
                 phase = self._phase_summary_for(plans, decisions)
                 existing_phase = journal.state.phase_summaries.get(
@@ -2311,6 +2353,9 @@ class MediaAssetBackfiller(object):
                 )
             self._verify_database_plan_closure(
                 plans, require_registered=True
+            )
+            self._verify_receipt_plan_closure(
+                plans, receipts_by_image
             )
             phase = self._phase_summary_for(plans, decisions)
             journal.append_phase_complete("backfill", phase)
