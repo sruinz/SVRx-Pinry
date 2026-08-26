@@ -234,7 +234,12 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         journal.state = state
         return journal
 
-    def _completed_path_journal(self, service, backfill_total=None):
+    def _completed_path_journal(
+        self,
+        service,
+        backfill_total=None,
+        coordinator_attempt=True,
+    ):
         images = list(Image.objects.order_by("pk"))
         receipts = []
         for image in images:
@@ -284,6 +289,8 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             "2" * 64,
         )
         self.addCleanup(journal.close)
+        if coordinator_attempt:
+            journal.record_attempt("2026-08-27T00:00:00Z")
         journal.freeze_work_totals(
             len(images),
             len(receipts),
@@ -781,6 +788,62 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         self.assertEqual(summary.registered, 1)
         self.assertEqual(MediaAsset.objects.count(), 1)
 
+    def test_injected_backfill_does_not_duplicate_coordinator_attempt(self):
+        self._create_candidate()
+        service = self._service(batch_size=1)
+        service.batch_journal = self._completed_path_journal(service)
+
+        summary = service.run(execute=True)
+
+        self.assertEqual(summary.registered, 1)
+        self.assertEqual(len(service.batch_journal.state.attempts), 1)
+
+    def test_injected_backfill_requires_attempt_before_work(self):
+        self._create_candidate()
+        service = self._service(batch_size=1)
+        journal = self._completed_path_journal(
+            service, coordinator_attempt=False
+        )
+        service.batch_journal = journal
+
+        with mock.patch.object(
+            service,
+            "_freeze_all_plans",
+            wraps=service._freeze_all_plans,
+        ) as freeze_plans, mock.patch.object(
+            service,
+            "_verify_database_plan_closure",
+            wraps=service._verify_database_plan_closure,
+        ) as database_closure, mock.patch.object(
+            service,
+            "_apply_database_batch",
+            wraps=service._apply_database_batch,
+        ) as database_batch, mock.patch.object(
+            MediaStorage,
+            "prepare_from_receipts",
+            autospec=True,
+            wraps=MediaStorage.prepare_from_receipts,
+        ) as prepare_from_receipts, mock.patch.object(
+            journal,
+            "append_intent",
+            wraps=journal.append_intent,
+        ) as append_intent, mock.patch.object(
+            journal,
+            "import_v2_batch",
+            wraps=journal.import_v2_batch,
+        ) as import_v2_batch, self.assertRaisesRegex(
+            CommandError, "^linear_journal_invalid$"
+        ):
+            service.run(execute=True)
+
+        self.assertEqual(freeze_plans.call_count, 0)
+        self.assertEqual(database_closure.call_count, 0)
+        self.assertEqual(database_batch.call_count, 0)
+        self.assertEqual(prepare_from_receipts.call_count, 0)
+        self.assertEqual(append_intent.call_count, 0)
+        self.assertEqual(import_v2_batch.call_count, 0)
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
     def test_backfill_resume_after_intent_reapplies_database_batch(self):
         self._assert_linear_resume_boundary(
             "after_backfill_intent", 1, 1
@@ -790,6 +853,30 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         self._assert_linear_resume_boundary(
             "after_backfill_database_commit", 0, 1
         )
+
+    def test_commit_only_resume_reuses_coordinator_attempt(self):
+        self._create_candidate()
+        crashed = {"value": False}
+
+        def crash_once(point):
+            if (
+                point == "after_backfill_database_commit"
+                and not crashed["value"]
+            ):
+                crashed["value"] = True
+                raise RuntimeError("database committed")
+
+        service = self._service(batch_size=1, fault_injector=crash_once)
+        service.batch_journal = self._completed_path_journal(service)
+        with self.assertRaisesRegex(RuntimeError, "database committed"):
+            service.run(execute=True)
+        service.fault_injector = None
+
+        summary = service.run(execute=True)
+
+        self.assertEqual(summary.registered, 1)
+        self.assertEqual(len(service.batch_journal.state.attempts), 1)
+        self.assertTrue(service.batch_journal.is_phase_complete("backfill"))
 
     def test_commit_only_resume_rejects_replaced_receipt_identity(self):
         candidate = self._create_candidate(
@@ -868,6 +955,7 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
 
         service.run(execute=True)
 
+        self.assertEqual(before, 1)
         self.assertEqual(
             len(service.batch_journal.state.attempts), before
         )
@@ -916,6 +1004,7 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         self.assertEqual(manifest_path.read_bytes(), before)
         self.assertEqual(prepared_image_ids, [second["image"].pk])
         self.assertEqual(summary.registered, 2)
+        self.assertEqual(len(service.batch_journal.state.attempts), 1)
         self.assertTrue(service.batch_journal.is_phase_complete("backfill"))
 
     def test_registry_complete_v2_upgrade_never_reopens_candidates(self):

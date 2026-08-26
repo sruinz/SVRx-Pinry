@@ -1,6 +1,5 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
 import hashlib
 import json
 import os
@@ -1277,6 +1276,12 @@ class MediaAssetBackfiller(object):
             and not self.batch_journal.is_phase_complete("paths")
         ):
             raise _command_error("paths_not_complete")
+        if (
+            execute
+            and self.batch_journal is not None
+            and not self.batch_journal.state.attempts
+        ):
+            raise _command_error("linear_journal_invalid")
         expected_receipts = None
         if self.batch_journal is not None:
             expected_receipts = self._path_receipts()
@@ -2301,9 +2306,6 @@ class MediaAssetBackfiller(object):
                 return self._summary_from_phase(
                     manifest, phase, self.run_id
                 )
-            journal.record_attempt(
-                datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            )
             if old_manifest_complete:
                 self._verify_database_plan_closure(
                     plans, require_registered=True
