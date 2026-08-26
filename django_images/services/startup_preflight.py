@@ -364,6 +364,11 @@ def remove_confirmed_missing_unreferenced_images(
             database_receipt,
             expected_database_identity,
         )
+        file_ops.recover_media_lock_state(
+            media_directory,
+            os.geteuid(),
+            os.getegid(),
+        )
         with file_ops.media_lifecycle_lock(
             media_directory,
             exclusive=True,

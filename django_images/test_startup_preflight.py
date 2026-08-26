@@ -618,6 +618,31 @@ class LegacyEvidenceTests(SimpleTestCase):
         finally:
             connection.close()
 
+    def test_cleanup_repairs_existing_lock_mode_before_acquiring_lock(self):
+        relative_path = (
+            "originals/{}/"
+            "스크린샷_2026-08-20_21.23.05.png".format(ASSET_UUID)
+        )
+        self._create_database(image_paths=(relative_path,))
+        self._add_asset_metadata_and_derivatives(
+            "스크린샷 2026-08-20 21.23.05.png",
+        )
+        self._add_reference_tables()
+        evidence = self._inspect(_DiskGraph())
+        lock_directory = self.media_root / ".pinry-locks"
+        lock_directory.mkdir(mode=0o700)
+        lifecycle_lock = lock_directory / "media-lifecycle.lock"
+        lifecycle_lock.write_bytes(b"")
+        lifecycle_lock.chmod(0o700)
+
+        removed = self._cleanup(evidence)
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(
+            stat.S_IMODE(lifecycle_lock.stat().st_mode),
+            0o600,
+        )
+
     def test_cleanup_requires_expected_database_and_media_identities(self):
         relative_path = (
             "originals/{}/"
