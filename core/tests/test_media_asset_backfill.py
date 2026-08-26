@@ -331,8 +331,11 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
     def test_backfill_refuses_to_start_before_paths_complete(self):
         journal = self._journal_without_paths_complete()
 
-        with self.assertRaisesRegex(CommandError, "^paths_not_complete$"):
-            self._service(batch_journal=journal).run(execute=True)
+        for execute in (False, True):
+            with self.subTest(execute=execute), self.assertRaisesRegex(
+                CommandError, "^paths_not_complete$"
+            ):
+                self._service(batch_journal=journal).run(execute=execute)
 
     def test_plan_uses_keyset_and_bulk_queries(self):
         self._create_bulk_candidates(120)
@@ -841,6 +844,61 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         self.assertEqual(database_batch.call_count, 0)
         self.assertEqual(prepare_from_receipts.call_count, 0)
         self.assertEqual(append_intent.call_count, 0)
+        self.assertEqual(import_v2_batch.call_count, 0)
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_injected_dry_run_requires_attempt_before_work(self):
+        self._create_candidate()
+        service = self._service(batch_size=1)
+        journal = self._completed_path_journal(
+            service, coordinator_attempt=False
+        )
+        service.batch_journal = journal
+
+        with mock.patch.object(
+            service,
+            "_path_receipts",
+            wraps=service._path_receipts,
+        ) as path_receipts, mock.patch.object(
+            media_asset_backfill._BackfillManifestLog,
+            "open",
+            wraps=media_asset_backfill._BackfillManifestLog.open,
+        ) as manifest_open, mock.patch.object(
+            service,
+            "_freeze_all_plans",
+            wraps=service._freeze_all_plans,
+        ) as freeze_plans, mock.patch.object(
+            service,
+            "_verify_database_plan_closure",
+            wraps=service._verify_database_plan_closure,
+        ) as database_closure, mock.patch.object(
+            service,
+            "_apply_database_batch",
+            wraps=service._apply_database_batch,
+        ) as database_batch, mock.patch.object(
+            journal,
+            "append_intent",
+            wraps=journal.append_intent,
+        ) as append_intent, mock.patch.object(
+            journal,
+            "append_commit",
+            wraps=journal.append_commit,
+        ) as append_commit, mock.patch.object(
+            journal,
+            "import_v2_batch",
+            wraps=journal.import_v2_batch,
+        ) as import_v2_batch, self.assertRaisesRegex(
+            CommandError, "^linear_journal_invalid$"
+        ):
+            service.run(execute=False)
+
+        self.assertEqual(path_receipts.call_count, 0)
+        self.assertEqual(manifest_open.call_count, 0)
+        self.assertEqual(freeze_plans.call_count, 0)
+        self.assertEqual(database_closure.call_count, 0)
+        self.assertEqual(database_batch.call_count, 0)
+        self.assertEqual(append_intent.call_count, 0)
+        self.assertEqual(append_commit.call_count, 0)
         self.assertEqual(import_v2_batch.call_count, 0)
         self.assertEqual(MediaAsset.objects.count(), 0)
 

@@ -1271,14 +1271,12 @@ class MediaAssetBackfiller(object):
         if type(execute) is not bool:
             raise _command_error("invalid_execute_flag")
         if (
-            execute
-            and self.batch_journal is not None
+            self.batch_journal is not None
             and not self.batch_journal.is_phase_complete("paths")
         ):
             raise _command_error("paths_not_complete")
         if (
-            execute
-            and self.batch_journal is not None
+            self.batch_journal is not None
             and not self.batch_journal.state.attempts
         ):
             raise _command_error("linear_journal_invalid")
