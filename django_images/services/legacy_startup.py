@@ -256,6 +256,15 @@ class LegacyStartupCoordinator(object):
             "snapshot_complete",
         )
 
+    def prepare_migration_locks(self, run):
+        """스키마 실행 전 이관 잠금을 startup identity로 고정한다."""
+        if run is None:
+            return None
+        self._ensure_allowed_media_layout()
+        self._configuration_preflight(os.geteuid(), os.getegid())
+        self._seal_current_identities(run)
+        return run
+
     def converge_after_schema(self, run):
         """preflight, path, registry, archive, complete를 순서대로 수렴한다."""
         if run is None and self._evidence is None:
@@ -279,14 +288,24 @@ class LegacyStartupCoordinator(object):
                 raise LegacyStartupError("migration_state_phase_mismatch")
 
         self._ensure_allowed_media_layout()
-        self._configuration_preflight()
         if run is None:
+            self._configuration_preflight(
+                self.service_uid,
+                self.service_gid,
+            )
             return None
-        self._seal_current_identities(run)
         status = migration_state.read_run_status(run)
         if status.phase == "complete":
+            self._configuration_preflight(
+                self.service_uid,
+                self.service_gid,
+            )
+            self._seal_current_identities(run)
             self._write_summary(run)
             return run
+        self._configuration_preflight(os.geteuid(), os.getegid())
+        self._seal_current_identities(run)
+        status = migration_state.read_run_status(run)
         if status.phase in ("schema_complete", "copying"):
             self._converge_media(run)
             self._seal_current_identities(run)
@@ -303,6 +322,10 @@ class LegacyStartupCoordinator(object):
         status = migration_state.read_run_status(run)
         if status.phase != "complete":
             raise LegacyStartupError("migration_state_phase_mismatch")
+        self._configuration_preflight(
+            self.service_uid,
+            self.service_gid,
+        )
         return run
 
     def adjust_ownership(self, startup_lock_descriptor):
@@ -608,7 +631,7 @@ class LegacyStartupCoordinator(object):
             raise LegacyStartupError("archive_state_conflict")
         self._transition_complete(run, "archive_complete")
 
-    def _configuration_preflight(self):
+    def _configuration_preflight(self, lock_uid, lock_gid):
         image_storage = Image._meta.get_field("image").storage
         thumbnail_storage = Thumbnail._meta.get_field("image").storage
         result = startup_preflight.validate_storage_configuration_preflight(
@@ -616,8 +639,8 @@ class LegacyStartupCoordinator(object):
             image_storage,
             thumbnail_storage,
             settings.IMAGE_SIZES,
-            self.service_uid,
-            self.service_gid,
+            lock_uid,
+            lock_gid,
         )
         if not result.ok:
             raise LegacyStartupError(result.reason_code)

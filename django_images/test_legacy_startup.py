@@ -397,6 +397,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                     evidence,
                     evidence,
                     evidence,
+                    evidence,
                     archive_evidence,
                 ),
             ),
@@ -488,6 +489,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                 patches[10], patches[11], patches[12], patches[13], \
                 patches[14], patches[15]:
             run = coordinator.prepare_before_schema()
+            coordinator.prepare_migration_locks(run)
             events.extend(("collectstatic", "migrate"))
             coordinator.converge_after_schema(run)
 
@@ -498,6 +500,8 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "snapshot",
             "orphan_cleanup",
             "state:snapshot_complete",
+            "storage_configuration",
+            "identity_seal",
             "collectstatic",
             "migrate",
             "state:schema_complete",
@@ -519,6 +523,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "state:archive_intent",
             "state:archive_complete",
             "state:complete",
+            "storage_configuration",
         ])
         summary_path = Path(run.path, "migration-summary.json")
         summary = json.loads(summary_path.read_text("utf-8"))
@@ -540,6 +545,216 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                 "^media_root_not_writable$",
             ):
                 self.coordinator().runtime_check(self.uid, self.gid)
+
+    def test_prepare_migration_locks_uses_startup_identity(self):
+        run = self._summary_run()
+        coordinator = self.coordinator()
+        startup_identity = (os.geteuid(), os.getegid())
+
+        with mock.patch.object(
+            coordinator,
+            "_configuration_preflight",
+        ) as configuration, mock.patch.object(
+            coordinator,
+            "_seal_current_identities",
+        ) as seal:
+            result = coordinator.prepare_migration_locks(run)
+
+        self.assertIs(result, run)
+        configuration.assert_called_once_with(*startup_identity)
+        seal.assert_called_once_with(run)
+
+    def test_prepare_migration_locks_creates_allowed_missing_media_layout(
+        self,
+    ):
+        self.media_root.rmdir()
+        coordinator = self.coordinator()
+        coordinator._allow_missing_media_layout = True
+        run = mock.sentinel.run
+
+        with mock.patch.object(
+            coordinator,
+            "_seal_current_identities",
+        ) as seal:
+            result = coordinator.prepare_migration_locks(run)
+
+        self.assertIs(result, run)
+        self.assertTrue(self.media_root.is_dir())
+        self.assertEqual(
+            stat.S_IMODE(self.media_root.stat().st_mode),
+            0o700,
+        )
+        seal.assert_called_once_with(run)
+
+    def test_migration_keeps_startup_lock_identity_until_complete(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run,
+            "initialized",
+            "schema_complete",
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        service_identity = (self.uid + 1000, self.gid + 1000)
+        startup_identity = (os.geteuid(), os.getegid())
+        configuration_identities = []
+        coordinator = LegacyStartupCoordinator(*service_identity)
+
+        def configure(*args):
+            configuration_identities.append(args[-2:])
+            return PreflightResult(ok=True)
+
+        def converge_backfill(current_run):
+            self.assertEqual(
+                configuration_identities[-1],
+                startup_identity,
+            )
+            migration_state.transition_state(
+                current_run,
+                "paths_complete",
+                "registry_complete",
+                plan_sha256="3" * 64,
+                manifest_sha256="4" * 64,
+            )
+
+        def converge_archive(current_run):
+            migration_state.transition_state(
+                current_run,
+                "registry_complete",
+                "complete",
+            )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_configuration_preflight",
+            side_effect=configure,
+        ), mock.patch.object(
+            coordinator,
+            "_seal_current_identities",
+        ), mock.patch.object(
+            coordinator,
+            "_converge_backfill",
+            side_effect=converge_backfill,
+        ), mock.patch.object(
+            coordinator,
+            "_converge_archive",
+            side_effect=converge_archive,
+        ):
+            coordinator.converge_after_schema(run)
+
+        self.assertEqual(
+            configuration_identities,
+            [startup_identity, service_identity],
+        )
+
+    def test_complete_resume_keeps_runtime_lock_identity_on_summary_error(
+        self,
+    ):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run,
+            "initialized",
+            "schema_complete",
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "paths_complete",
+            "registry_complete",
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "registry_complete",
+            "complete",
+        )
+        service_identity = (self.uid + 1000, self.gid + 1000)
+        configuration_identities = []
+        coordinator = LegacyStartupCoordinator(*service_identity)
+
+        def configure(*args):
+            configuration_identities.append(args[-2:])
+            return PreflightResult(ok=True)
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_configuration_preflight",
+            side_effect=configure,
+        ), mock.patch.object(
+            coordinator,
+            "_seal_current_identities",
+        ) as seal, mock.patch.object(
+            coordinator,
+            "_write_summary",
+            side_effect=LegacyStartupError("unsafe_migration_summary"),
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^unsafe_migration_summary$",
+        ):
+            coordinator.converge_after_schema(run)
+
+        self.assertEqual(
+            configuration_identities,
+            [service_identity],
+        )
+        seal.assert_called_once_with(run)
+
+    def test_failed_migration_does_not_handoff_runtime_lock_identity(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run,
+            "initialized",
+            "schema_complete",
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        service_identity = (self.uid + 1000, self.gid + 1000)
+        startup_identity = (os.geteuid(), os.getegid())
+        configuration_identities = []
+        coordinator = LegacyStartupCoordinator(*service_identity)
+
+        def configure(*args):
+            configuration_identities.append(args[-2:])
+            return PreflightResult(ok=True)
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_configuration_preflight",
+            side_effect=configure,
+        ), mock.patch.object(
+            coordinator,
+            "_seal_current_identities",
+        ), mock.patch.object(
+            coordinator,
+            "_converge_backfill",
+            side_effect=LegacyStartupError("migration_state_plan_mismatch"),
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^migration_state_plan_mismatch$",
+        ):
+            coordinator.converge_after_schema(run)
+
+        self.assertEqual(
+            configuration_identities,
+            [startup_identity],
+        )
 
     def _summary_run(self):
         self.backup_root.mkdir(mode=0o700, exist_ok=True)

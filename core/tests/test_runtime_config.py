@@ -528,6 +528,9 @@ class RuntimeConfigTests(unittest.TestCase):
             "        event('prepare_no_flag'); fail('prepare_no_flag', 'legacy_migration_flag_required')\n"
             "    def prepare_before_schema(self):\n"
             "        event('prepare'); fail('prepare', 'sqlite_snapshot_failed'); return object()\n"
+            "    def prepare_migration_locks(self, run):\n"
+            "        del run; event('prepare_migration_locks'); "
+            "fail('prepare_migration_locks', 'media_lifecycle_lock_failed')\n"
             "    def schema_required(self, run):\n"
             "        del run; return os.environ.get('PINRY_SCHEMA_REQUIRED', '1') == '1'\n"
             "    def converge_after_schema(self, run):\n"
@@ -786,6 +789,7 @@ class RuntimeConfigTests(unittest.TestCase):
                 "setup:pinry.settings.docker",
                 "coordinator",
                 "prepare",
+                "prepare_migration_locks",
                 "collectstatic",
                 "migrate",
                 "converge:run",
@@ -841,6 +845,38 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertNotIn("collectstatic", events)
         self.assertNotIn("migrate", events)
         self.assertLess(events.index("prepare"), events.index("converge:run"))
+
+    def test_python_runner_prepares_migration_locks_before_schema_failure(
+        self,
+    ):
+        for point in ("collectstatic", "migrate"):
+            with self.subTest(point=point):
+                environment, capture, runner, _data_root = (
+                    self._python_runner_environment()
+                )
+                environment["PINRY_FAIL_POINT"] = point
+
+                completed = subprocess.run(
+                    [
+                        str(REPOSITORY_ROOT / ".venv/bin/python"),
+                        str(runner),
+                        "--migrate-legacy",
+                    ],
+                    cwd="/private/tmp",
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                self.assertEqual(completed.returncode, 1)
+                events = self._runner_events(capture)
+                self.assertIn("prepare_migration_locks", events)
+                self.assertLess(
+                    events.index("prepare_migration_locks"),
+                    events.index(point),
+                )
+                self.assertNotIn("converge:run", events)
+                self.assertNotIn("ownership", events)
 
     def test_python_runner_failures_never_start_application_service(self):
         cases = (

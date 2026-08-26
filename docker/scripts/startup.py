@@ -200,6 +200,7 @@ def _run(arguments):  # noqa: C901
         coordinator = LegacyStartupCoordinator(service_uid, service_gid)
         if migration_requested:
             run = coordinator.prepare_before_schema()
+            coordinator.prepare_migration_locks(run)
             if coordinator.schema_required(run):
                 _run_schema_commands(call_command)
         else:
