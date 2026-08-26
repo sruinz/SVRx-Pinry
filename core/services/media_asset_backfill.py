@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import uuid
+import warnings
 
 from django.conf import settings
 from django.core.management.base import CommandError
@@ -51,6 +52,7 @@ _PRELIMINARY_REASONS = {
     "multi_owner",
     "orphan",
     "pipeline_closure_mismatch",
+    "processing_pixel_limit_exceeded",
     "unsafe_media_file",
 }
 SAFE_BACKFILL_REASON_CODES = frozenset(
@@ -82,6 +84,13 @@ def _command_error(code, cause=None, retryable=None):
 
 def _identity(file_stat):
     return file_stat.st_dev, file_stat.st_ino
+
+
+def _processing_pixel_limit():
+    pillow_limit = PILImage.MAX_IMAGE_PIXELS
+    if pillow_limit is None:
+        return settings.PINRY_FETCH_MAX_PIXELS
+    return min(settings.PINRY_FETCH_MAX_PIXELS, pillow_limit)
 
 
 def _valid_digest(value):
@@ -1453,6 +1462,14 @@ class MediaAssetBackfiller(object):
                     width,
                     height,
                 ))
+                if (
+                    kind == "original"
+                    and width * height > _processing_pixel_limit()
+                ):
+                    raise _CandidateSkip(
+                        "processing_pixel_limit_exceeded",
+                        tuple(file_identities),
+                    )
                 if kind == "original":
                     original_content = self._read_descriptor(
                         receipt.descriptor
@@ -1565,10 +1582,15 @@ class MediaAssetBackfiller(object):
 
     @staticmethod
     def _inspect(descriptor):
-        with os.fdopen(os.dup(descriptor), "rb") as file_obj:
-            with PILImage.open(file_obj) as image:
-                image.load()
-                return image.format, image.width, image.height
+        with warnings.catch_warnings():
+            # 이관된 파일은 헤더만 검증하고 재처리 대상은 별도로 결정한다.
+            warnings.simplefilter("ignore", PILImage.DecompressionBombWarning)
+            with os.fdopen(os.dup(descriptor), "rb") as file_obj:
+                with PILImage.open(file_obj) as image:
+                    image_format = image.format
+                    width, height = image.size
+                    image.verify()
+                    return image_format, width, height
 
     @staticmethod
     def _read_descriptor(descriptor):

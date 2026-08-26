@@ -13,6 +13,7 @@ from django.core.management import CommandError, call_command
 from django.test import TransactionTestCase, override_settings
 from django.utils.text import get_valid_filename
 from PIL import Image as PILImage
+from PIL import WebPImagePlugin
 
 from django_images.file_ops import (
     MediaPathError,
@@ -396,6 +397,42 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertTrue(plan.already_current)
         self.assertEqual({entry.operation for entry in plan.files}, {"verify"})
         self.assertTrue(all(entry.source_inode > 0 for entry in plan.files))
+
+    def test_existing_valid_image_above_pillow_warning_limit_is_migrated(self):
+        image = self.make_image(generation="pinry-md5", sizes=())
+        self.write_media(
+            image.image.name,
+            make_image_bytes("red", image_format="WEBP"),
+        )
+        expected_path = canonical_original_path(
+            image.asset_uuid,
+            image.original_filename,
+            ".webp",
+        )
+
+        with mock.patch.object(PILImage, "MAX_IMAGE_PIXELS", 600):
+            with mock.patch.object(
+                WebPImagePlugin.WebPImageFile,
+                "load",
+                side_effect=AssertionError("legacy migration decoded pixels"),
+            ):
+                self.migrator().run(execute=True)
+
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, expected_path)
+        self.assertTrue(
+            Path(self.temporary_media.name, expected_path).is_file()
+        )
+
+    def test_existing_image_above_pillow_hard_limit_is_rejected_safely(self):
+        image = self.make_image(generation="pinry-md5", sizes=())
+
+        with mock.patch.object(PILImage, "MAX_IMAGE_PIXELS", 500):
+            with self.assertRaisesRegex(
+                CommandError,
+                "invalid_legacy_media",
+            ):
+                AutoV2MigrationPlan.for_image(image, self.open_root())
 
     def test_missing_derivative_is_allowed_but_not_backfill_eligible(self):
         image = self.make_image(sizes=("thumbnail", "square"))

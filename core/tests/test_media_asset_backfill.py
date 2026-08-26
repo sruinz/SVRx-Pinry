@@ -24,6 +24,7 @@ from django.db.models.signals import post_save
 from django.test import TransactionTestCase, override_settings
 import mock
 from PIL import Image as PILImage
+from PIL import ImageFile
 
 from core import models as core_models
 from core.models import Board, MediaAsset, Pin
@@ -674,6 +675,71 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             "unsafe_media_file": 1,
         })
         self.assertFalse(MediaAsset.objects.exists())
+
+    @override_settings(PINRY_FETCH_MAX_PIXELS=2000)
+    def test_processing_pixel_limit_is_skipped_before_full_decode(self):
+        candidate = self._create_candidate(
+            content=_png_bytes(size=(32, 32)),
+        )
+
+        with mock.patch.object(PILImage, "MAX_IMAGE_PIXELS", 600):
+            with mock.patch.object(
+                ImageFile.ImageFile,
+                "load",
+                side_effect=AssertionError(
+                    "backfill decoded oversized pixels"
+                ),
+            ):
+                summary = self._service().run(execute=True)
+
+        self.assertEqual(summary.scanned, 1)
+        self.assertEqual(summary.eligible, 0)
+        self.assertEqual(summary.skipped, 1)
+        self.assertEqual(
+            summary.reason_counts,
+            {"processing_pixel_limit_exceeded": 1},
+        )
+        self.assertIn(
+            "processing_pixel_limit_exceeded",
+            SAFE_BACKFILL_REASON_CODES,
+        )
+        self.assertFalse(MediaAsset.objects.exists())
+        self.assertTrue(Image.objects.filter(pk=candidate["image"].pk).exists())
+        self.assertEqual(
+            Thumbnail.objects.filter(original=candidate["image"]).count(),
+            3,
+        )
+        self.assertEqual(
+            Pin.objects.filter(image=candidate["image"]).count(),
+            len(candidate["pins"]),
+        )
+        for relative_path in candidate["paths"].values():
+            self.assertTrue(
+                Path(self.temporary_media.name, relative_path).is_file()
+            )
+
+    @override_settings(PINRY_FETCH_MAX_PIXELS=2000)
+    def test_processing_pixel_limit_skip_detects_replaced_original(self):
+        candidate = self._create_candidate(
+            content=_png_bytes("red", size=(32, 32)),
+        )
+        service = self._service()
+
+        with mock.patch.object(PILImage, "MAX_IMAGE_PIXELS", 600):
+            service.run()
+            original = Path(
+                self.temporary_media.name,
+                candidate["paths"]["original"],
+            )
+            replacement = original.with_name("replacement.png")
+            replacement.write_bytes(_png_bytes("blue", size=(32, 32)))
+            os.replace(str(replacement), str(original))
+
+            with self.assertRaisesRegex(
+                CommandError,
+                "^registry_plan_identity_changed$",
+            ):
+                service.run(execute=True)
 
     def test_file_receipt_rejects_hardlink_symlink_and_fifo_before_prepare(self):
         cases = ("hardlink", "symlink", "fifo")

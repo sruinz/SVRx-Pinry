@@ -260,7 +260,11 @@ class AutoV2MigrationPlan(object):
                 )
             except (MediaPathError, OSError) as error:
                 raise _command_error("unsafe_media_file", error)
-            except (PILImage.UnidentifiedImageError, Warning) as error:
+            except (
+                PILImage.DecompressionBombError,
+                PILImage.UnidentifiedImageError,
+                Warning,
+            ) as error:
                 raise _command_error("invalid_legacy_media", error)
             finally:
                 if receipt is not None:
@@ -483,17 +487,14 @@ def _inspect_receipt(receipt):
     receipt.verify_current()
     digest = sha256_file_descriptor(receipt.descriptor)
     with warnings.catch_warnings():
-        warnings.simplefilter("error", PILImage.DecompressionBombWarning)
+        # 기존 파일은 경고 구간까지 허용하되 Pillow hard limit은 유지한다.
+        warnings.simplefilter("ignore", PILImage.DecompressionBombWarning)
         with os.fdopen(os.dup(receipt.descriptor), "rb") as source:
             source.seek(0)
             with PILImage.open(source) as image:
-                image.verify()
-        with os.fdopen(os.dup(receipt.descriptor), "rb") as source:
-            source.seek(0)
-            with PILImage.open(source) as image:
-                image.load()
                 image_format = image.format
                 width, height = image.size
+                image.verify()
     try:
         extension = FORMAT_EXTENSIONS[image_format]
     except KeyError as error:
@@ -2650,15 +2651,3 @@ def _verify_staging(descriptor, file_plan):
         or sha256_file_descriptor(descriptor) != file_plan.sha256
     ):
         raise _command_error("media_verification_failed")
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", PILImage.DecompressionBombWarning)
-        with os.fdopen(os.dup(descriptor), "rb") as staging:
-            staging.seek(0)
-            with PILImage.open(staging) as image:
-                image.load()
-                if (
-                    image.format != file_plan.image_format
-                    or image.size
-                    != (file_plan.width, file_plan.height)
-                ):
-                    raise _command_error("media_verification_failed")
