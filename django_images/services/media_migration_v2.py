@@ -1938,13 +1938,14 @@ class AutoV2MediaMigrator(object):
             if source is not None:
                 source.close()
 
-    def _verify_intent_staging_identity(
+    def _verify_named_staging_object(
         self,
         staging_directory,
         staging_name,
         descriptor,
-        publish_intent,
+        expected_identity,
         expected_link_count,
+        expected_size=None,
     ):
         try:
             staging_directory.verify_current()
@@ -1962,17 +1963,167 @@ class AutoV2MediaMigrator(object):
             or (
                 named_stat.st_dev,
                 named_stat.st_ino,
-            ) != publish_intent[:2]
+            ) != expected_identity
             or (
                 descriptor_stat.st_dev,
                 descriptor_stat.st_ino,
-            ) != publish_intent[:2]
+            ) != expected_identity
             or named_stat.st_nlink != expected_link_count
             or descriptor_stat.st_nlink != expected_link_count
-            or named_stat.st_uid != self.service_uid
-            or stat.S_IMODE(named_stat.st_mode) != 0o600
+            or (
+                expected_size is not None
+                and (
+                    named_stat.st_size != expected_size
+                    or descriptor_stat.st_size != expected_size
+                )
+            )
         ):
             raise _command_error("media_verification_failed")
+        return named_stat, descriptor_stat
+
+    def _verify_intent_staging_identity(
+        self,
+        staging_directory,
+        staging_name,
+        descriptor,
+        expected_identity,
+        expected_link_count,
+        expected_size=None,
+    ):
+        named_stat, descriptor_stat = self._verify_named_staging_object(
+            staging_directory,
+            staging_name,
+            descriptor,
+            expected_identity,
+            expected_link_count,
+            expected_size=expected_size,
+        )
+        for current_stat in (named_stat, descriptor_stat):
+            if (
+                current_stat.st_uid != self.service_uid
+                or current_stat.st_gid != self.service_gid
+                or stat.S_IMODE(current_stat.st_mode) != 0o600
+            ):
+                raise _command_error("media_verification_failed")
+        return descriptor_stat
+
+    def _set_new_staging_service_identity(
+        self,
+        staging_directory,
+        staging_name,
+        descriptor,
+        expected_identity,
+    ):
+        named_stat, descriptor_stat = self._verify_named_staging_object(
+            staging_directory,
+            staging_name,
+            descriptor,
+            expected_identity,
+            1,
+            expected_size=0,
+        )
+        effective_uid = os.geteuid()
+        if (
+            effective_uid not in (0, self.service_uid)
+            or named_stat.st_uid != effective_uid
+            or descriptor_stat.st_uid != effective_uid
+            or named_stat.st_gid != descriptor_stat.st_gid
+        ):
+            raise _command_error("media_verification_failed")
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.fchown(descriptor, self.service_uid, self.service_gid)
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            os.fsync(staging_directory.descriptor)
+        except OSError as error:
+            raise _command_error("media_verification_failed", error)
+        return self._verify_intent_staging_identity(
+            staging_directory,
+            staging_name,
+            descriptor,
+            expected_identity,
+            1,
+            expected_size=0,
+        )
+
+    def _recover_root_staging_service_identity(
+        self,
+        staging_directory,
+        staging_name,
+        descriptor,
+        publish_intent,
+        file_plan,
+        expected_link_count,
+        destination_directory,
+        destination_name,
+    ):
+        named_stat, descriptor_stat = self._verify_named_staging_object(
+            staging_directory,
+            staging_name,
+            descriptor,
+            publish_intent[:2],
+            expected_link_count,
+            expected_size=file_plan.size,
+        )
+        expected_metadata = (
+            self.service_uid,
+            self.service_gid,
+            0o600,
+        )
+        named_metadata = (
+            named_stat.st_uid,
+            named_stat.st_gid,
+            stat.S_IMODE(named_stat.st_mode),
+        )
+        descriptor_metadata = (
+            descriptor_stat.st_uid,
+            descriptor_stat.st_gid,
+            stat.S_IMODE(descriptor_stat.st_mode),
+        )
+        if (
+            named_metadata == expected_metadata
+            and descriptor_metadata == expected_metadata
+        ):
+            return descriptor_stat
+        if (
+            os.geteuid() != 0
+            or named_metadata != descriptor_metadata
+            or named_metadata != (0, 0, 0o600)
+        ):
+            raise _command_error("media_verification_failed")
+        try:
+            destination_directory.verify_current()
+            try:
+                os.stat(
+                    destination_name,
+                    dir_fd=destination_directory.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise _command_error("destination_collision")
+        except CommandError:
+            raise
+        except (MediaPathError, OSError) as error:
+            raise _command_error("media_verification_failed", error)
+        try:
+            os.fchown(descriptor, self.service_uid, self.service_gid)
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            os.fsync(staging_directory.descriptor)
+        except OSError as error:
+            raise _command_error("media_verification_failed", error)
+        descriptor_stat = self._verify_intent_staging_identity(
+            staging_directory,
+            staging_name,
+            descriptor,
+            publish_intent[:2],
+            expected_link_count,
+            expected_size=file_plan.size,
+        )
+        _verify_staging(descriptor, file_plan)
         return descriptor_stat
 
     def _open_intent_staging(
@@ -1981,6 +2132,8 @@ class AutoV2MediaMigrator(object):
         publish_intent,
         file_plan,
         expected_link_count,
+        destination_directory,
+        destination_name,
     ):
         flags = os.O_RDONLY | os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
@@ -1994,20 +2147,49 @@ class AutoV2MediaMigrator(object):
                 flags,
                 dir_fd=staging_directory.descriptor,
             )
-            file_stat = self._verify_intent_staging_identity(
+            self._verify_named_staging_object(
+                staging_directory,
+                publish_intent[4],
+                descriptor,
+                publish_intent[:2],
+                expected_link_count,
+                expected_size=file_plan.size,
+            )
+            _verify_staging(descriptor, file_plan)
+            self._verify_named_staging_object(
+                staging_directory,
+                publish_intent[4],
+                descriptor,
+                publish_intent[:2],
+                expected_link_count,
+                expected_size=file_plan.size,
+            )
+            self._recover_root_staging_service_identity(
                 staging_directory,
                 publish_intent[4],
                 descriptor,
                 publish_intent,
+                file_plan,
                 expected_link_count,
+                destination_directory,
+                destination_name,
+            )
+            file_stat = self._verify_intent_staging_identity(
+                staging_directory,
+                publish_intent[4],
+                descriptor,
+                publish_intent[:2],
+                expected_link_count,
+                expected_size=file_plan.size,
             )
             _verify_staging(descriptor, file_plan)
             self._verify_intent_staging_identity(
                 staging_directory,
                 publish_intent[4],
                 descriptor,
-                publish_intent,
+                publish_intent[:2],
                 expected_link_count,
+                expected_size=file_plan.size,
             )
             return OwnedStagingFile(
                 staging_directory,
@@ -2108,7 +2290,11 @@ class AutoV2MediaMigrator(object):
             or destination_stat.st_nlink != 1
             or descriptor_stat.st_nlink != 1
             or destination_stat.st_uid != self.service_uid
+            or destination_stat.st_gid != self.service_gid
+            or descriptor_stat.st_uid != self.service_uid
+            or descriptor_stat.st_gid != self.service_gid
             or stat.S_IMODE(destination_stat.st_mode) != 0o600
+            or stat.S_IMODE(descriptor_stat.st_mode) != 0o600
         ):
             raise _command_error("media_verification_failed")
         _verify_staging(staging_descriptor, file_plan)
@@ -2128,8 +2314,9 @@ class AutoV2MediaMigrator(object):
             staging_directory,
             staging_name,
             staging_descriptor,
-            publish_intent,
+            publish_intent[:2],
             1,
+            expected_size=file_plan.size,
         )
         destination_directory.verify_current()
         try:
@@ -2215,6 +2402,8 @@ class AutoV2MediaMigrator(object):
                     publish_intent,
                     file_plan,
                     1,
+                    destination_directory,
+                    destination_name,
                 )
                 self._atomic_publish_staging(
                     staging_directory,
@@ -2234,6 +2423,7 @@ class AutoV2MediaMigrator(object):
                     ) != publish_intent[:2]
                     or destination_stat.st_nlink != 1
                     or destination_stat.st_uid != self.service_uid
+                    or destination_stat.st_gid != self.service_gid
                     or stat.S_IMODE(destination_stat.st_mode) != 0o600
                 ):
                     raise _command_error("destination_collision")
@@ -2285,6 +2475,15 @@ class AutoV2MediaMigrator(object):
                 staging_directory,
                 "auto-v2-{}.part".format(uuid.uuid4()),
             )
+            staging.file_stat = self._set_new_staging_service_identity(
+                staging_directory,
+                staging.name,
+                staging.descriptor,
+                (
+                    staging.file_stat.st_dev,
+                    staging.file_stat.st_ino,
+                ),
+            )
             with os.fdopen(os.dup(source.descriptor), "rb") as source_file:
                 source_file.seek(0)
                 with os.fdopen(os.dup(staging.descriptor), "wb") as target:
@@ -2295,6 +2494,15 @@ class AutoV2MediaMigrator(object):
                         target.write(chunk)
                     target.flush()
                     os.fsync(target.fileno())
+            staging_stat = os.fstat(staging.descriptor)
+            self._verify_intent_staging_identity(
+                staging_directory,
+                staging.name,
+                staging.descriptor,
+                (staging_stat.st_dev, staging_stat.st_ino),
+                1,
+                expected_size=file_plan.size,
+            )
             _verify_staging(staging.descriptor, file_plan)
             relative_directory, destination_name = file_plan.new_path.rsplit(
                 "/", 1

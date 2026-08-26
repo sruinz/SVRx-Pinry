@@ -32,6 +32,7 @@ from django_images.services.media_migration_v2 import (
     AutoV2MigrationFile,
     AutoV2MigrationPlan,
     AutoV2PlanSummary,
+    _verify_staging,
     _valid_staging_name,
     load_auto_v2_archive_direct_roots,
     load_auto_v2_archive_sources,
@@ -169,6 +170,21 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             self.service_gid,
             batch_size=batch_size,
             fault_injector=fault_injector,
+        )
+
+    def alternate_service_gid(self):
+        for group_id in os.getgroups():
+            if group_id != self.service_gid:
+                return group_id
+        self.skipTest("alternate service group is unavailable")
+
+    def use_distinct_root_service_identity(self):
+        if os.geteuid() != 0:
+            self.skipTest("root-created staging ownership test")
+        self.service_uid = 1000
+        self.service_gid = 1000
+        os.chown(
+            str(self.run_directory), self.service_uid, self.service_gid
         )
 
     def database_paths(self):
@@ -1298,6 +1314,294 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertEqual(image.image.name, destination_relative)
         self.assertEqual(os.stat(str(destination)).st_nlink, 1)
         self.assertEqual(self.manifest_events()[-1]["event"], "committed")
+
+    def test_new_staging_uses_service_identity_before_publish_intent(self):
+        image = self.make_image(sizes=())
+        service_gid = self.alternate_service_gid()
+        os.chown(
+            str(self.run_directory), self.service_uid, service_gid
+        )
+
+        def crash(point):
+            if point == "after_publish_intent":
+                raise SimulatedProcessCrash()
+
+        migrator = AutoV2MediaMigrator(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            service_gid,
+            fault_injector=crash,
+        )
+        with self.assertRaises(SimulatedProcessCrash):
+            migrator.run(execute=True)
+
+        intent = next(
+            event
+            for event in self.manifest_events()
+            if event["event"] == "publish_intent"
+        )
+        staging = Path(
+            self.temporary_media.name,
+            ".staging",
+            intent["staging_name"],
+        )
+        staging_stat = os.stat(str(staging))
+        self.assertEqual(
+            (staging_stat.st_uid, staging_stat.st_gid),
+            (self.service_uid, service_gid),
+        )
+        self.assertEqual(stat.S_IMODE(staging_stat.st_mode), 0o600)
+        image.refresh_from_db()
+        self.assertNotEqual(
+            image.image.name,
+            canonical_original_path(
+                image.asset_uuid, image.original_filename, ".png"
+            ),
+        )
+
+    def test_resume_rejects_service_owner_with_wrong_group(self):
+        image = self.make_image(sizes=())
+
+        def crash(point):
+            if point == "after_publish_intent":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+
+        intent = next(
+            event
+            for event in self.manifest_events()
+            if event["event"] == "publish_intent"
+        )
+        staging = Path(
+            self.temporary_media.name,
+            ".staging",
+            intent["staging_name"],
+        )
+        original_group = os.stat(str(staging)).st_gid
+        service_gid = self.alternate_service_gid()
+        self.assertNotEqual(original_group, service_gid)
+        os.chown(str(staging), self.service_uid, service_gid)
+
+        with self.assertRaisesRegex(
+            CommandError, "^media_verification_failed$"
+        ):
+            self.migrator().run(execute=True)
+
+        staging_stat = os.stat(str(staging))
+        self.assertEqual(staging_stat.st_uid, self.service_uid)
+        self.assertEqual(staging_stat.st_gid, service_gid)
+        image.refresh_from_db()
+        self.assertNotEqual(
+            image.image.name,
+            canonical_original_path(
+                image.asset_uuid, image.original_filename, ".png"
+            ),
+        )
+        events = {event["event"] for event in self.manifest_events()}
+        self.assertNotIn("published", events)
+        self.assertNotIn("committed", events)
+
+    def test_resume_does_not_reown_root_with_service_group(self):
+        migrator = self.migrator()
+        migrator.service_uid = 1000
+        migrator.service_gid = 1000
+        root_service_stat = mock.Mock(
+            st_uid=0,
+            st_gid=migrator.service_gid,
+            st_mode=stat.S_IFREG | 0o600,
+        )
+        file_plan = mock.Mock(size=4)
+
+        with mock.patch.object(
+            migrator,
+            "_verify_named_staging_object",
+            return_value=(root_service_stat, root_service_stat),
+        ), mock.patch(
+            "django_images.services.media_migration_v2.os.geteuid",
+            return_value=0,
+        ), mock.patch(
+            "django_images.services.media_migration_v2.os.fchown"
+        ) as reown, mock.patch(
+            "django_images.services.media_migration_v2.os.fchmod"
+        ), mock.patch(
+            "django_images.services.media_migration_v2.os.fsync"
+        ), mock.patch(
+            "django_images.services.media_migration_v2._verify_staging"
+        ):
+            with self.assertRaisesRegex(
+                CommandError, "^media_verification_failed$"
+            ):
+                migrator._recover_root_staging_service_identity(
+                    mock.Mock(),
+                    "auto-v2-test.part",
+                    123,
+                    (1, 2, 3, 4, "auto-v2-test.part"),
+                    file_plan,
+                    1,
+                    mock.Mock(),
+                    "original.png",
+                )
+
+        reown.assert_not_called()
+
+    def test_resume_rechecks_destination_before_root_reownership(self):
+        image = self.make_image(sizes=())
+        old_path = image.image.name
+
+        def crash(point):
+            if point == "after_publish_intent":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        destination = Path(
+            self.temporary_media.name, destination_relative
+        )
+        migrator = self.migrator()
+        verify_named = migrator._verify_named_staging_object
+        named_calls = []
+        sha_calls = []
+
+        def verify_then_create_destination(descriptor, file_plan):
+            result = _verify_staging(descriptor, file_plan)
+            if not sha_calls:
+                destination.write_bytes(b"external destination")
+                sha_calls.append(True)
+            return result
+
+        def report_root_on_recovery(*args, **kwargs):
+            named_stat, descriptor_stat = verify_named(*args, **kwargs)
+            named_calls.append(True)
+            if len(named_calls) != 3:
+                return named_stat, descriptor_stat
+            migrator.service_uid = 1000
+            migrator.service_gid = 1000
+            root_stat = mock.Mock(
+                st_uid=0,
+                st_gid=0,
+                st_mode=stat.S_IFREG | 0o600,
+            )
+            return root_stat, root_stat
+
+        with mock.patch(
+            "django_images.services.media_migration_v2._verify_staging",
+            side_effect=verify_then_create_destination,
+        ), mock.patch.object(
+            migrator,
+            "_verify_named_staging_object",
+            side_effect=report_root_on_recovery,
+        ), mock.patch(
+            "django_images.services.media_migration_v2.os.geteuid",
+            return_value=0,
+        ), mock.patch(
+            "django_images.services.media_migration_v2.os.fchown"
+        ) as reown:
+            with self.assertRaisesRegex(
+                CommandError, "^destination_collision$"
+            ):
+                migrator.run(execute=True)
+
+        self.assertEqual(len(sha_calls), 1)
+        self.assertEqual(destination.read_bytes(), b"external destination")
+        reown.assert_not_called()
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, old_path)
+
+    def test_resume_reowns_manifest_bound_root_staging_for_service(self):
+        self.use_distinct_root_service_identity()
+        image = self.make_image(sizes=())
+
+        def crash(point):
+            if point == "after_publish_intent":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+
+        intent = next(
+            event
+            for event in self.manifest_events()
+            if event["event"] == "publish_intent"
+        )
+        staging = Path(
+            self.temporary_media.name,
+            ".staging",
+            intent["staging_name"],
+        )
+        os.chown(str(staging), 0, 0)
+
+        self.migrator().run(execute=True)
+
+        destination_relative = canonical_original_path(
+            image.asset_uuid, image.original_filename, ".png"
+        )
+        destination = Path(
+            self.temporary_media.name, destination_relative
+        )
+        destination_stat = os.stat(str(destination))
+        self.assertEqual(
+            (destination_stat.st_uid, destination_stat.st_gid),
+            (self.service_uid, self.service_gid),
+        )
+        self.assertEqual(stat.S_IMODE(destination_stat.st_mode), 0o600)
+        self.assertFalse(staging.exists())
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, destination_relative)
+        self.assertEqual(self.manifest_events()[-1]["event"], "committed")
+
+    def test_resume_does_not_reown_tampered_root_staging(self):
+        self.use_distinct_root_service_identity()
+        image = self.make_image(sizes=())
+
+        def crash(point):
+            if point == "after_publish_intent":
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(fault_injector=crash).run(execute=True)
+
+        intent = next(
+            event
+            for event in self.manifest_events()
+            if event["event"] == "publish_intent"
+        )
+        staging = Path(
+            self.temporary_media.name,
+            ".staging",
+            intent["staging_name"],
+        )
+        os.chown(str(staging), 0, 0)
+        content = bytearray(staging.read_bytes())
+        content[0] ^= 1
+        staging.write_bytes(content)
+
+        with self.assertRaisesRegex(
+            CommandError, "^media_verification_failed$"
+        ):
+            self.migrator().run(execute=True)
+
+        staging_stat = os.stat(str(staging))
+        self.assertEqual(
+            (staging_stat.st_uid, staging_stat.st_gid), (0, 0)
+        )
+        image.refresh_from_db()
+        self.assertNotEqual(
+            image.image.name,
+            canonical_original_path(
+                image.asset_uuid, image.original_filename, ".png"
+            ),
+        )
+        events = {event["event"] for event in self.manifest_events()}
+        self.assertNotIn("published", events)
+        self.assertNotIn("committed", events)
 
     def test_initial_publish_rejects_swap_in_exact_detach_primitive_window(self):
         image = self.make_image(sizes=())
