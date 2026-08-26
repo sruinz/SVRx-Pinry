@@ -1117,6 +1117,11 @@ class _AutoV2ManifestState(object):
         self.torn_tail = None
         self.torn_offset = None
         self.raw_bytes = b""
+        self.content_size = 0
+        self.content_sha256 = hashlib.sha256(b"").hexdigest()
+        self.content_mtime_ns = None
+        self.content_ctime_ns = None
+        self.plan_sha256 = None
         self.format_version = None
 
     def __setattr__(self, name, value):
@@ -1173,6 +1178,11 @@ def _copy_manifest_state(state):
     copied.torn_tail = state.torn_tail
     copied.torn_offset = state.torn_offset
     copied.raw_bytes = state.raw_bytes
+    copied.content_size = state.content_size
+    copied.content_sha256 = state.content_sha256
+    copied.content_mtime_ns = state.content_mtime_ns
+    copied.content_ctime_ns = state.content_ctime_ns
+    copied.plan_sha256 = state.plan_sha256
     copied.format_version = state.format_version
     return copied
 
@@ -1561,6 +1571,15 @@ class AutoV2ManifestLog(object):
                 raw,
             )
             offset += len(line)
+        current = os.fstat(self.descriptor)
+        state.content_size = len(raw)
+        state.content_sha256 = hashlib.sha256(raw).hexdigest()
+        state.content_mtime_ns = current.st_mtime_ns
+        state.content_ctime_ns = current.st_ctime_ns
+        if state.plan_end_offset is not None:
+            state.plan_sha256 = hashlib.sha256(
+                raw[:state.plan_end_offset]
+            ).hexdigest()
         return state.freeze()
 
     def append(self, event):
@@ -1620,6 +1639,15 @@ class AutoV2ManifestLog(object):
         ):
             raise _command_error("unsafe_auto_v2_manifest")
         candidate.raw_bytes = current
+        current_stat = os.fstat(self.descriptor)
+        candidate.content_size = len(current)
+        candidate.content_sha256 = hashlib.sha256(current).hexdigest()
+        candidate.content_mtime_ns = current_stat.st_mtime_ns
+        candidate.content_ctime_ns = current_stat.st_ctime_ns
+        if candidate.plan_end_offset is not None:
+            candidate.plan_sha256 = hashlib.sha256(
+                current[:candidate.plan_end_offset]
+            ).hexdigest()
         self.state = candidate.freeze()
 
     def write_frozen_plan(self, plans):
@@ -1634,12 +1662,24 @@ class AutoV2ManifestLog(object):
             "run_id": self.run_id,
         }
         digest = hashlib.sha256()
+        candidate = _AutoV2ManifestState()
+        offset = 0
         self._verify_current()
         os.lseek(self.descriptor, 0, os.SEEK_END)
 
         def write_event(event):
+            nonlocal offset
             line = _json_line(event)
+            canonical_event = json.loads(line.decode("utf-8"))
             digest.update(line)
+            offset += len(line)
+            _apply_manifest_event(
+                candidate,
+                canonical_event,
+                self.run_id,
+                offset,
+                b"",
+            )
             view = memoryview(line)
             while view:
                 written = os.write(self.descriptor, view)
@@ -1660,9 +1700,17 @@ class AutoV2ManifestLog(object):
             files_total=sum(len(plan.files) for plan in plans),
         ))
         _durable_fsync(self.descriptor, "plan_manifest")
-        self.state = self._load_state()
-        if hashlib.sha256(self.state.raw_bytes).digest() != digest.digest():
+        self._verify_current()
+        current = os.fstat(self.descriptor)
+        if current.st_size != offset:
             raise _command_error("unsafe_auto_v2_manifest")
+        candidate.raw_bytes = None
+        candidate.content_size = offset
+        candidate.content_sha256 = digest.hexdigest()
+        candidate.content_mtime_ns = current.st_mtime_ns
+        candidate.content_ctime_ns = current.st_ctime_ns
+        candidate.plan_sha256 = digest.hexdigest()
+        self.state = candidate.freeze()
         return digest.hexdigest()
 
     def record_plan(self, plan):
@@ -1822,9 +1870,7 @@ class AutoV2ManifestLog(object):
         return AutoV2PlanSummary(
             run_id=self.run_id,
             plan_sha256=self._plan_sha256(),
-            manifest_sha256=hashlib.sha256(
-                self.state.raw_bytes
-            ).hexdigest(),
+            manifest_sha256=self.state.content_sha256,
             image_count=marker["image_count"],
             md5_legacy=counts["md5_legacy"],
             fixed_slot=counts["fixed_slot"],
@@ -1839,11 +1885,19 @@ class AutoV2ManifestLog(object):
             )
         if not self.state.plan_complete:
             raise _command_error("auto_v2_plan_incomplete")
-        return hashlib.sha256(
-            self.state.raw_bytes[:self.state.plan_end_offset]
-        ).hexdigest()
+        return self.state.plan_sha256
 
     def _ensure_content_current(self):
+        if self.state.raw_bytes is None:
+            self._verify_current()
+            current = os.fstat(self.descriptor)
+            if (
+                current.st_size != self.state.content_size
+                or current.st_mtime_ns != self.state.content_mtime_ns
+                or current.st_ctime_ns != self.state.content_ctime_ns
+            ):
+                raise _command_error("unsafe_auto_v2_manifest")
+            return True
         if self._read_all() != self.state.raw_bytes:
             raise _command_error("unsafe_auto_v2_manifest")
         return True
@@ -2484,7 +2538,10 @@ class AutoV2MediaMigrator(object):
                 )
                 if repaired:
                     journal.write_checkpoint()
-                self._validate_image_plan_closure(plans)
+                self._validate_image_plan_closure(
+                    plans,
+                    committed_receipts=journal.receipts_by_image("paths"),
+                )
                 return self._summary_from_journal(summary, journal)
 
             committed = journal.committed_ids("paths")
@@ -2517,6 +2574,7 @@ class AutoV2MediaMigrator(object):
                         continue
                     prepared = self._prepare_path_files(root, batch)
                     self._sync_staging_devices(prepared)
+                    self._inject_fault("after_staging_sync")
                     self._publish_batch_and_sync_directories(prepared)
                     self._report_linear_copy_progress(
                         journal, batch, prepared
@@ -2539,6 +2597,7 @@ class AutoV2MediaMigrator(object):
                         )
                         for item in prepared
                     )
+                    self._verify_source_name_identities(root, prepared)
                     intent = BatchIntent.for_values(
                         batch_id=batch_id,
                         batch_number=batch_number,
@@ -2567,7 +2626,10 @@ class AutoV2MediaMigrator(object):
                     self._report_linear_batch_progress(journal)
             finally:
                 root.close()
-            self._validate_image_plan_closure(plans)
+            self._validate_image_plan_closure(
+                plans,
+                committed_receipts=journal.receipts_by_image("paths"),
+            )
             phase_summary = self._paths_phase_summary(journal, plans)
             journal.append_phase_complete("paths", phase_summary)
             journal.write_checkpoint()
@@ -2740,6 +2802,7 @@ class AutoV2MediaMigrator(object):
         source = None
         staging_directory = None
         staging = None
+        reused_staging = False
         try:
             source = open_verified_media_file(root, file_plan.old_path)
             source_stat = source.file_stat
@@ -2756,12 +2819,22 @@ class AutoV2MediaMigrator(object):
             staging_directory = open_or_create_media_directory_from(
                 root, ".staging"
             )
-            staging = create_owned_staging_file(
-                staging_directory, self._staging_name(file_key)
+            staging_name = self._staging_name(file_key)
+            staging = self._open_existing_linear_staging(
+                staging_directory, staging_name, file_plan
             )
-            prepared = self._stream_source_to_staging_and_inspect(
-                source, staging, file_key
-            )
+            if staging is None:
+                staging = create_owned_staging_file(
+                    staging_directory, staging_name
+                )
+                prepared = self._stream_source_to_staging_and_inspect(
+                    source, staging, file_key
+                )
+            else:
+                reused_staging = True
+                prepared = self._inspect_existing_linear_staging(
+                    staging, file_key
+                )
             if (
                 prepared[1] != file_plan.size
                 or prepared[3] != file_plan.width
@@ -2827,11 +2900,105 @@ class AutoV2MediaMigrator(object):
                 source.close()
             if staging is not None:
                 try:
-                    staging.cleanup()
+                    if not reused_staging:
+                        staging.cleanup()
                 finally:
                     staging.close()
             if staging_directory is not None:
                 staging_directory.close()
+
+    def _open_existing_linear_staging(
+        self, staging_directory, staging_name, file_plan
+    ):
+        if not self._resume_attempt:
+            return None
+        flags = os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        descriptor = None
+        try:
+            try:
+                descriptor = os.open(
+                    staging_name,
+                    flags,
+                    dir_fd=staging_directory.descriptor,
+                )
+            except FileNotFoundError:
+                return None
+            descriptor_stat = os.fstat(descriptor)
+            identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            file_stat = self._verify_intent_staging_identity(
+                staging_directory,
+                staging_name,
+                descriptor,
+                identity,
+                1,
+                expected_size=file_plan.size,
+            )
+            staging = OwnedStagingFile(
+                staging_directory,
+                staging_name,
+                descriptor,
+                file_stat,
+                staging_name,
+                owns_directory=False,
+                idempotent_cleanup=True,
+            )
+            descriptor = None
+            return staging
+        except (MediaPathError, OSError) as error:
+            raise _command_error("media_verification_failed", error)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _inspect_existing_linear_staging(self, staging, file_key):
+        del file_key
+        parser = ImageFile.Parser()
+        digest = hashlib.sha256()
+        size = 0
+        descriptor = os.dup(staging.descriptor)
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                parser.feed(chunk)
+                size += len(chunk)
+            with warnings.catch_warnings():
+                warnings.simplefilter(
+                    "ignore", PILImage.DecompressionBombWarning
+                )
+                image = parser.close()
+            try:
+                image_format = image.format
+                width, height = image.size
+            finally:
+                image.close()
+            self._verify_intent_staging_identity(
+                staging.directory,
+                staging.name,
+                staging.descriptor,
+                (staging.file_stat.st_dev, staging.file_stat.st_ino),
+                1,
+                expected_size=size,
+            )
+            return digest.hexdigest(), size, image_format, width, height
+        except (
+            PILImage.DecompressionBombError,
+            PILImage.UnidentifiedImageError,
+            OSError,
+            Warning,
+        ) as error:
+            raise _command_error("media_verification_failed", error)
+        finally:
+            os.close(descriptor)
 
     def _open_source_descriptor(self, source, file_key):
         del file_key
@@ -3075,6 +3242,33 @@ class AutoV2MediaMigrator(object):
             database_signature,
         )
 
+    def _verify_source_name_identities(self, root, prepared):
+        for item in prepared:
+            source = None
+            try:
+                source = open_verified_media_file(
+                    root, item.file_plan.old_path
+                )
+                current = os.fstat(source.descriptor)
+                if (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_size,
+                ) != (
+                    item.source_device,
+                    item.source_inode,
+                    item.size,
+                ):
+                    raise _command_error("media_verification_failed")
+                source.verify_current()
+            except CommandError:
+                raise
+            except (MediaPathError, OSError) as error:
+                raise _command_error("media_verification_failed", error)
+            finally:
+                if source is not None:
+                    source.close()
+
     def _signature_rows(self, batch, path_by_key):
         rows = []
         for plan in batch:
@@ -3130,6 +3324,16 @@ class AutoV2MediaMigrator(object):
         current_images = list(images)
         current_thumbnails = list(thumbnails)
         if [image.pk for image in current_images] != image_ids:
+            return "changed"
+        planned_thumbnail_ids = {
+            file_plan.thumbnail_id
+            for plan in batch
+            for file_plan in plan.files
+            if file_plan.thumbnail_id is not None
+        }
+        if {
+            thumbnail.pk for thumbnail in current_thumbnails
+        } != planned_thumbnail_ids:
             return "changed"
         for image in current_images:
             path_by_key["original:{}".format(image.pk)] = image.image.name
@@ -4622,15 +4826,59 @@ class AutoV2MediaMigrator(object):
             return "new"
         return "changed"
 
-    def _validate_image_plan_closure(self, plans, lock=False):
-        queryset = Image.objects.order_by("pk")
+    def _validate_image_plan_closure(
+        self, plans, lock=False, committed_receipts=None
+    ):
+        image_queryset = Image.objects.order_by("pk")
+        thumbnail_queryset = Thumbnail.objects.order_by(
+            "original_id", "size", "pk"
+        )
         if lock:
-            queryset = queryset.select_for_update()
+            image_queryset = image_queryset.select_for_update()
+            thumbnail_queryset = thumbnail_queryset.select_for_update()
         current_image_ids = tuple(
-            queryset.values_list("pk", flat=True)
+            image_queryset.values_list("pk", flat=True)
         )
         planned_image_ids = tuple(plan.image_id for plan in plans)
         if current_image_ids != planned_image_ids:
+            raise _command_error("media_migration_database_changed")
+        thumbnail_fields = [
+            "pk", "original_id", "size", "width", "height"
+        ]
+        receipt_paths = None
+        if committed_receipts is not None:
+            thumbnail_fields.insert(3, "image")
+            receipt_paths = {
+                receipt.file_key: receipt.relative_path
+                for receipts in committed_receipts.values()
+                for receipt in receipts
+            }
+        current_thumbnails = tuple(
+            thumbnail_queryset.values_list(*thumbnail_fields)
+        )
+
+        def planned_thumbnail(plan, row):
+            values = [row[0], plan.image_id, row[1]]
+            if receipt_paths is not None:
+                key = "thumbnail:{}:{}".format(plan.image_id, row[0])
+                try:
+                    values.append(receipt_paths[key])
+                except KeyError as error:
+                    raise _command_error(
+                        "media_migration_database_changed", error
+                    )
+            values.extend((row[3], row[4]))
+            return tuple(values)
+
+        planned_thumbnails = tuple(sorted(
+            [
+                planned_thumbnail(plan, row)
+                for plan in plans
+                for row in plan.thumbnail_rows
+            ],
+            key=lambda row: (row[1], row[2], row[0]),
+        ))
+        if current_thumbnails != planned_thumbnails:
             raise _command_error("media_migration_database_changed")
 
     def _commit_batches(self, manifest, plans):

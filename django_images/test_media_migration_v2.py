@@ -238,6 +238,34 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             ["plan_manifest"],
         )
 
+    def test_fresh_plan_builds_state_without_replay_or_raw_materialization(
+        self,
+    ):
+        self.make_image()
+        plans = self.migrator()._freeze_all_plans()
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ) as manifest:
+            with mock.patch.object(
+                manifest,
+                "_load_state",
+                side_effect=AssertionError("fresh plan must not replay"),
+            ) as load_state, mock.patch.object(
+                manifest,
+                "_read_all",
+                side_effect=AssertionError("fresh plan must not reread"),
+            ) as read_all:
+                plan_sha256 = manifest.write_frozen_plan(plans)
+
+            self.assertEqual(load_state.call_count, 0)
+            self.assertEqual(read_all.call_count, 0)
+            self.assertIsNone(manifest.state.raw_bytes)
+            self.assertEqual(manifest.summary().plan_sha256, plan_sha256)
+
     def test_fresh_execute_uses_sidecar_and_keeps_plan_immutable(self):
         image = self.make_image(sizes=())
 
@@ -371,7 +399,7 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         )
 
     def test_syncfs_failure_records_no_batch_intent(self):
-        self.make_image(sizes=())
+        image = self.make_image(sizes=())
         self.migrator().run(execute=False)
 
         with mock.patch(
@@ -384,6 +412,63 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             event["event"] == "batch_intent"
             for event in self.journal_events()
         ))
+
+        migrator = self.migrator()
+        with mock.patch.object(
+            migrator,
+            "_iter_source_chunks",
+            wraps=migrator._iter_source_chunks,
+        ) as source_chunks:
+            migrator.run(execute=True)
+
+        self.assertEqual(source_chunks.call_count, 0)
+        image.refresh_from_db()
+        self.assertEqual(
+            image.image.name,
+            canonical_original_path(
+                image.asset_uuid, image.original_filename, ".png"
+            ),
+        )
+
+    def test_mid_batch_publish_crash_reuses_remaining_staging(self):
+        image = self.make_image(sizes=("thumbnail",))
+        publish_calls = []
+
+        def crash_before_second_publish(point):
+            if point != "before_atomic_publish":
+                return
+            publish_calls.append(point)
+            if len(publish_calls) == 2:
+                raise SimulatedProcessCrash()
+
+        with self.assertRaises(SimulatedProcessCrash):
+            self.migrator(
+                fault_injector=crash_before_second_publish
+            ).run(execute=True)
+
+        migrator = self.migrator()
+        with mock.patch.object(
+            migrator,
+            "_iter_source_chunks",
+            wraps=migrator._iter_source_chunks,
+        ) as source_chunks:
+            migrator.run(execute=True)
+
+        self.assertEqual(source_chunks.call_count, 1)
+        image.refresh_from_db()
+        self.assertEqual(
+            image.image.name,
+            canonical_original_path(
+                image.asset_uuid, image.original_filename, ".png"
+            ),
+        )
+        thumbnail = image.thumbnail_set.get(size="thumbnail")
+        self.assertEqual(
+            thumbnail.image.name,
+            canonical_derivative_path(
+                image.asset_uuid, "thumbnail", ".png"
+            ),
+        )
 
     def test_global_plan_closure_runs_exactly_before_and_after_batches(self):
         self.make_image(sizes=())
@@ -398,6 +483,73 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             migrator.run(execute=True)
 
         self.assertEqual(closure.call_count, 2)
+
+    def _assert_thumbnail_change_rejected(self, plans, before_signature):
+        migrator = self.migrator()
+        self.assertNotEqual(
+            migrator._current_batch_signature(plans), before_signature
+        )
+        with self.assertRaisesRegex(
+            CommandError, "^media_migration_database_changed$"
+        ):
+            migrator._validate_image_plan_closure(plans)
+
+    def test_thumbnail_addition_breaks_batch_and_global_plan_closure(self):
+        image = self.make_image(sizes=("thumbnail",))
+        plans = self.migrator()._freeze_all_plans()
+        before_signature = self.migrator()._current_batch_signature(plans)
+        thumbnail = image.thumbnail_set.get(size="thumbnail")
+        Thumbnail.objects.create(
+            original=image,
+            image=thumbnail.image.name,
+            size="added-after-plan",
+            width=thumbnail.width,
+            height=thumbnail.height,
+        )
+
+        self._assert_thumbnail_change_rejected(plans, before_signature)
+
+    def test_thumbnail_deletion_breaks_batch_and_global_plan_closure(self):
+        image = self.make_image(sizes=("thumbnail",))
+        plans = self.migrator()._freeze_all_plans()
+        before_signature = self.migrator()._current_batch_signature(plans)
+        image.thumbnail_set.get(size="thumbnail").delete()
+
+        self._assert_thumbnail_change_rejected(plans, before_signature)
+
+    def test_thumbnail_metadata_breaks_batch_and_global_plan_closure(self):
+        image = self.make_image(sizes=("thumbnail",))
+        plans = self.migrator()._freeze_all_plans()
+        before_signature = self.migrator()._current_batch_signature(plans)
+        image.thumbnail_set.filter(size="thumbnail").update(width=31)
+
+        self._assert_thumbnail_change_rejected(plans, before_signature)
+
+    def test_final_closure_rejects_committed_thumbnail_path_change(self):
+        image = self.make_image(sizes=("thumbnail",))
+        changed = []
+
+        def change_committed_thumbnail(point):
+            if point != "after_batch_commit" or changed:
+                return
+            thumbnail = image.thumbnail_set.get(size="thumbnail")
+            Thumbnail.objects.filter(pk=thumbnail.pk).update(
+                image="external/changed-after-commit.png"
+            )
+            changed.append(True)
+
+        with self.assertRaisesRegex(
+            CommandError, "^media_migration_database_changed$"
+        ):
+            self.migrator(
+                fault_injector=change_committed_thumbnail
+            ).run(execute=True)
+
+        self.assertEqual(changed, [True])
+        self.assertFalse(any(
+            event["event"] == "phase_complete"
+            for event in self.journal_events()
+        ))
 
     def test_batch_closes_at_first_resource_limit(self):
         for _index in range(3):
@@ -1912,6 +2064,35 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         self.assertEqual(self.database_paths(), old_paths)
 
+    def test_source_name_swap_after_stream_is_rejected_before_intent(self):
+        image = self.make_image(sizes=())
+        old_path = image.image.name
+        source = Path(self.temporary_media.name, old_path)
+        swapped = []
+
+        def replace_source_name(point):
+            if point != "after_source_revalidation" or swapped:
+                return
+            replacement = source.with_name("replacement.png")
+            replacement.write_bytes(make_image_bytes("blue"))
+            os.replace(str(replacement), str(source))
+            swapped.append(True)
+
+        with self.assertRaisesRegex(
+            CommandError, "^media_verification_failed$"
+        ):
+            self.migrator(
+                fault_injector=replace_source_name
+            ).run(execute=True)
+
+        self.assertEqual(len(swapped), 1)
+        image.refresh_from_db()
+        self.assertEqual(image.image.name, old_path)
+        self.assertFalse(any(
+            event["event"] == "batch_intent"
+            for event in self.journal_events()
+        ))
+
     def test_execute_updates_database_only_after_destinations_are_verified(self):
         image = self.make_image()
 
@@ -2269,31 +2450,54 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         image.refresh_from_db()
         self.assertEqual(image.image.name, destination_relative)
 
-    def test_resume_reowns_manifest_bound_root_staging_for_service(self):
-        self.use_distinct_root_service_identity()
+    def _leave_pre_intent_staging(self):
+        if os.geteuid() == 0:
+            self.use_distinct_root_service_identity()
         image = self.make_image(sizes=())
 
         def crash(point):
-            if point == "after_publish_intent":
+            if point == "after_staging_sync":
                 raise SimulatedProcessCrash()
 
         with self.assertRaises(SimulatedProcessCrash):
             self.migrator(fault_injector=crash).run(execute=True)
 
-        intent = next(
-            event
-            for event in self.manifest_events()
-            if event["event"] == "publish_intent"
+        self.assertEqual(
+            [event["event"] for event in self.manifest_events()],
+            ["planned_skeleton", "plan_complete"],
         )
+        self.assertFalse(any(
+            event["event"] == "batch_intent"
+            for event in self.journal_events()
+        ))
         staging = Path(
             self.temporary_media.name,
             ".staging",
-            intent["staging_name"],
+            self.migrator()._staging_name(
+                "original:{}".format(image.pk)
+            ),
         )
-        os.chown(str(staging), 0, 0)
+        self.assertTrue(staging.exists())
+        return image, staging
 
-        self.migrator().run(execute=True)
+    def test_resume_reowns_manifest_bound_root_staging_for_service(self):
+        image, staging = self._leave_pre_intent_staging()
+        staging_stat = os.stat(str(staging))
+        self.assertEqual(
+            (staging_stat.st_uid, staging_stat.st_gid),
+            (self.service_uid, self.service_gid),
+        )
+        self.assertEqual(stat.S_IMODE(staging_stat.st_mode), 0o600)
 
+        migrator = self.migrator()
+        with mock.patch.object(
+            migrator,
+            "_iter_source_chunks",
+            wraps=migrator._iter_source_chunks,
+        ) as source_chunks:
+            migrator.run(execute=True)
+
+        self.assertEqual(source_chunks.call_count, 0)
         destination_relative = canonical_original_path(
             image.asset_uuid, image.original_filename, ".png"
         )
@@ -2309,30 +2513,14 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertFalse(staging.exists())
         image.refresh_from_db()
         self.assertEqual(image.image.name, destination_relative)
-        self.assertEqual(self.manifest_events()[-1]["event"], "committed")
+        self.assertTrue(any(
+            event["event"] == "batch_commit"
+            for event in self.journal_events()
+        ))
 
     def test_resume_does_not_reown_tampered_root_staging(self):
-        self.use_distinct_root_service_identity()
-        image = self.make_image(sizes=())
-
-        def crash(point):
-            if point == "after_publish_intent":
-                raise SimulatedProcessCrash()
-
-        with self.assertRaises(SimulatedProcessCrash):
-            self.migrator(fault_injector=crash).run(execute=True)
-
-        intent = next(
-            event
-            for event in self.manifest_events()
-            if event["event"] == "publish_intent"
-        )
-        staging = Path(
-            self.temporary_media.name,
-            ".staging",
-            intent["staging_name"],
-        )
-        os.chown(str(staging), 0, 0)
+        image, staging = self._leave_pre_intent_staging()
+        before_identity = os.stat(str(staging))
         content = bytearray(staging.read_bytes())
         content[0] ^= 1
         staging.write_bytes(content)
@@ -2344,7 +2532,12 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
 
         staging_stat = os.stat(str(staging))
         self.assertEqual(
-            (staging_stat.st_uid, staging_stat.st_gid), (0, 0)
+            (staging_stat.st_dev, staging_stat.st_ino),
+            (before_identity.st_dev, before_identity.st_ino),
+        )
+        self.assertEqual(
+            (staging_stat.st_uid, staging_stat.st_gid),
+            (self.service_uid, self.service_gid),
         )
         image.refresh_from_db()
         self.assertNotEqual(
@@ -2353,9 +2546,9 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 image.asset_uuid, image.original_filename, ".png"
             ),
         )
-        events = {event["event"] for event in self.manifest_events()}
-        self.assertNotIn("published", events)
-        self.assertNotIn("committed", events)
+        events = {event["event"] for event in self.journal_events()}
+        self.assertNotIn("batch_intent", events)
+        self.assertNotIn("batch_commit", events)
 
     def test_initial_publish_rejects_swap_in_exact_detach_primitive_window(self):
         image = self.make_image(sizes=())

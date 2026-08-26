@@ -2217,9 +2217,9 @@ def _preverified_staging_stat(staging_file, expected_identity):
             expected_identity.st_ino,
             expected_identity.st_size,
         )
+    elif type(expected_identity) is tuple and len(expected_identity) == 3:
+        expected = expected_identity
     else:
-        expected = tuple(expected_identity)
-    if len(expected) not in (2, 3):
         raise MediaPathError("unsafe_staging_file")
     staging_file.directory.verify_current()
     current = os.fstat(staging_file.descriptor)
@@ -2229,9 +2229,7 @@ def _preverified_staging_stat(staging_file, expected_identity):
         current,
     )
     current_identity = (current.st_dev, current.st_ino)
-    if current_identity != expected[:2] or (
-        len(expected) == 3 and current.st_size != expected[2]
-    ):
+    if current_identity != expected[:2] or current.st_size != expected[2]:
         raise MediaPathError("unsafe_staging_file")
     return current
 
