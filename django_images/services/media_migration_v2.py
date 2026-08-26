@@ -5,6 +5,7 @@ import json
 import os
 import re
 import stat
+from types import MappingProxyType
 import uuid
 import warnings
 
@@ -820,6 +821,7 @@ class AutoV2ArchiveAuthority(object):
 
 class _AutoV2ManifestState(object):
     def __init__(self):
+        self._frozen = False
         self.events = []
         self.plans = []
         self.plan_by_image = {}
@@ -831,6 +833,166 @@ class _AutoV2ManifestState(object):
         self.torn_tail = None
         self.torn_offset = None
         self.raw_bytes = b""
+
+    def __setattr__(self, name, value):
+        if getattr(self, "_frozen", False):
+            raise AttributeError("manifest_state_is_read_only")
+        object.__setattr__(self, name, value)
+
+    def freeze(self):
+        self.events = tuple(_freeze_manifest_value(event) for event in self.events)
+        self.plans = tuple(self.plans)
+        self.plan_by_image = MappingProxyType(dict(self.plan_by_image))
+        self.latest_by_image = MappingProxyType(dict(self.latest_by_image))
+        self.publish_intents_by_image = MappingProxyType({
+            image_id: MappingProxyType(dict(intents))
+            for image_id, intents in self.publish_intents_by_image.items()
+        })
+        self.published_by_image = MappingProxyType({
+            image_id: MappingProxyType(dict(published))
+            for image_id, published in self.published_by_image.items()
+        })
+        self._frozen = True
+        return self
+
+
+def _freeze_manifest_value(value):
+    if isinstance(value, MappingProxyType):
+        return value
+    if isinstance(value, dict):
+        return MappingProxyType({
+            key: _freeze_manifest_value(nested)
+            for key, nested in value.items()
+        })
+    if isinstance(value, list):
+        return tuple(_freeze_manifest_value(nested) for nested in value)
+    return value
+
+
+def _copy_manifest_state(state):
+    copied = _AutoV2ManifestState()
+    copied.events = list(state.events)
+    copied.plans = list(state.plans)
+    copied.plan_by_image = dict(state.plan_by_image)
+    copied.latest_by_image = dict(state.latest_by_image)
+    copied.publish_intents_by_image = {
+        image_id: dict(intents)
+        for image_id, intents in state.publish_intents_by_image.items()
+    }
+    copied.published_by_image = {
+        image_id: dict(published)
+        for image_id, published in state.published_by_image.items()
+    }
+    copied.plan_complete = state.plan_complete
+    copied.plan_end_offset = state.plan_end_offset
+    copied.torn_tail = state.torn_tail
+    copied.torn_offset = state.torn_offset
+    copied.raw_bytes = state.raw_bytes
+    return copied
+
+
+def _apply_manifest_event(  # noqa: C901
+    state,
+    event,
+    expected_run_id,
+    offset,
+    raw,
+):
+    _validate_manifest_event(event, expected_run_id)
+    event_name = event["event"]
+    if event_name == "planned":
+        if state.plan_complete:
+            raise _command_error("invalid_auto_v2_manifest")
+        plan = AutoV2MigrationPlan.from_dict(event.get("plan"))
+        if plan.image_id in state.plan_by_image:
+            raise _command_error("manifest_plan_mismatch")
+        state.plans.append(plan)
+        state.plan_by_image[plan.image_id] = plan
+    elif event_name == "plan_complete":
+        if state.plan_complete:
+            raise _command_error("invalid_auto_v2_manifest")
+        _validate_plan_marker(event, state.plans)
+        state.plan_complete = True
+        state.plan_end_offset = offset
+    else:
+        if not state.plan_complete:
+            raise _command_error("invalid_auto_v2_manifest")
+        image_id = event.get("image_id")
+        if image_id not in state.plan_by_image:
+            raise _command_error("manifest_plan_mismatch")
+        if event.get("plan_sha256") != hashlib.sha256(
+            raw[:state.plan_end_offset]
+        ).hexdigest():
+            raise _command_error("manifest_plan_mismatch")
+        previous = state.latest_by_image.get(image_id)
+        if previous in ("committed", "recovered_commit", "already_current"):
+            raise _command_error("invalid_auto_v2_manifest")
+        if event_name == "publish_intent":
+            plan = state.plan_by_image[image_id]
+            file_by_key = {
+                file_plan.kind_key: file_plan for file_plan in plan.files
+            }
+            file_key = event.get("file_key")
+            identity = (
+                event.get("staging_device"),
+                event.get("staging_inode"),
+                event.get("destination_parent_device"),
+                event.get("destination_parent_inode"),
+                event.get("staging_name"),
+            )
+            current_intents = state.publish_intents_by_image.get(
+                image_id, {}
+            )
+            if (
+                file_key not in file_by_key
+                or file_by_key[file_key].operation != "copy"
+                or file_key in current_intents
+                or any(type(value) is not int for value in identity[:4])
+                or identity[0] < 0
+                or identity[1] <= 0
+                or identity[2] < 0
+                or identity[3] <= 0
+                or not _valid_staging_name(identity[4])
+            ):
+                raise _command_error("invalid_auto_v2_manifest")
+            intents = dict(current_intents)
+            intents[file_key] = identity
+            state.publish_intents_by_image[image_id] = intents
+        elif event_name == "published":
+            plan = state.plan_by_image[image_id]
+            file_by_key = {
+                file_plan.kind_key: file_plan for file_plan in plan.files
+            }
+            file_key = event.get("file_key")
+            destination_device = event.get("destination_device")
+            destination_inode = event.get("destination_inode")
+            current_published = state.published_by_image.get(image_id, {})
+            if (
+                file_key not in file_by_key
+                or file_by_key[file_key].operation != "copy"
+                or file_key in current_published
+                or type(destination_device) is not int
+                or type(destination_inode) is not int
+                or destination_device < 0
+                or destination_inode <= 0
+            ):
+                raise _command_error("invalid_auto_v2_manifest")
+            intent = state.publish_intents_by_image.get(image_id, {}).get(
+                file_key
+            )
+            if intent is not None and (
+                destination_device,
+                destination_inode,
+            ) != intent[:2]:
+                raise _command_error("manifest_plan_mismatch")
+            published = dict(current_published)
+            published[file_key] = (
+                destination_device,
+                destination_inode,
+            )
+            state.published_by_image[image_id] = published
+        state.latest_by_image[image_id] = event_name
+    state.events.append(event)
 
 
 def _verify_contained_run_directory(data_directory, run_directory):
@@ -1096,105 +1258,15 @@ class AutoV2ManifestLog(object):
                 event = json.loads(line.decode("utf-8"))
             except (TypeError, ValueError, UnicodeDecodeError) as error:
                 raise _command_error("invalid_auto_v2_manifest", error)
-            _validate_manifest_event(event, self.run_id)
-            event_name = event["event"]
-            if event_name == "planned":
-                if state.plan_complete:
-                    raise _command_error("invalid_auto_v2_manifest")
-                plan = AutoV2MigrationPlan.from_dict(event.get("plan"))
-                if plan.image_id in state.plan_by_image:
-                    raise _command_error("manifest_plan_mismatch")
-                state.plans.append(plan)
-                state.plan_by_image[plan.image_id] = plan
-            elif event_name == "plan_complete":
-                if state.plan_complete:
-                    raise _command_error("invalid_auto_v2_manifest")
-                _validate_plan_marker(event, state.plans)
-                state.plan_complete = True
-                state.plan_end_offset = offset + len(line)
-            else:
-                if not state.plan_complete:
-                    raise _command_error("invalid_auto_v2_manifest")
-                image_id = event.get("image_id")
-                if image_id not in state.plan_by_image:
-                    raise _command_error("manifest_plan_mismatch")
-                if event.get("plan_sha256") != hashlib.sha256(
-                    raw[:state.plan_end_offset]
-                ).hexdigest():
-                    raise _command_error("manifest_plan_mismatch")
-                previous = state.latest_by_image.get(image_id)
-                if previous in ("committed", "recovered_commit", "already_current"):
-                    raise _command_error("invalid_auto_v2_manifest")
-                if event_name == "publish_intent":
-                    plan = state.plan_by_image[image_id]
-                    file_by_key = {
-                        file_plan.kind_key: file_plan
-                        for file_plan in plan.files
-                    }
-                    file_key = event.get("file_key")
-                    identity = (
-                        event.get("staging_device"),
-                        event.get("staging_inode"),
-                        event.get("destination_parent_device"),
-                        event.get("destination_parent_inode"),
-                        event.get("staging_name"),
-                    )
-                    intents = state.publish_intents_by_image.setdefault(
-                        image_id, {}
-                    )
-                    if (
-                        file_key not in file_by_key
-                        or file_by_key[file_key].operation != "copy"
-                        or file_key in intents
-                        or any(
-                            type(value) is not int for value in identity[:4]
-                        )
-                        or identity[0] < 0
-                        or identity[1] <= 0
-                        or identity[2] < 0
-                        or identity[3] <= 0
-                        or not _valid_staging_name(identity[4])
-                    ):
-                        raise _command_error("invalid_auto_v2_manifest")
-                    intents[file_key] = identity
-                elif event_name == "published":
-                    plan = state.plan_by_image[image_id]
-                    file_by_key = {
-                        file_plan.kind_key: file_plan
-                        for file_plan in plan.files
-                    }
-                    file_key = event.get("file_key")
-                    destination_device = event.get("destination_device")
-                    destination_inode = event.get("destination_inode")
-                    published = state.published_by_image.setdefault(
-                        image_id, {}
-                    )
-                    if (
-                        file_key not in file_by_key
-                        or file_by_key[file_key].operation != "copy"
-                        or file_key in published
-                        or type(destination_device) is not int
-                        or type(destination_inode) is not int
-                        or destination_device < 0
-                        or destination_inode <= 0
-                    ):
-                        raise _command_error("invalid_auto_v2_manifest")
-                    intent = state.publish_intents_by_image.get(
-                        image_id, {}
-                    ).get(file_key)
-                    if intent is not None and (
-                        destination_device,
-                        destination_inode,
-                    ) != intent[:2]:
-                        raise _command_error("manifest_plan_mismatch")
-                    published[file_key] = (
-                        destination_device,
-                        destination_inode,
-                    )
-                state.latest_by_image[image_id] = event_name
-            state.events.append(event)
+            _apply_manifest_event(
+                state,
+                event,
+                self.run_id,
+                offset + len(line),
+                raw,
+            )
             offset += len(line)
-        return state
+        return state.freeze()
 
     def append(self, event):
         if self.state.torn_tail is not None:
@@ -1222,6 +1294,18 @@ class AutoV2ManifestLog(object):
             }
         )
         line = _json_line(event)
+        try:
+            canonical_event = json.loads(line.decode("utf-8"))
+        except (TypeError, ValueError, UnicodeDecodeError) as error:
+            raise _command_error("invalid_auto_v2_manifest", error)
+        candidate = _copy_manifest_state(self.state)
+        _apply_manifest_event(
+            candidate,
+            canonical_event,
+            self.run_id,
+            len(self.state.raw_bytes) + len(line),
+            self.state.raw_bytes,
+        )
         self._verify_current()
         os.lseek(self.descriptor, 0, os.SEEK_END)
         view = memoryview(line)
@@ -1232,7 +1316,16 @@ class AutoV2ManifestLog(object):
             view = view[written:]
         os.fsync(self.descriptor)
         self._verify_current()
-        self.state = self._load_state()
+        current = self._read_all()
+        previous_size = len(self.state.raw_bytes)
+        if (
+            len(current) != previous_size + len(line)
+            or current[:previous_size] != self.state.raw_bytes
+            or current[previous_size:] != line
+        ):
+            raise _command_error("unsafe_auto_v2_manifest")
+        candidate.raw_bytes = current
+        self.state = candidate.freeze()
 
     def record_plan(self, plan):
         _validate_new_plan_archive_authority(plan)
@@ -1262,7 +1355,7 @@ class AutoV2ManifestLog(object):
             {
                 "event": event_name,
                 "image_id": image_id,
-                "plan_sha256": self.summary().plan_sha256,
+                "plan_sha256": self._plan_sha256(),
             }
         )
 
@@ -1274,7 +1367,7 @@ class AutoV2ManifestLog(object):
                 "file_key": file_key,
                 "destination_device": destination_identity[0],
                 "destination_inode": destination_identity[1],
-                "plan_sha256": self.summary().plan_sha256,
+                "plan_sha256": self._plan_sha256(),
             }
         )
 
@@ -1300,7 +1393,7 @@ class AutoV2ManifestLog(object):
                 "destination_parent_inode": (
                     destination_parent_identity[1]
                 ),
-                "plan_sha256": self.summary().plan_sha256,
+                "plan_sha256": self._plan_sha256(),
             }
         )
 
@@ -1380,9 +1473,7 @@ class AutoV2ManifestLog(object):
         )
         return AutoV2PlanSummary(
             run_id=self.run_id,
-            plan_sha256=hashlib.sha256(
-                self.state.raw_bytes[:self.state.plan_end_offset]
-            ).hexdigest(),
+            plan_sha256=self._plan_sha256(),
             manifest_sha256=hashlib.sha256(
                 self.state.raw_bytes
             ).hexdigest(),
@@ -1392,6 +1483,17 @@ class AutoV2ManifestLog(object):
             named_canonical=marker["named_canonical"],
             copy_required_bytes=marker["copy_required_bytes"],
         )
+
+    def _plan_sha256(self):
+        if self.state.torn_tail is not None:
+            raise _command_error(
+                "media_manifest_torn_tail_requires_execute"
+            )
+        if not self.state.plan_complete:
+            raise _command_error("auto_v2_plan_incomplete")
+        return hashlib.sha256(
+            self.state.raw_bytes[:self.state.plan_end_offset]
+        ).hexdigest()
 
     def _ensure_content_current(self):
         if self._read_all() != self.state.raw_bytes:
@@ -1677,9 +1779,12 @@ class AutoV2MediaMigrator(object):
         service_gid,
         batch_size=100,
         fault_injector=None,
+        progress_reporter=None,
     ):
         if type(batch_size) is not int or batch_size <= 0:
             raise _command_error("batch_size_must_be_positive")
+        if progress_reporter is not None and not callable(progress_reporter):
+            raise _command_error("invalid_progress_reporter")
         self.run_directory = run_directory
         self.filename = filename
         self.run_id = run_id
@@ -1687,6 +1792,8 @@ class AutoV2MediaMigrator(object):
         self.service_gid = service_gid
         self.batch_size = batch_size
         self.fault_injector = fault_injector
+        self.progress_reporter = progress_reporter
+        self._planning_reported = False
 
     def recover_execution_tail(self):
         """완료된 계획 뒤 torn execute event만 복구한다."""
@@ -1726,6 +1833,7 @@ class AutoV2MediaMigrator(object):
             elif not manifest.state.plan_complete:
                 raise _command_error("auto_v2_plan_incomplete")
             plans = list(manifest.state.plans)
+            self._report_planning(plans)
             summary = manifest.summary()
             if not execute:
                 return summary
@@ -1762,6 +1870,10 @@ class AutoV2MediaMigrator(object):
         destination_verifications = []
         already_current = []
         recovered = []
+        images_total = len(plans)
+        files_total = sum(len(plan.files) for plan in plans)
+        images_done = 0
+        files_done = 0
         for plan in plans:
             state = self._database_state(plan)
             latest = manifest.state.latest_by_image.get(plan.image_id)
@@ -1802,11 +1914,27 @@ class AutoV2MediaMigrator(object):
                 )
             for plan in source_verifications:
                 self._verify_plan_sources_from(root_directory, plan)
+                images_done += 1
+                files_done += len(plan.files)
+                self._report_copying(
+                    images_done,
+                    images_total,
+                    files_done,
+                    files_total,
+                )
             for plan in destination_verifications:
                 self._verify_plan_destinations_from(
                     root_directory,
                     plan,
                     self._destination_identities(manifest, plan),
+                )
+                images_done += 1
+                files_done += len(plan.files)
+                self._report_copying(
+                    images_done,
+                    images_total,
+                    files_done,
+                    files_total,
                 )
             for plan in pending:
                 reusable_destinations = {
@@ -1835,6 +1963,14 @@ class AutoV2MediaMigrator(object):
                         ),
                         publish_intents.get(file_plan.kind_key),
                     )
+                images_done += 1
+                files_done += len(plan.files)
+                self._report_copying(
+                    images_done,
+                    images_total,
+                    files_done,
+                    files_total,
+                )
             if root_directory is not None:
                 root_directory.verify_current()
         except CommandError:
@@ -1849,9 +1985,14 @@ class AutoV2MediaMigrator(object):
             manifest.record_result("already_current", plan.image_id)
         for plan in recovered:
             manifest.record_result("recovered_commit", plan.image_id)
+        if not plans:
+            self._report_copying(0, 0, 0, 0)
+
         if pending:
             self._inject_fault("before_database_transaction")
             self._commit_batches(manifest, pending)
+        else:
+            self._report_database_progress(manifest, plans)
 
     def _prepare_file(
         self,
@@ -2839,6 +2980,7 @@ class AutoV2MediaMigrator(object):
                     manifest.record_result(
                         "committed", plan.image_id
                     )
+                self._report_database_progress(manifest, all_plans)
         except CommandError:
             raise
         except (MediaPathError, OSError) as error:
@@ -2850,6 +2992,58 @@ class AutoV2MediaMigrator(object):
     def _inject_fault(self, point):
         if self.fault_injector is not None:
             self.fault_injector(point)
+
+    def _report_planning(self, plans):
+        if self._planning_reported:
+            return
+        self._planning_reported = True
+        self._report_progress(
+            {
+                "phase": "planning",
+                "images_total": len(plans),
+                "files_total": sum(len(plan.files) for plan in plans),
+            }
+        )
+
+    def _report_copying(
+        self,
+        images_done,
+        images_total,
+        files_done,
+        files_total,
+    ):
+        self._report_progress(
+            {
+                "phase": "copying",
+                "images_done": images_done,
+                "images_total": images_total,
+                "files_done": files_done,
+                "files_total": files_total,
+            }
+        )
+
+    def _report_database_progress(self, manifest, plans):
+        terminal = ("committed", "recovered_commit", "already_current")
+        images_done = sum(
+            manifest.state.latest_by_image.get(plan.image_id) in terminal
+            for plan in plans
+        )
+        self._report_progress(
+            {
+                "phase": "database",
+                "images_done": images_done,
+                "images_total": len(plans),
+            }
+        )
+
+    def _report_progress(self, event):
+        if self.progress_reporter is None:
+            return False
+        try:
+            self.progress_reporter(dict(event))
+        except Exception:
+            return False
+        return True
 
 
 def _verify_staging(descriptor, file_plan):

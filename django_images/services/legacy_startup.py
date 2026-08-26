@@ -49,6 +49,7 @@ class LegacyStartupCoordinator(object):
         service_gid,
         fault_injector=None,
         archive_adapter=None,
+        progress_reporter=None,
     ):
         if (
             type(service_uid) is not int
@@ -57,10 +58,13 @@ class LegacyStartupCoordinator(object):
             or service_gid < 0
         ):
             raise LegacyStartupError("media_storage_configuration_invalid")
+        if progress_reporter is not None and not callable(progress_reporter):
+            raise LegacyStartupError("media_storage_configuration_invalid")
         self.service_uid = service_uid
         self.service_gid = service_gid
         self.fault_injector = fault_injector
         self.archive_adapter = archive_adapter
+        self.progress_reporter = progress_reporter
         self._evidence = None
         self._allow_missing_media_layout = False
         self._media_summary = None
@@ -131,6 +135,8 @@ class LegacyStartupCoordinator(object):
             return None
 
         status = migration_state.read_run_status(run)
+        if status.phase != "complete":
+            self._report_progress({"phase": "preparing"})
         if (
             status.phase in ("initialized", "snapshot_intent")
             and not initial_space_checked
@@ -170,6 +176,7 @@ class LegacyStartupCoordinator(object):
                 "snapshot_intent",
                 "snapshot_complete",
             )
+            self._report_progress({"phase": "snapshot"})
             self._fault("after_snapshot_complete")
             status = migration_state.read_run_status(run)
         elif status.phase in ("snapshot_complete", "schema_complete"):
@@ -365,6 +372,7 @@ class LegacyStartupCoordinator(object):
             self.service_uid,
             self.service_gid,
             fault_injector=self.fault_injector,
+            progress_reporter=self.progress_reporter,
         )
         resume_torn_execution = False
         try:
@@ -527,6 +535,7 @@ class LegacyStartupCoordinator(object):
             plan_sha256=executed.plan_sha256,
             manifest_sha256=executed.manifest_sha256,
         )
+        self._report_progress({"phase": "backfill"})
         self._fault("after_registry_complete")
 
     def _converge_archive(self, run):
@@ -601,6 +610,8 @@ class LegacyStartupCoordinator(object):
             )
             if self._first_incomplete(plan.progress) != status.intent:
                 raise LegacyStartupError("archive_state_conflict")
+
+        self._report_progress({"phase": "archive"})
 
         def record_completion(intent, progress, result):
             del intent, result
@@ -698,11 +709,22 @@ class LegacyStartupCoordinator(object):
         if status.phase != expected:
             raise LegacyStartupError("migration_state_phase_mismatch")
         self._restore_summary_values(run, status, force_reload=True)
-        return migration_state.transition_state(
+        completed = migration_state.transition_state(
             run,
             expected,
             "complete",
         )
+        self._report_progress({"phase": "complete"})
+        return completed
+
+    def _report_progress(self, event):
+        if self.progress_reporter is None:
+            return False
+        try:
+            self.progress_reporter(dict(event))
+        except Exception:
+            return False
+        return True
 
     def _write_summary(self, run, phase_override=None):
         if phase_override not in (None, "complete"):

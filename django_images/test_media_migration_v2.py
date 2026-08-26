@@ -1047,6 +1047,141 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 self.service_gid,
             )
 
+    def test_manifest_append_updates_state_without_full_replay(self):
+        image = self.make_image(sizes=())
+        plan = AutoV2MigrationPlan.for_image(image, self.open_root())
+
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ) as manifest:
+            with mock.patch.object(
+                manifest,
+                "_read_all",
+                wraps=manifest._read_all,
+            ) as read_all, mock.patch.object(
+                manifest,
+                "_load_state",
+                wraps=manifest._load_state,
+            ) as load_state:
+                manifest.record_plan(plan)
+                manifest.record_plan_complete((plan,))
+
+            self.assertEqual(read_all.call_count, 4)
+            self.assertEqual(load_state.call_count, 0)
+            self.assertEqual(manifest.state.plans, (plan,))
+            self.assertTrue(manifest.state.plan_complete)
+            self.assertEqual(len(manifest.state.events), 2)
+
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            create=False,
+        ) as reopened:
+            self.assertEqual(reopened.state.plans, (plan,))
+            self.assertTrue(reopened.state.plan_complete)
+
+    def test_incremental_manifest_state_matches_full_replay(self):
+        image = self.make_image(sizes=())
+        plan = AutoV2MigrationPlan.for_image(image, self.open_root())
+        file_key = plan.files[0].kind_key
+        staging_name = "auto-v2-{}.part".format(uuid.uuid4())
+
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ) as manifest:
+            manifest.record_plan(plan)
+            manifest.record_plan_complete((plan,))
+            manifest.record_publish_intent(
+                plan.image_id,
+                file_key,
+                staging_name,
+                (17, 19),
+                (23, 29),
+            )
+            manifest.record_published(
+                plan.image_id,
+                file_key,
+                (17, 19),
+            )
+            manifest.record_result("committed", plan.image_id)
+            incremental = self._manifest_state_snapshot(manifest.state)
+
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            create=False,
+        ) as reopened:
+            replayed = self._manifest_state_snapshot(reopened.state)
+
+        self.assertEqual(incremental, replayed)
+
+    def test_manifest_state_is_read_only_between_appends(self):
+        image = self.make_image(sizes=())
+        plan = AutoV2MigrationPlan.for_image(image, self.open_root())
+
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+        ) as manifest:
+            manifest.record_plan(plan)
+            manifest.record_plan_complete((plan,))
+
+            with self.assertRaisesRegex(
+                AttributeError,
+                "^manifest_state_is_read_only$",
+            ):
+                manifest.state.plan_end_offset = 0
+            with self.assertRaises(TypeError):
+                manifest.state.latest_by_image[plan.image_id] = "committed"
+
+            manifest.record_result("committed", plan.image_id)
+
+        with AutoV2ManifestLog.open(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            create=False,
+        ) as reopened:
+            self.assertEqual(
+                reopened.state.latest_by_image[plan.image_id],
+                "committed",
+            )
+
+    @staticmethod
+    def _manifest_state_snapshot(state):
+        return {
+            "events": state.events,
+            "plans": state.plans,
+            "plan_by_image": state.plan_by_image,
+            "latest_by_image": state.latest_by_image,
+            "publish_intents_by_image": state.publish_intents_by_image,
+            "published_by_image": state.published_by_image,
+            "plan_complete": state.plan_complete,
+            "plan_end_offset": state.plan_end_offset,
+            "torn_tail": state.torn_tail,
+            "torn_offset": state.torn_offset,
+            "raw_bytes": state.raw_bytes,
+        }
+
     def test_open_manifest_detects_external_append_before_adding_event(self):
         self.make_image(generation="named")
         self.migrator().run(execute=False)
@@ -1066,6 +1201,97 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             manifest.record_result("already_current", Image.objects.get().pk)
 
         self.assertEqual(self.manifest_path.stat().st_size, changed_size)
+
+    def test_execute_reports_copy_and_database_progress(self):
+        self.make_image()
+        progress = []
+        migrator = AutoV2MediaMigrator(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            progress_reporter=progress.append,
+        )
+
+        migrator.run(execute=True)
+
+        self.assertEqual(
+            progress,
+            [
+                {
+                    "phase": "planning",
+                    "images_total": 1,
+                    "files_total": 4,
+                },
+                {
+                    "phase": "copying",
+                    "images_done": 1,
+                    "images_total": 1,
+                    "files_done": 4,
+                    "files_total": 4,
+                },
+                {
+                    "phase": "database",
+                    "images_done": 1,
+                    "images_total": 1,
+                },
+            ],
+        )
+
+    def test_progress_reporter_failure_does_not_abort_migration(self):
+        self.make_image()
+        reporter = mock.Mock(side_effect=OSError("closed output"))
+        migrator = AutoV2MediaMigrator(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            progress_reporter=reporter,
+        )
+
+        summary = migrator.run(execute=True)
+
+        self.assertEqual(summary.image_count, 1)
+        self.assertGreaterEqual(reporter.call_count, 3)
+
+    def test_empty_migration_reports_phases_in_order(self):
+        progress = []
+        migrator = AutoV2MediaMigrator(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            progress_reporter=progress.append,
+        )
+
+        summary = migrator.run(execute=True)
+
+        self.assertEqual(summary.image_count, 0)
+        self.assertEqual(
+            progress,
+            [
+                {
+                    "phase": "planning",
+                    "images_total": 0,
+                    "files_total": 0,
+                },
+                {
+                    "phase": "copying",
+                    "images_done": 0,
+                    "images_total": 0,
+                    "files_done": 0,
+                    "files_total": 0,
+                },
+                {
+                    "phase": "database",
+                    "images_done": 0,
+                    "images_total": 0,
+                },
+            ],
+        )
 
     def test_execute_uses_one_shared_media_root_descriptor_for_named_closure(self):
         self.make_image(generation="named")

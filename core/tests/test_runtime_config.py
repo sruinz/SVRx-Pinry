@@ -262,6 +262,59 @@ def _assert_nginx_contract(source):
 
 
 class RuntimeConfigTests(unittest.TestCase):
+    def test_startup_progress_writer_outputs_safe_korean_message(self):
+        startup_path = REPOSITORY_ROOT / "docker/scripts/startup.py"
+        spec = importlib.util.spec_from_file_location(
+            "test_startup_progress",
+            str(startup_path),
+        )
+        startup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(startup)
+        output = mock.Mock()
+
+        with mock.patch.object(startup.sys, "stdout", output):
+            startup._write_progress(
+                {
+                    "phase": "copying",
+                    "images_done": 1,
+                    "images_total": 2,
+                    "files_done": 4,
+                    "files_total": 8,
+                }
+            )
+
+        output.write.assert_called_once_with(
+            "SVRx Pinry 데이터 이전: 파일 처리 "
+            "1/2 이미지, 4/8 파일 (50.0%)\n"
+        )
+        output.flush.assert_called_once_with()
+
+    def test_startup_progress_writer_rejects_unexpected_details(self):
+        startup_path = REPOSITORY_ROOT / "docker/scripts/startup.py"
+        spec = importlib.util.spec_from_file_location(
+            "test_startup_progress_rejection",
+            str(startup_path),
+        )
+        startup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(startup)
+        output = mock.Mock()
+
+        with mock.patch.object(startup.sys, "stdout", output):
+            accepted = startup._write_progress(
+                {
+                    "phase": "copying",
+                    "images_done": 1,
+                    "images_total": 2,
+                    "files_done": 4,
+                    "files_total": 8,
+                    "path": "/data/static/media/secret.png",
+                }
+            )
+
+        self.assertFalse(accepted)
+        output.write.assert_not_called()
+        output.flush.assert_not_called()
+
     def _import_docker_settings(self, local_secret, environment_secret=None):
         script = (
             "import sys, types\n"
@@ -524,7 +577,8 @@ class RuntimeConfigTests(unittest.TestCase):
             "def fail(point, code):\n"
             "    if os.environ.get('PINRY_FAIL_POINT') == point: raise Failure(code)\n"
             "class LegacyStartupCoordinator(object):\n"
-            "    def __init__(self, uid, gid): del uid, gid; event('coordinator')\n"
+            "    def __init__(self, uid, gid, progress_reporter=None): "
+            "del uid, gid, progress_reporter; event('coordinator')\n"
             "    def prepare_no_flag_before_schema(self):\n"
             "        event('prepare_no_flag'); fail('prepare_no_flag', 'legacy_migration_flag_required')\n"
             "    def prepare_before_schema(self):\n"

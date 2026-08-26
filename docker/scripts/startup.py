@@ -92,6 +92,94 @@ def _write_error(code):
     sys.stderr.flush()
 
 
+def _write_progress(event):
+    if not isinstance(event, dict):
+        return False
+    phase = event.get("phase")
+    message = None
+    if phase == "planning" and set(event) == {
+        "phase",
+        "images_total",
+        "files_total",
+    }:
+        images_total = event["images_total"]
+        files_total = event["files_total"]
+        if _valid_total(images_total) and _valid_total(files_total):
+            message = (
+                "SVRx Pinry 데이터 이전: 계획 완료 - "
+                "{}개 이미지, {}개 파일"
+            ).format(images_total, files_total)
+    elif phase == "copying" and set(event) == {
+        "phase",
+        "images_done",
+        "images_total",
+        "files_done",
+        "files_total",
+    }:
+        values = (
+            event["images_done"],
+            event["images_total"],
+            event["files_done"],
+            event["files_total"],
+        )
+        if _valid_progress_pair(values[0], values[1]) and (
+            _valid_progress_pair(values[2], values[3])
+        ):
+            message = (
+                "SVRx Pinry 데이터 이전: 파일 처리 "
+                "{}/{} 이미지, {}/{} 파일 ({:.1f}%)"
+            ).format(
+                values[0],
+                values[1],
+                values[2],
+                values[3],
+                _progress_percent(values[2], values[3]),
+            )
+    elif phase == "database" and set(event) == {
+        "phase",
+        "images_done",
+        "images_total",
+    }:
+        images_done = event["images_done"]
+        images_total = event["images_total"]
+        if _valid_progress_pair(images_done, images_total):
+            message = (
+                "SVRx Pinry 데이터 이전: 데이터베이스 처리 "
+                "{}/{} 이미지 ({:.1f}%)"
+            ).format(
+                images_done,
+                images_total,
+                _progress_percent(images_done, images_total),
+            )
+    elif set(event) == {"phase"}:
+        message = {
+            "preparing": "SVRx Pinry 데이터 이전을 준비하고 있습니다.",
+            "snapshot": "데이터베이스 백업을 완료했습니다.",
+            "backfill": "이미지 정보 등록을 완료했습니다.",
+            "archive": "기존 이미지 폴더를 백업 위치로 옮기고 있습니다.",
+            "complete": "SVRx Pinry 데이터 이전을 완료했습니다.",
+        }.get(phase)
+    if message is None:
+        return False
+    sys.stdout.write("{}\n".format(message))
+    sys.stdout.flush()
+    return True
+
+
+def _valid_total(value):
+    return type(value) is int and value >= 0
+
+
+def _valid_progress_pair(done, total):
+    return _valid_total(done) and _valid_total(total) and done <= total
+
+
+def _progress_percent(done, total):
+    if total == 0:
+        return 100.0
+    return (float(done) * 100.0) / float(total)
+
+
 def _safe_error_code(error, fallback="legacy_startup_failed"):
     code = getattr(error, "code", None)
     if code in _SAFE_ERROR_CODES:
@@ -201,7 +289,11 @@ def _run(arguments):  # noqa: C901
                 _write_error("legacy_migration_flag_required")
                 return 1
 
-        coordinator = LegacyStartupCoordinator(service_uid, service_gid)
+        coordinator = LegacyStartupCoordinator(
+            service_uid,
+            service_gid,
+            progress_reporter=_write_progress,
+        )
         if migration_requested:
             run = coordinator.prepare_before_schema()
             coordinator.prepare_migration_locks(run)

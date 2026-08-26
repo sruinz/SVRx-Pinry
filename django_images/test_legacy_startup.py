@@ -103,11 +103,12 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             media_root_identity={"device": 3, "inode": 4},
         )
 
-    def coordinator(self, fault_injector=None):
+    def coordinator(self, fault_injector=None, progress_reporter=None):
         return LegacyStartupCoordinator(
             self.uid,
             self.gid,
             fault_injector=fault_injector,
+            progress_reporter=progress_reporter,
         )
 
     def test_fresh_empty_install_never_creates_backup_run(self):
@@ -277,6 +278,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
 
     def test_full_run_uses_exact_phase_and_service_order(self):
         events = []
+        progress_events = []
         candidate = MissingUnreferencedImage(
             image_id=1,
             image_path="originals/asset/old.png",
@@ -321,8 +323,16 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         )
 
         class Migrator(object):
+            def __init__(self, reporter):
+                self.reporter = reporter
+
             def run(self, execute=False):
                 events.append("media_execute" if execute else "media_plan")
+                if execute:
+                    self.reporter({"phase": "copying"})
+                    self.reporter({"phase": "database"})
+                else:
+                    self.reporter({"phase": "planning"})
                 return media_execute if execute else media_dry
 
         class Backfiller(object):
@@ -380,7 +390,9 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             events.append("identity_seal")
             return real_seal(run, current_evidence)
 
-        coordinator = self.coordinator()
+        coordinator = self.coordinator(
+            progress_reporter=progress_events.append,
+        )
         backup_guard = mock.Mock()
         archive_evidence = LegacyEvidence(
             **dict(
@@ -438,7 +450,9 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             ),
             mock.patch(
                 "django_images.services.legacy_startup.AutoV2MediaMigrator",
-                return_value=Migrator(),
+                side_effect=lambda *args, **kwargs: Migrator(
+                    kwargs["progress_reporter"]
+                ),
             ),
             mock.patch(
                 "django_images.services.legacy_startup.MediaAssetBackfiller",
@@ -494,6 +508,19 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             coordinator.converge_after_schema(run)
 
         self.assertEqual(migration_state.read_run_status(run).phase, "complete")
+        self.assertEqual(
+            [event["phase"] for event in progress_events],
+            [
+                "preparing",
+                "snapshot",
+                "planning",
+                "copying",
+                "database",
+                "backfill",
+                "archive",
+                "complete",
+            ],
+        )
         self.assertEqual(events, [
             "space",
             "state:snapshot_intent",
@@ -1152,6 +1179,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         )
 
     def test_complete_resume_repairs_missing_summary_from_typed_manifests(self):
+        progress_events = []
         run = self._summary_run()
         migration_state.transition_state(
             run, "initialized", "schema_complete"
@@ -1175,7 +1203,9 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "registry_complete",
             "complete",
         )
-        coordinator = self.coordinator()
+        coordinator = self.coordinator(
+            progress_reporter=progress_events.append,
+        )
         self._set_terminal_summaries(coordinator, run)
         media = coordinator._media_summary
         backfill = coordinator._backfill_summary
@@ -1207,6 +1237,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         self.assertEqual(summary["phase"], "complete")
         self.assertEqual(summary["media_image_count"], 1)
         self.assertEqual(summary["backfill_registered"], 1)
+        self.assertEqual(progress_events, [])
 
     def test_resume_at_schema_complete_never_repeats_snapshot_or_first_space(self):
         run = self._summary_run()
@@ -1621,6 +1652,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         backfiller.run.assert_called_once_with(execute=False)
 
     def test_zero_archive_intents_complete_without_adapter_call(self):
+        progress_events = []
         run = self._summary_run()
         migration_state.transition_state(
             run,
@@ -1648,7 +1680,9 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         )
         evidence = self.evidence(present=False)
 
-        coordinator = self.coordinator()
+        coordinator = self.coordinator(
+            progress_reporter=progress_events.append,
+        )
         self._set_terminal_summaries(coordinator, run)
         with mock.patch(
             "django_images.services.legacy_startup."
@@ -1685,8 +1719,13 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             archive.prepare.call_args.kwargs["expected_manifest_sha256"],
             "2" * 64,
         )
+        self.assertEqual(
+            [event["phase"] for event in progress_events],
+            ["complete"],
+        )
 
     def test_archive_complete_resume_revalidates_archived_media(self):
+        progress_events = []
         run = SimpleNamespace(path="/backup/run", run_id=RUN_ID)
         progress = {
             "items": [{
@@ -1703,7 +1742,9 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         plan = SimpleNamespace(intents=(_Intent(10),), progress=progress)
         archive = mock.Mock()
         archive.prepare.return_value = plan
-        coordinator = self.coordinator()
+        coordinator = self.coordinator(
+            progress_reporter=progress_events.append,
+        )
 
         with mock.patch.object(
             coordinator,
@@ -1733,6 +1774,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         transition_complete.assert_called_once_with(
             run, "archive_complete"
         )
+        self.assertEqual(progress_events, [])
 
     def test_legacy_archive_complete_recovers_fixed_only_archive(self):
         run = SimpleNamespace(path="/backup/run", run_id=RUN_ID)
