@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+from types import SimpleNamespace
 import uuid
 
 from django.test import SimpleTestCase, override_settings
@@ -26,6 +27,7 @@ from django_images.file_ops import (
     verify_published_name,
 )
 from django_images.test_helpers import TemporaryMediaMixin
+from django_images.services.migration_batch_log import FileReceipt
 
 
 ASSET_UUID = uuid.UUID("12345678-1234-5678-1234-567812345678")
@@ -2247,6 +2249,125 @@ class MediaStorageOwnedRootTests(TemporaryMediaMixin, SimpleTestCase):
         finally:
             duplicate.close()
             root.close()
+
+    def test_receipt_resource_is_stat_only_and_has_narrow_contract(self):
+        storage = MediaStorage(media_root=self.temporary_media.name)
+        prepared = storage.prepare(
+            make_fetched_image(size=(40, 30)),
+            ASSET_UUID,
+            "receipt.png",
+        )
+        by_kind = {entry.kind: entry for entry in prepared.files}
+        destination_stats = {}
+        try:
+            for entry in prepared.files:
+                destination = Path(
+                    self.temporary_media.name,
+                    entry.final_relative_path,
+                )
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(os.pread(
+                    entry.owned_staging_handle.descriptor,
+                    entry.size,
+                    0,
+                ))
+                destination_stats[entry.kind] = destination.stat()
+        finally:
+            prepared.cleanup()
+        image = SimpleNamespace(
+            pk=1,
+            asset_uuid=ASSET_UUID,
+            original_filename="receipt.png",
+            image=SimpleNamespace(name=by_kind["original"].final_relative_path),
+            width=by_kind["original"].width,
+            height=by_kind["original"].height,
+        )
+        thumbnails = []
+        for thumbnail_id, kind in enumerate(
+            ("thumbnail", "standard", "square"), 10
+        ):
+            entry = by_kind[kind]
+            thumbnails.append(SimpleNamespace(
+                pk=thumbnail_id,
+                original_id=image.pk,
+                size=kind,
+                image=SimpleNamespace(name=entry.final_relative_path),
+                width=entry.width,
+                height=entry.height,
+            ))
+        database_signature = (
+            image.pk,
+            str(image.asset_uuid),
+            image.original_filename,
+            image.image.name,
+            image.width,
+            image.height,
+            tuple(
+                (
+                    thumbnail.pk,
+                    thumbnail.size,
+                    thumbnail.image.name,
+                    thumbnail.width,
+                    thumbnail.height,
+                )
+                for thumbnail in sorted(
+                    thumbnails, key=lambda value: (value.size, value.pk)
+                )
+            ),
+        )
+        receipts = []
+        for kind, entry in by_kind.items():
+            thumbnail = next(
+                (
+                    value for value in thumbnails
+                    if value.size == kind
+                ),
+                None,
+            )
+            receipts.append(FileReceipt.for_values(
+                file_key=(
+                    "original:{}".format(image.pk)
+                    if thumbnail is None
+                    else "thumbnail:{}:{}".format(
+                        image.pk, thumbnail.pk
+                    )
+                ),
+                relative_path=entry.final_relative_path,
+                operation="verify",
+                size=entry.size,
+                image_format=entry.image_format,
+                width=entry.width,
+                height=entry.height,
+                source_device=destination_stats[kind].st_dev,
+                source_inode=destination_stats[kind].st_ino,
+                destination_device=destination_stats[kind].st_dev,
+                destination_inode=destination_stats[kind].st_ino,
+                sha256=entry.sha256,
+                database_signature="a" * 64,
+            ))
+
+        with mock.patch(
+            "core.services.media_storage.sha256_file_descriptor",
+            side_effect=AssertionError("receipt path hashed media"),
+        ), mock.patch.object(
+            PILImage,
+            "open",
+            side_effect=AssertionError("receipt path decoded media"),
+        ), mock.patch(
+            "core.services.media_storage._open_regular_nofollow",
+            side_effect=AssertionError("receipt path opened media"),
+        ):
+            resource = storage.prepare_from_receipts(
+                image,
+                thumbnails,
+                tuple(receipts),
+                database_signature,
+            )
+            self.assertTrue(resource.verify_current())
+
+        self.assertFalse(hasattr(resource, "verify_reusable"))
+        resource.close()
+        resource.close()
 
     def test_prepare_from_root_uses_duplicate_and_keeps_shared_root_open(self):
         root = file_ops.open_verified_media_root(self.temporary_media.name)

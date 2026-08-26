@@ -22,6 +22,7 @@ from django_images.file_ops import (
     media_lifecycle_lock,
     open_media_root,
     open_or_create_media_directory_from,
+    open_verified_media_root,
     publish_owned_noreplace,
     sha256_file_descriptor,
     unlink_published_name_if_current,
@@ -38,6 +39,7 @@ from django_images.paths import (
     sanitize_original_filename,
 )
 from django_images.models import Image, Thumbnail
+from django_images.services.migration_batch_log import FileReceipt
 from django_images.utils import scale_and_crop_iter, write_image_to_file
 
 
@@ -489,6 +491,76 @@ class ReusableAsset(object):
             raise _processing_timeout()
 
 
+@dataclass(frozen=True)
+class _ReceiptStatFile:
+    receipt: object
+    directory: object
+    name: str
+    file_stat: object
+
+
+class _ReceiptStatResource(object):
+    def __init__(self, root_directory, files, directories):
+        self._root_directory = root_directory
+        self._files = tuple(files)
+        self._directories = tuple(directories)
+        self._closed = False
+
+    def verify_current(self):
+        if self._closed:
+            raise _media_conflict()
+        try:
+            self._root_directory.verify_current()
+            for item in self._files:
+                item.directory.verify_current()
+                current = os.stat(
+                    item.name,
+                    dir_fd=item.directory.descriptor,
+                    follow_symlinks=False,
+                )
+                expected = item.receipt
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino)
+                    != (
+                        expected.destination_device,
+                        expected.destination_inode,
+                    )
+                    or current.st_size != expected.size
+                    or _identity(current) != _identity(item.file_stat)
+                ):
+                    raise _media_conflict()
+            self._root_directory.verify_current()
+        except MediaStorageError:
+            raise
+        except (MediaPathError, OSError):
+            raise _media_conflict() from None
+        return True
+
+    def close(self):
+        if self._closed:
+            return
+        first_error = None
+        for directory in reversed(self._directories):
+            try:
+                directory.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        try:
+            self._root_directory.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        self._closed = (
+            not self._root_directory.descriptors
+            and all(not directory.descriptors for directory in self._directories)
+        )
+        if first_error is not None:
+            raise first_error
+
+
 class MediaStorage(object):
     def __init__(
         self,
@@ -679,6 +751,128 @@ class MediaStorage(object):
                     pass
                 if partial._released:
                     break
+            if not isinstance(error, Exception):
+                raise
+            if isinstance(error, MediaStorageError):
+                raise
+            raise _media_conflict() from None
+
+    def prepare_from_receipts(
+        self,
+        image,
+        thumbnails,
+        expected_receipts,
+        database_signature,
+    ):
+        root_directory = None
+        directories = []
+        try:
+            manifest = self._reusable_manifest(image, thumbnails)
+            thumbnail_list = sorted(
+                list(thumbnails), key=lambda value: (value.size, value.pk)
+            )
+            current_signature = (
+                image.pk,
+                str(image.asset_uuid),
+                image.original_filename,
+                image.image.name,
+                image.width,
+                image.height,
+                tuple(
+                    (
+                        thumbnail.pk,
+                        thumbnail.size,
+                        thumbnail.image.name,
+                        thumbnail.width,
+                        thumbnail.height,
+                    )
+                    for thumbnail in thumbnail_list
+                ),
+            )
+            if current_signature != database_signature:
+                raise _media_conflict()
+            receipts = tuple(expected_receipts)
+            if not all(isinstance(receipt, FileReceipt) for receipt in receipts):
+                raise _media_conflict()
+            expected_keys = {
+                "original:{}".format(image.pk): "original"
+            }
+            expected_keys.update({
+                "thumbnail:{}:{}".format(image.pk, thumbnail.pk): (
+                    thumbnail.size
+                )
+                for thumbnail in thumbnail_list
+            })
+            by_key = {
+                receipt.file_key: receipt for receipt in receipts
+            }
+            if (
+                len(receipts) != len(by_key)
+                or set(by_key) != set(expected_keys)
+            ):
+                raise _media_conflict()
+            root_directory = open_verified_media_root(self.media_root)
+            directory_by_path = {}
+            files = []
+            for file_key, kind in sorted(expected_keys.items()):
+                receipt = by_key[file_key]
+                entry = manifest[kind]
+                extension = FORMAT_EXTENSIONS.get(receipt.image_format)
+                if (
+                    receipt.relative_path != entry["path"]
+                    or receipt.width != entry["width"]
+                    or receipt.height != entry["height"]
+                    or extension is None
+                    or not receipt.relative_path.endswith(extension)
+                ):
+                    raise _media_conflict()
+                relative_directory, name = receipt.relative_path.rsplit(
+                    "/", 1
+                )
+                directory = directory_by_path.get(relative_directory)
+                if directory is None:
+                    directory = self._open_existing_directory(
+                        root_directory, relative_directory
+                    )
+                    directory_by_path[relative_directory] = directory
+                    directories.append(directory)
+                current = os.stat(
+                    name,
+                    dir_fd=directory.descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino)
+                    != (
+                        receipt.destination_device,
+                        receipt.destination_inode,
+                    )
+                    or current.st_size != receipt.size
+                ):
+                    raise _media_conflict()
+                files.append(_ReceiptStatFile(
+                    receipt, directory, name, current
+                ))
+            resource = _ReceiptStatResource(
+                root_directory, files, directories
+            )
+            root_directory = None
+            directories = []
+            resource.verify_current()
+            return resource
+        except BaseException as error:
+            for directory in reversed(directories):
+                try:
+                    directory.close()
+                except BaseException:
+                    pass
+            if root_directory is not None:
+                try:
+                    root_directory.close()
+                except BaseException:
+                    pass
             if not isinstance(error, Exception):
                 raise
             if isinstance(error, MediaStorageError):

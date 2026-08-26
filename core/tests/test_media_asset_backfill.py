@@ -8,6 +8,7 @@ import stat
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import uuid
 
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -22,6 +23,7 @@ from django.db import (
 )
 from django.db.models.signals import post_save
 from django.test import TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 import mock
 from PIL import Image as PILImage
 from PIL import ImageFile
@@ -44,6 +46,13 @@ from core.services.pin_import import ImportMetadata, PinImportService
 from core.services.safe_url_fetch import FetchedImage
 from django_images import file_ops
 from django_images.models import Image, Thumbnail
+from django_images.services.migration_batch_log import (
+    BatchIntent,
+    BatchLimits,
+    FileReceipt,
+    JOURNAL_FILENAME,
+    MigrationBatchJournal,
+)
 from django_images.test_helpers import TemporaryMediaMixin
 from users.models import User
 
@@ -136,6 +145,8 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         run_directory=None,
         fault_injector=None,
         storage=None,
+        batch_size=100,
+        **kwargs
     ):
         if run_id is None:
             run_id, run_directory = self._new_run()
@@ -145,10 +156,558 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             run_id,
             os.geteuid(),
             os.getegid(),
-            batch_size=100,
+            batch_size=batch_size,
             media_storage=storage,
             fault_injector=fault_injector,
+            **kwargs
         )
+
+    def _create_bulk_candidates(self, count):
+        images = []
+        for index in range(count):
+            asset_uuid = uuid.UUID(int=index + 1000)
+            images.append(Image(
+                image="originals/{}/legacy.png".format(asset_uuid),
+                asset_uuid=asset_uuid,
+                original_filename="legacy.png",
+                width=10,
+                height=10,
+            ))
+        Image.objects.bulk_create(images)
+        images = list(Image.objects.order_by("pk"))
+        thumbnails = []
+        pins = []
+        for image in images:
+            for size in ("thumbnail", "standard", "square"):
+                thumbnails.append(Thumbnail(
+                    original=image,
+                    size=size,
+                    image="derivatives/{}/{}.png".format(
+                        image.asset_uuid, size
+                    ),
+                    width=10,
+                    height=10,
+                ))
+            pins.append(Pin(submitter=self.owner, image=image))
+        Thumbnail.objects.bulk_create(thumbnails)
+        Pin.objects.bulk_create(pins)
+        return images
+
+    @staticmethod
+    def _fake_candidate_resources(
+        image,
+        thumbnails,
+        submitter_id,
+        root_directory,
+        database_signature,
+        phase,
+        expected_receipts=None,
+    ):
+        del thumbnails, root_directory, phase, expected_receipts
+
+        class Resources(object):
+            def __init__(self):
+                self._closed = False
+                self.closure = media_asset_backfill.VerifiedClosure(
+                    image_id=image.pk,
+                    submitter_id=submitter_id,
+                    content_sha256="{:064x}".format(image.pk),
+                    database_signature=database_signature,
+                    file_identities=tuple(
+                        (kind, image.image.name)
+                        for kind in (
+                            "original", "thumbnail", "standard", "square"
+                        )
+                    ),
+                )
+
+            def close(self):
+                self._closed = True
+
+        return Resources()
+
+    @staticmethod
+    def _journal_without_paths_complete():
+        journal = object.__new__(MigrationBatchJournal)
+        state = type("JournalState", (), {})()
+        state.phase_summaries = {}
+        journal.state = state
+        return journal
+
+    def _completed_path_journal(self, service, backfill_total=None):
+        images = list(Image.objects.order_by("pk"))
+        receipts = []
+        for image in images:
+            rows = [("original", None, image)]
+            rows.extend(
+                (thumbnail.size, thumbnail, thumbnail)
+                for thumbnail in Thumbnail.objects.filter(
+                    original=image
+                ).order_by("size", "pk")
+            )
+            for kind, thumbnail, row in rows:
+                target = Path(self.temporary_media.name, row.image.name)
+                file_stat = target.stat()
+                content = target.read_bytes()
+                receipts.append(FileReceipt.for_values(
+                    file_key=(
+                        "original:{}".format(image.pk)
+                        if thumbnail is None
+                        else "thumbnail:{}:{}".format(
+                            image.pk, thumbnail.pk
+                        )
+                    ),
+                    relative_path=row.image.name,
+                    operation="verify",
+                    size=file_stat.st_size,
+                    image_format="PNG",
+                    width=row.width,
+                    height=row.height,
+                    source_device=file_stat.st_dev,
+                    source_inode=file_stat.st_ino,
+                    destination_device=file_stat.st_dev,
+                    destination_inode=file_stat.st_ino,
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    database_signature="b" * 64,
+                ))
+        run_directory = file_ops.open_verified_media_root(
+            service.run_directory
+        )
+        self.addCleanup(run_directory.close)
+        journal = MigrationBatchJournal.open(
+            run_directory,
+            JOURNAL_FILENAME,
+            service.run_id,
+            service.service_uid,
+            service.service_gid,
+            "1" * 64,
+            "2" * 64,
+        )
+        self.addCleanup(journal.close)
+        journal.freeze_work_totals(
+            len(images),
+            len(receipts),
+            len(images) if backfill_total is None else backfill_total,
+        )
+        if images:
+            journal.append_intent(BatchIntent.for_values(
+                batch_id="paths:{}-{}".format(
+                    images[0].pk, images[-1].pk
+                ),
+                batch_number=1,
+                phase="paths",
+                first_pk=images[0].pk,
+                last_pk=images[-1].pk,
+                receipts=tuple(receipts),
+                pre_signature="a" * 64,
+                post_signature="b" * 64,
+                images=len(images),
+                files=len(receipts),
+                total_bytes=sum(receipt.size for receipt in receipts),
+                total_pixels=sum(
+                    receipt.width * receipt.height for receipt in receipts
+                ),
+            ))
+            journal.append_commit(
+                "paths:{}-{}".format(images[0].pk, images[-1].pk),
+                "b" * 64,
+            )
+        journal.append_phase_complete("paths", {
+            "image_count": len(images),
+            "md5_legacy": 0,
+            "fixed_slot": 0,
+            "named_canonical": len(images),
+            "copy_required_bytes": 0,
+        })
+        return journal
+
+    def test_backfill_refuses_to_start_before_paths_complete(self):
+        journal = self._journal_without_paths_complete()
+
+        with self.assertRaisesRegex(CommandError, "^paths_not_complete$"):
+            self._service(batch_journal=journal).run(execute=True)
+
+    def test_plan_uses_keyset_and_bulk_queries(self):
+        self._create_bulk_candidates(120)
+        service = self._service(batch_size=50)
+
+        with mock.patch.object(
+            service,
+            "_open_candidate_resources",
+            side_effect=self._fake_candidate_resources,
+        ), CaptureQueriesContext(connection) as queries:
+            service.run(execute=False)
+
+        self.assertLessEqual(len(queries), 18)
+        self.assertFalse(any(
+            " OFFSET " in query["sql"].upper() for query in queries
+        ))
+
+    def test_count_planned_images_opens_no_media_and_matches_frozen_plan(self):
+        self._create_bulk_candidates(5)
+        service = self._service(batch_size=2)
+
+        with mock.patch.object(
+            service,
+            "_open_candidate_resources",
+            side_effect=AssertionError("count opened candidate media"),
+        ):
+            estimated = service.count_planned_images()
+        with mock.patch.object(
+            service,
+            "_open_candidate_resources",
+            side_effect=self._fake_candidate_resources,
+        ):
+            planned = service.run(execute=False)
+
+        self.assertEqual(estimated, planned.scanned)
+
+    def test_backfill_plan_uses_one_group_fsync(self):
+        self._create_bulk_candidates(3)
+        service = self._service(batch_size=2)
+
+        with mock.patch.object(
+            service,
+            "_open_candidate_resources",
+            side_effect=self._fake_candidate_resources,
+        ), mock.patch(
+            "core.services.media_asset_backfill._durable_fsync"
+        ) as durable_fsync:
+            service.run(execute=False)
+
+        self.assertEqual(
+            [call.args[1] for call in durable_fsync.call_args_list],
+            ["plan_manifest"],
+        )
+
+    def test_receipt_backfill_never_reopens_or_decodes_media(self):
+        self._create_candidate()
+        service = self._service(batch_size=1)
+        journal = self._completed_path_journal(service)
+        service.batch_journal = journal
+
+        with mock.patch.object(
+            MediaStorage,
+            "prepare_from_root",
+            side_effect=AssertionError("receipt path reopened media"),
+        ), mock.patch(
+            "core.services.media_asset_backfill.PILImage.open",
+            side_effect=AssertionError("receipt path decoded media"),
+        ):
+            summary = service.run(execute=True)
+
+        self.assertEqual(summary.registered, 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+
+    def test_backfill_batch_closes_at_first_resource_limit(self):
+        service = self._service(
+            batch_limits=BatchLimits(
+                max_images=10,
+                max_bytes=100,
+                max_pixels=500000000,
+            )
+        )
+        candidates = []
+        for image_id in (1, 2, 3):
+            receipt = SimpleNamespace(
+                size=10,
+                width=20000,
+                height=10000,
+            )
+            resources = SimpleNamespace(receipts=(receipt,))
+            candidates.append(media_asset_backfill.BatchCandidate(
+                SimpleNamespace(image_id=image_id),
+                resources,
+                {},
+            ))
+
+        batches = list(service._build_backfill_batches(candidates))
+
+        self.assertEqual([len(batch) for batch in batches], [2, 1])
+
+    def test_backfill_global_closure_runs_exactly_twice(self):
+        self._create_candidate(content=_png_bytes("red", size=(30, 20)))
+        self._create_candidate(content=_png_bytes("blue", size=(30, 20)))
+        service = self._service(batch_size=1)
+        service.batch_journal = self._completed_path_journal(service)
+
+        with mock.patch.object(
+            service,
+            "_verify_database_plan_closure",
+            wraps=service._verify_database_plan_closure,
+        ) as closure:
+            service.run(execute=True)
+
+        self.assertEqual(closure.call_count, 2)
+
+    def test_linear_backfill_keeps_plan_manifest_bytes_and_loads_sidecar(self):
+        self._create_candidate()
+        service = self._service(batch_size=1)
+        service.batch_journal = self._completed_path_journal(service)
+        service.run(execute=False)
+        manifest_path = Path(service.run_directory, MANIFEST_FILENAME)
+        before = manifest_path.read_bytes()
+
+        executed = service.run(execute=True)
+        loaded = load_completed_media_asset_backfill_summary(
+            service.run_directory,
+            MANIFEST_FILENAME,
+            service.run_id,
+            service.service_uid,
+            service.service_gid,
+            batch_journal=service.batch_journal,
+        )
+
+        self.assertEqual(manifest_path.read_bytes(), before)
+        self.assertEqual(loaded, executed)
+
+    def test_linear_backfill_reports_global_batch_progress(self):
+        self._create_candidate()
+        events = []
+        service = self._service(
+            batch_size=1,
+            progress_reporter=events.append,
+        )
+        service.batch_journal = self._completed_path_journal(service)
+
+        service.run(execute=True)
+
+        self.assertEqual(
+            [event["phase"] for event in events],
+            ["backfill_planning", "backfill_registering", "finalizing"],
+        )
+        registering = events[1]
+        self.assertEqual(registering["backfill_done"], 1)
+        self.assertEqual(registering["backfill_total"], 1)
+        self.assertEqual(registering["last_committed_batch"], 2)
+
+    def _assert_linear_resume_boundary(
+        self, fault_point, expected_database_applies, expected_commits
+    ):
+        self._create_candidate()
+        crashed = {"value": False}
+
+        def crash_once(point):
+            if point == fault_point and not crashed["value"]:
+                crashed["value"] = True
+                raise RuntimeError("simulated linear crash")
+
+        service = self._service(batch_size=1, fault_injector=crash_once)
+        service.batch_journal = self._completed_path_journal(service)
+        with self.assertRaisesRegex(RuntimeError, "simulated linear crash"):
+            service.run(execute=True)
+        service.fault_injector = None
+
+        with mock.patch.object(
+            service,
+            "_apply_database_batch",
+            wraps=service._apply_database_batch,
+        ) as database_apply, mock.patch.object(
+            service.batch_journal,
+            "append_commit",
+            wraps=service.batch_journal.append_commit,
+        ) as append_commit:
+            summary = service.run(execute=True)
+
+        self.assertEqual(database_apply.call_count, expected_database_applies)
+        self.assertEqual(append_commit.call_count, expected_commits)
+        self.assertEqual(summary.registered, 1)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+
+    def test_backfill_resume_after_intent_reapplies_database_batch(self):
+        self._assert_linear_resume_boundary(
+            "after_backfill_intent", 1, 1
+        )
+
+    def test_backfill_resume_after_database_commit_repairs_commit_only(self):
+        self._assert_linear_resume_boundary(
+            "after_backfill_database_commit", 0, 1
+        )
+
+    def test_backfill_resume_after_commit_repeats_no_batch_work(self):
+        self._assert_linear_resume_boundary(
+            "after_backfill_commit", 0, 0
+        )
+
+    def test_partial_v2_backfill_imports_prefix_and_preserves_bytes(self):
+        self._create_candidate(content=_png_bytes("red", size=(30, 20)))
+        second = self._create_candidate(
+            content=_png_bytes("blue", size=(30, 20))
+        )
+        service = self._service(batch_size=1)
+        service.run(execute=False)
+        original_record = media_asset_backfill._BackfillManifestLog.record_result
+        recorded = {"value": False}
+
+        def record_then_crash(manifest, *args, **kwargs):
+            result = original_record(manifest, *args, **kwargs)
+            if not recorded["value"]:
+                recorded["value"] = True
+                raise RuntimeError("partial v2 crash")
+            return result
+
+        with mock.patch.object(
+            media_asset_backfill._BackfillManifestLog,
+            "record_result",
+            new=record_then_crash,
+        ), self.assertRaisesRegex(RuntimeError, "partial v2 crash"):
+            service.run(execute=True)
+        manifest_path = Path(service.run_directory, MANIFEST_FILENAME)
+        before = manifest_path.read_bytes()
+        service.batch_journal = self._completed_path_journal(service)
+        prepared_image_ids = []
+        real_prepare = MediaStorage.prepare_from_receipts
+
+        def prepare(storage, image, *args, **kwargs):
+            prepared_image_ids.append(image.pk)
+            return real_prepare(storage, image, *args, **kwargs)
+
+        with mock.patch.object(
+            MediaStorage,
+            "prepare_from_receipts",
+            autospec=True,
+            side_effect=prepare,
+        ):
+            summary = service.run(execute=True)
+
+        self.assertEqual(manifest_path.read_bytes(), before)
+        self.assertEqual(prepared_image_ids, [second["image"].pk])
+        self.assertEqual(summary.registered, 2)
+        self.assertTrue(service.batch_journal.is_phase_complete("backfill"))
+
+    def test_registry_complete_v2_upgrade_never_reopens_candidates(self):
+        self._create_candidate()
+        service = self._service(batch_size=1)
+        service.run(execute=True)
+        manifest_path = Path(service.run_directory, MANIFEST_FILENAME)
+        before = manifest_path.read_bytes()
+        service.batch_journal = self._completed_path_journal(service)
+
+        with mock.patch.object(
+            MediaStorage,
+            "prepare_from_receipts",
+            side_effect=AssertionError("complete v2 reopened candidate"),
+        ), mock.patch.object(
+            service,
+            "_verify_database_plan_closure",
+            wraps=service._verify_database_plan_closure,
+        ) as closure:
+            summary = service.run(execute=True)
+
+        self.assertEqual(manifest_path.read_bytes(), before)
+        self.assertEqual(summary.registered, 1)
+        self.assertEqual(closure.call_count, 1)
+        self.assertEqual(
+            service.batch_journal.committed_ids("backfill"), frozenset()
+        )
+        self.assertTrue(service.batch_journal.is_phase_complete("backfill"))
+
+    def test_partial_v2_import_intent_is_repaired_before_resume(self):
+        self._create_candidate(content=_png_bytes("red", size=(30, 20)))
+        self._create_candidate(content=_png_bytes("blue", size=(30, 20)))
+        service = self._service(batch_size=1)
+        service.run(execute=False)
+        original_record = media_asset_backfill._BackfillManifestLog.record_result
+        recorded = {"value": False}
+
+        def record_then_crash(manifest, *args, **kwargs):
+            result = original_record(manifest, *args, **kwargs)
+            if not recorded["value"]:
+                recorded["value"] = True
+                raise RuntimeError("partial v2 crash")
+            return result
+
+        with mock.patch.object(
+            media_asset_backfill._BackfillManifestLog,
+            "record_result",
+            new=record_then_crash,
+        ), self.assertRaisesRegex(RuntimeError, "partial v2 crash"):
+            service.run(execute=True)
+        service.batch_journal = self._completed_path_journal(service)
+        real_append_commit = service.batch_journal.append_commit
+        interrupted = {"value": False}
+
+        def interrupt_import(batch_id, post_signature):
+            if (
+                batch_id.startswith("upgrade-backfill:")
+                and not interrupted["value"]
+            ):
+                interrupted["value"] = True
+                raise RuntimeError("upgrade import crash")
+            return real_append_commit(batch_id, post_signature)
+
+        with mock.patch.object(
+            service.batch_journal,
+            "append_commit",
+            side_effect=interrupt_import,
+        ), self.assertRaisesRegex(RuntimeError, "upgrade import crash"):
+            service.run(execute=True)
+
+        summary = service.run(execute=True)
+
+        self.assertEqual(summary.registered, 2)
+        self.assertEqual(MediaAsset.objects.count(), 2)
+        self.assertTrue(service.batch_journal.is_phase_complete("backfill"))
+
+    def test_v2_upgrade_rejects_terminal_database_conflict(self):
+        candidate = self._create_candidate()
+        service = self._service(batch_size=1)
+        service.run(execute=True)
+        MediaAsset.objects.filter(image=candidate["image"]).update(
+            content_sha256="0" * 64
+        )
+        service.batch_journal = self._completed_path_journal(service)
+
+        with self.assertRaisesRegex(
+            CommandError, "^linear_journal_database_conflict$"
+        ):
+            service.run(execute=True)
+
+    def test_completed_summary_requires_complete_matching_sidecar(self):
+        self._create_candidate()
+        service = self._service(batch_size=1)
+        service.batch_journal = self._completed_path_journal(service)
+        service.run(execute=False)
+
+        with self.assertRaisesRegex(
+            CommandError, "^media_asset_plan_incomplete$"
+        ):
+            load_completed_media_asset_backfill_summary(
+                service.run_directory,
+                MANIFEST_FILENAME,
+                service.run_id,
+                service.service_uid,
+                service.service_gid,
+                batch_journal=service.batch_journal,
+            )
+
+        service.run(execute=True)
+        service.batch_journal.state.phase_summaries["backfill"][
+            "registered"
+        ] = 0
+        with self.assertRaisesRegex(
+            CommandError, "^manifest_plan_mismatch$"
+        ):
+            load_completed_media_asset_backfill_summary(
+                service.run_directory,
+                MANIFEST_FILENAME,
+                service.run_id,
+                service.service_uid,
+                service.service_gid,
+                batch_journal=service.batch_journal,
+            )
+
+    def test_completed_linear_backfill_rejects_missing_registry_row(self):
+        candidate = self._create_candidate()
+        service = self._service(batch_size=1)
+        service.batch_journal = self._completed_path_journal(service)
+        service.run(execute=True)
+        MediaAsset.objects.filter(image=candidate["image"]).delete()
+
+        with self.assertRaisesRegex(
+            CommandError, "^linear_journal_database_conflict$"
+        ):
+            service.run(execute=True)
 
     @staticmethod
     def _sqlite_fence_connection(
@@ -519,19 +1078,21 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         self._create_candidate(content=_png_bytes("red"))
         self._create_candidate(content=_png_bytes("blue"))
         service = self._service()
-        original_record = media_asset_backfill._BackfillManifestLog.record_plan
+        original_write = (
+            media_asset_backfill._BackfillManifestLog._write_frozen_line
+        )
         recorded = {"value": False}
 
-        def record_then_crash(manifest, plan):
-            original_record(manifest, plan)
+        def write_then_crash(manifest, line):
+            original_write(manifest, line)
             if not recorded["value"]:
                 recorded["value"] = True
                 raise RuntimeError("plan interrupted")
 
         with mock.patch.object(
             media_asset_backfill._BackfillManifestLog,
-            "record_plan",
-            new=record_then_crash,
+            "_write_frozen_line",
+            new=write_then_crash,
         ):
             with self.assertRaisesRegex(RuntimeError, "plan interrupted"):
                 service.run(execute=False)
@@ -553,16 +1114,18 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
     def test_incomplete_torn_plan_prefix_is_quarantined_then_reset(self):
         self._create_candidate()
         service = self._service()
-        original_record = media_asset_backfill._BackfillManifestLog.record_plan
+        original_write = (
+            media_asset_backfill._BackfillManifestLog._write_frozen_line
+        )
 
-        def record_then_crash(manifest, plan):
-            original_record(manifest, plan)
+        def write_then_crash(manifest, line):
+            original_write(manifest, line)
             raise RuntimeError("plan interrupted")
 
         with mock.patch.object(
             media_asset_backfill._BackfillManifestLog,
-            "record_plan",
-            new=record_then_crash,
+            "_write_frozen_line",
+            new=write_then_crash,
         ):
             with self.assertRaisesRegex(RuntimeError, "plan interrupted"):
                 service.run(execute=False)
@@ -1865,7 +2428,7 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         with mock.patch(
             "core.services.media_asset_backfill.open_verified_media_root",
             side_effect=record_root,
-        ) as strict_open:
+        ):
             service.run()
             self.assertEqual(len(roots), 1)
             self.assertFalse(roots[0].descriptors)
