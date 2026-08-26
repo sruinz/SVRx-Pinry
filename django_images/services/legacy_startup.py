@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import uuid
+from datetime import datetime
 
 from django.conf import settings
 from django.core.management import CommandError
@@ -21,10 +22,17 @@ from django_images.services import migration_state, startup_preflight
 from django_images.services.media_archive import LegacyMediaArchive
 from django_images.services.media_migration_v2 import (
     AUTO_V2_MANIFEST_FILENAME,
+    AutoV2CompletionAuthority,
+    AutoV2ManifestLog,
     AutoV2MediaMigrator,
     AutoV2PlanSummary,
     load_completed_auto_v2_summary,
     recover_incomplete_auto_v2_plan,
+)
+from django_images.services.migration_batch_log import (
+    JOURNAL_FILENAME,
+    MigrationBatchJournal,
+    MigrationBatchLogError,
 )
 from django_images.services.sqlite_snapshot import (
     protect_orphan_cleanup,
@@ -34,6 +42,96 @@ from django_images.services.sqlite_snapshot import (
 
 SUMMARY_FILENAME = "migration-summary.json"
 _BACKUP_ROOT_NAME = "legacy-backup"
+
+_PROGRESS_KEYS = {
+    "preparing": frozenset(("phase",)),
+    "snapshot": frozenset(("phase",)),
+    "planning": frozenset((
+        "phase",
+        "run_id",
+        "attempt",
+        "resume_count",
+        "started_at",
+        "images_total",
+        "files_total",
+        "backfill_total",
+    )),
+    "recovery": frozenset((
+        "phase",
+        "run_id",
+        "attempt",
+        "resume_count",
+        "started_at",
+        "images_done",
+        "images_total",
+        "files_done",
+        "files_total",
+        "backfill_done",
+        "backfill_total",
+        "last_committed_batch",
+    )),
+    "upgrade_v2": frozenset((
+        "phase", "images_done", "images_total",
+    )),
+    "copying": frozenset((
+        "phase",
+        "images_done",
+        "images_total",
+        "files_done",
+        "files_total",
+    )),
+    "database": frozenset((
+        "phase", "images_done", "images_total",
+    )),
+    "backfill_planning": frozenset((
+        "phase", "backfill_total",
+    )),
+    "backfill_registering": frozenset((
+        "phase",
+        "backfill_done",
+        "backfill_total",
+        "last_committed_batch",
+    )),
+    "archive": frozenset(("phase",)),
+    "finalizing": frozenset(("phase",)),
+}
+
+_SAFE_INTERNAL_ERROR_CODES = frozenset((
+    "archive_failed",
+    "archive_manifest_mismatch",
+    "archive_state_conflict",
+    "atomic_archive_unsupported",
+    "legacy_media_still_referenced",
+    "legacy_migration_flag_required",
+    "legacy_migration_space_insufficient",
+    "legacy_progress_event_invalid",
+    "linear_batch_file_sync_failed",
+    "linear_checkpoint_ahead",
+    "linear_committed_repair_failed",
+    "linear_committed_source_changed",
+    "linear_journal_database_conflict",
+    "linear_journal_invalid",
+    "linear_journal_source_changed",
+    "linear_journal_tail_repair_failed",
+    "linear_work_totals_changed",
+    "media_path_conflict",
+    "media_storage_configuration_invalid",
+    "migration_state_conflict",
+    "migration_state_create_failed",
+    "migration_state_identity_changed",
+    "migration_state_invalid",
+    "migration_state_invalid_transition",
+    "migration_state_missing_or_invalid",
+    "migration_state_phase_mismatch",
+    "migration_state_plan_mismatch",
+    "migration_state_root_invalid",
+    "migration_state_write_failed",
+    "paths_not_complete",
+    "runtime_supervisor_failed",
+    "sqlite_snapshot_failed",
+    "unsafe_auto_v2_manifest",
+    "unsafe_migration_summary",
+))
 
 
 class LegacyStartupError(Exception):
@@ -69,6 +167,7 @@ class LegacyStartupCoordinator(object):
         self._allow_missing_media_layout = False
         self._media_summary = None
         self._backfill_summary = None
+        self._child_progress_error = None
 
     def prepare_no_flag_before_schema(self):
         """No-flag startup의 pre-schema evidence를 read-only로 고정한다."""
@@ -273,6 +372,19 @@ class LegacyStartupCoordinator(object):
         return run
 
     def converge_after_schema(self, run):
+        try:
+            return self._converge_after_schema(run)
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if code is None and isinstance(error, CommandError):
+                code = str(error)
+            if isinstance(error, LegacyStartupError):
+                code = error.code
+            if code not in _SAFE_INTERNAL_ERROR_CODES:
+                code = "legacy_startup_failed"
+            raise LegacyStartupError(code) from error
+
+    def _converge_after_schema(self, run):
         """preflight, path, registry, archive, complete를 순서대로 수렴한다."""
         if run is None and self._evidence is None:
             self._allow_missing_media_layout = False
@@ -312,20 +424,7 @@ class LegacyStartupCoordinator(object):
             return run
         self._configuration_preflight(os.geteuid(), os.getegid())
         self._seal_current_identities(run)
-        status = migration_state.read_run_status(run)
-        if status.phase in ("schema_complete", "copying"):
-            self._converge_media(run)
-            self._seal_current_identities(run)
-            status = migration_state.read_run_status(run)
-        if status.phase == "paths_complete":
-            self._converge_backfill(run)
-            status = migration_state.read_run_status(run)
-        if status.phase in (
-            "registry_complete",
-            "archive_intent",
-            "archive_complete",
-        ):
-            self._converge_archive(run)
+        self._converge_media(run)
         status = migration_state.read_run_status(run)
         if status.phase != "complete":
             raise LegacyStartupError("migration_state_phase_mismatch")
@@ -363,7 +462,7 @@ class LegacyStartupCoordinator(object):
             raise LegacyStartupError(result.reason_code)
         return result
 
-    def _converge_media(self, run):
+    def _converge_media(self, run):  # noqa: C901
         status = migration_state.read_run_status(run)
         migrator = AutoV2MediaMigrator(
             run.path,
@@ -372,11 +471,14 @@ class LegacyStartupCoordinator(object):
             self.service_uid,
             self.service_gid,
             fault_injector=self.fault_injector,
-            progress_reporter=self.progress_reporter,
+            progress_reporter=self._report_child_progress,
         )
+        self._child_progress_error = None
         resume_torn_execution = False
         try:
-            planned = migrator.run(execute=False)
+            planned = self._run_child(
+                lambda: migrator.run(execute=False)
+            )
         except CommandError as error:
             reason = str(error)
             if reason not in (
@@ -402,40 +504,79 @@ class LegacyStartupCoordinator(object):
                     self.service_uid,
                     self.service_gid,
                 )
-                planned = migrator.run(execute=False)
+                planned = self._run_child(
+                    lambda: migrator.run(execute=False)
+                )
         if resume_torn_execution:
             recovered = migrator.recover_execution_tail()
             self._validate_summary_run(recovered, run)
             if recovered.plan_sha256 != status.media_plan_sha256:
                 raise LegacyStartupError("migration_state_plan_mismatch")
-            migration_state.persist_manifest_identity(
-                run,
-                "copying",
-                "media",
-                recovered.plan_sha256,
-                recovered.manifest_sha256,
-            )
             remaining = startup_preflight.calculate_remaining_space(
                 recovered.copy_required_bytes,
                 status.initial_margin_bytes,
             )
             self._require_space(remaining.required_bytes)
             expected_plan_sha256 = recovered.plan_sha256
+            planned = recovered
         else:
             self._validate_summary_run(planned, run)
-            migration_state.persist_manifest_identity(
-                run,
-                status.phase,
-                "media",
-                planned.plan_sha256,
-                planned.manifest_sha256,
-            )
             remaining = startup_preflight.calculate_remaining_space(
                 planned.copy_required_bytes,
                 status.initial_margin_bytes,
             )
             self._require_space(remaining.required_bytes)
+            expected_plan_sha256 = planned.plan_sha256
+        create_journal = status.phase == "schema_complete"
+        run_directory = file_ops.open_verified_media_root(run.path)
+        try:
+            journal = MigrationBatchJournal.open(
+                run_directory,
+                JOURNAL_FILENAME,
+                run.run_id,
+                self.service_uid,
+                self.service_gid,
+                planned.plan_sha256,
+                planned.manifest_sha256,
+                create=create_journal,
+            )
+        except BaseException:
+            run_directory.close()
+            raise
+        try:
+            self._child_progress_error = None
+            journal.record_attempt(
+                datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+            backfiller = MediaAssetBackfiller(
+                run.path,
+                BACKFILL_MANIFEST_FILENAME,
+                run.run_id,
+                self.service_uid,
+                self.service_gid,
+                fault_injector=self.fault_injector,
+                progress_reporter=self._report_child_progress,
+                batch_journal=journal,
+            )
+            if journal.state.work_totals is None:
+                if not create_journal:
+                    raise MigrationBatchLogError("linear_journal_invalid")
+                journal.freeze_work_totals(
+                    planned.image_count,
+                    self._planned_file_count(migrator, run, planned),
+                    backfiller.count_planned_images(),
+                )
+                self._report_planning(journal.recovery_snapshot())
+            self._report_recovery(journal.recovery_snapshot())
+            migrator.batch_journal = journal
             if status.phase == "schema_complete":
+                migration_state.persist_manifest_identity(
+                    run,
+                    "schema_complete",
+                    "media",
+                    planned.plan_sha256,
+                    planned.manifest_sha256,
+                )
                 self._media_summary = planned
                 self._transition(
                     run,
@@ -443,44 +584,151 @@ class LegacyStartupCoordinator(object):
                     "copying",
                     plan_sha256=planned.plan_sha256,
                     manifest_sha256=planned.manifest_sha256,
+                    batch_journal=journal,
                 )
                 self._fault("after_copying_intent")
-            expected_plan_sha256 = planned.plan_sha256
-        executed = migrator.run(execute=True)
-        self._validate_summary_run(executed, run)
-        if executed.plan_sha256 != expected_plan_sha256:
-            raise LegacyStartupError("migration_state_plan_mismatch")
-        migration_state.persist_manifest_identity(
-            run,
-            "copying",
-            "media",
-            executed.plan_sha256,
-            executed.manifest_sha256,
-        )
-        self._media_summary = executed
-        self._fault("after_media_execute")
-        self._transition(
-            run,
-            "copying",
-            "paths_complete",
-            plan_sha256=executed.plan_sha256,
-            manifest_sha256=executed.manifest_sha256,
-        )
-        self._fault("after_paths_complete")
+            executed = self._run_child(
+                lambda: migrator.run(execute=True, upgrade_v2=True)
+            )
+            self._validate_summary_run(executed, run)
+            if executed.plan_sha256 != expected_plan_sha256:
+                raise LegacyStartupError("migration_state_plan_mismatch")
+            self._media_summary = executed
+            status = migration_state.read_run_status(run)
+            if status.phase == "copying":
+                migration_state.persist_manifest_identity(
+                    run,
+                    "copying",
+                    "media",
+                    executed.plan_sha256,
+                    executed.manifest_sha256,
+                )
+                self._fault("after_media_execute")
+                self._transition(
+                    run,
+                    "copying",
+                    "paths_complete",
+                    plan_sha256=executed.plan_sha256,
+                    manifest_sha256=executed.manifest_sha256,
+                    batch_journal=journal,
+                )
+                self._fault("after_paths_complete")
+            else:
+                self._validate_summary_identity(
+                    executed,
+                    run,
+                    (
+                        status.media_plan_sha256,
+                        status.media_manifest_sha256,
+                    ),
+                )
+            self._converge_backfill(run, journal, backfiller)
+            archive_evidence = self._seal_current_identities(run)
+            completion_authority = self._load_completion_authority(
+                run, journal
+            )
+            expected = self._converge_archive(
+                run,
+                journal,
+                completion_authority,
+                archive_evidence,
+            )
+            self._report_progress({"phase": "finalizing"})
+            self._transition_complete(
+                run,
+                expected,
+                journal,
+                completion_authority=completion_authority,
+            )
+        finally:
+            try:
+                journal.close()
+            finally:
+                run_directory.close()
 
-    def _converge_backfill(self, run):
-        backfiller = MediaAssetBackfiller(
+    def _planned_file_count(self, migrator, run, planned):
+        plans = getattr(migrator, "_frozen_plans", None)
+        if plans is None:
+            with AutoV2ManifestLog.open(
+                run.path,
+                AUTO_V2_MANIFEST_FILENAME,
+                run.run_id,
+                self.service_uid,
+                self.service_gid,
+                create=False,
+            ) as manifest:
+                summary = manifest.summary()
+                self._validate_summary_identity(
+                    summary,
+                    run,
+                    (
+                        planned.plan_sha256,
+                        planned.manifest_sha256,
+                    ),
+                )
+                plans = tuple(manifest.state.plans)
+        return sum(len(plan.files) for plan in plans)
+
+    @staticmethod
+    def _report_planning_values(snapshot):
+        return {
+            "phase": "planning",
+            "run_id": snapshot["run_id"],
+            "attempt": snapshot["attempt"],
+            "resume_count": snapshot["resume_count"],
+            "started_at": snapshot["started_at"],
+            "images_total": snapshot["images_total"],
+            "files_total": snapshot["files_total"],
+            "backfill_total": snapshot["backfill_total"],
+        }
+
+    def _report_planning(self, snapshot):
+        self._report_progress(self._report_planning_values(snapshot))
+
+    def _report_recovery(self, snapshot):
+        self._report_progress(dict({"phase": "recovery"}, **snapshot))
+
+    def _load_completion_authority(self, run, journal):
+        with AutoV2ManifestLog.open(
             run.path,
-            BACKFILL_MANIFEST_FILENAME,
+            AUTO_V2_MANIFEST_FILENAME,
             run.run_id,
             self.service_uid,
             self.service_gid,
-            fault_injector=self.fault_injector,
+            create=False,
+        ) as manifest:
+            authority = AutoV2CompletionAuthority.load(
+                manifest, journal
+            )
+        status = migration_state.read_run_status(run)
+        self._validate_summary_identity(
+            authority.summary,
+            run,
+            (
+                status.media_plan_sha256,
+                status.media_manifest_sha256,
+            ),
         )
+        return authority
+
+    def _converge_backfill(self, run, journal, backfiller=None):
+        if backfiller is None:
+            backfiller = MediaAssetBackfiller(
+                run.path,
+                BACKFILL_MANIFEST_FILENAME,
+                run.run_id,
+                self.service_uid,
+                self.service_gid,
+                fault_injector=self.fault_injector,
+                progress_reporter=self._report_child_progress,
+                batch_journal=journal,
+            )
         status = migration_state.read_run_status(run)
         resume_torn_execution = False
         try:
-            planned = backfiller.run(execute=False)
+            planned = self._run_child(
+                lambda: backfiller.run(execute=False)
+            )
         except CommandError as error:
             reason = str(error)
             if reason not in (
@@ -502,44 +750,65 @@ class LegacyStartupCoordinator(object):
                     self.service_uid,
                     self.service_gid,
                 )
-                planned = backfiller.run(execute=False)
+                planned = self._run_child(
+                    lambda: backfiller.run(execute=False)
+                )
         if resume_torn_execution:
             expected_plan_sha256 = status.backfill_plan_sha256
         else:
             self._validate_summary_run(planned, run)
+            if status.phase == "paths_complete":
+                migration_state.persist_manifest_identity(
+                    run,
+                    "paths_complete",
+                    "backfill",
+                    planned.plan_sha256,
+                    planned.manifest_sha256,
+                )
+            expected_plan_sha256 = planned.plan_sha256
+        executed = self._run_child(
+            lambda: backfiller.run(execute=True)
+        )
+        self._validate_summary_run(executed, run)
+        if executed.plan_sha256 != expected_plan_sha256:
+            raise LegacyStartupError("migration_state_plan_mismatch")
+        self._backfill_summary = executed
+        status = migration_state.read_run_status(run)
+        if status.phase == "paths_complete":
             migration_state.persist_manifest_identity(
                 run,
                 "paths_complete",
                 "backfill",
-                planned.plan_sha256,
-                planned.manifest_sha256,
+                executed.plan_sha256,
+                executed.manifest_sha256,
             )
-            expected_plan_sha256 = planned.plan_sha256
-        executed = backfiller.run(execute=True)
-        self._validate_summary_run(executed, run)
-        if executed.plan_sha256 != expected_plan_sha256:
-            raise LegacyStartupError("migration_state_plan_mismatch")
-        migration_state.persist_manifest_identity(
-            run,
-            "paths_complete",
-            "backfill",
-            executed.plan_sha256,
-            executed.manifest_sha256,
-        )
-        self._backfill_summary = executed
-        self._fault("after_backfill_execute")
-        self._transition(
-            run,
-            "paths_complete",
-            "registry_complete",
-            plan_sha256=executed.plan_sha256,
-            manifest_sha256=executed.manifest_sha256,
-        )
-        self._report_progress({"phase": "backfill"})
-        self._fault("after_registry_complete")
+            self._fault("after_backfill_execute")
+            self._transition(
+                run,
+                "paths_complete",
+                "registry_complete",
+                plan_sha256=executed.plan_sha256,
+                manifest_sha256=executed.manifest_sha256,
+                batch_journal=journal,
+            )
+            self._fault("after_registry_complete")
+        else:
+            self._validate_summary_identity(
+                executed,
+                run,
+                (
+                    status.backfill_plan_sha256,
+                    status.backfill_manifest_sha256,
+                ),
+            )
 
-    def _converge_archive(self, run):
-        evidence = self._seal_current_identities(run)
+    def _converge_archive(
+        self,
+        run,
+        journal,
+        completion_authority,
+        evidence,
+    ):
         status = migration_state.read_run_status(run)
         if evidence.has_md5_paths or evidence.has_fixed_slot_paths:
             raise LegacyStartupError("legacy_media_still_referenced")
@@ -551,6 +820,8 @@ class LegacyStartupCoordinator(object):
             run.run_id,
             self.service_uid,
             self.service_gid,
+            batch_journal=journal,
+            completion_authority=completion_authority,
         )
         if status.phase == "archive_complete":
             if status.progress is None:
@@ -573,8 +844,7 @@ class LegacyStartupCoordinator(object):
                 plan,
                 syscall_adapter=self.archive_adapter,
             )
-            self._transition_complete(run, "archive_complete")
-            return
+            return "archive_complete"
         if status.phase == "registry_complete":
             plan = archive.prepare(
                 has_media_image_directory=(
@@ -589,8 +859,7 @@ class LegacyStartupCoordinator(object):
                 ),
             )
             if not plan.intents:
-                self._transition_complete(run, "registry_complete")
-                return
+                return "registry_complete"
             first = self._first_incomplete(plan.progress)
             self._transition(
                 run,
@@ -598,6 +867,8 @@ class LegacyStartupCoordinator(object):
                 "archive_intent",
                 intent=first,
                 progress=plan.progress,
+                batch_journal=journal,
+                completion_authority=completion_authority,
             )
             self._fault("after_archive_intent")
         else:
@@ -622,6 +893,8 @@ class LegacyStartupCoordinator(object):
                     "archive_intent",
                     "archive_complete",
                     progress=progress,
+                    batch_journal=journal,
+                    completion_authority=completion_authority,
                 )
             else:
                 self._transition(
@@ -630,6 +903,8 @@ class LegacyStartupCoordinator(object):
                     "archive_intent",
                     intent=next_intent,
                     progress=progress,
+                    batch_journal=journal,
+                    completion_authority=completion_authority,
                 )
             self._fault("after_archive_progress")
 
@@ -640,7 +915,7 @@ class LegacyStartupCoordinator(object):
         )
         if migration_state.read_run_status(run).phase != "archive_complete":
             raise LegacyStartupError("archive_state_conflict")
-        self._transition_complete(run, "archive_complete")
+        return "archive_complete"
 
     def _configuration_preflight(self, lock_uid, lock_gid):
         image_storage = Image._meta.get_field("image").storage
@@ -684,53 +959,171 @@ class LegacyStartupCoordinator(object):
         )
 
     def _transition(self, run, expected, next_phase, **kwargs):
+        batch_journal = kwargs.pop("batch_journal", None)
+        completion_authority = kwargs.pop(
+            "completion_authority", None
+        )
         transitioned = migration_state.transition_state(
             run,
             expected,
             next_phase,
             **kwargs
         )
-        self._write_summary(transitioned)
+        self._write_summary(
+            transitioned,
+            batch_journal=batch_journal,
+            completion_authority=completion_authority,
+        )
         return transitioned
 
-    def _transition_complete(self, run, expected):
+    def _transition_complete(
+        self,
+        run,
+        expected,
+        batch_journal,
+        completion_authority=None,
+    ):
         status = migration_state.read_run_status(run)
         if status.phase != expected:
             raise LegacyStartupError("migration_state_phase_mismatch")
-        self._restore_summary_values(run, status, force_reload=True)
+        self._restore_summary_values(
+            run,
+            status,
+            force_reload=True,
+            batch_journal=batch_journal,
+            completion_authority=completion_authority,
+        )
         if (
             not isinstance(self._media_summary, AutoV2PlanSummary)
             or not isinstance(self._backfill_summary, BackfillSummary)
         ):
             raise LegacyStartupError("migration_state_plan_mismatch")
-        self._write_summary(run, phase_override="complete")
+        self._write_summary(
+            run,
+            phase_override="complete",
+            batch_journal=batch_journal,
+            completion_authority=completion_authority,
+        )
         self._fault("after_complete_summary")
         status = migration_state.read_run_status(run)
         if status.phase != expected:
             raise LegacyStartupError("migration_state_phase_mismatch")
-        self._restore_summary_values(run, status, force_reload=True)
-        completed = migration_state.transition_state(
+        return migration_state.transition_state(
             run,
             expected,
             "complete",
         )
-        self._report_progress({"phase": "complete"})
-        return completed
+
+    def _run_child(self, operation):
+        try:
+            result = operation()
+        except BaseException:
+            self._raise_child_progress_error()
+            raise
+        self._raise_child_progress_error()
+        return result
+
+    def _report_child_progress(self, event):
+        try:
+            phase = event.get("phase") if isinstance(event, dict) else None
+            if phase == "finalizing":
+                self._validate_progress_event(event)
+                return False
+            return self._report_progress(event)
+        except BaseException as error:
+            if self._child_progress_error is None:
+                self._child_progress_error = error
+            raise
+
+    def _raise_child_progress_error(self):
+        error = self._child_progress_error
+        self._child_progress_error = None
+        if error is not None:
+            raise error
+
+    @staticmethod
+    def _validate_progress_event(event):
+        if not isinstance(event, dict):
+            raise LegacyStartupError("legacy_progress_event_invalid")
+        phase = event.get("phase")
+        if (
+            phase not in _PROGRESS_KEYS
+            or frozenset(event) != _PROGRESS_KEYS[phase]
+        ):
+            raise LegacyStartupError("legacy_progress_event_invalid")
+        count_names = frozenset((
+            "attempt",
+            "resume_count",
+            "images_done",
+            "images_total",
+            "files_done",
+            "files_total",
+            "backfill_done",
+            "backfill_total",
+            "last_committed_batch",
+        ))
+        if any(
+            type(value) is not int or value < 0
+            for name, value in event.items()
+            if name in count_names
+        ):
+            raise LegacyStartupError("legacy_progress_event_invalid")
+        if "attempt" in event and (
+            event["attempt"] < 1
+            or event["resume_count"] != event["attempt"] - 1
+        ):
+            raise LegacyStartupError("legacy_progress_event_invalid")
+        for done_name, total_name in (
+            ("images_done", "images_total"),
+            ("files_done", "files_total"),
+            ("backfill_done", "backfill_total"),
+        ):
+            if (
+                done_name in event
+                and event[done_name] > event[total_name]
+            ):
+                raise LegacyStartupError("legacy_progress_event_invalid")
+        if "run_id" in event and not migration_state._is_run_id(
+            event["run_id"]
+        ):
+            raise LegacyStartupError("legacy_progress_event_invalid")
+        if "started_at" in event:
+            try:
+                parsed = datetime.strptime(
+                    event["started_at"], "%Y-%m-%dT%H:%M:%SZ"
+                )
+            except (TypeError, ValueError):
+                raise LegacyStartupError(
+                    "legacy_progress_event_invalid"
+                ) from None
+            if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != event[
+                "started_at"
+            ]:
+                raise LegacyStartupError("legacy_progress_event_invalid")
 
     def _report_progress(self, event):
+        self._validate_progress_event(event)
         if self.progress_reporter is None:
             return False
-        try:
-            self.progress_reporter(dict(event))
-        except Exception:
-            return False
+        self.progress_reporter(dict(event))
         return True
 
-    def _write_summary(self, run, phase_override=None):
+    def _write_summary(
+        self,
+        run,
+        phase_override=None,
+        batch_journal=None,
+        completion_authority=None,
+    ):
         if phase_override not in (None, "complete"):
             raise LegacyStartupError("unsafe_migration_summary")
         status = migration_state.read_run_status(run)
-        self._restore_summary_values(run, status)
+        self._restore_summary_values(
+            run,
+            status,
+            batch_journal=batch_journal,
+            completion_authority=completion_authority,
+        )
         media = self._media_summary
         backfill = self._backfill_summary
         reasons = {} if backfill is None else dict(backfill.reason_counts)
@@ -779,7 +1172,14 @@ class LegacyStartupCoordinator(object):
         }
         _atomic_write_summary(run, payload)
 
-    def _restore_summary_values(self, run, status, force_reload=False):
+    def _restore_summary_values(
+        self,
+        run,
+        status,
+        force_reload=False,
+        batch_journal=None,
+        completion_authority=None,
+    ):
         media_hashes = (
             status.media_plan_sha256,
             status.media_manifest_sha256,
@@ -797,6 +1197,8 @@ class LegacyStartupCoordinator(object):
                     run.run_id,
                     self.service_uid,
                     self.service_gid,
+                    batch_journal=batch_journal,
+                    completion_authority=completion_authority,
                 )
             except CommandError as error:
                 raise LegacyStartupError(
@@ -832,6 +1234,7 @@ class LegacyStartupCoordinator(object):
                     run.run_id,
                     self.service_uid,
                     self.service_gid,
+                    batch_journal=batch_journal,
                 )
             except CommandError as error:
                 raise LegacyStartupError(
