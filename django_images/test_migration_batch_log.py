@@ -19,6 +19,7 @@ from django_images.services.migration_batch_log import (
     _durable_fsync,
     _durable_syncfs,
     _frame_for_event,
+    _read_once,
 )
 
 
@@ -177,9 +178,7 @@ class VerifiedRunDirectory(object):
 
 class MigrationBatchJournalTestCase(SimpleTestCase):
     def setUp(self):
-        self.temporary_directory = tempfile.TemporaryDirectory(
-            dir="/private/tmp"
-        )
+        self.temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary_directory.cleanup)
         self.run_directory = VerifiedRunDirectory(
             self.temporary_directory.name
@@ -225,6 +224,39 @@ class MigrationBatchJournalTestCase(SimpleTestCase):
 
 
 class MigrationBatchJournalOpenTests(MigrationBatchJournalTestCase):
+    def test_open_fsyncs_header_before_rename_and_directory_fsync(self):
+        calls = []
+        real_rename = os.rename
+
+        def record_fsync(descriptor, reason):
+            calls.append(("fsync", descriptor, reason))
+            _durable_fsync(descriptor, reason)
+
+        def record_rename(*args, **kwargs):
+            calls.append(("rename", args[0], args[1]))
+            return real_rename(*args, **kwargs)
+
+        with mock.patch(
+            "django_images.services.migration_batch_log._durable_fsync",
+            side_effect=record_fsync,
+        ), mock.patch(
+            "django_images.services.migration_batch_log.os.rename",
+            side_effect=record_rename,
+        ):
+            journal = self.open_journal()
+        self.addCleanup(journal.close)
+
+        self.assertEqual(
+            [(call[0], call[-1]) for call in calls],
+            [
+                ("fsync", "journal_header"),
+                ("rename", JOURNAL_FILENAME),
+                ("fsync", "journal_header"),
+            ],
+        )
+        self.assertEqual(calls[0][1], journal.descriptor)
+        self.assertEqual(calls[2][1], self.run_directory.descriptor)
+
     def test_open_creates_one_fsynced_header_bound_to_v2_hashes(self):
         journal = self.open_journal()
         self.addCleanup(journal.close)
@@ -373,16 +405,51 @@ class MigrationBatchJournalAppendTests(MigrationBatchJournalTestCase):
             [call.args[1] for call in durable_fsync.call_args_list],
             ["journal_intent", "journal_commit"],
         )
-        self.assertEqual(journal.state.replay_count, 4)
+        self.assertEqual(journal.state.replay_count, 1)
 
     def test_append_never_reads_the_complete_journal_again(self):
         journal = self.journal()
+        journal.close()
 
-        with mock.patch.object(journal, "_read_complete_file") as read_all:
-            journal.append_intent(self.intent())
-            journal.append_commit("paths:1-50", "f" * 64)
+        with mock.patch(
+            "django_images.services.migration_batch_log._read_once",
+            wraps=_read_once,
+        ) as read_once:
+            reopened = self.open_journal()
+            self.addCleanup(reopened.close)
+            reopened.append_intent(self.intent())
+            reopened.append_commit("paths:1-50", "f" * 64)
 
-        read_all.assert_not_called()
+        read_once.assert_called_once_with(reopened.descriptor)
+
+    def test_rejected_backfill_completion_does_not_append_or_poison_journal(
+        self,
+    ):
+        journal = self.open_journal()
+        self.addCleanup(journal.close)
+        journal.bind_source("backfill", "c" * 64, "d" * 64)
+        before = self.path.read_bytes()
+
+        with self.assertRaisesMessage(
+            MigrationBatchLogError,
+            "linear_journal_invalid",
+        ):
+            journal.append_phase_complete(
+                "backfill",
+                {
+                    "scanned": 0,
+                    "registered": 0,
+                    "already_registered": 0,
+                    "skipped": 0,
+                    "reason_counts": {},
+                },
+            )
+
+        self.assertEqual(self.path.read_bytes(), before)
+        journal.close()
+        reopened = self.open_journal()
+        self.addCleanup(reopened.close)
+        self.assertFalse(reopened.is_phase_complete("backfill"))
 
     @mock.patch(
         "django_images.services.migration_batch_log._durable_fsync"
@@ -556,6 +623,19 @@ class MigrationBatchJournalAppendTests(MigrationBatchJournalTestCase):
             journal.recover_batch("paths:1-50", "f" * 64),
             "committed",
         )
+
+    def test_committed_batch_rejects_non_post_database_signatures(self):
+        journal = self.committed_journal()
+
+        for current_signature in ("e" * 64, "1" * 64, "other"):
+            with self.subTest(current_signature=current_signature):
+                with self.assertRaisesMessage(
+                    MigrationBatchLogError,
+                    "linear_journal_database_conflict",
+                ):
+                    journal.recover_batch(
+                        "paths:1-50", current_signature
+                    )
 
     @mock.patch(
         "django_images.services.migration_batch_log._durable_fsync"

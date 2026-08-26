@@ -418,6 +418,7 @@ class BatchIntent(object):
 class JournalState(object):
     def __init__(self):
         self.replay_count = 0
+        self.journal_generation = 0
         self.run_id = None
         self.started_at = None
         self.source_bindings = {}
@@ -448,7 +449,7 @@ class JournalState(object):
         if handler is None:
             raise MigrationBatchLogError("linear_journal_invalid")
         handler(event)
-        self.replay_count += 1
+        self.journal_generation += 1
 
     def _apply_header(self, event):
         keys = {
@@ -460,7 +461,7 @@ class JournalState(object):
             "source_plan_sha256",
         }
         if (
-            self.replay_count != 0
+            self.journal_generation != 0
             or set(event) != keys
             or event["format_version"] != FORMAT_VERSION
             or type(event["run_id"]) is not str
@@ -487,7 +488,7 @@ class JournalState(object):
         }
         phase = event.get("phase")
         if (
-            self.replay_count == 0
+            self.journal_generation == 0
             or set(event) != keys
             or phase not in ("paths", "backfill")
             or phase in self.source_bindings
@@ -551,7 +552,7 @@ class JournalState(object):
         self.receipt_overlays[batch_id] = repaired
         if intent.phase in self.phase_summaries:
             self.checkpoint_projection = _checkpoint_projection_for_state(
-                self, self.replay_count + 1
+                self, self.journal_generation + 1
             )
 
     def _apply_attempt_started(self, event):
@@ -597,25 +598,17 @@ class JournalState(object):
     def _apply_phase_complete(self, event):
         keys = {"event", "phase", "summary"}
         phase = event.get("phase")
-        try:
-            summary = _validated_phase_summary(phase, event.get("summary"))
-        except MigrationBatchLogError:
+        if set(event) != keys:
             raise MigrationBatchLogError("linear_journal_invalid")
-        uncommitted = any(
-            intent.phase == phase and batch_id not in self.commits
-            for batch_id, intent in self.intents.items()
-        )
-        if (
-            set(event) != keys
-            or phase not in self.source_bindings
-            or phase in self.phase_summaries
-            or uncommitted
-            or (phase == "backfill" and "paths" not in self.phase_summaries)
-        ):
+        try:
+            summary = _validated_new_phase_completion(
+                self, phase, event.get("summary")
+            )
+        except MigrationBatchLogError:
             raise MigrationBatchLogError("linear_journal_invalid")
         self.phase_summaries[phase] = summary
         self.checkpoint_projection = _checkpoint_projection_for_state(
-            self, self.replay_count + 1
+            self, self.journal_generation + 1
         )
 
     def require_source(self, phase, plan_sha256, manifest_sha256):
@@ -781,6 +774,22 @@ def _validated_phase_summary(phase, summary):
         value["reason_counts"] = dict(sorted(reason_counts.items()))
         return value
     raise MigrationBatchLogError("linear_journal_invalid")
+
+
+def _validated_new_phase_completion(state, phase, summary):
+    validated = _validated_phase_summary(phase, summary)
+    uncommitted = any(
+        intent.phase == phase and batch_id not in state.commits
+        for batch_id, intent in state.intents.items()
+    )
+    if (
+        phase not in state.source_bindings
+        or phase in state.phase_summaries
+        or uncommitted
+        or (phase == "backfill" and "paths" not in state.phase_summaries)
+    ):
+        raise MigrationBatchLogError("linear_journal_invalid")
+    return validated
 
 
 def _image_id_from_file_key(file_key):
@@ -1034,6 +1043,7 @@ class MigrationBatchJournal(object):
                 raise MigrationBatchLogError("linear_journal_invalid")
         if state.run_id != run_id:
             raise MigrationBatchLogError("linear_journal_invalid")
+        state.replay_count = 1
         return state
 
     @classmethod
@@ -1208,7 +1218,9 @@ class MigrationBatchJournal(object):
         if intent is None:
             raise MigrationBatchLogError("linear_journal_batch_conflict")
         if batch_id in self.state.commits:
-            return "committed"
+            if current_signature == intent.post_signature:
+                return "committed"
+            raise MigrationBatchLogError("linear_journal_database_conflict")
         if current_signature == intent.post_signature:
             return "append_commit"
         if current_signature == intent.pre_signature:
@@ -1222,11 +1234,9 @@ class MigrationBatchJournal(object):
             if existing != validated:
                 raise MigrationBatchLogError("linear_journal_invalid")
             return
-        if phase not in self.state.source_bindings or any(
-            intent.phase == phase and batch_id not in self.state.commits
-            for batch_id, intent in self.state.intents.items()
-        ):
-            raise MigrationBatchLogError("linear_journal_invalid")
+        validated = _validated_new_phase_completion(
+            self.state, phase, validated
+        )
         self._append_event(
             {
                 "event": "phase_complete",
@@ -1361,7 +1371,7 @@ class MigrationBatchJournal(object):
         committed = value.get("last_committed_batch")
         return (
             type(generation) is int
-            and generation > self.state.replay_count
+            and generation > self.state.journal_generation
         ) or (
             type(committed) is int
             and committed > self.last_committed_batch()
@@ -1431,9 +1441,6 @@ class MigrationBatchJournal(object):
 
     def last_committed_batch(self):
         return len(self.state.commit_order)
-
-    def _read_complete_file(self):
-        return _read_once(self.descriptor)
 
     def close(self):
         if self.descriptor is None:
