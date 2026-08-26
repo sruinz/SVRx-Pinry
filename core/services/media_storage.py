@@ -767,6 +767,7 @@ class MediaStorage(object):
         root_directory = None
         directories = []
         try:
+            self._validate_storage_configuration()
             manifest = self._reusable_manifest(image, thumbnails)
             thumbnail_list = sorted(
                 list(thumbnails), key=lambda value: (value.size, value.pk)

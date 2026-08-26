@@ -544,6 +544,8 @@ class _ManifestState(object):
         self.torn_tail = None
         self.torn_offset = None
         self.raw_bytes = b""
+        self.plan_sha256_value = None
+        self.manifest_sha256_value = hashlib.sha256(b"").hexdigest()
 
 
 def _verify_contained_run_directory(data_directory, run_directory):
@@ -806,6 +808,7 @@ class _BackfillManifestLog(object):
         raw = self._read_all()
         state = _ManifestState()
         state.raw_bytes = raw
+        state.manifest_sha256_value = hashlib.sha256(raw).hexdigest()
         offset = 0
         lines = raw.splitlines(True)
         for line_number, line in enumerate(lines, 1):
@@ -836,16 +839,16 @@ class _BackfillManifestLog(object):
                     raise _command_error("manifest_plan_mismatch")
                 state.plan_complete = True
                 state.plan_end_offset = offset + len(line)
+                state.plan_sha256_value = hashlib.sha256(
+                    raw[:state.plan_end_offset]
+                ).hexdigest()
             else:
                 if not state.plan_complete:
                     raise _command_error("invalid_media_asset_manifest")
                 image_id = event.get("image_id")
                 if image_id not in state.plan_by_image:
                     raise _command_error("manifest_plan_mismatch")
-                expected_plan_sha = hashlib.sha256(
-                    raw[:state.plan_end_offset]
-                ).hexdigest()
-                if event.get("plan_sha256") != expected_plan_sha:
+                if event.get("plan_sha256") != state.plan_sha256_value:
                     raise _command_error("manifest_plan_mismatch")
                 if image_id in state.latest_by_image:
                     raise _command_error("invalid_media_asset_manifest")
@@ -910,38 +913,53 @@ class _BackfillManifestLog(object):
     def write_frozen_plan(self, plans):
         if self.state.raw_bytes or self.state.events:
             raise _command_error("media_asset_plan_reset_forbidden")
-        plans = tuple(plans)
-        for plan in plans:
-            plan._validate()
         common = {
             "format_version": 2,
             "target_signature": TARGET_SIGNATURE,
             "run_id": self.run_id,
         }
         digest = hashlib.sha256()
+        state = _ManifestState()
+        written_bytes = 0
         self._verify_current()
         os.lseek(self.descriptor, 0, os.SEEK_END)
 
         def write_event(event):
+            nonlocal written_bytes
             line = _json_line(event)
             digest.update(line)
             self._write_frozen_line(line)
+            written_bytes += len(line)
 
+        scanned = 0
         for plan in plans:
+            plan._validate()
+            if plan.image_id in state.plan_by_image:
+                raise _command_error("manifest_plan_mismatch")
             write_event(dict(
                 common,
                 event="planned",
                 plan=plan.as_dict(),
             ))
+            state.plans.append(plan)
+            state.plan_by_image[plan.image_id] = plan
+            scanned += 1
         write_event(dict(
             common,
             event="plan_complete",
-            scanned=len(plans),
+            scanned=scanned,
         ))
         _durable_fsync(self.descriptor, "plan_manifest")
         self._verify_current()
-        self.state = self._load_state()
-        return digest.hexdigest()
+        digest_value = digest.hexdigest()
+        state.events.append({"event": "plan_complete"})
+        state.plan_complete = True
+        state.plan_end_offset = written_bytes
+        state.raw_bytes = None
+        state.plan_sha256_value = digest_value
+        state.manifest_sha256_value = digest_value
+        self.state = state
+        return digest_value
 
     def _write_frozen_line(self, line):
         view = memoryview(line)
@@ -1040,9 +1058,7 @@ class _BackfillManifestLog(object):
             raise _command_error(
                 "media_asset_manifest_torn_tail_requires_execute"
             )
-        return hashlib.sha256(
-            self.state.raw_bytes[:self.state.plan_end_offset]
-        ).hexdigest()
+        return self.state.plan_sha256_value
 
     def manifest_sha256(self):
         if self.state.torn_tail is not None:
@@ -1050,10 +1066,20 @@ class _BackfillManifestLog(object):
                 "media_asset_manifest_torn_tail_requires_execute"
             )
         self._ensure_content_current()
-        return hashlib.sha256(self.state.raw_bytes).hexdigest()
+        return self.state.manifest_sha256_value
 
     def _ensure_content_current(self):
-        if self._read_all() != self.state.raw_bytes:
+        self._verify_current()
+        digest = hashlib.sha256()
+        position = 0
+        while True:
+            chunk = os.pread(self.descriptor, 1024 * 1024, position)
+            if not chunk:
+                break
+            digest.update(chunk)
+            position += len(chunk)
+        self._verify_current()
+        if digest.hexdigest() != self.state.manifest_sha256_value:
             raise _command_error("unsafe_media_asset_manifest")
         return True
 
@@ -1321,23 +1347,44 @@ class MediaAssetBackfiller(object):
         expected_receipts_by_image=None,
     ):
         root_directory = None
+        remaining_receipt_ids = (
+            None
+            if expected_receipts_by_image is None
+            else set(expected_receipts_by_image)
+        )
         try:
             root_directory = open_verified_media_root(settings.MEDIA_ROOT)
             plans = []
             for context in self._plan_batches():
+                batch_plans = []
                 for image_id in sorted(context.images):
-                    plans.append(self._freeze_plan(
+                    if (
+                        remaining_receipt_ids is not None
+                        and image_id not in remaining_receipt_ids
+                    ):
+                        raise _command_error(
+                            "linear_journal_batch_conflict"
+                        )
+                    expected_receipts = (
+                        None
+                        if remaining_receipt_ids is None
+                        else expected_receipts_by_image[image_id]
+                    )
+                    batch_plans.append(self._freeze_plan(
                         context.images[image_id],
                         root_directory,
                         phase,
                         context=context,
-                        expected_receipts=(
-                            None
-                            if expected_receipts_by_image is None
-                            else expected_receipts_by_image.get(image_id)
-                        ),
+                        expected_receipts=expected_receipts,
                     ))
+                    if remaining_receipt_ids is not None:
+                        remaining_receipt_ids.remove(image_id)
                     root_directory.verify_current()
+                plans.extend(
+                    self._attach_key_registry_signatures(batch_plans)
+                )
+            if remaining_receipt_ids:
+                raise _command_error("linear_journal_batch_conflict")
             root_directory.verify_current()
             return plans
         except CommandError:
@@ -1437,16 +1484,8 @@ class MediaAssetBackfiller(object):
             image_id: tuple(owner_ids)
             for image_id, owner_ids in owner_ids_by_image.items()
         }
-        owner_ids = {
-            owner_id
-            for values in owner_ids_by_image.values()
-            for owner_id in values
-        }
-        registry_filter = Q(image_id__in=image_ids)
-        if owner_ids:
-            registry_filter |= Q(submitter_id__in=owner_ids)
         registries = list(MediaAsset.objects.filter(
-            registry_filter
+            image_id__in=image_ids
         ).values("pk", "image_id", "submitter_id", "content_sha256"))
         registries_by_image = {
             registry["image_id"]: registry for registry in registries
@@ -1463,6 +1502,56 @@ class MediaAssetBackfiller(object):
             registries_by_key,
             database_signatures,
         )
+
+    def _attach_key_registry_signatures(self, plans):
+        pairs = {
+            (plan.submitter_id, plan.content_sha256)
+            for plan in plans
+            if plan.preliminary_reason is None
+            and plan.registry_signature is None
+        }
+        registries_by_key = {}
+        if pairs:
+            registry_filter = Q()
+            for submitter_id, content_sha256 in sorted(pairs):
+                registry_filter |= Q(
+                    submitter_id=submitter_id,
+                    content_sha256=content_sha256,
+                )
+            registries_by_key = {
+                (registry["submitter_id"], registry["content_sha256"]): (
+                    registry
+                )
+                for registry in MediaAsset.objects.filter(
+                    registry_filter
+                ).values(
+                    "pk", "image_id", "submitter_id", "content_sha256"
+                )
+            }
+        indexed = []
+        for plan in plans:
+            if plan.preliminary_reason is not None:
+                indexed.append(plan)
+                continue
+            signature = plan.key_registry_signature
+            if plan.registry_signature is None:
+                signature = self._registry_signature(
+                    registries_by_key.get((
+                        plan.submitter_id, plan.content_sha256
+                    ))
+                )
+            indexed.append(_CandidatePlan(
+                image_id=plan.image_id,
+                submitter_id=plan.submitter_id,
+                content_sha256=plan.content_sha256,
+                database_signature=plan.database_signature,
+                file_identities=plan.file_identities,
+                owner_ids=plan.owner_ids,
+                registry_signature=plan.registry_signature,
+                key_registry_signature=signature,
+                preliminary_reason=plan.preliminary_reason,
+            ))
+        return indexed
 
     def _freeze_plan(
         self,
@@ -2153,12 +2242,28 @@ class MediaAssetBackfiller(object):
     ):
         journal = self.batch_journal
         try:
-            journal.record_attempt(
-                datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            )
             old_manifest_complete = all(
                 plan.image_id in manifest.state.latest_by_image
                 for plan in plans
+            )
+            if journal.is_phase_complete("backfill"):
+                self._verify_database_plan_closure(
+                    plans,
+                    require_registered=old_manifest_complete,
+                )
+                if not old_manifest_complete:
+                    self._verify_database_plan_closure(
+                        plans, require_registered=True
+                    )
+                phase = journal.state.phase_summaries["backfill"]
+                expected = self._phase_summary_for(plans, decisions)
+                if phase != expected:
+                    raise _command_error("manifest_plan_mismatch")
+                return self._summary_from_phase(
+                    manifest, phase, self.run_id
+                )
+            journal.record_attempt(
+                datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
             )
             if old_manifest_complete:
                 self._verify_database_plan_closure(
@@ -2177,32 +2282,12 @@ class MediaAssetBackfiller(object):
                     manifest, phase, self.run_id
                 )
             self._verify_database_plan_closure(plans)
-            if journal.is_phase_complete("backfill"):
-                self._verify_database_plan_closure(
-                    plans, require_registered=True
-                )
-                phase = journal.state.phase_summaries["backfill"]
-                expected = self._phase_summary_for(plans, decisions)
-                if phase != expected:
-                    raise _command_error("manifest_plan_mismatch")
-                return self._summary_from_phase(
-                    manifest, phase, self.run_id
-                )
-
-            self._upgrade_v2_terminal_prefix(
+            imported_last_pk = self._upgrade_v2_terminal_prefix(
                 manifest,
                 journal,
                 plans,
                 decisions,
                 receipts_by_image,
-            )
-            committed_ids = journal.committed_ids("backfill")
-            last_committed_pk = max(
-                (
-                    journal.intent_for(batch_id).last_pk
-                    for batch_id in committed_ids
-                ),
-                default=0,
             )
             pending = [
                 BatchCandidate(
@@ -2213,13 +2298,16 @@ class MediaAssetBackfiller(object):
                     None,
                 )
                 for plan in plans
-                if plan.image_id > last_committed_pk
+                if plan.image_id > imported_last_pk
             ]
             for batch in self._build_backfill_batches(pending):
                 self._execute_linear_batch(
                     journal,
                     tuple(batch),
                     decisions,
+                    allow_v2_post_state=bool(
+                        manifest.state.latest_by_image
+                    ),
                 )
             self._verify_database_plan_closure(
                 plans, require_registered=True
@@ -2259,7 +2347,7 @@ class MediaAssetBackfiller(object):
                 None,
             ))
         if not completed:
-            return
+            return 0
         for batch_number, batch in enumerate(
             self._build_backfill_batches(completed),
             1,
@@ -2306,8 +2394,15 @@ class MediaAssetBackfiller(object):
                 continue
             journal.import_v2_batch(intent, committed=True)
             self._report_registering(journal)
+        return completed[-1].plan.image_id
 
-    def _execute_linear_batch(self, journal, batch, decisions):
+    def _execute_linear_batch(
+        self,
+        journal,
+        batch,
+        decisions,
+        allow_v2_post_state=False,
+    ):
         plans = tuple(candidate.plan for candidate in batch)
         batch_id = "backfill:{}-{}".format(
             plans[0].image_id, plans[-1].image_id
@@ -2319,6 +2414,8 @@ class MediaAssetBackfiller(object):
             plans, decisions, after=True
         )
         existing = journal.intent_for(batch_id)
+        recovery = None
+        adopt_v2_post_state = False
         if existing is not None:
             if (
                 existing.first_pk != plans[0].image_id
@@ -2331,13 +2428,13 @@ class MediaAssetBackfiller(object):
             recovery = journal.recover_batch(
                 batch_id, self._current_registry_signature(plans)
             )
-            if recovery == "committed":
-                return
-            if recovery == "append_commit":
-                journal.append_commit(batch_id, post_signature)
-                self._fault("after_backfill_commit")
-                self._report_registering(journal)
-                return
+        else:
+            current = self._current_registry_signature(plans)
+            adopt_v2_post_state = (
+                allow_v2_post_state and current == post_signature
+            )
+            if current != pre_signature and not adopt_v2_post_state:
+                raise _command_error("linear_journal_database_conflict")
 
         prepared = []
         try:
@@ -2348,7 +2445,10 @@ class MediaAssetBackfiller(object):
                 [plan.image_id for plan in plans],
             )
             for candidate in batch:
-                if decisions[candidate.plan.image_id] == "register":
+                if decisions[candidate.plan.image_id] in (
+                    "register",
+                    "already_registered",
+                ):
                     prepared.append(self._prepare_candidate(
                         candidate.plan,
                         candidate.resources.receipts,
@@ -2356,6 +2456,13 @@ class MediaAssetBackfiller(object):
                     ))
                 else:
                     prepared.append(candidate)
+            if recovery == "committed":
+                return
+            if recovery == "append_commit":
+                journal.append_commit(batch_id, post_signature)
+                self._fault("after_backfill_commit")
+                self._report_registering(journal)
+                return
             if existing is None:
                 batch_number = (
                     journal.last_committed_batch_for_phase("backfill") + 1
@@ -2368,13 +2475,10 @@ class MediaAssetBackfiller(object):
                     post_signature,
                 ))
                 self._fault("after_backfill_intent")
-            current = self._current_registry_signature(plans)
-            if current == pre_signature:
+            if not adopt_v2_post_state:
                 self._apply_database_batch(
                     prepared, decisions, pre_signature, post_signature
                 )
-            elif current != post_signature:
-                raise _command_error("linear_journal_database_conflict")
             self._fault("after_backfill_database_commit")
             journal.append_commit(batch_id, post_signature)
             self._fault("after_backfill_commit")
@@ -2396,15 +2500,20 @@ class MediaAssetBackfiller(object):
         ):
             raise _command_error("registry_plan_identity_changed")
         thumbnails = context.thumbnails_by_image[plan.image_id]
-        resources = self._open_candidate_resources(
-            image,
-            thumbnails,
-            plan.submitter_id,
-            None,
-            plan.database_signature,
-            "execute",
-            expected_receipts=receipts,
-        )
+        try:
+            resources = self._open_candidate_resources(
+                image,
+                thumbnails,
+                plan.submitter_id,
+                None,
+                plan.database_signature,
+                "execute",
+                expected_receipts=receipts,
+            )
+        except _CandidateSkip as error:
+            raise _command_error(
+                "registry_plan_identity_changed", error
+            )
         try:
             if (
                 resources.closure.content_sha256
@@ -2662,6 +2771,9 @@ class MediaAssetBackfiller(object):
                     root_directory,
                     "execute_verify",
                 )
+                current = self._attach_key_registry_signatures(
+                    [current]
+                )[0]
                 self._verify_plan_equivalence(
                     plan,
                     current,
@@ -2774,6 +2886,9 @@ class MediaAssetBackfiller(object):
                 root_directory,
                 "execute_verify",
             )
+            current = self._attach_key_registry_signatures(
+                [current]
+            )[0]
             self._verify_plan_equivalence(
                 plan,
                 current,

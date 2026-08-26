@@ -343,6 +343,42 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             " OFFSET " in query["sql"].upper() for query in queries
         ))
 
+    def test_registry_rows_materialized_once_across_plan_batches(self):
+        images = self._create_bulk_candidates(120)
+        MediaAsset.objects.bulk_create([
+            MediaAsset(
+                image=image,
+                submitter=self.owner,
+                content_sha256="{:064x}".format(image.pk),
+            )
+            for image in images
+        ])
+        service = self._service(batch_size=50)
+
+        with mock.patch.object(
+            service,
+            "_open_candidate_resources",
+            side_effect=self._fake_candidate_resources,
+        ), CaptureQueriesContext(connection) as queries:
+            service.run(execute=False)
+
+        table_name = MediaAsset._meta.db_table
+        registry_queries = [
+            query["sql"].rstrip(";")
+            for query in queries
+            if table_name in query["sql"]
+            and query["sql"].lstrip().upper().startswith("SELECT")
+        ]
+        row_counts = []
+        with connection.cursor() as cursor:
+            for sql in registry_queries:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM ({}) registry_rows".format(sql)
+                )
+                row_counts.append(cursor.fetchone()[0])
+
+        self.assertEqual(row_counts, [50, 50, 20])
+
     def test_count_planned_images_opens_no_media_and_matches_frozen_plan(self):
         self._create_bulk_candidates(5)
         service = self._service(batch_size=2)
@@ -380,6 +416,59 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             ["plan_manifest"],
         )
 
+    def test_frozen_plan_streams_without_rematerializing_or_replaying(self):
+        self._create_bulk_candidates(2)
+        service = self._service(batch_size=2)
+        with mock.patch.object(
+            service,
+            "_open_candidate_resources",
+            side_effect=self._fake_candidate_resources,
+        ):
+            plans = service._freeze_all_plans("plan")
+        iterated_before_write = {"value": False}
+        write_count = {"value": 0}
+
+        def stream():
+            yield plans[0]
+            if write_count["value"] != 1:
+                iterated_before_write["value"] = True
+            yield plans[1]
+
+        with media_asset_backfill._BackfillManifestLog.open(
+            service.run_directory,
+            MANIFEST_FILENAME,
+            service.run_id,
+            service.service_uid,
+            service.service_gid,
+        ) as manifest:
+            real_write = manifest._write_frozen_line
+            real_read = manifest._read_all
+            replayed = {"value": False}
+
+            def write_line(line):
+                real_write(line)
+                write_count["value"] += 1
+
+            def read_all():
+                replayed["value"] = True
+                return real_read()
+
+            with mock.patch.object(
+                manifest,
+                "_write_frozen_line",
+                side_effect=write_line,
+            ), mock.patch.object(
+                manifest,
+                "_read_all",
+                side_effect=read_all,
+            ):
+                digest = manifest.write_frozen_plan(stream())
+
+            self.assertFalse(iterated_before_write["value"])
+            self.assertFalse(replayed["value"])
+            self.assertEqual(digest, manifest.plan_sha256())
+            self.assertEqual(len(manifest.state.plans), 2)
+
     def test_receipt_backfill_never_reopens_or_decodes_media(self):
         self._create_candidate()
         service = self._service(batch_size=1)
@@ -398,6 +487,33 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
 
         self.assertEqual(summary.registered, 1)
         self.assertEqual(MediaAsset.objects.count(), 1)
+
+    def test_missing_path_receipt_fails_before_any_media_read(self):
+        self._create_candidate(content=_png_bytes("red", size=(30, 20)))
+        service = self._service(batch_size=1)
+        service.batch_journal = self._completed_path_journal(service)
+        self._create_candidate(content=_png_bytes("blue", size=(30, 20)))
+        real_open = media_asset_backfill.open_verified_media_file
+        real_hash = media_asset_backfill.sha256_file_descriptor
+        real_decode = PILImage.open
+
+        with mock.patch(
+            "core.services.media_asset_backfill.open_verified_media_file",
+            wraps=real_open,
+        ) as media_open, mock.patch(
+            "core.services.media_asset_backfill.sha256_file_descriptor",
+            wraps=real_hash,
+        ) as media_hash, mock.patch(
+            "core.services.media_asset_backfill.PILImage.open",
+            wraps=real_decode,
+        ) as media_decode, self.assertRaisesRegex(
+            CommandError, "^linear_journal_batch_conflict$"
+        ):
+            service.run(execute=True)
+
+        self.assertEqual(media_open.call_count, 0)
+        self.assertEqual(media_hash.call_count, 0)
+        self.assertEqual(media_decode.call_count, 0)
 
     def test_backfill_batch_closes_at_first_resource_limit(self):
         service = self._service(
@@ -524,9 +640,85 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
             "after_backfill_database_commit", 0, 1
         )
 
+    def test_commit_only_resume_rejects_replaced_receipt_identity(self):
+        candidate = self._create_candidate(
+            content=_png_bytes("red", size=(30, 20))
+        )
+        crashed = {"value": False}
+
+        def crash_once(point):
+            if point == "after_backfill_database_commit" and not crashed[
+                "value"
+            ]:
+                crashed["value"] = True
+                raise RuntimeError("database committed")
+
+        service = self._service(batch_size=1, fault_injector=crash_once)
+        service.batch_journal = self._completed_path_journal(service)
+        with self.assertRaisesRegex(RuntimeError, "database committed"):
+            service.run(execute=True)
+        service.fault_injector = None
+        original = Path(
+            self.temporary_media.name,
+            candidate["image"].image.name,
+        )
+        replacement = original.with_name("replacement.png")
+        replacement.write_bytes(b"X" * original.stat().st_size)
+        os.replace(str(replacement), str(original))
+
+        with self.assertRaisesRegex(
+            CommandError, "^registry_plan_identity_changed$"
+        ):
+            service.run(execute=True)
+
+        self.assertFalse(
+            service.batch_journal.is_phase_complete("backfill")
+        )
+
+    def test_fresh_batch_rejects_post_state_without_durable_intent(self):
+        candidate = self._create_candidate()
+        service = self._service(batch_size=1)
+        service.batch_journal = self._completed_path_journal(service)
+        service.run(execute=False)
+        original = next(
+            receipt
+            for receipt in service.batch_journal.receipts_by_image(
+                "paths"
+            )[candidate["image"].pk]
+            if receipt.file_key.startswith("original:")
+        )
+        MediaAsset.objects.create(
+            image=candidate["image"],
+            submitter=self.owner,
+            content_sha256=original.sha256,
+        )
+
+        with self.assertRaisesRegex(
+            CommandError, "^linear_journal_database_conflict$"
+        ):
+            service.run(execute=True)
+
+        self.assertFalse(any(
+            intent.phase == "backfill"
+            for intent in service.batch_journal.state.intents.values()
+        ))
+
     def test_backfill_resume_after_commit_repeats_no_batch_work(self):
         self._assert_linear_resume_boundary(
             "after_backfill_commit", 0, 0
+        )
+
+    def test_completed_backfill_noop_does_not_record_attempt(self):
+        self._create_candidate()
+        service = self._service(batch_size=1)
+        service.batch_journal = self._completed_path_journal(service)
+        service.run(execute=True)
+        before = len(service.batch_journal.state.attempts)
+
+        service.run(execute=True)
+
+        self.assertEqual(
+            len(service.batch_journal.state.attempts), before
         )
 
     def test_partial_v2_backfill_imports_prefix_and_preserves_bytes(self):

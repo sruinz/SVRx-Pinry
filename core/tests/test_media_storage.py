@@ -2369,6 +2369,105 @@ class MediaStorageOwnedRootTests(TemporaryMediaMixin, SimpleTestCase):
         resource.close()
         resource.close()
 
+    def test_receipt_resource_rejects_alternate_media_namespace(self):
+        alternate = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.addCleanup(alternate.cleanup)
+        asset_uuid = str(ASSET_UUID)
+        paths = {
+            "original": "originals/{}/receipt.png".format(asset_uuid),
+            "thumbnail": "derivatives/{}/thumbnail.png".format(
+                asset_uuid
+            ),
+            "standard": "derivatives/{}/standard.png".format(asset_uuid),
+            "square": "derivatives/{}/square.png".format(asset_uuid),
+        }
+        stats = {}
+        for kind, relative_path in paths.items():
+            target = Path(alternate.name, relative_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(kind.encode("ascii"))
+            stats[kind] = target.stat()
+        image = SimpleNamespace(
+            pk=1,
+            asset_uuid=ASSET_UUID,
+            original_filename="receipt.png",
+            image=SimpleNamespace(name=paths["original"]),
+            width=1,
+            height=1,
+        )
+        thumbnails = [
+            SimpleNamespace(
+                pk=index,
+                original_id=image.pk,
+                size=kind,
+                image=SimpleNamespace(name=paths[kind]),
+                width=1,
+                height=1,
+            )
+            for index, kind in enumerate(
+                ("thumbnail", "standard", "square"), 10
+            )
+        ]
+        database_signature = (
+            image.pk,
+            asset_uuid,
+            image.original_filename,
+            image.image.name,
+            image.width,
+            image.height,
+            tuple(
+                (
+                    thumbnail.pk,
+                    thumbnail.size,
+                    thumbnail.image.name,
+                    thumbnail.width,
+                    thumbnail.height,
+                )
+                for thumbnail in sorted(
+                    thumbnails, key=lambda value: (value.size, value.pk)
+                )
+            ),
+        )
+        receipts = []
+        for kind in ("original", "thumbnail", "standard", "square"):
+            thumbnail = next(
+                (
+                    value for value in thumbnails
+                    if value.size == kind
+                ),
+                None,
+            )
+            file_stat = stats[kind]
+            receipts.append(FileReceipt.for_values(
+                file_key=(
+                    "original:1"
+                    if thumbnail is None
+                    else "thumbnail:1:{}".format(thumbnail.pk)
+                ),
+                relative_path=paths[kind],
+                operation="verify",
+                size=file_stat.st_size,
+                image_format="PNG",
+                width=1,
+                height=1,
+                source_device=file_stat.st_dev,
+                source_inode=file_stat.st_ino,
+                destination_device=file_stat.st_dev,
+                destination_inode=file_stat.st_ino,
+                sha256="a" * 64,
+                database_signature="b" * 64,
+            ))
+
+        with self.assertRaises(MediaStorageError) as caught:
+            MediaStorage(media_root=alternate.name).prepare_from_receipts(
+                image,
+                thumbnails,
+                tuple(receipts),
+                database_signature,
+            )
+
+        self.assertEqual(caught.exception.code, "media_configuration_error")
+
     def test_prepare_from_root_uses_duplicate_and_keeps_shared_root_open(self):
         root = file_ops.open_verified_media_root(self.temporary_media.name)
         prepared = None
