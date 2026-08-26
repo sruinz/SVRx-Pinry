@@ -135,7 +135,12 @@ def _run(arguments):  # noqa: C901
         os.fspath(os.environ.get("PINRY_DATA_ROOT", _DEFAULT_DATA_ROOT))
     )
     try:
-        held_lock = startup_lock.acquire_startup_lock(data_root)
+        service_uid, service_gid = _service_identity()
+        held_lock = startup_lock.acquire_startup_lock(
+            data_root,
+            service_uid,
+            service_gid,
+        )
     except BaseException as error:
         _write_error(_safe_error_code(error, "startup_lock_failed"))
         return 1
@@ -196,7 +201,6 @@ def _run(arguments):  # noqa: C901
                 _write_error("legacy_migration_flag_required")
                 return 1
 
-        service_uid, service_gid = _service_identity()
         coordinator = LegacyStartupCoordinator(service_uid, service_gid)
         if migration_requested:
             run = coordinator.prepare_before_schema()

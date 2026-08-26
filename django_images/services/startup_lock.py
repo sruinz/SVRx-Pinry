@@ -105,8 +105,18 @@ class StartupLock(object):
             raise first_error
 
 
-def acquire_startup_lock(data_root):
+def acquire_startup_lock(data_root, service_uid=None, service_gid=None):
     _require_startup_lock_support()
+    if not (
+        (service_uid is None and service_gid is None)
+        or (
+            type(service_uid) is int
+            and service_uid >= 0
+            and type(service_gid) is int
+            and service_gid >= 0
+        )
+    ):
+        raise StartupLockError("startup_lock_failed")
     owner_uid = os.geteuid()
     owner_gid = os.getegid()
     root_directory = None
@@ -126,12 +136,10 @@ def acquire_startup_lock(data_root):
             os.fsync(lock_descriptor)
             os.fsync(root_directory.descriptor)
             opened_stat = os.fstat(lock_descriptor)
-        _verify_named_startup_lock(
+        _verify_named_startup_lock_structure(
             root_directory,
             lock_descriptor,
             opened_stat,
-            owner_uid,
-            owner_gid,
         )
         try:
             fcntl.flock(
@@ -144,6 +152,16 @@ def acquire_startup_lock(data_root):
                     "startup_lock_busy", retryable=True
                 )
             raise StartupLockError("startup_lock_failed") from error
+        if not created:
+            _normalize_persistent_startup_lock(
+                root_directory,
+                lock_descriptor,
+                opened_stat,
+                owner_uid,
+                owner_gid,
+                service_uid,
+                service_gid,
+            )
         _verify_held_startup_lock(
             root_directory,
             lock_descriptor,
@@ -231,11 +249,18 @@ def _open_startup_lock(directory_descriptor):
     raise StartupLockError("startup_lock_failed")
 
 
-def _verify_startup_lock_stat(file_stat, owner_uid, owner_gid):
+def _verify_startup_lock_structure(file_stat):
     if (
         not stat.S_ISREG(file_stat.st_mode)
-        or stat.S_IMODE(file_stat.st_mode) != 0o600
         or file_stat.st_nlink != 1
+    ):
+        raise StartupLockError("startup_lock_failed")
+
+
+def _verify_startup_lock_stat(file_stat, owner_uid, owner_gid):
+    _verify_startup_lock_structure(file_stat)
+    if (
+        stat.S_IMODE(file_stat.st_mode) != 0o600
         or file_stat.st_uid != owner_uid
         or file_stat.st_gid != owner_gid
     ):
@@ -246,12 +271,10 @@ def _identity(file_stat):
     return file_stat.st_dev, file_stat.st_ino
 
 
-def _verify_named_startup_lock(
+def _verify_named_startup_lock_structure(
     root_directory,
     lock_descriptor,
     expected_stat,
-    owner_uid,
-    owner_gid,
 ):
     try:
         root_directory.verify_current()
@@ -268,8 +291,101 @@ def _verify_named_startup_lock(
         or _identity(named_stat) != _identity(expected_stat)
     ):
         raise StartupLockError("startup_lock_failed")
+    _verify_startup_lock_structure(descriptor_stat)
+    _verify_startup_lock_structure(named_stat)
+    return descriptor_stat, named_stat
+
+
+def _verify_named_startup_lock(
+    root_directory,
+    lock_descriptor,
+    expected_stat,
+    owner_uid,
+    owner_gid,
+):
+    descriptor_stat, named_stat = _verify_named_startup_lock_structure(
+        root_directory,
+        lock_descriptor,
+        expected_stat,
+    )
     _verify_startup_lock_stat(descriptor_stat, owner_uid, owner_gid)
     _verify_startup_lock_stat(named_stat, owner_uid, owner_gid)
+
+
+def _normalize_persistent_startup_lock(
+    root_directory,
+    lock_descriptor,
+    expected_stat,
+    owner_uid,
+    owner_gid,
+    service_uid,
+    service_gid,
+):
+    descriptor_stat, named_stat = _verify_named_startup_lock_structure(
+        root_directory,
+        lock_descriptor,
+        expected_stat,
+    )
+    try:
+        _verify_startup_lock_stat(
+            descriptor_stat,
+            owner_uid,
+            owner_gid,
+        )
+        _verify_startup_lock_stat(named_stat, owner_uid, owner_gid)
+        return
+    except StartupLockError:
+        pass
+
+    lock_owner = descriptor_stat.st_uid, descriptor_stat.st_gid
+    named_owner = named_stat.st_uid, named_stat.st_gid
+    lock_mode = stat.S_IMODE(descriptor_stat.st_mode)
+    named_mode = stat.S_IMODE(named_stat.st_mode)
+    try:
+        root_stat = os.fstat(root_directory.descriptor)
+    except OSError as error:
+        raise StartupLockError("startup_lock_failed") from error
+    data_owner = root_stat.st_uid, root_stat.st_gid
+    current_owner = owner_uid, owner_gid
+    service_owner = service_uid, service_gid
+    same_owner_mode_drift = (
+        lock_owner == current_owner
+        and named_owner == current_owner
+        and lock_mode == 0o700
+        and named_mode == 0o700
+    )
+    root_service_owner_drift = (
+        owner_uid == 0
+        and service_uid is not None
+        and service_owner != current_owner
+        and data_owner == service_owner
+        and lock_owner == service_owner
+        and named_owner == service_owner
+        and lock_mode in (0o600, 0o700)
+        and named_mode == lock_mode
+    )
+    if (
+        descriptor_stat.st_size != 0
+        or named_stat.st_size != 0
+        or not (same_owner_mode_drift or root_service_owner_drift)
+    ):
+        raise StartupLockError("startup_lock_failed")
+
+    try:
+        if lock_owner != current_owner:
+            os.fchown(lock_descriptor, owner_uid, owner_gid)
+        os.fchmod(lock_descriptor, 0o600)
+        os.fsync(lock_descriptor)
+        os.fsync(root_directory.descriptor)
+    except OSError as error:
+        raise StartupLockError("startup_lock_failed") from error
+    _verify_named_startup_lock(
+        root_directory,
+        lock_descriptor,
+        expected_stat,
+        owner_uid,
+        owner_gid,
+    )
 
 
 def _verify_held_startup_lock(

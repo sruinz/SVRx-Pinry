@@ -47,6 +47,31 @@ class StartupLockTests(SimpleTestCase):
             (file_stat.st_dev, file_stat.st_ino),
         )
 
+    def test_service_identity_must_be_a_complete_nonnegative_pair(self):
+        invalid_pairs = (
+            (1000, None),
+            (None, 1000),
+            (-1, 1000),
+            (1000, -1),
+            (True, 1000),
+            (1000, False),
+        )
+
+        for service_uid, service_gid in invalid_pairs:
+            with self.subTest(
+                service_uid=service_uid,
+                service_gid=service_gid,
+            ):
+                self._assert_lock_error(
+                    "startup_lock_failed",
+                    lambda: startup_lock.acquire_startup_lock(
+                        str(self.data_root),
+                        service_uid,
+                        service_gid,
+                    ),
+                )
+                self.assertFalse(self.lock_path.exists())
+
     def test_existing_valid_lock_is_reused_without_truncating(self):
         self.lock_path.write_bytes(b"persistent-lock-content")
         os.chmod(str(self.lock_path), 0o600)
@@ -58,6 +83,111 @@ class StartupLockTests(SimpleTestCase):
             self.assertEqual(
                 self.lock_path.read_bytes(), b"persistent-lock-content"
             )
+
+    def test_restart_repairs_unlocked_persistent_lock_mode_in_place(self):
+        with startup_lock.acquire_startup_lock(str(self.data_root)):
+            pass
+        before = self.lock_path.stat()
+        os.chmod(str(self.lock_path), 0o700)
+
+        with startup_lock.acquire_startup_lock(str(self.data_root)):
+            during = self.lock_path.stat()
+            self.assertEqual(during.st_ino, before.st_ino)
+            self.assertEqual(stat.S_IMODE(during.st_mode), 0o600)
+            self.assertEqual(during.st_uid, os.geteuid())
+            self.assertEqual(during.st_gid, os.getegid())
+
+        with startup_lock.acquire_startup_lock(str(self.data_root)):
+            self.assertEqual(self.lock_path.stat().st_ino, before.st_ino)
+
+    def test_restart_never_repairs_nonempty_persistent_lock(self):
+        self.lock_path.write_bytes(b"unexpected-content")
+        os.chmod(str(self.lock_path), 0o700)
+        before = self.lock_path.stat()
+
+        self._assert_lock_error(
+            "startup_lock_failed",
+            lambda: startup_lock.acquire_startup_lock(
+                str(self.data_root)
+            ),
+        )
+
+        after = self.lock_path.stat()
+        self.assertEqual(after.st_ino, before.st_ino)
+        self.assertEqual(stat.S_IMODE(after.st_mode), 0o700)
+        self.assertEqual(
+            self.lock_path.read_bytes(), b"unexpected-content"
+        )
+
+    def test_busy_persistent_lock_is_not_repaired_or_replaced(self):
+        project_root = str(Path(__file__).resolve().parent.parent)
+        script = "\n".join((
+            "import sys",
+            "from django_images.services.startup_lock import (",
+            "    StartupLockError, acquire_startup_lock,",
+            ")",
+            "try:",
+            "    acquire_startup_lock(sys.argv[1])",
+            "except StartupLockError as error:",
+            "    print(error.code)",
+            "else:",
+            "    print('unexpected-success')",
+        ))
+        acquired = startup_lock.acquire_startup_lock(str(self.data_root))
+        self.addCleanup(acquired.close)
+        before = self.lock_path.stat()
+        os.chmod(str(self.lock_path), 0o700)
+
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(self.data_root)],
+            cwd=project_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=5,
+        )
+
+        after = self.lock_path.stat()
+        self.assertEqual(completed.stdout.strip(), "startup_lock_busy")
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(after.st_ino, before.st_ino)
+        self.assertEqual(stat.S_IMODE(after.st_mode), 0o700)
+
+    def test_root_restart_repairs_data_owner_lock_in_place(self):
+        if os.geteuid() != 0:
+            self.skipTest("root ownership transition test")
+        persistent_uid = 1000
+        persistent_gid = 1000
+        os.chown(str(self.data_root), persistent_uid, persistent_gid)
+        self.addCleanup(
+            lambda: os.chown(str(self.data_root), os.geteuid(), os.getegid())
+        )
+
+        for persistent_mode in (0o600, 0o700):
+            with self.subTest(persistent_mode=oct(persistent_mode)):
+                self._remove_lock_entry()
+                self.lock_path.write_bytes(b"")
+                os.chown(
+                    str(self.lock_path),
+                    persistent_uid,
+                    persistent_gid,
+                )
+                os.chmod(str(self.lock_path), persistent_mode)
+                before = self.lock_path.stat()
+
+                with startup_lock.acquire_startup_lock(
+                    str(self.data_root),
+                    persistent_uid,
+                    persistent_gid,
+                ):
+                    during = self.lock_path.stat()
+                    self.assertEqual(during.st_ino, before.st_ino)
+                    self.assertEqual(
+                        stat.S_IMODE(during.st_mode), 0o600
+                    )
+                    self.assertEqual(during.st_uid, 0)
+                    self.assertEqual(during.st_gid, 0)
 
     def test_second_process_is_rejected_without_blocking(self):
         project_root = str(Path(__file__).resolve().parent.parent)
