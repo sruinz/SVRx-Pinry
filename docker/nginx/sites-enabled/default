@@ -2,54 +2,134 @@ server {
     listen 80 default;
     server_name _;
 
-    access_log /data/nginx-access.log;
-    error_log /data/nginx-error.log;
+    access_log /dev/stdout;
+    error_log /dev/stderr warn;
 
     root /pinry/pinry-spa/dist/;
 
     client_max_body_size 50M;
     add_header X-Frame-Options sameorigin always;
 
-    
+    error_page 418 = @migration_page;
+    error_page 419 = @migration_unavailable;
+
+    location @migration_page {
+        root /pinry/docker;
+        add_header Cache-Control "no-store" always;
+        try_files /migration/index.html =503;
+    }
+
+    location @migration_unavailable {
+        add_header Cache-Control "no-store" always;
+        add_header Retry-After "5" always;
+        return 503;
+    }
+
+    location = /migration {
+        if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+        add_header Cache-Control "no-store" always;
+        add_header Allow "GET, HEAD" always;
+        return 308 /migration/;
+    }
+
+    location = /migration-status.json {
+        if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+        alias /run/svrx-pinry/migration-status.json;
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        add_header Allow "GET, HEAD" always;
+    }
+
+    location ^~ /migration/ {
+        if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+        alias /pinry/docker/migration/;
+        add_header Cache-Control "no-store" always;
+        add_header Allow "GET, HEAD" always;
+    }
+
+    location = /healthz {
+        if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+        default_type text/plain;
+        add_header Cache-Control "no-store" always;
+        add_header Allow "GET, HEAD" always;
+        return 200 "ok\n";
+    }
+
+    location = /readyz {
+        if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+        if (-f /run/svrx-pinry/maintenance) { return 419; }
+        add_header Cache-Control "no-store" always;
+        add_header Allow "GET, HEAD" always;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_pass http://127.0.0.1:8000/api/v2/version/;
+    }
+
+    location = /service-worker.js {
+        if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+        default_type application/javascript;
+        add_header Cache-Control "no-store" always;
+        add_header Service-Worker-Allowed / always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Allow "GET, HEAD" always;
+        try_files /service-worker.js =404;
+    }
+
     location /static {
+        if (-f /run/svrx-pinry/maintenance) { return 419; }
         alias /data/static;
         expires max;
         access_log off;
     }
+
     location /media {
+        if (-f /run/svrx-pinry/maintenance) { return 419; }
         alias /data/static/media;
         expires max;
         access_log off;
     }
 
     location = /api/v2/pins/batch/ {
+        if (-f /run/svrx-pinry/maintenance) { return 419; }
         client_max_body_size 1m;
         proxy_read_timeout 65s;
         proxy_send_timeout 65s;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_pass http://localhost:8000;
+        proxy_pass http://127.0.0.1:8000;
         break;
     }
 
     location /api {
+        if (-f /run/svrx-pinry/maintenance) { return 419; }
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_pass http://localhost:8000;
+        proxy_pass http://127.0.0.1:8000;
         break;
     }
 
     location /admin {
+        if (-f /run/svrx-pinry/maintenance) { return 419; }
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_pass http://localhost:8000;
+        proxy_pass http://127.0.0.1:8000;
         break;
     }
 
     location / {
+        set $svrx_maintenance_gate "";
+        if (-f /run/svrx-pinry/maintenance) {
+            set $svrx_maintenance_gate "read";
+        }
+        if ($request_method !~ ^(GET|HEAD)$) {
+            set $svrx_maintenance_gate "$svrx_maintenance_gate-write";
+        }
+        if ($svrx_maintenance_gate = "read-write") { return 419; }
+        if ($svrx_maintenance_gate = "read") { return 418; }
         try_files $uri $uri/ /index.html;
         access_log off;
     }

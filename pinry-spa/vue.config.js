@@ -1,3 +1,5 @@
+const path = require('path');
+
 module.exports = {
   devServer: {
     proxy: {
@@ -20,8 +22,6 @@ module.exports = {
     name: 'SVRx Pinry',
     appleMobileWebAppCapable: 'yes',
     appleMobileWebAppStatusBarStyle: 'black',
-    // configure the workbox plugin
-    workboxPluginMode: 'GenerateSW',
     iconPaths: {
       favicon32: 'favicon.png',
       favicon16: 'favicon.png',
@@ -43,5 +43,16 @@ module.exports = {
         },
       ],
     },
+  },
+  chainWebpack: (config) => {
+    config.plugins.delete('workbox');
+    config.plugin('copy').tap((args) => {
+      args[0].push({
+        from: path.resolve(__dirname, 'src/service-worker.js'),
+        to: path.resolve(__dirname, 'dist/service-worker.js'),
+        toType: 'file',
+      });
+      return args;
+    });
   },
 };

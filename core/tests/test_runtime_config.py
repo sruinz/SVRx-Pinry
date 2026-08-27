@@ -233,7 +233,7 @@ def _assert_nginx_contract(source):
         raise AssertionError("batch read timeout must be exactly 65s")
     if _direct_values(batch, "proxy_send_timeout") != [["65s"]]:
         raise AssertionError("batch send timeout must be exactly 65s")
-    if _direct_values(batch, "proxy_pass") != [["http://localhost:8000"]]:
+    if _direct_values(batch, "proxy_pass") != [["http://127.0.0.1:8000"]]:
         raise AssertionError("batch proxy_pass must be direct and unique")
     if _direct_values(batch, "break") != [[]]:
         raise AssertionError("batch break must be direct and unique")
@@ -259,6 +259,103 @@ def _assert_nginx_contract(source):
     ]
     if len(one_megabyte_limits) != 1:
         raise AssertionError("the exact batch location must own the only 1m limit")
+
+
+def _single_nginx_location(server, arguments):
+    matches = [
+        children
+        for name, actual, children in server
+        if name == "location"
+        and actual == arguments
+        and children is not None
+    ]
+    if len(matches) != 1:
+        raise AssertionError(
+            "expected one location {}".format(" ".join(arguments))
+        )
+    return matches[0]
+
+
+def _assert_nginx_maintenance_contract(source):
+    tokens = _nginx_tokens(source)
+    parsed, final_index = _parse_nginx_block(tokens)
+    if final_index != len(tokens):
+        raise AssertionError("nginx source was not fully parsed")
+    servers = [
+        children
+        for name, _arguments, children in parsed
+        if name == "server" and children is not None
+    ]
+    if len(servers) != 1:
+        raise AssertionError("expected one server block")
+    server = servers[0]
+    if _direct_values(server, "access_log") != [["/dev/stdout"]]:
+        raise AssertionError("nginx access log must use stdout")
+    error_logs = _direct_values(server, "error_log")
+    if len(error_logs) != 1 or error_logs[0][:1] != ["/dev/stderr"]:
+        raise AssertionError("nginx error log must use stderr")
+
+    public_locations = (
+        ["=", "/migration"],
+        ["^~", "/migration/"],
+        ["=", "/migration-status.json"],
+        ["=", "/healthz"],
+        ["=", "/readyz"],
+    )
+    for arguments in public_locations:
+        location = _single_nginx_location(server, arguments)
+        if _direct_values(location, "add_header").count(
+                ["Allow", '"GET,', 'HEAD"', "always"]) != 1:
+            raise AssertionError(
+                "public location {} must expose GET/HEAD Allow".format(
+                    " ".join(arguments)
+                )
+            )
+
+    worker = _single_nginx_location(server, ["=", "/service-worker.js"])
+    expected_worker_headers = {
+        ("Cache-Control", '"no-store"', "always"),
+        ("Service-Worker-Allowed", "/", "always"),
+        ("X-Content-Type-Options", "nosniff", "always"),
+        ("Allow", '"GET,', 'HEAD"', "always"),
+    }
+    worker_headers = {
+        tuple(arguments)
+        for arguments in _direct_values(worker, "add_header")
+    }
+    if not expected_worker_headers.issubset(worker_headers):
+        raise AssertionError("service worker response headers are incomplete")
+    if _direct_values(worker, "default_type") != [["application/javascript"]]:
+        raise AssertionError("service worker MIME must be JavaScript")
+
+    for arguments in (
+        ["=", "/api/v2/pins/batch/"],
+        ["/api"],
+        ["/admin"],
+        ["/media"],
+        ["/static"],
+    ):
+        location = _single_nginx_location(server, arguments)
+        maintenance_checks = [
+            child
+            for name, condition, child in location
+            if name == "if"
+            and condition == ["(-f", "/run/svrx-pinry/maintenance)"]
+            and child is not None
+        ]
+        if len(maintenance_checks) != 1:
+            raise AssertionError(
+                "protected location {} lacks marker gate".format(
+                    " ".join(arguments)
+                )
+            )
+        if _direct_values(maintenance_checks[0], "return") != [["419"]]:
+            raise AssertionError("marker gate must use internal 419")
+
+    if "error_page 418" not in source or "error_page 419" not in source:
+        raise AssertionError("maintenance internal transitions are missing")
+    if "/data/nginx-" in source:
+        raise AssertionError("nginx must not write bootstrap logs below /data")
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -1692,6 +1789,21 @@ class RuntimeConfigTests(unittest.TestCase):
         ).read_text()
 
         _assert_nginx_contract(source)
+
+    def test_nginx_maintenance_contract_is_fail_closed(self):
+        source = (
+            REPOSITORY_ROOT / "docker/nginx/sites-enabled/default"
+        ).read_text()
+
+        _assert_nginx_maintenance_contract(source)
+
+    def test_runtime_image_copies_maintenance_assets(self):
+        source = (REPOSITORY_ROOT / "Dockerfile.autobuild").read_text()
+
+        self.assertEqual(
+            source.count("COPY docker/migration ./docker/migration"),
+            1,
+        )
 
     def test_nginx_validator_rejects_duplicate_direct_batch_break(self):
         source = (

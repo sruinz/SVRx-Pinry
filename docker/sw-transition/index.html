@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>SVRx Pinry 전환 준비</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f2f4f7;
+      color: #17202a;
+    }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      box-sizing: border-box;
+    }
+    main {
+      width: min(620px, 100%);
+      padding: clamp(28px, 7vw, 56px);
+      border: 1px solid #c9d1d9;
+      border-radius: 24px;
+      background: #fff;
+      box-shadow: 0 18px 50px rgb(23 32 42 / 12%);
+      box-sizing: border-box;
+    }
+    .eyebrow {
+      margin: 0 0 12px;
+      color: #52606d;
+      font-size: 0.875rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    h1 { margin: 0 0 32px; font-size: clamp(2rem, 7vw, 3.2rem); line-height: 1.05; }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 0 0 12px;
+      font-size: clamp(1.25rem, 4vw, 1.6rem);
+      font-weight: 750;
+    }
+    .status::before {
+      width: 12px;
+      height: 12px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: #0b806f;
+      content: "";
+      box-shadow: 0 0 0 5px rgb(11 128 111 / 14%);
+    }
+    .detail { margin: 0; color: #52606d; font-size: 1rem; line-height: 1.7; }
+    @media (prefers-color-scheme: dark) {
+      :root { background: #090d12; color: #f4f7fa; }
+      main { border-color: #34404c; background: #111820; box-shadow: 0 18px 50px rgb(0 0 0 / 35%); }
+      .eyebrow, .detail { color: #b7c2cc; }
+      .status::before { background: #52d6bd; box-shadow: 0 0 0 5px rgb(82 214 189 / 16%); }
+    }
+  </style>
+</head>
+<body>
+  <main aria-labelledby="page-title">
+    <p class="eyebrow">SVRx Pinry</p>
+    <h1 id="page-title">안전한 업데이트 준비</h1>
+    <p id="status" class="status" role="status" aria-live="polite">서비스 워커를 전환하는 중입니다.</p>
+    <p id="detail" class="detail">이 화면이 열린 동안 브라우저 캐시를 안전하게 정리합니다. 데이터 폴더는 사용하지 않습니다.</p>
+  </main>
+  <script>
+    (() => {
+      'use strict';
+
+      const VERSION = 'network-only-v1';
+      const CACHE_PREFIX = 'pinry-spa-';
+      const status = document.getElementById('status');
+      const detail = document.getElementById('detail');
+      let acknowledged = false;
+      let completed = false;
+      let retryTimer = null;
+
+      async function legacyCacheCount() {
+        const names = await caches.keys();
+        return names.filter((name) => name.startsWith(CACHE_PREFIX)).length;
+      }
+
+      async function updateReadyState() {
+        if (completed) return;
+        const cacheCount = await legacyCacheCount();
+        if (!acknowledged || cacheCount !== 0) return;
+
+        completed = true;
+        if (retryTimer !== null) clearTimeout(retryTimer);
+        status.textContent = '전환 준비 완료';
+        detail.textContent = '이제 본 이전 이미지로 교체해도 기존 캐시가 진행 화면을 가리지 않습니다.';
+      }
+
+      function pingController() {
+        const controller = navigator.serviceWorker.controller;
+        if (controller) {
+          controller.postMessage({ type: 'SVRX_PINRY_NETWORK_ONLY_PING' });
+        }
+        if (!completed) retryTimer = setTimeout(pingController, 500);
+      }
+
+      navigator.serviceWorker.addEventListener('message', (event) => {
+        if (event.source !== navigator.serviceWorker.controller) return;
+        if (!event.data || event.data.type !== 'SVRX_PINRY_NETWORK_ONLY_ACK') return;
+        if (event.data.version !== VERSION) return;
+        acknowledged = true;
+        updateReadyState().catch(showFailure);
+      });
+
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        acknowledged = false;
+        pingController();
+      });
+
+      function showFailure() {
+        status.textContent = '전환 상태를 확인할 수 없습니다.';
+        detail.textContent = '잠시 후 이 페이지를 새로고침해 주세요.';
+      }
+
+      async function start() {
+        if (!('serviceWorker' in navigator) || !('caches' in self)) {
+          showFailure();
+          return;
+        }
+        const registration = await navigator.serviceWorker.register('/service-worker.js');
+        await registration.update();
+        await navigator.serviceWorker.ready;
+        pingController();
+      }
+
+      start().catch(showFailure);
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>SVRx Pinry 데이터 이전</title>
+    <link rel="stylesheet" href="/migration/migration.css">
+    <script src="/migration/migration.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="migration-card" aria-labelledby="page-title">
+        <header class="brand-row">
+          <picture class="brand-mark">
+            <source media="(prefers-color-scheme: dark)" srcset="/migration/svrx-pinry-dark-ui.png">
+            <source media="(prefers-color-scheme: light)" srcset="/migration/svrx-pinry-light-ui.png">
+            <img src="/migration/svrx-pinry-light-ui.png" alt="SVRx Pinry" width="72" height="72">
+          </picture>
+          <div class="brand-copy">
+            <p class="eyebrow">SVRx Pinry</p>
+            <span id="state-badge" class="state-badge">상태 확인 중</span>
+          </div>
+        </header>
+
+        <div class="hero-copy">
+          <h1 id="page-title">기존 Pinry 데이터를 이전하고 있습니다.</h1>
+          <p>브라우저를 닫아도 작업은 계속됩니다. 컨테이너를 중지하지 마세요.</p>
+          <p class="danger-copy">데이터 폴더를 삭제하거나 수정하지 마세요.</p>
+          <p class="danger-copy">프로젝트를 삭제하거나 컨테이너를 강제 종료하지 마세요.</p>
+        </div>
+
+        <section class="progress-panel" aria-labelledby="phase-heading">
+          <div class="section-heading">
+            <div>
+              <p class="section-kicker">현재 작업</p>
+              <h2 id="phase-heading">진행 상태</h2>
+            </div>
+            <p id="phase-name" class="phase-name">실행 환경을 확인하고 있습니다.</p>
+          </div>
+
+          <div class="progress-group">
+            <div class="progress-label-row">
+              <span id="overall-progress-label">전체 이전 진행률</span>
+              <strong id="overall-progress-value">확인 중</strong>
+            </div>
+            <progress id="overall-progress" max="100" aria-labelledby="overall-progress-label"></progress>
+          </div>
+
+          <div class="progress-group">
+            <div class="progress-label-row">
+              <span id="phase-progress-label">현재 단계 진행률</span>
+              <strong id="phase-progress-value">확인 중</strong>
+            </div>
+            <progress id="phase-progress" max="100" aria-labelledby="phase-progress-label"></progress>
+          </div>
+
+          <div class="metric-grid" aria-label="이전 처리량">
+            <article class="metric">
+              <span>이미지</span>
+              <strong id="images-count">0 / 확인 중</strong>
+            </article>
+            <article class="metric">
+              <span>파일</span>
+              <strong id="files-count">0 / 확인 중</strong>
+            </article>
+            <article class="metric">
+              <span>미디어 자산</span>
+              <strong id="backfill-count">0 / 확인 중</strong>
+            </article>
+          </div>
+        </section>
+
+        <section class="status-grid" aria-label="작업 상태 상세">
+          <div class="status-item">
+            <span>상태 신호</span>
+            <strong id="heartbeat-age">확인 중</strong>
+          </div>
+          <div class="status-item">
+            <span>마지막 처리 완료</span>
+            <strong id="progress-age">아직 없음</strong>
+          </div>
+          <div class="status-item">
+            <span>재개 횟수</span>
+            <strong id="resume-count">0회</strong>
+          </div>
+          <div class="status-item">
+            <span>마지막 확정 배치</span>
+            <strong id="last-batch">0</strong>
+          </div>
+        </section>
+
+        <section id="notice-panel" class="notice-panel" aria-labelledby="notice-title">
+          <h2 id="notice-title">안전하게 이전하는 중입니다.</h2>
+          <p id="notice-text">중지해야 한다면 DSM Container Manager의 정상 중지를 사용하세요.</p>
+        </section>
+
+        <section id="error-panel" class="error-panel" aria-labelledby="error-title">
+          <h2 id="error-title">상태 정보를 읽을 수 없습니다.</h2>
+          <p id="operator-hint">Container Manager 로그를 확인하세요.</p>
+          <dl class="error-details">
+            <div>
+              <dt>오류 분류</dt>
+              <dd id="error-class">확인 중</dd>
+            </div>
+            <div>
+              <dt>오류 코드</dt>
+              <dd id="error-code">확인 중</dd>
+            </div>
+          </dl>
+        </section>
+
+        <div class="action-row">
+          <button id="refresh-button" type="button">상태 다시 확인</button>
+          <button id="copy-error-button" type="button">오류 코드 복사</button>
+          <button id="copy-diagnostics-button" type="button">진단 정보 복사</button>
+          <button id="open-button" type="button" hidden>SVRx Pinry 열기</button>
+        </div>
+
+        <p id="copy-result" class="copy-result" role="status"></p>
+        <p id="live-status" class="sr-only" aria-live="polite" aria-atomic="true">
+          데이터 이전 상태를 확인하고 있습니다.
+        </p>
+      </section>
+    </main>
+  </body>
+</html>

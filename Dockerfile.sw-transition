@@ -1,0 +1,7 @@
+FROM nginx:1.27-alpine
+
+COPY docker/sw-transition/nginx.conf /etc/nginx/conf.d/default.conf
+COPY docker/sw-transition/index.html /usr/share/nginx/html/index.html
+COPY pinry-spa/src/service-worker.js /usr/share/nginx/html/service-worker.js
+
+EXPOSE 80
