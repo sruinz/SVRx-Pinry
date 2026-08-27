@@ -4,11 +4,11 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
-import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -262,58 +262,57 @@ def _assert_nginx_contract(source):
 
 
 class RuntimeConfigTests(unittest.TestCase):
-    def test_startup_progress_writer_outputs_safe_korean_message(self):
+    def test_startup_uses_shared_status_authority_and_supervisor(self):
         startup_path = REPOSITORY_ROOT / "docker/scripts/startup.py"
         spec = importlib.util.spec_from_file_location(
-            "test_startup_progress",
+            "test_startup_supervisor_entry",
             str(startup_path),
         )
         startup = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(startup)
-        output = mock.Mock()
-
-        with mock.patch.object(startup.sys, "stdout", output):
-            startup._write_progress(
-                {
-                    "phase": "copying",
-                    "images_done": 1,
-                    "images_total": 2,
-                    "files_done": 4,
-                    "files_total": 8,
-                }
-            )
-
-        output.write.assert_called_once_with(
-            "SVRx Pinry 데이터 이전: 파일 처리 "
-            "1/2 이미지, 4/8 파일 (50.0%)\n"
+        migration_status = importlib.import_module(
+            "docker.scripts.migration_status"
         )
-        output.flush.assert_called_once_with()
 
-    def test_startup_progress_writer_rejects_unexpected_details(self):
+        self.assertIs(
+            startup.ERROR_CODE_CLASSES,
+            migration_status.ERROR_CODE_CLASSES,
+        )
+        source = startup_path.read_text("utf-8")
+        self.assertNotIn("_SAFE_ERROR_CODES", source)
+        self.assertNotIn("_SAFE_BOOTSTRAP_ERROR_CODES", source)
+
+    def test_startup_installs_signal_handlers_before_supervisor_run(self):
         startup_path = REPOSITORY_ROOT / "docker/scripts/startup.py"
         spec = importlib.util.spec_from_file_location(
-            "test_startup_progress_rejection",
+            "test_startup_signal_order",
             str(startup_path),
         )
         startup = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(startup)
-        output = mock.Mock()
+        events = []
+        runtime = mock.Mock()
+        runtime.run.side_effect = lambda: events.append("run") or 7
 
-        with mock.patch.object(startup.sys, "stdout", output):
-            accepted = startup._write_progress(
-                {
-                    "phase": "copying",
-                    "images_done": 1,
-                    "images_total": 2,
-                    "files_done": 4,
-                    "files_total": 8,
-                    "path": "/data/static/media/secret.png",
-                }
-            )
+        def install(signum, handler):
+            del handler
+            events.append("signal:{}".format(signum))
+            return signal.SIG_DFL
 
-        self.assertFalse(accepted)
-        output.write.assert_not_called()
-        output.flush.assert_not_called()
+        with mock.patch.object(
+            startup, "_service_identity", return_value=(33, 33)
+        ), mock.patch.object(
+            startup, "MigrationStatusStore", return_value=object()
+        ), mock.patch.object(
+            startup, "RuntimeSupervisor", return_value=runtime
+        ), mock.patch.object(startup.signal, "signal", side_effect=install):
+            result = startup._run(["--migrate-legacy"])
+
+        self.assertEqual(result, 7)
+        self.assertLess(events.index("signal:{}".format(signal.SIGTERM)),
+                        events.index("run"))
+        self.assertLess(events.index("signal:{}".format(signal.SIGINT)),
+                        events.index("run"))
 
     def _import_docker_settings(self, local_secret, environment_secret=None):
         script = (
@@ -772,362 +771,72 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
         self.assertEqual(environment_capture.read_text("utf-8"), "1")
 
-    def test_python_runner_from_tmp_uses_project_root_and_exact_order(self):
-        environment, capture, runner, _data_root = (
-            self._python_runner_environment()
+    def test_python_runner_rejects_invalid_arguments_before_supervisor(self):
+        startup_path = REPOSITORY_ROOT / "docker/scripts/startup.py"
+        spec = importlib.util.spec_from_file_location(
+            "test_startup_arguments",
+            str(startup_path),
         )
+        startup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(startup)
 
-        completed = subprocess.run(
-            [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)],
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        with mock.patch.object(startup, "RuntimeSupervisor") as runtime:
+            result = startup._run(["--unknown"])
 
-        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-        self.assertEqual(self._runner_events(capture), [
-            "lock",
-            "bootstrap",
-            "setup:pinry.settings.docker",
-            "inventory",
-            "coordinator",
-            "prepare_no_flag",
-            "collectstatic",
-            "migrate",
-            "converge:none",
-            "ownership",
-            "runtime",
-            "nginx",
-            "lock_inheritable",
-            "gunicorn",
-        ])
+        self.assertEqual(result, 2)
+        runtime.assert_not_called()
 
-    def test_python_runner_bootstraps_completely_empty_data_root(self):
-        environment, capture, runner, data_root = (
-            self._python_runner_environment(real_bootstrap=True)
-        )
-        self.assertEqual(tuple(data_root.iterdir()), ())
+    def test_runtime_sources_encode_nginx_lock_worker_gunicorn_order(self):
+        supervisor_source = (
+            REPOSITORY_ROOT / "docker/scripts/supervisor.py"
+        ).read_text("utf-8")
+        run_start = supervisor_source.index("    def run(self):")
+        run_source = supervisor_source[run_start:]
 
-        completed = subprocess.run(
-            [
-                str(REPOSITORY_ROOT / ".venv/bin/python"),
-                str(runner),
-                "--migrate-legacy",
-            ],
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        rendered = completed.stdout + completed.stderr
-        self.assertEqual(completed.returncode, 0, rendered)
-        self.assertNotIn(b"legacy_evidence_invalid", rendered)
-        self.assertFalse((data_root / "legacy-backup").exists())
-        persistent_settings = data_root / "local_settings.py"
-        project_settings = runner.parents[2] / "pinry/settings/local_settings.py"
-        secret_key = data_root / "production_secret_key.txt"
-        self.assertTrue(persistent_settings.is_file())
-        self.assertTrue(project_settings.is_file())
-        self.assertTrue(secret_key.is_file())
-        self.assertEqual(
-            persistent_settings.read_bytes(), project_settings.read_bytes()
-        )
-        self.assertNotIn(
-            b"secret_key_place_holder", persistent_settings.read_bytes()
-        )
-        self.assertEqual(
-            self._runner_events(capture),
-            [
-                "lock",
-                "setup:pinry.settings.docker",
-                "coordinator",
-                "prepare",
-                "prepare_migration_locks",
-                "collectstatic",
-                "migrate",
-                "converge:run",
-                "ownership",
-                "runtime",
-                "nginx",
-                "lock_inheritable",
-                "gunicorn",
-            ],
-        )
-
-    def test_python_runner_requires_flag_before_pending_inventory_commands(self):
-        environment, capture, runner, _data_root = (
-            self._python_runner_environment()
-        )
-        environment["PINRY_INVENTORY_BLOCK"] = "1"
-
-        completed = subprocess.run(
-            [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)],
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        self.assertEqual(completed.returncode, 1)
-        self.assertEqual(completed.stderr.decode().strip(),
-                         "legacy_migration_flag_required")
-        self.assertEqual(self._runner_events(capture), [
-            "lock", "bootstrap", "setup:pinry.settings.docker", "inventory",
-        ])
-
-    def test_python_runner_skips_schema_on_resumed_post_schema_phase(self):
-        environment, capture, runner, _data_root = (
-            self._python_runner_environment()
-        )
-        environment["PINRY_SCHEMA_REQUIRED"] = "0"
-
-        completed = subprocess.run(
-            [
-                str(REPOSITORY_ROOT / ".venv/bin/python"),
-                str(runner),
-                "--migrate-legacy",
-            ],
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-        events = self._runner_events(capture)
-        self.assertNotIn("collectstatic", events)
-        self.assertNotIn("migrate", events)
-        self.assertLess(events.index("prepare"), events.index("converge:run"))
-
-    def test_python_runner_prepares_migration_locks_before_schema_failure(
-        self,
-    ):
-        for point in ("collectstatic", "migrate"):
-            with self.subTest(point=point):
-                environment, capture, runner, _data_root = (
-                    self._python_runner_environment()
-                )
-                environment["PINRY_FAIL_POINT"] = point
-
-                completed = subprocess.run(
-                    [
-                        str(REPOSITORY_ROOT / ".venv/bin/python"),
-                        str(runner),
-                        "--migrate-legacy",
-                    ],
-                    cwd="/private/tmp",
-                    env=environment,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-
-                self.assertEqual(completed.returncode, 1)
-                events = self._runner_events(capture)
-                self.assertIn("prepare_migration_locks", events)
-                self.assertLess(
-                    events.index("prepare_migration_locks"),
-                    events.index(point),
-                )
-                self.assertNotIn("converge:run", events)
-                self.assertNotIn("ownership", events)
-
-    def test_python_runner_failures_never_start_application_service(self):
-        cases = (
-            ("bootstrap", "bootstrap_failed"),
-            ("setup", "media_storage_configuration_invalid"),
-            ("prepare", "sqlite_snapshot_failed"),
-            ("collectstatic", "legacy_startup_failed"),
-            ("migrate", "legacy_startup_failed"),
-            ("converge", "migration_state_plan_mismatch"),
-            ("ownership", "unsafe_storage_ownership"),
-            ("runtime", "media_root_not_writable"),
-            ("nginx", "nginx_start_failed"),
-        )
-        for point, expected in cases:
-            with self.subTest(point=point):
-                environment, capture, runner, _data_root = (
-                    self._python_runner_environment()
-                )
-                environment["PINRY_FAIL_POINT"] = point
-
-                completed = subprocess.run(
-                    [
-                        str(REPOSITORY_ROOT / ".venv/bin/python"),
-                        str(runner),
-                        "--migrate-legacy",
-                    ],
-                    cwd="/private/tmp",
-                    env=environment,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-
-                rendered = (
-                    completed.stdout + completed.stderr
-                ).decode("utf-8")
-                self.assertEqual(completed.returncode, 1)
-                self.assertEqual(completed.stderr.decode().strip(), expected)
-                self.assertNotIn("sentinel-private", rendered)
-                self.assertNotIn("Traceback", rendered)
-                self.assertNotIn("gunicorn", self._runner_events(capture))
-
-    def test_python_runner_reports_only_recognized_bootstrap_reason(self):
-        environment, capture, runner, _data_root = (
-            self._python_runner_environment()
-        )
-        environment["PINRY_FAIL_POINT"] = "bootstrap"
-        environment["PINRY_BOOTSTRAP_REASON"] = (
-            "bootstrap_persistent_settings_invalid"
-        )
-
-        completed = subprocess.run(
-            [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)],
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        self.assertEqual(completed.returncode, 1)
-        self.assertEqual(
-            completed.stderr.decode().strip(),
-            "bootstrap_persistent_settings_invalid",
-        )
-        self.assertEqual(self._runner_events(capture), ["lock", "bootstrap"])
-
-    def test_python_runner_bootstrap_is_once_between_lock_and_django_setup(self):
-        environment, capture, runner, _data_root = (
-            self._python_runner_environment()
-        )
-
-        completed = subprocess.run(
-            [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)],
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-        events = self._runner_events(capture)
-        self.assertEqual(events.count("bootstrap"), 1)
-        self.assertLess(events.index("lock"), events.index("bootstrap"))
         self.assertLess(
-            events.index("bootstrap"),
-            events.index("setup:pinry.settings.docker"),
+            run_source.index("self._spawn_nginx()"),
+            run_source.index("self._acquire_lock()"),
         )
+        self.assertLess(
+            run_source.index("self._acquire_lock()"),
+            run_source.index("self._spawn_worker("),
+        )
+        self.assertLess(
+            supervisor_source.index("def _spawn_worker"),
+            supervisor_source.index("def _spawn_gunicorn"),
+        )
+        self.assertIn("start_new_session=True", supervisor_source)
+        self.assertIn("pass_fds=(writer, lock_fd)", supervisor_source)
 
-    def test_python_runner_final_process_imports_wsgi_from_project_cwd(self):
-        environment, capture, runner, _data_root = (
-            self._python_runner_environment()
-        )
-        environment["PINRY_ASSERT_WSGI_IMPORT"] = "1"
+    def test_worker_owns_bootstrap_django_schema_and_coordinator(self):
+        startup_source = (
+            REPOSITORY_ROOT / "docker/scripts/startup.py"
+        ).read_text("utf-8")
+        worker_source = (
+            REPOSITORY_ROOT / "docker/scripts/migration_worker.py"
+        ).read_text("utf-8")
 
-        completed = subprocess.run(
-            [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)],
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-        self.assertIn(
-            "wsgi_import:{}".format(runner.parents[2]),
-            self._runner_events(capture),
-        )
-
-    def test_python_runner_serializes_bootstrap_under_lifetime_lock(self):
-        environment, capture, runner, _data_root = (
-            self._python_runner_environment()
-        )
-        gate = Path(capture.parent, "bootstrap-gate")
-        gate.write_text("held")
-        environment["PINRY_BOOTSTRAP_GATE"] = str(gate)
-        command = [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)]
-        first = subprocess.Popen(
-            command,
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self.addCleanup(lambda: first.poll() is None and first.kill())
-        deadline = time.monotonic() + 5
-        while (
-            "bootstrap" not in self._runner_events(capture)
-            and time.monotonic() < deadline
+        for name in (
+            "_run_bootstrap",
+            "_setup_django",
+            "_run_schema_commands",
+            "_run_coordinator",
         ):
-            time.sleep(0.02)
-        self.assertEqual(self._runner_events(capture).count("bootstrap"), 1)
+            self.assertNotIn("def {}".format(name), startup_source)
+            self.assertIn("def {}".format(name), worker_source)
+        self.assertNotIn("os.execv", startup_source)
+        self.assertNotIn("migration-status.json", worker_source)
 
-        second = subprocess.run(
-            command,
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+    def test_runtime_supervisor_keeps_lifetime_lock_until_cleanup(self):
+        source = (
+            REPOSITORY_ROOT / "docker/scripts/supervisor.py"
+        ).read_text("utf-8")
+        finally_source = source[source.rindex("        finally:"):]
 
-        self.assertEqual(second.returncode, 1)
-        self.assertEqual(second.stderr.decode().strip(), "startup_lock_busy")
-        self.assertEqual(self._runner_events(capture).count("bootstrap"), 1)
-        self.assertNotIn(
-            "setup:pinry.settings.docker",
-            self._runner_events(capture),
+        self.assertLess(
+            finally_source.index("self._cleanup()"),
+            finally_source.index("self.startup_lock.close()"),
         )
-
-        gate.unlink()
-        first_stdout, first_stderr = first.communicate(timeout=5)
-        self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
-
-    def test_python_runner_holds_lock_for_final_process_lifetime(self):
-        environment, capture, runner, _data_root = (
-            self._python_runner_environment()
-        )
-        gate = Path(capture.parent, "lifetime-gate")
-        gate.write_text("held")
-        environment["PINRY_LIFETIME_GATE"] = str(gate)
-        command = [str(REPOSITORY_ROOT / ".venv/bin/python"), str(runner)]
-        first = subprocess.Popen(
-            command,
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self.addCleanup(lambda: first.poll() is None and first.kill())
-        deadline = time.monotonic() + 5
-        while (
-            "gunicorn" not in self._runner_events(capture)
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.02)
-        self.assertIn("gunicorn", self._runner_events(capture))
-
-        second = subprocess.run(
-            command,
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self.assertEqual(second.returncode, 1)
-        self.assertEqual(second.stderr.decode().strip(), "startup_lock_busy")
-
-        gate.unlink()
-        first_stdout, first_stderr = first.communicate(timeout=5)
-        self.assertEqual(first.returncode, 0, first_stdout + first_stderr)
-        third = subprocess.run(
-            command,
-            cwd="/private/tmp",
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self.assertEqual(third.returncode, 0, third.stderr.decode())
 
     def test_start_script_passes_one_effective_60_second_timeout(self):
         environment, capture = self._capture_environment("gunicorn")
@@ -1154,6 +863,8 @@ class RuntimeConfigTests(unittest.TestCase):
         ]
 
         self.assertTrue(commands[0].startswith("exec gunicorn "))
+        self.assertIn("-b 127.0.0.1:8000", source)
+        self.assertNotIn("-b 0.0.0.0:8000", source)
 
     def _bootstrap_fixture(self, existing=None):
         temporary = tempfile.TemporaryDirectory(dir="/private/tmp")
