@@ -763,7 +763,15 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
             self.migrator(fault_injector=crash).run(execute=True)
         image.refresh_from_db()
         migrated_path = image.image.name
-        resumed = self.migrator()
+        progress = []
+        resumed = AutoV2MediaMigrator(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            progress_reporter=progress.append,
+        )
         with mock.patch.object(
             resumed,
             "_stream_source_to_staging_and_inspect",
@@ -780,6 +788,14 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 if event["event"] in ("batch_intent", "batch_commit")
             ],
             ["batch_intent", "batch_commit"],
+        )
+        self.assertEqual(
+            [
+                event["last_committed_batch"]
+                for event in progress
+                if event["phase"] == "database"
+            ],
+            [1],
         )
 
     def test_restart_after_destination_rename_reuses_durable_orphan(self):
@@ -984,6 +1000,76 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                 "paths:{}-{}".format(second.pk, second.pk),
             ],
         )
+
+    def test_partial_v2_reports_each_imported_global_commit_ordinal(self):
+        first = self.make_image(sizes=())
+        second = self.make_image(sizes=())
+        pending = self.make_image(sizes=())
+        self.write_v2_plans((first, second, pending), completed=2)
+        summary = self.migrator(batch_size=1).run(execute=False)
+        journal = self.injected_journal(summary, 3, 3, 0)
+        progress = []
+        migrator = AutoV2MediaMigrator(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            batch_size=1,
+            batch_journal=journal,
+            progress_reporter=progress.append,
+        )
+
+        migrator.run(execute=True, upgrade_v2=True)
+
+        self.assertEqual(
+            [
+                (
+                    event["images_done"],
+                    event["images_total"],
+                    event["last_committed_batch"],
+                )
+                for event in progress
+                if event["phase"] == "upgrade_v2"
+            ],
+            [(1, 2, 1), (2, 2, 2)],
+        )
+        self.assertEqual(journal.last_committed_batch(), 3)
+
+    def test_paths_continue_global_ordinal_after_partial_v2_imports(self):
+        first = self.make_image(sizes=())
+        second = self.make_image(sizes=())
+        pending = self.make_image(sizes=())
+        self.write_v2_plans((first, second, pending), completed=2)
+        summary = self.migrator(batch_size=1).run(execute=False)
+        journal = self.injected_journal(summary, 3, 3, 0)
+        progress = []
+        migrator = AutoV2MediaMigrator(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            batch_size=1,
+            batch_journal=journal,
+            progress_reporter=progress.append,
+        )
+
+        migrator.run(execute=True, upgrade_v2=True)
+
+        upgrade_ordinals = [
+            event["last_committed_batch"]
+            for event in progress
+            if event["phase"] == "upgrade_v2"
+        ]
+        database_ordinals = [
+            event["last_committed_batch"]
+            for event in progress
+            if event["phase"] == "database"
+        ]
+        self.assertEqual(upgrade_ordinals, [1, 2])
+        self.assertEqual(database_ordinals, [3])
+        self.assertEqual(journal.last_committed_batch(), 3)
 
     def test_copying_v2_imports_terminal_prefix_then_resumes_pending(self):
         first = self.make_image(sizes=())
@@ -2181,9 +2267,41 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
                     "phase": "database",
                     "images_done": 1,
                     "images_total": 1,
+                    "last_committed_batch": 1,
                 },
                 {"phase": "finalizing"},
             ],
+        )
+
+    def test_multi_batch_progress_exposes_only_post_commit_ordinals(self):
+        self.make_image(sizes=())
+        self.make_image(sizes=())
+        progress = []
+        migrator = AutoV2MediaMigrator(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            batch_size=1,
+            progress_reporter=progress.append,
+        )
+
+        migrator.run(execute=True)
+
+        copying = [
+            event for event in progress if event["phase"] == "copying"
+        ]
+        database = [
+            event for event in progress if event["phase"] == "database"
+        ]
+        self.assertEqual(len(copying), 2)
+        self.assertTrue(all(
+            "last_committed_batch" not in event for event in copying
+        ))
+        self.assertEqual(
+            [event["last_committed_batch"] for event in database],
+            [1, 2],
         )
 
     def test_progress_reporter_failure_does_not_abort_migration(self):

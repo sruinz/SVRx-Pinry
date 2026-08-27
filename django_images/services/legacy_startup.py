@@ -71,7 +71,7 @@ _PROGRESS_KEYS = {
         "last_committed_batch",
     )),
     "upgrade_v2": frozenset((
-        "phase", "images_done", "images_total",
+        "phase", "images_done", "images_total", "last_committed_batch",
     )),
     "copying": frozenset((
         "phase",
@@ -81,7 +81,7 @@ _PROGRESS_KEYS = {
         "files_total",
     )),
     "database": frozenset((
-        "phase", "images_done", "images_total",
+        "phase", "images_done", "images_total", "last_committed_batch",
     )),
     "backfill_planning": frozenset((
         "phase", "backfill_total",
@@ -168,6 +168,7 @@ class LegacyStartupCoordinator(object):
         self._media_summary = None
         self._backfill_summary = None
         self._child_progress_error = None
+        self._last_committed_batch = None
 
     def prepare_no_flag_before_schema(self):
         """No-flag startup의 pre-schema evidence를 read-only로 고정한다."""
@@ -1037,8 +1038,7 @@ class LegacyStartupCoordinator(object):
         if error is not None:
             raise error
 
-    @staticmethod
-    def _validate_progress_event(event):
+    def _validate_progress_event(self, event):
         if not isinstance(event, dict):
             raise LegacyStartupError("legacy_progress_event_invalid")
         phase = event.get("phase")
@@ -1096,6 +1096,14 @@ class LegacyStartupCoordinator(object):
                 "started_at"
             ]:
                 raise LegacyStartupError("legacy_progress_event_invalid")
+        if "last_committed_batch" in event:
+            committed = event["last_committed_batch"]
+            if (
+                self._last_committed_batch is not None
+                and committed < self._last_committed_batch
+            ):
+                raise LegacyStartupError("legacy_progress_event_invalid")
+            self._last_committed_batch = committed
 
     def _report_progress(self, event):
         self._validate_progress_event(event)

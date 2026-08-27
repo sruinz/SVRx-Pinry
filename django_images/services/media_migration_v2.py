@@ -2702,11 +2702,7 @@ class AutoV2MediaMigrator(object):
                 seen_pending = True
         if not completed:
             return
-        self._report_progress({
-            "phase": "upgrade_v2",
-            "images_done": 0,
-            "images_total": len(completed),
-        })
+        images_done = 0
         for batch_number, batch in enumerate(
             self._build_batches(completed), 1
         ):
@@ -2773,11 +2769,13 @@ class AutoV2MediaMigrator(object):
                 ),
             )
             journal.import_v2_batch(intent, committed=True)
-        self._report_progress({
-            "phase": "upgrade_v2",
-            "images_done": len(completed),
-            "images_total": len(completed),
-        })
+            images_done += len(batch)
+            self._report_progress({
+                "phase": "upgrade_v2",
+                "images_done": images_done,
+                "images_total": len(completed),
+                "last_committed_batch": journal.last_committed_batch(),
+            })
 
     def _build_batches(self, plans):
         batch = []
@@ -3501,6 +3499,7 @@ class AutoV2MediaMigrator(object):
         )
         if recovery == "append_commit":
             journal.append_commit(intent.batch_id, intent.post_signature)
+            self._report_linear_batch_progress(journal)
             return
         if recovery == "committed":
             return
@@ -3511,6 +3510,7 @@ class AutoV2MediaMigrator(object):
         self._apply_database_batch(batch, prepared, intent.post_signature)
         self._inject_fault("after_database_commit")
         journal.append_commit(intent.batch_id, intent.post_signature)
+        self._report_linear_batch_progress(journal)
 
     def _prepared_from_receipt(self, batch, receipt):
         by_key = {
@@ -3841,6 +3841,7 @@ class AutoV2MediaMigrator(object):
             "phase": "database",
             "images_done": snapshot["images_done"],
             "images_total": snapshot["images_total"],
+            "last_committed_batch": journal.last_committed_batch(),
         })
 
     def _report_linear_copy_progress(self, journal, batch, prepared):

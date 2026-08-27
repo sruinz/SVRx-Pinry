@@ -186,7 +186,53 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                 "files_total": 0,
             })
 
-        self.assertEqual(reported, [valid])
+        database = {
+            "phase": "database",
+            "images_done": 1,
+            "images_total": 2,
+            "last_committed_batch": 1,
+        }
+        upgrade = {
+            "phase": "upgrade_v2",
+            "images_done": 2,
+            "images_total": 2,
+            "last_committed_batch": 2,
+        }
+        self.assertTrue(coordinator._report_progress(database))
+        self.assertTrue(coordinator._report_progress(upgrade))
+        for event in (
+            {key: value for key, value in database.items()
+             if key != "last_committed_batch"},
+            {key: value for key, value in upgrade.items()
+             if key != "last_committed_batch"},
+        ):
+            with self.assertRaisesRegex(
+                LegacyStartupError,
+                "^legacy_progress_event_invalid$",
+            ):
+                coordinator._report_progress(event)
+
+        self.assertEqual(reported, [valid, database, upgrade])
+
+    def test_progress_events_reject_invalid_or_decreasing_commit_ordinal(self):
+        coordinator = self.coordinator()
+        base = {
+            "phase": "database",
+            "images_done": 1,
+            "images_total": 2,
+            "last_committed_batch": 2,
+        }
+
+        self.assertFalse(coordinator._report_progress(base))
+        for ordinal in (True, "2", -1, 1):
+            with self.subTest(ordinal=ordinal), self.assertRaisesRegex(
+                LegacyStartupError,
+                "^legacy_progress_event_invalid$",
+            ):
+                coordinator._report_progress(dict(
+                    base,
+                    last_committed_batch=ordinal,
+                ))
 
     def test_child_finalizing_is_filtered_and_invalid_child_event_surfaces(self):
         reported = []
@@ -211,13 +257,15 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         events = (
             {
                 "phase": "upgrade_v2",
-                "images_done": 0,
+                "images_done": 1,
                 "images_total": 2,
+                "last_committed_batch": 1,
             },
             {
                 "phase": "upgrade_v2",
                 "images_done": 2,
                 "images_total": 2,
+                "last_committed_batch": 2,
             },
         )
 
@@ -592,6 +640,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                         "phase": "database",
                         "images_done": 2,
                         "images_total": 2,
+                        "last_committed_batch": 1,
                     })
                     self.reporter({"phase": "finalizing"})
                 return media_execute if execute else media_dry
