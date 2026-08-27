@@ -375,6 +375,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         )
         coordinator = self.coordinator()
         self._set_terminal_summaries(coordinator, run)
+        coordinator._write_summary(run)
 
         with mock.patch.object(
             coordinator,
@@ -952,7 +953,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         summary = json.loads(summary_path.read_text("utf-8"))
         self.assertEqual(summary["phase"], "complete")
         self.assertEqual(summary["reason_counts"], {"orphan": 1})
-        self.assertEqual(oct(summary_path.stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct(summary_path.stat().st_mode & 0o777), "0o644")
 
     def test_runtime_probe_failure_is_normalized(self):
         with mock.patch(
@@ -1114,7 +1115,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "_seal_current_identities",
         ) as seal, mock.patch.object(
             coordinator,
-            "_write_summary",
+            "_read_completed_summary",
             side_effect=LegacyStartupError("unsafe_migration_summary"),
         ), self.assertRaisesRegex(
             LegacyStartupError,
@@ -1126,7 +1127,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             configuration_identities,
             [service_identity],
         )
-        seal.assert_called_once_with(run)
+        seal.assert_not_called()
 
     def test_failed_migration_does_not_handoff_runtime_lock_identity(self):
         run = self._summary_run()
@@ -1209,6 +1210,117 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             reason_counts={},
         )
 
+    def _completed_run_with_summary(self):
+        run = self._summary_run()
+        migration_state.transition_state(
+            run, "initialized", "schema_complete"
+        )
+        migration_state.transition_state(
+            run,
+            "schema_complete",
+            "paths_complete",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "paths_complete",
+            "registry_complete",
+            plan_sha256="3" * 64,
+            manifest_sha256="4" * 64,
+        )
+        migration_state.transition_state(
+            run,
+            "registry_complete",
+            "complete",
+        )
+        coordinator = self.coordinator()
+        self._set_terminal_summaries(coordinator, run)
+        coordinator._write_summary(run)
+        summary_path = Path(run.path, "migration-summary.json")
+        os.chmod(str(summary_path), 0o644)
+        return run, summary_path
+
+    def test_completed_separate_start_uses_only_durable_summary(self):
+        run, summary_path = self._completed_run_with_summary()
+        original_summary = summary_path.read_bytes()
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            side_effect=AssertionError("completed run legacy scan"),
+        ) as inspect_evidence, mock.patch(
+            "django_images.services.legacy_startup."
+            "AutoV2ManifestLog.open",
+            side_effect=AssertionError("completed run manifest open"),
+        ) as manifest_open, mock.patch(
+            "django_images.services.legacy_startup."
+            "MigrationBatchJournal.open",
+            side_effect=AssertionError("completed run journal open"),
+        ) as journal_open, mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_auto_v2_summary",
+            side_effect=AssertionError("completed run media reload"),
+        ) as load_media, mock.patch(
+            "django_images.services.legacy_startup."
+            "load_completed_media_asset_backfill_summary",
+            side_effect=AssertionError("completed run backfill reload"),
+        ) as load_backfill, mock.patch.object(
+            coordinator,
+            "_seal_current_identities",
+            side_effect=AssertionError("completed run legacy seal"),
+        ) as seal, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_configuration_preflight",
+            return_value=PreflightResult(ok=True),
+        ):
+            resumed = coordinator.prepare_before_schema()
+            result = coordinator.converge_after_schema(resumed)
+
+        self.assertEqual(result.run_id, run.run_id)
+        self.assertEqual(summary_path.read_bytes(), original_summary)
+        self.assertEqual(stat.S_IMODE(summary_path.stat().st_mode), 0o644)
+        self.assertEqual(summary_path.stat().st_uid, os.geteuid())
+        self.assertEqual(summary_path.stat().st_gid, os.getegid())
+        inspect_evidence.assert_not_called()
+        manifest_open.assert_not_called()
+        journal_open.assert_not_called()
+        load_media.assert_not_called()
+        load_backfill.assert_not_called()
+        seal.assert_not_called()
+
+    def test_completed_separate_start_rejects_tampered_summary(self):
+        run, summary_path = self._completed_run_with_summary()
+        payload = json.loads(summary_path.read_text("utf-8"))
+        payload["unexpected"] = True
+        summary_path.write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(str(summary_path), 0o644)
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            side_effect=AssertionError("completed run legacy scan"),
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_configuration_preflight",
+            return_value=PreflightResult(ok=True),
+        ), mock.patch.object(
+            coordinator,
+            "_seal_current_identities",
+            side_effect=AssertionError("completed run legacy seal"),
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^unsafe_migration_summary$",
+        ):
+            resumed = coordinator.prepare_before_schema()
+            coordinator.converge_after_schema(resumed)
+
     def test_summary_rejects_symlink_hardlink_and_wrong_mode_target(self):
         mutators = (
             "symlink",
@@ -1228,7 +1340,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                     os.link(str(retained), str(summary))
                 else:
                     summary.write_text("wrong mode", encoding="utf-8")
-                    os.chmod(str(summary), 0o644)
+                    os.chmod(str(summary), 0o600)
 
                 with self.assertRaisesRegex(
                     LegacyStartupError,
@@ -1616,8 +1728,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "registry_complete",
         )
 
-    def test_complete_resume_repairs_missing_summary_from_typed_manifests(self):
-        progress_events = []
+    def test_completed_separate_start_rejects_missing_summary(self):
         run = self._summary_run()
         migration_state.transition_state(
             run, "initialized", "schema_complete"
@@ -1641,9 +1752,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "registry_complete",
             "complete",
         )
-        coordinator = self.coordinator(
-            progress_reporter=progress_events.append,
-        )
+        coordinator = self.coordinator()
         self._set_terminal_summaries(coordinator, run)
         media = coordinator._media_summary
         backfill = coordinator._backfill_summary
@@ -1653,7 +1762,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         with mock.patch(
             "django_images.services.legacy_startup."
             "startup_preflight.inspect_legacy_evidence",
-            return_value=self.evidence(present=False),
+            side_effect=AssertionError("completed run legacy scan"),
         ), mock.patch(
             "django_images.services.legacy_startup."
             "startup_preflight.validate_storage_configuration_preflight",
@@ -1666,16 +1775,18 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "django_images.services.legacy_startup."
             "load_completed_media_asset_backfill_summary",
             return_value=backfill,
+        ), mock.patch.object(
+            coordinator,
+            "_seal_current_identities",
+            side_effect=AssertionError("completed run legacy seal"),
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^unsafe_migration_summary$",
         ):
-            coordinator.converge_after_schema(run)
+            resumed = coordinator.prepare_before_schema()
+            coordinator.converge_after_schema(resumed)
 
-        summary = json.loads(
-            Path(run.path, "migration-summary.json").read_text("utf-8")
-        )
-        self.assertEqual(summary["phase"], "complete")
-        self.assertEqual(summary["media_image_count"], 1)
-        self.assertEqual(summary["backfill_registered"], 1)
-        self.assertEqual(progress_events, [])
+        self.assertFalse(Path(run.path, "migration-summary.json").exists())
 
     def test_resume_at_schema_complete_never_repeats_snapshot_or_first_space(self):
         run = self._summary_run()

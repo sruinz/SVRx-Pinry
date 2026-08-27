@@ -1071,6 +1071,181 @@ class AutoV2MediaMigrationTest(TransactionTestCase):
         self.assertEqual(database_ordinals, [3])
         self.assertEqual(journal.last_committed_batch(), 3)
 
+    def test_partial_v2_restart_continues_after_first_import_commit(self):
+        first = self.make_image(sizes=())
+        second = self.make_image(sizes=())
+        pending = self.make_image(sizes=())
+        self.write_v2_plans((first, second, pending), completed=2)
+        original = self.manifest_path.read_bytes()
+        summary = self.migrator(batch_size=1).run(execute=False)
+        journal = self.injected_journal(summary, 3, 3, 0)
+        first_batch_id = "upgrade-paths:{}-{}".format(
+            first.pk, first.pk
+        )
+        real_import = journal.import_v2_batch
+
+        def crash_after_first_commit(intent, committed=True):
+            result = real_import(intent, committed=committed)
+            if intent.batch_id == first_batch_id:
+                raise SimulatedProcessCrash()
+            return result
+
+        with mock.patch.object(
+            journal,
+            "import_v2_batch",
+            side_effect=crash_after_first_commit,
+        ), self.assertRaises(SimulatedProcessCrash):
+            self.migrator(
+                batch_size=1,
+                batch_journal=journal,
+            ).run(execute=True, upgrade_v2=True)
+
+        self.assertEqual(journal.last_committed_batch(), 1)
+        progress = []
+        resumed = AutoV2MediaMigrator(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            batch_size=1,
+            batch_journal=journal,
+            progress_reporter=progress.append,
+        )
+        with mock.patch.object(
+            resumed,
+            "_stream_source_to_staging_and_inspect",
+            wraps=resumed._stream_source_to_staging_and_inspect,
+        ) as stream:
+            resumed.run(execute=True, upgrade_v2=True)
+
+        self.assertEqual(stream.call_count, 1)
+        self.assertEqual(self.manifest_path.read_bytes(), original)
+        self.assertEqual(
+            [
+                (
+                    event["images_done"],
+                    event["images_total"],
+                    event["last_committed_batch"],
+                )
+                for event in progress
+                if event["phase"] == "upgrade_v2"
+            ],
+            [(2, 2, 2)],
+        )
+        self.assertEqual(
+            [
+                event["last_committed_batch"]
+                for event in progress
+                if event["phase"] == "database"
+            ],
+            [3],
+        )
+        self.assertEqual(journal.last_committed_batch(), 3)
+
+    def test_partial_v2_restart_recovers_matching_uncommitted_import(self):
+        first = self.make_image(sizes=())
+        pending = self.make_image(sizes=())
+        self.write_v2_plans((first, pending), completed=1)
+        summary = self.migrator(batch_size=1).run(execute=False)
+        journal = self.injected_journal(summary, 2, 2, 0)
+        first_batch_id = "upgrade-paths:{}-{}".format(
+            first.pk, first.pk
+        )
+
+        with mock.patch.object(
+            journal,
+            "append_commit",
+            side_effect=SimulatedProcessCrash(),
+        ), self.assertRaises(SimulatedProcessCrash):
+            self.migrator(
+                batch_size=1,
+                batch_journal=journal,
+            ).run(execute=True, upgrade_v2=True)
+
+        self.assertIsNotNone(journal.intent_for(first_batch_id))
+        self.assertFalse(journal.is_committed(first_batch_id))
+        progress = []
+        resumed = AutoV2MediaMigrator(
+            str(self.run_directory),
+            MANIFEST_FILENAME,
+            RUN_ID,
+            self.service_uid,
+            self.service_gid,
+            batch_size=1,
+            batch_journal=journal,
+            progress_reporter=progress.append,
+        )
+        with mock.patch.object(
+            journal,
+            "recover_batch",
+            wraps=journal.recover_batch,
+        ) as recover:
+            resumed.run(execute=True, upgrade_v2=True)
+
+        recover.assert_any_call(
+            first_batch_id,
+            journal.intent_for(first_batch_id).post_signature,
+        )
+        self.assertTrue(journal.is_committed(first_batch_id))
+        self.assertEqual(journal.last_committed_batch(), 2)
+        self.assertEqual(
+            [
+                event["last_committed_batch"]
+                for event in progress
+                if event["phase"] in ("upgrade_v2", "database")
+            ],
+            [1, 2],
+        )
+
+    def test_partial_v2_restart_rejects_changed_upgrade_intent(self):
+        first = self.make_image(sizes=())
+        second = self.make_image(sizes=())
+        pending = self.make_image(sizes=())
+        self.write_v2_plans((first, second, pending), completed=2)
+        summary = self.migrator(batch_size=1).run(execute=False)
+        journal = self.injected_journal(summary, 3, 3, 0)
+        first_batch_id = "upgrade-paths:{}-{}".format(
+            first.pk, first.pk
+        )
+        real_import = journal.import_v2_batch
+
+        def crash_after_first_commit(intent, committed=True):
+            real_import(intent, committed=committed)
+            raise SimulatedProcessCrash()
+
+        with mock.patch.object(
+            journal,
+            "import_v2_batch",
+            side_effect=crash_after_first_commit,
+        ), self.assertRaises(SimulatedProcessCrash):
+            self.migrator(
+                batch_size=1,
+                batch_journal=journal,
+            ).run(execute=True, upgrade_v2=True)
+
+        original_intent = journal.intent_for(first_batch_id)
+        mismatched = replace(
+            original_intent,
+            batch_number=original_intent.batch_number + 100,
+        )
+
+        with mock.patch.object(
+            journal,
+            "intent_for",
+            side_effect=lambda batch_id: (
+                mismatched
+                if batch_id == first_batch_id
+                else journal.state.intents.get(batch_id)
+            ),
+        ), self.assertRaisesRegex(
+            CommandError, "^linear_journal_invalid$"
+        ):
+            self.migrator(
+                batch_size=1,
+                batch_journal=journal,
+            ).run(execute=True, upgrade_v2=True)
+
     def test_copying_v2_imports_terminal_prefix_then_resumes_pending(self):
         first = self.make_image(sizes=())
         second = self.make_image(sizes=())

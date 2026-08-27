@@ -2534,7 +2534,6 @@ class AutoV2MediaMigrator(object):
                 )
                 if (
                     manifest.state.format_version == 2
-                    and not journal.state.intents
                 ):
                     self._upgrade_v2_terminal_prefix(
                         manifest, journal, plans
@@ -2547,7 +2546,6 @@ class AutoV2MediaMigrator(object):
                 if (
                     upgrade_v2
                     and manifest.state.format_version == 2
-                    and not journal.state.intents
                 ):
                     self._upgrade_v2_terminal_prefix(
                         manifest, journal, plans
@@ -2768,7 +2766,27 @@ class AutoV2MediaMigrator(object):
                     item.width * item.height for item in prepared
                 ),
             )
-            journal.import_v2_batch(intent, committed=True)
+            existing = journal.intent_for(intent.batch_id)
+            if existing is not None:
+                if existing.as_dict() != intent.as_dict():
+                    raise _command_error("linear_journal_invalid")
+                if journal.is_committed(intent.batch_id):
+                    images_done += len(batch)
+                    continue
+                recovery = journal.recover_batch(
+                    intent.batch_id,
+                    post_signature,
+                )
+                if recovery != "append_commit":
+                    raise _command_error(
+                        "linear_journal_database_conflict"
+                    )
+                journal.append_commit(
+                    intent.batch_id,
+                    post_signature,
+                )
+            else:
+                journal.import_v2_batch(intent, committed=True)
             images_done += len(batch)
             self._report_progress({
                 "phase": "upgrade_v2",
