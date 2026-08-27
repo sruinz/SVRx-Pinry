@@ -709,6 +709,7 @@ class LegacyStartupCoordinator(object):
                 status.media_manifest_sha256,
             ),
         )
+        self._media_summary = authority.summary
         return authority
 
     def _converge_backfill(self, run, journal, backfiller=None):
@@ -986,16 +987,11 @@ class LegacyStartupCoordinator(object):
         status = migration_state.read_run_status(run)
         if status.phase != expected:
             raise LegacyStartupError("migration_state_phase_mismatch")
-        self._restore_summary_values(
-            run,
-            status,
-            force_reload=True,
-            batch_journal=batch_journal,
-            completion_authority=completion_authority,
-        )
         if (
             not isinstance(self._media_summary, AutoV2PlanSummary)
             or not isinstance(self._backfill_summary, BackfillSummary)
+            or completion_authority is None
+            or completion_authority.summary is not self._media_summary
         ):
             raise LegacyStartupError("migration_state_plan_mismatch")
         self._write_summary(
@@ -1118,12 +1114,35 @@ class LegacyStartupCoordinator(object):
         if phase_override not in (None, "complete"):
             raise LegacyStartupError("unsafe_migration_summary")
         status = migration_state.read_run_status(run)
-        self._restore_summary_values(
-            run,
-            status,
-            batch_journal=batch_journal,
-            completion_authority=completion_authority,
-        )
+        if phase_override == "complete":
+            if (
+                completion_authority is None
+                or completion_authority.summary is not self._media_summary
+            ):
+                raise LegacyStartupError("migration_state_plan_mismatch")
+            self._validate_summary_identity(
+                self._media_summary,
+                run,
+                (
+                    status.media_plan_sha256,
+                    status.media_manifest_sha256,
+                ),
+            )
+            self._validate_summary_identity(
+                self._backfill_summary,
+                run,
+                (
+                    status.backfill_plan_sha256,
+                    status.backfill_manifest_sha256,
+                ),
+            )
+        else:
+            self._restore_summary_values(
+                run,
+                status,
+                batch_journal=batch_journal,
+                completion_authority=completion_authority,
+            )
         media = self._media_summary
         backfill = self._backfill_summary
         reasons = {} if backfill is None else dict(backfill.reason_counts)

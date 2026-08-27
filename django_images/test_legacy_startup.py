@@ -1442,7 +1442,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         ):
             self.coordinator()._write_summary(run)
 
-    def test_transition_complete_reloads_cached_terminal_manifests(self):
+    def test_transition_complete_uses_prefrozen_terminal_objects_only(self):
         run = self._summary_run()
         migration_state.transition_state(
             run, "initialized", "schema_complete"
@@ -1463,18 +1463,32 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         )
         coordinator = self.coordinator()
         self._set_terminal_summaries(coordinator, run)
+        media_summary = coordinator._media_summary
+        backfill_summary = coordinator._backfill_summary
         journal = mock.sentinel.journal
-        authority = mock.sentinel.authority
+        authority = SimpleNamespace(summary=media_summary)
 
         with mock.patch(
             "django_images.services.legacy_startup."
             "load_completed_auto_v2_summary",
-            return_value=coordinator._media_summary,
+            side_effect=AssertionError("post-archive media reload"),
         ) as load_media, mock.patch(
             "django_images.services.legacy_startup."
             "load_completed_media_asset_backfill_summary",
-            return_value=coordinator._backfill_summary,
-        ) as load_backfill:
+            side_effect=AssertionError("post-archive backfill reload"),
+        ) as load_backfill, mock.patch(
+            "django_images.services.legacy_startup."
+            "MigrationBatchJournal.open",
+            side_effect=AssertionError("post-archive journal reopen"),
+        ) as journal_open, mock.patch(
+            "django_images.services.legacy_startup."
+            "AutoV2ManifestLog.open",
+            side_effect=AssertionError("post-archive manifest reopen"),
+        ) as manifest_open, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            side_effect=AssertionError("post-archive legacy root scan"),
+        ) as inspect_evidence:
             coordinator._transition_complete(
                 run,
                 "registry_complete",
@@ -1482,19 +1496,16 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                 completion_authority=authority,
             )
 
-        self.assertGreaterEqual(load_media.call_count, 1)
-        self.assertGreaterEqual(load_backfill.call_count, 1)
-        self.assertIs(
-            load_media.call_args.kwargs["batch_journal"], journal
-        )
-        self.assertIs(
-            load_media.call_args.kwargs["completion_authority"], authority
-        )
-        self.assertIs(
-            load_backfill.call_args.kwargs["batch_journal"], journal
-        )
+        load_media.assert_not_called()
+        load_backfill.assert_not_called()
+        journal_open.assert_not_called()
+        manifest_open.assert_not_called()
+        inspect_evidence.assert_not_called()
+        self.assertIs(coordinator._media_summary, media_summary)
+        self.assertIs(coordinator._backfill_summary, backfill_summary)
+        self.assertIs(authority.summary, media_summary)
 
-    def test_transition_complete_rejects_tampered_cached_backfill_manifest(self):
+    def test_transition_complete_rejects_missing_prefrozen_backfill_summary(self):
         run = self._summary_run()
         migration_state.transition_state(
             run, "initialized", "schema_complete"
@@ -1515,18 +1526,28 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         )
         coordinator = self.coordinator()
         self._set_terminal_summaries(coordinator, run)
+        media_summary = coordinator._media_summary
+        coordinator._backfill_summary = None
         journal = mock.sentinel.journal
-        authority = mock.sentinel.authority
+        authority = SimpleNamespace(summary=media_summary)
 
         with mock.patch(
             "django_images.services.legacy_startup."
             "load_completed_auto_v2_summary",
-            return_value=coordinator._media_summary,
-        ), mock.patch(
+            side_effect=AssertionError("post-archive media reload"),
+        ) as load_media, mock.patch(
             "django_images.services.legacy_startup."
             "load_completed_media_asset_backfill_summary",
-            side_effect=CommandError("unsafe_media_asset_manifest"),
-        ), self.assertRaisesRegex(
+            side_effect=AssertionError("post-archive backfill reload"),
+        ) as load_backfill, mock.patch(
+            "django_images.services.legacy_startup."
+            "MigrationBatchJournal.open",
+            side_effect=AssertionError("post-archive journal reopen"),
+        ) as journal_open, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            side_effect=AssertionError("post-archive legacy root scan"),
+        ) as inspect_evidence, self.assertRaisesRegex(
             LegacyStartupError,
             "^migration_state_plan_mismatch$",
         ):
@@ -1537,6 +1558,10 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                 completion_authority=authority,
             )
 
+        load_media.assert_not_called()
+        load_backfill.assert_not_called()
+        journal_open.assert_not_called()
+        inspect_evidence.assert_not_called()
         self.assertEqual(
             migration_state.read_run_status(run).phase,
             "registry_complete",
@@ -2542,7 +2567,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             progress=None,
         )
         journal = mock.sentinel.journal
-        authority = mock.sentinel.authority
+        authority = SimpleNamespace(summary=coordinator._media_summary)
         evidence = self.evidence(present=False)
 
         with mock.patch(
@@ -2613,7 +2638,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             progress=None,
         )
         journal = mock.sentinel.journal
-        authority = mock.sentinel.authority
+        authority = SimpleNamespace(summary=coordinator._media_summary)
         evidence = self.evidence(present=False)
 
         with mock.patch(
@@ -2655,6 +2680,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
 
         resumed = self.coordinator()
         self._set_terminal_summaries(resumed, run)
+        resumed_authority = SimpleNamespace(summary=resumed._media_summary)
         with mock.patch(
             "django_images.services.legacy_startup.LegacyMediaArchive",
             return_value=archive,
@@ -2670,14 +2696,14 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             expected = resumed._converge_archive(
                 run,
                 journal,
-                authority,
+                resumed_authority,
                 evidence,
             )
             resumed._transition_complete(
                 run,
                 expected,
                 journal,
-                completion_authority=authority,
+                completion_authority=resumed_authority,
             )
 
         self.assertEqual(
