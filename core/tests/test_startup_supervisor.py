@@ -1,4 +1,6 @@
 import errno
+import fcntl
+import http.client
 import importlib.util
 import importlib
 import json
@@ -343,6 +345,325 @@ class WorkerCliTests(unittest.TestCase):
                     "--progress-fd", str(self.progress_writer),
                     "--lock-fd", str(self.lock_file.fileno()),
                 ])
+
+    def test_cli_sanitizes_huge_decimal_descriptor(self):
+        with self.assertRaisesRegex(
+            self.worker.WorkerProtocolError,
+            "startup_argument_invalid",
+        ):
+            self.worker._parse_cli([
+                "--progress-fd", "9" * 1000,
+                "--lock-fd", str(self.lock_file.fileno()),
+            ])
+
+
+class WorkerSubprocessIntegrationTests(unittest.TestCase):
+    def test_real_worker_uses_passed_fds_project_cwd_and_terminal_eof(self):
+        temporary = Path(tempfile.mkdtemp(dir="/private/tmp"))
+        wrapper = temporary / "worker_wrapper.py"
+        capture = temporary / "capture.jsonl"
+        lock_path = temporary / "startup.lock"
+        wrapper.write_text(
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            "root = sys.argv[1]\n"
+            "capture = sys.argv[2]\n"
+            "arguments = sys.argv[3:]\n"
+            "sys.path.insert(0, root)\n"
+            "from docker.scripts import migration_worker as worker\n"
+            "def record(name, **values):\n"
+            "    values.update({'name': name, 'cwd': os.getcwd()})\n"
+            "    with open(capture, 'a', encoding='utf-8') as target:\n"
+            "        target.write(json.dumps(values, sort_keys=True) + '\\n')\n"
+            "record('wrapper')\n"
+            "def bootstrap():\n"
+            "    record('bootstrap')\n"
+            "def setup_django():\n"
+            "    record('django')\n"
+            "def coordinator(args, lock_fd, reporter):\n"
+            "    os.fstat(lock_fd)\n"
+            "    record('coordinator', args=args, "
+            "lock_inheritable=os.get_inheritable(lock_fd), "
+            "progress_inheritable=os.get_inheritable(reporter.progress_fd))\n"
+            "    reporter.send({'phase': 'preparing'})\n"
+            "worker._run_bootstrap = bootstrap\n"
+            "worker._setup_django = setup_django\n"
+            "worker._run_coordinator = coordinator\n"
+            "raise SystemExit(worker._entrypoint(arguments))\n",
+            encoding="utf-8",
+        )
+        reader, writer = os.pipe()
+        lock_file = open(str(lock_path), "a+b")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.addCleanup(lock_file.close)
+        self.addCleanup(os.close, reader)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(wrapper),
+                str(REPOSITORY_ROOT),
+                str(capture),
+                "--migrate-legacy",
+                "--progress-fd",
+                str(writer),
+                "--lock-fd",
+                str(lock_file.fileno()),
+            ],
+            cwd="/private/tmp",
+            close_fds=True,
+            pass_fds=(writer, lock_file.fileno()),
+        )
+        os.close(writer)
+
+        chunks = []
+        while True:
+            payload = os.read(reader, 4096)
+            if not payload:
+                break
+            chunks.append(payload)
+
+        self.assertEqual(process.wait(timeout=5), 0)
+        frames = [
+            json.loads(line.decode("utf-8"))
+            for line in b"".join(chunks).splitlines()
+        ]
+        self.assertEqual(frames, [
+            {"phase": "preparing"},
+            {"phase": "complete"},
+        ])
+        records = [
+            json.loads(line)
+            for line in capture.read_text("utf-8").splitlines()
+        ]
+        self.assertEqual(
+            [record["name"] for record in records],
+            ["wrapper", "bootstrap", "django", "coordinator"],
+        )
+        self.assertEqual(records[0]["cwd"], "/private/tmp")
+        self.assertTrue(all(
+            record["cwd"] == str(REPOSITORY_ROOT)
+            for record in records[1:]
+        ))
+        self.assertEqual(records[-1]["args"], ["--migrate-legacy"])
+        self.assertFalse(records[-1]["lock_inheritable"])
+        self.assertFalse(records[-1]["progress_inheritable"])
+
+        contender = open(str(lock_path), "a+b")
+        try:
+            with self.assertRaises((IOError, OSError)):
+                fcntl.flock(
+                    contender.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+        finally:
+            contender.close()
+
+
+class StartupRunnerSubprocessIntegrationTests(unittest.TestCase):
+    def test_real_runner_imports_project_modules_from_private_tmp(self):
+        temporary = Path(tempfile.mkdtemp(dir="/private/tmp"))
+        project_root = temporary / "project"
+        scripts = project_root / "docker/scripts"
+        scripts.mkdir(parents=True)
+        for package in (project_root / "docker", scripts):
+            (package / "__init__.py").write_text("", encoding="utf-8")
+        (scripts / "startup.py").write_text(
+            (REPOSITORY_ROOT / "docker/scripts/startup.py").read_text(
+                encoding="utf-8"
+            ),
+            encoding="utf-8",
+        )
+        (scripts / "migration_status.py").write_text(
+            "ERROR_CODE_CLASSES = {'runtime_supervisor_failed': 'runtime'}\n"
+            "STATUS_DIRECTORY = '/private/tmp/status'\n"
+            "class MigrationStatusStore(object):\n"
+            "    def __init__(self, *arguments): self.arguments = arguments\n",
+            encoding="utf-8",
+        )
+        capture = temporary / "runner.jsonl"
+        (scripts / "supervisor.py").write_text(
+            "import json, os\n"
+            "class RuntimeSupervisor(object):\n"
+            "    def __init__(self, arguments, data_root, uid, gid, status):\n"
+            "        self.values = {'arguments': arguments, 'data_root': data_root, "
+            "'uid': uid, 'gid': gid, 'cwd': os.getcwd()}\n"
+            "    def handle_signal(self, signum, frame): pass\n"
+            "    def run(self):\n"
+            "        with open(os.environ['PINRY_STARTUP_CAPTURE'], 'w') as target:\n"
+            "            json.dump(self.values, target)\n"
+            "        return 0\n",
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        environment["PINRY_STARTUP_CAPTURE"] = str(capture)
+        environment["PINRY_DATA_ROOT"] = str(temporary / "data")
+        environment["PYTHONPATH"] = ""
+
+        completed = subprocess.run(
+            [sys.executable, str(scripts / "startup.py"), "--migrate-legacy"],
+            cwd="/private/tmp",
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        values = json.loads(capture.read_text(encoding="utf-8"))
+        self.assertEqual(values["arguments"], ["--migrate-legacy"])
+        self.assertEqual(values["data_root"], str(temporary / "data"))
+        self.assertEqual(values["cwd"], "/private/tmp")
+
+
+class GunicornSubprocessIntegrationTests(unittest.TestCase):
+    def test_real_gunicorn_process_is_started_from_project_root(self):
+        supervisor_module = _load_script("supervisor")
+        temporary = Path(tempfile.mkdtemp(dir="/private/tmp"))
+        capture = temporary / "cwd.txt"
+        command = temporary / "capture_cwd.py"
+        command.write_text(
+            "#!{}\n"
+            "import os\n"
+            "with open({!r}, 'w') as target:\n"
+            "    target.write(os.getcwd())\n".format(
+                sys.executable,
+                str(capture),
+            ),
+            encoding="utf-8",
+        )
+        command.chmod(0o700)
+
+        def identity_reader(pid):
+            return {
+                "pid": pid,
+                "pgid": pid,
+                "session": pid,
+                "starttime": "100",
+                "state": "S",
+            }
+
+        status = _FakeStatusStore([], supervisor_module.StatusError)
+        runtime = supervisor_module.RuntimeSupervisor(
+            [],
+            "/data",
+            33,
+            33,
+            status,
+            identity_reader=identity_reader,
+            group_reader=lambda pgid: {},
+        )
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir("/private/tmp")
+            with mock.patch.object(
+                supervisor_module, "GUNICORN_PATH", str(command)
+            ):
+                record = runtime._spawn_gunicorn()
+            self.assertEqual(record.process.wait(timeout=5), 0)
+            runtime._reap_record(record, timeout=0)
+        finally:
+            os.chdir(previous_cwd)
+            if "gunicorn" in runtime.children:
+                runtime._terminate_record(runtime.children["gunicorn"])
+
+        self.assertEqual(capture.read_text(encoding="utf-8"), str(
+            REPOSITORY_ROOT
+        ))
+        self.assertNotIn("gunicorn", runtime.children)
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "POSIX fork is required")
+class ProcessGroupIntegrationTests(unittest.TestCase):
+    def test_exited_master_record_survives_until_real_descendant_cleanup(self):
+        supervisor_module = _load_script("supervisor")
+        temporary = Path(tempfile.mkdtemp(dir="/private/tmp"))
+        info_path = temporary / "group.json"
+        script = (
+            "import json, os, signal, sys, time\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    signal.signal(signal.SIGTERM, "
+            "lambda signum, frame: sys.exit(0))\n"
+            "    while True:\n"
+            "        time.sleep(0.05)\n"
+            "with open(sys.argv[1], 'w') as target:\n"
+            "    json.dump({'master': os.getpid(), 'child': child, "
+            "'pgid': os.getpgrp(), 'session': os.getsid(0)}, target)\n"
+            "time.sleep(0.2)\n"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(info_path)],
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 3
+        while not info_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(info_path.exists())
+        info = json.loads(info_path.read_text("utf-8"))
+        child_pid = info["child"]
+
+        def child_alive():
+            try:
+                os.kill(child_pid, 0)
+                return True
+            except OSError as error:
+                if error.errno == errno.ESRCH:
+                    return False
+                raise
+
+        def group_reader(pgid):
+            self.assertEqual(pgid, info["pgid"])
+            if not child_alive():
+                return {}
+            return {child_pid: {
+                "pid": child_pid,
+                "pgid": info["pgid"],
+                "session": info["session"],
+                "starttime": "101",
+                "state": "S",
+            }}
+
+        identity = {
+            "pid": info["master"],
+            "pgid": info["pgid"],
+            "session": info["session"],
+            "starttime": "100",
+            "state": "S",
+        }
+        status = _FakeStatusStore([], supervisor_module.StatusError)
+        runtime = supervisor_module.RuntimeSupervisor(
+            [],
+            "/data",
+            33,
+            33,
+            status,
+            group_reader=group_reader,
+            group_signaler=os.killpg,
+            sleeper=lambda seconds: time.sleep(min(seconds, 0.05)),
+        )
+        record = supervisor_module._ChildRecord(
+            "migration", process, identity
+        )
+        runtime.children["migration"] = record
+        try:
+            self.assertEqual(process.wait(timeout=3), 0)
+            self.assertEqual(runtime._reap_record(record, timeout=0), 0)
+            self.assertIn("migration", runtime.children)
+
+            runtime._terminate_record(record)
+
+            deadline = time.monotonic() + 3
+            while child_alive() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(child_alive())
+            self.assertNotIn("migration", runtime.children)
+        finally:
+            if child_alive():
+                try:
+                    os.killpg(info["pgid"], signal.SIGKILL)
+                except OSError:
+                    pass
 
 
 class _FakeStatusStore(object):
@@ -1075,6 +1396,134 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         self.assertTrue(process.kill_called)
         self.assertTrue(process.wait_called)
 
+    def test_direct_master_reap_keeps_record_until_descendant_exits(self):
+        process = _FakeProcess(
+            "migration", 5300, running=False, returncode=0
+        )
+        identity = {
+            "pid": 5300,
+            "pgid": 5300,
+            "session": 5300,
+            "starttime": "300",
+            "state": "S",
+        }
+        descendant_alive = [True]
+        signals = []
+
+        def read_group(pgid):
+            self.assertEqual(pgid, 5300)
+            if not descendant_alive[0]:
+                return {}
+            return {5301: {
+                "pid": 5301,
+                "pgid": 5300,
+                "session": 5300,
+                "starttime": "301",
+                "state": "S",
+            }}
+
+        def signal_group(pgid, signum):
+            self.assertEqual(pgid, 5300)
+            signals.append(signum)
+            if signum == signal.SIGTERM:
+                descendant_alive[0] = False
+
+        runtime = self.supervisor_module.RuntimeSupervisor(
+            ["--migrate-legacy"],
+            "/data",
+            33,
+            33,
+            self.status,
+            group_reader=read_group,
+            group_signaler=signal_group,
+            sleeper=lambda seconds: None,
+        )
+        record = self.supervisor_module._ChildRecord(
+            "migration", process, identity
+        )
+        runtime.children["migration"] = record
+
+        self.assertEqual(runtime._reap_record(record, timeout=0), 0)
+        self.assertIn("migration", runtime.children)
+
+        runtime._terminate_record(record)
+
+        self.assertEqual(signals, [signal.SIGTERM])
+        self.assertFalse(descendant_alive[0])
+        self.assertNotIn("migration", runtime.children)
+
+    def test_shutdown_children_share_one_fifteen_second_deadline(self):
+        now = [0.0]
+        records = {}
+        alive = {}
+        signals = []
+
+        def clock():
+            return now[0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        def identity_for(pid):
+            if not alive.get(pid):
+                raise OSError(errno.ESRCH, "gone")
+            return {
+                "pid": pid,
+                "pgid": pid,
+                "session": pid,
+                "starttime": str(pid),
+                "state": "S",
+            }
+
+        def read_group(pgid):
+            if not alive.get(pgid):
+                return {}
+            return {pgid: identity_for(pgid)}
+
+        def signal_group(pgid, signum):
+            signals.append((pgid, signum, now[0]))
+            if signum == signal.SIGKILL:
+                alive[pgid] = False
+                records[pgid].process.running = False
+                records[pgid].process.returncode = -signal.SIGKILL
+
+        runtime = self.supervisor_module.RuntimeSupervisor(
+            [],
+            "/data",
+            33,
+            33,
+            self.status,
+            clock=clock,
+            identity_reader=identity_for,
+            group_reader=read_group,
+            group_signaler=signal_group,
+            sleeper=sleep,
+        )
+        for role, pid in (("gunicorn", 5400), ("nginx", 5500)):
+            process = _FakeProcess(
+                role,
+                pid,
+                running=True,
+                block_wait_while_running=True,
+            )
+            identity = identity_for(pid) if alive.setdefault(pid, True) else None
+            record = self.supervisor_module._ChildRecord(
+                role, process, identity
+            )
+            records[pid] = record
+            runtime.children[role] = record
+
+        runtime.handle_signal(signal.SIGTERM, None)
+        runtime._cleanup()
+
+        self.assertLessEqual(now[0], 15.0)
+        term_times = [item[2] for item in signals if item[1] == signal.SIGTERM]
+        kill_times = [item[2] for item in signals if item[1] == signal.SIGKILL]
+        self.assertEqual(term_times, [0.0, 0.0])
+        self.assertEqual(len(kill_times), 2)
+        self.assertTrue(all(value <= 15.0 for value in kill_times))
+        self.assertEqual(runtime.children, {})
+
     def test_nginx_stop_signal_failure_kills_both_services(self):
         supervisor, processes = self._supervisor(
             b'{"phase":"complete"}\n',
@@ -1153,6 +1602,71 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
 
         self.assertEqual(supervisor.run(), 1)
         self.assertEqual(processes.processes, {})
+
+    def test_shutdown_before_run_starts_no_child(self):
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+        )
+
+        supervisor.handle_signal(signal.SIGTERM, None)
+
+        self.assertEqual(supervisor.run(), 0)
+        self.assertEqual(processes.processes, {})
+
+    def test_shutdown_during_lock_acquisition_starts_no_worker(self):
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+        )
+
+        def acquire_then_shutdown(*arguments):
+            lock = self._acquire_lock(*arguments)
+            supervisor.handle_signal(signal.SIGTERM, None)
+            return lock
+
+        supervisor.lock_acquirer = acquire_then_shutdown
+
+        self.assertEqual(supervisor.run(), 0)
+        self.assertNotIn("migration", processes.processes)
+        self.assertNotIn("gunicorn", processes.processes)
+
+    def test_shutdown_after_worker_complete_starts_no_gunicorn(self):
+        class ShutdownOnCompleteStatus(_FakeStatusStore):
+            runtime = None
+
+            def apply_worker_event(self, event):
+                super(ShutdownOnCompleteStatus, self).apply_worker_event(event)
+                if event["phase"] == "complete":
+                    self.runtime.handle_signal(signal.SIGTERM, None)
+
+        status = ShutdownOnCompleteStatus(
+            self.events,
+            self.supervisor_module.StatusError,
+        )
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            status=status,
+        )
+        status.runtime = supervisor
+
+        self.assertEqual(supervisor.run(), 0)
+        self.assertNotIn("gunicorn", processes.processes)
+
+    def test_gunicorn_is_spawned_from_project_root(self):
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+        )
+
+        record = supervisor._spawn_gunicorn()
+        self.addCleanup(supervisor._terminate_record, record)
+
+        self.assertEqual(
+            processes.spawn_kwargs["gunicorn"].get("cwd"),
+            str(REPOSITORY_ROOT),
+        )
 
     def test_nginx_spawn_failure_is_a_nonzero_supervisor_result(self):
         supervisor, _processes = self._supervisor(
@@ -1269,6 +1783,10 @@ class RuntimeSupervisorBoundaryTests(unittest.TestCase):
                 "source_commit": "development",
                 "display_version": "development",
             }, True),
+            (200, "application/json", {
+                "source_commit": "a" * 40 + "\n",
+                "display_version": "a" * 12,
+            }, False),
         )
         for status, content_type, payload, expected in cases:
             with self.subTest(payload=payload):
@@ -1280,6 +1798,87 @@ class RuntimeSupervisorBoundaryTests(unittest.TestCase):
                     ),
                     expected,
                 )
+
+    def test_default_readiness_ignores_environment_proxy(self):
+        payload = json.dumps({
+            "source_commit": "a" * 40,
+            "display_version": "a" * 12,
+        }).encode("utf-8")
+
+        class Response(object):
+            headers = {"Content-Type": "application/json"}
+
+            def read(self, size):
+                self.size = size
+                return payload
+
+            @staticmethod
+            def getcode():
+                return 200
+
+            @staticmethod
+            def close():
+                pass
+
+        class Opener(object):
+            @staticmethod
+            def open(request, timeout):
+                del request, timeout
+                return Response()
+
+        handlers = []
+
+        def build_opener(*items):
+            handlers.extend(items)
+            return Opener()
+
+        status = _FakeStatusStore([], self.supervisor.StatusError)
+        runtime = self.supervisor.RuntimeSupervisor(
+            [], "/data", 33, 33, status
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"HTTP_PROXY": "http://proxy.invalid:8080"},
+        ), mock.patch.object(
+            self.supervisor.urllib.request,
+            "build_opener",
+            side_effect=build_opener,
+        ):
+            self.assertTrue(runtime._default_readiness_probe())
+        empty_proxy_handlers = [
+            handler for handler in handlers
+            if isinstance(handler, self.supervisor.urllib.request.ProxyHandler)
+            and handler.proxies == {}
+        ]
+        self.assertEqual(len(empty_proxy_handlers), 1)
+
+    def test_default_readiness_normalizes_truncated_body(self):
+        class TruncatedResponse(object):
+            headers = {"Content-Type": "application/json"}
+
+            @staticmethod
+            def read(size):
+                del size
+                raise http.client.IncompleteRead(b"partial", 1000)
+
+            @staticmethod
+            def close():
+                pass
+
+        opener = mock.Mock()
+        opener.open.return_value = TruncatedResponse()
+        status = _FakeStatusStore([], self.supervisor.StatusError)
+        runtime = self.supervisor.RuntimeSupervisor(
+            [], "/data", 33, 33, status
+        )
+
+        with mock.patch.object(
+            self.supervisor.urllib.request,
+            "build_opener",
+            return_value=opener,
+        ):
+            self.assertFalse(runtime._default_readiness_probe())
 
     def test_proc_stat_uses_last_closing_parenthesis(self):
         stat_line = (

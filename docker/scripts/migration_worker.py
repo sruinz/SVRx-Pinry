@@ -264,7 +264,7 @@ def _parse_cli(arguments):
         descriptor = int(raw, 10)
         try:
             os.fstat(descriptor)
-        except OSError:
+        except (OSError, OverflowError):
             raise WorkerProtocolError("startup_argument_invalid")
         descriptors.append(descriptor)
     if descriptors[0] == descriptors[1]:
@@ -272,7 +272,7 @@ def _parse_cli(arguments):
     try:
         for descriptor in descriptors:
             os.set_inheritable(descriptor, False)
-    except OSError:
+    except (OSError, OverflowError):
         raise WorkerProtocolError("startup_argument_invalid")
     return migration_arguments, descriptors[0], descriptors[1]
 

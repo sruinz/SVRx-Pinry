@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import errno
+import http.client
 import json
 import os
 import re
@@ -26,7 +27,7 @@ _READINESS_INTERVAL_SECONDS = 0.5
 _QUIESCE_SECONDS = 5.0
 _SHUTDOWN_SECONDS = 15.0
 _READINESS_URL = "http://127.0.0.1:8000/api/v2/version/"
-_SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
 PROJECT_ROOT = os.path.realpath(
     os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
@@ -47,6 +48,10 @@ class SupervisorError(Exception):
     def __init__(self, code):
         super(SupervisorError, self).__init__(code)
         self.code = code
+
+
+class _ShutdownRequested(Exception):
+    pass
 
 
 def _safe_error_code(error, fallback="runtime_supervisor_failed"):
@@ -134,7 +139,7 @@ def _valid_readiness_payload(status, content_type, payload):
     if source_commit == "development":
         return display_version == "development"
     return (
-        _SOURCE_COMMIT_RE.match(source_commit) is not None
+        _SOURCE_COMMIT_RE.fullmatch(source_commit) is not None
         and display_version == source_commit[:12]
     )
 
@@ -154,6 +159,8 @@ class _ChildRecord(object):
         self.pgid = process.pid
         self.session = process.pid
         self.starttime = None
+        self.returncode = None
+        self.master_reaped = False
         if identity is not None:
             self.pgid = identity["pgid"]
             self.session = identity["session"]
@@ -293,6 +300,7 @@ class RuntimeSupervisor(object):
         self.last_worker_error = "legacy_startup_failed"
         self._last_heartbeat = None
         self._shutdown_signal = None
+        self._shutdown_deadline = None
         self._shutdown_signaled = set()
         self._worker_terminal = None
 
@@ -302,6 +310,10 @@ class RuntimeSupervisor(object):
             print(message, flush=True)
         except (IOError, OSError):
             pass
+
+    def _raise_if_shutdown(self):
+        if self._shutdown_signal is not None:
+            raise _ShutdownRequested()
 
     def _project_status(self, method, *arguments):
         try:
@@ -327,14 +339,25 @@ class RuntimeSupervisor(object):
             self._project_status(self.status_store.heartbeat)
             self._last_heartbeat = now
 
-    def _spawn(self, role, command, pass_fds=()):
+    def _spawn(self, role, command, pass_fds=(), cwd=None):
+        if self._shutdown_signal is not None:
+            raise _ShutdownRequested()
         try:
-            process = self.process_factory(
-                list(command),
-                close_fds=True,
-                pass_fds=tuple(pass_fds),
-                start_new_session=True,
-            )
+            if cwd is None:
+                process = self.process_factory(
+                    list(command),
+                    close_fds=True,
+                    pass_fds=tuple(pass_fds),
+                    start_new_session=True,
+                )
+            else:
+                process = self.process_factory(
+                    list(command),
+                    close_fds=True,
+                    pass_fds=tuple(pass_fds),
+                    start_new_session=True,
+                    cwd=cwd,
+                )
         except (IOError, OSError):
             code = {
                 "nginx": "nginx_start_failed",
@@ -410,13 +433,28 @@ class RuntimeSupervisor(object):
     def _reap_record(self, record, timeout=None):
         if record is None:
             return None
-        try:
-            result = record.process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        if record.master_reaped:
+            result = record.returncode
+        else:
+            try:
+                result = record.process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return None
+            except (IOError, OSError):
+                result = record.process.poll()
+            if result is not None:
+                record.returncode = result
+                record.master_reaped = True
+        if result is None:
             return None
-        except (IOError, OSError):
-            result = record.process.poll()
-        if result is not None:
+        if record.starttime is None:
+            self.children.pop(record.role, None)
+            return result
+        try:
+            group_alive = self._group_is_alive(record)
+        except SupervisorError:
+            group_alive = True
+        if not group_alive:
             self.children.pop(record.role, None)
         return result
 
@@ -464,71 +502,107 @@ class RuntimeSupervisor(object):
             raise SupervisorError("runtime_supervisor_failed")
         return True
 
-    def _terminate_record(self, record):  # noqa: C901
-        if record is None or record.role not in self.children:
+    def _record_is_registered(self, record):
+        return (
+            record is not None
+            and self.children.get(record.role) is record
+        )
+
+    def _send_term_record(self, record):
+        if not self._record_is_registered(record):
             return
+        if record.role in self._shutdown_signaled:
+            return
+        signaled = False
+        try:
+            signaled = self._signal_verified_group(
+                record, signal.SIGTERM
+            )
+        except SupervisorError:
+            signaled = False
+        if not signaled and record.process.poll() is None:
+            try:
+                record.process.terminate()
+                signaled = True
+            except (AttributeError, IOError, OSError):
+                pass
+        if signaled:
+            self._shutdown_signaled.add(record.role)
+
+    def _refresh_records(self, records):
+        active = []
+        for record in records:
+            if not self._record_is_registered(record):
+                continue
+            if record.master_reaped or record.process.poll() is not None:
+                self._reap_record(record, timeout=0)
+            if self._record_is_registered(record):
+                active.append(record)
+        return active
+
+    def _kill_record(self, record):
+        if not self._record_is_registered(record):
+            return
+        try:
+            if self._signal_verified_group(record, signal.SIGKILL):
+                return
+        except SupervisorError:
+            pass
         if record.process.poll() is None:
-            if record.role not in self._shutdown_signaled:
-                try:
-                    self._signal_record(record, signal.SIGTERM)
-                except SupervisorError:
-                    pass
-        deadline = self.clock() + _SHUTDOWN_SECONDS
-        group_alive = True
-        group_known = False
-        while self.clock() < deadline:
-            try:
-                group_alive = self._group_is_alive(record)
-                group_known = True
-            except SupervisorError:
-                group_known = False
-                group_alive = record.process.poll() is None
-            if (
-                group_known
-                and record.process.poll() is not None
-                and not group_alive
-            ):
-                break
-            self.sleeper(min(_POLL_SECONDS, max(0, deadline - self.clock())))
-        if group_known and group_alive:
-            try:
-                self._signal_verified_group(record, signal.SIGKILL)
-            except SupervisorError:
-                if record.process.poll() is None:
-                    try:
-                        record.process.kill()
-                    except (AttributeError, IOError, OSError):
-                        pass
-            try:
-                group_alive = self._group_is_alive(record)
-                group_known = True
-            except SupervisorError:
-                group_known = False
-                group_alive = record.process.poll() is None
-            kill_deadline = self.clock() + _POLL_SECONDS
-            while group_known and group_alive and self.clock() < kill_deadline:
-                try:
-                    group_alive = self._group_is_alive(record)
-                except SupervisorError:
-                    group_known = False
-                    break
-                self.sleeper(0.05)
-        elif record.process.poll() is None:
             try:
                 record.process.kill()
             except (AttributeError, IOError, OSError):
                 pass
-            try:
-                record.process.wait(timeout=_POLL_SECONDS)
-            except (AttributeError, IOError, OSError,
-                    subprocess.TimeoutExpired):
-                pass
-        if (
-            group_known
-            and record.process.poll() is not None
-            and not group_alive
-        ):
-            self._reap_record(record, timeout=0)
+
+    def _terminate_records(self, records, deadline=None):
+        active = [
+            record for record in records
+            if self._record_is_registered(record)
+        ]
+        if not active:
+            return
+        if deadline is None:
+            deadline = self.clock() + _SHUTDOWN_SECONDS
+        for record in active:
+            self._send_term_record(record)
+        kill_at = max(self.clock(), deadline - _POLL_SECONDS)
+        while active:
+            now = self.clock()
+            if now >= kill_at:
+                break
+            active = self._refresh_records(active)
+            if active:
+                self.sleeper(min(
+                    0.05,
+                    max(0, kill_at - now),
+                ))
+        active = self._refresh_records(active)
+        for record in active:
+            self._kill_record(record)
+        active = self._refresh_records(active)
+        observable = []
+        for record in active:
+            if record.master_reaped:
+                try:
+                    self._verified_group_members(record)
+                except SupervisorError:
+                    continue
+            observable.append(record)
+        active = observable
+        while active:
+            now = self.clock()
+            if now >= deadline:
+                break
+            active = self._refresh_records(active)
+            if active:
+                self.sleeper(min(
+                    0.05,
+                    max(0, deadline - now),
+                ))
+        self._refresh_records(active)
+
+    def _terminate_record(self, record, deadline=None):
+        self._terminate_records((record,), deadline=deadline)
 
     def _spawn_nginx(self):
         return self._spawn("nginx", NGINX_COMMAND)
@@ -572,19 +646,24 @@ class RuntimeSupervisor(object):
         return record, reader
 
     def _spawn_gunicorn(self):
-        return self._spawn("gunicorn", (GUNICORN_PATH,))
+        return self._spawn(
+            "gunicorn", (GUNICORN_PATH,), cwd=PROJECT_ROOT
+        )
 
     def _child_survived_start(self, record):
         if record.process.poll() is not None:
             self._reap_record(record)
+            self._terminate_record(record)
             return False
         self.sleeper(0.05)
         if record.process.poll() is not None:
             self._reap_record(record)
+            self._terminate_record(record)
             return False
         return True
 
     def _acquire_lock(self):
+        self._raise_if_shutdown()
         if self.lock_acquirer is None:
             from django_images.services import startup_lock
             acquire = startup_lock.acquire_startup_lock
@@ -600,7 +679,7 @@ class RuntimeSupervisor(object):
         if phase in ("complete", "error"):
             self._worker_terminal = phase
 
-    def _drive_worker_and_heartbeat(self):
+    def _drive_worker_and_heartbeat(self):  # noqa: C901
         decoder = ProgressFrameDecoder()
         selector = self.selector_factory()
         eof = False
@@ -612,7 +691,7 @@ class RuntimeSupervisor(object):
                     return _WORKER_SHUTDOWN
                 if self.nginx.process.poll() is not None:
                     self._reap_record(self.nginx)
-                    self._terminate_record(self.worker)
+                    self._terminate_records((self.nginx, self.worker))
                     return _NGINX_EXITED
                 ready = selector.select(_POLL_SECONDS)
                 for key, _mask in ready:
@@ -636,6 +715,10 @@ class RuntimeSupervisor(object):
             result = self._reap_record(self.worker, timeout=_POLL_SECONDS)
             if result is None:
                 raise SupervisorError("worker_protocol_invalid")
+            if self._record_is_registered(self.worker):
+                self._terminate_record(self.worker)
+            if self._record_is_registered(self.worker):
+                raise SupervisorError("runtime_supervisor_failed")
             if result == 0 and self._worker_terminal == "complete":
                 return 0
             if result != 0 and self._worker_terminal == "error":
@@ -660,7 +743,10 @@ class RuntimeSupervisor(object):
             self.progress_reader = None
 
     def _default_readiness_probe(self):
-        opener = urllib.request.build_opener(_NoRedirectHandler())
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _NoRedirectHandler(),
+        )
         request = urllib.request.Request(_READINESS_URL, method="GET")
         try:
             response = opener.open(request, timeout=2)
@@ -681,6 +767,7 @@ class RuntimeSupervisor(object):
             finally:
                 response.close()
         except (IOError, OSError, UnicodeError, ValueError,
+                http.client.HTTPException,
                 urllib.error.URLError):
             return False
 
@@ -776,9 +863,11 @@ class RuntimeSupervisor(object):
             return _WORKER_SHUTDOWN
         if self.nginx.process.poll() is not None:
             self._reap_record(self.nginx, timeout=0)
+            self._terminate_record(self.nginx)
             return _NGINX_EXITED
         if self.gunicorn.process.poll() is not None:
             self._reap_record(self.gunicorn, timeout=0)
+            self._terminate_record(self.gunicorn)
             return 1
         return 0
 
@@ -787,8 +876,7 @@ class RuntimeSupervisor(object):
         if state == 0:
             return None
         if not self._confirm_gate():
-            self._terminate_record(self.gunicorn)
-            self._terminate_record(self.nginx)
+            self._terminate_records((self.gunicorn, self.nginx))
             return 1
         if state == _WORKER_SHUTDOWN:
             return 0
@@ -829,8 +917,7 @@ class RuntimeSupervisor(object):
                 )
             except SupervisorError:
                 pass
-            self._terminate_record(self.gunicorn)
-            self._terminate_record(self.nginx)
+            self._terminate_records((self.gunicorn, self.nginx))
             return 1
         guarded = self._guard_gate_transition(nginx_stopped=True)
         if guarded is not None:
@@ -846,8 +933,7 @@ class RuntimeSupervisor(object):
                 )
             except SupervisorError:
                 pass
-            self._terminate_record(self.gunicorn)
-            self._terminate_record(self.nginx)
+            self._terminate_records((self.gunicorn, self.nginx))
             return 1
         guarded = self._guard_gate_transition(nginx_stopped=True)
         if guarded is not None:
@@ -897,16 +983,15 @@ class RuntimeSupervisor(object):
             resumed = False
         if not resumed:
             if not self._confirm_gate():
-                self._terminate_record(self.gunicorn)
-                self._terminate_record(self.nginx)
+                self._terminate_records((self.gunicorn, self.nginx))
                 return 1
-            self._terminate_record(self.gunicorn)
-            self._terminate_record(self.nginx)
+            self._terminate_records((self.gunicorn, self.nginx))
             return 1
         return self._serve_application()
 
     def _project_until_durable(self, method, deadline):
         while self.clock() < deadline:
+            self._raise_if_shutdown()
             if self._project_status(method):
                 return True
             self._status_tick()
@@ -922,10 +1007,12 @@ class RuntimeSupervisor(object):
         return self._hold_failed(code)
 
     def _start_application_and_serve(self):
+        self._raise_if_shutdown()
         try:
             self.gunicorn = self._spawn_gunicorn()
         except SupervisorError:
             return self._hold_failed("gunicorn_start_failed")
+        self._raise_if_shutdown()
         if not self._child_survived_start(self.gunicorn):
             return self._hold_failed("gunicorn_start_failed")
         ready = self._wait_for_readiness()
@@ -944,10 +1031,11 @@ class RuntimeSupervisor(object):
             self._status_tick()
             if self.nginx.process.poll() is not None:
                 self._reap_record(self.nginx)
-                self._terminate_record(self.gunicorn)
+                self._terminate_records((self.nginx, self.gunicorn))
                 return 1
             if self.gunicorn.process.poll() is not None:
                 self._reap_record(self.gunicorn)
+                self._terminate_record(self.gunicorn)
                 try:
                     self.status_store.create_gate()
                 except StatusError:
@@ -967,6 +1055,7 @@ class RuntimeSupervisor(object):
             if self.nginx is None or self.nginx.process.poll() is not None:
                 if self.nginx is not None:
                     self._reap_record(self.nginx)
+                    self._terminate_record(self.nginx)
                 return 1
             self.sleeper(_POLL_SECONDS)
         return 0
@@ -976,23 +1065,26 @@ class RuntimeSupervisor(object):
         if self._shutdown_signal is not None:
             return
         self._shutdown_signal = signum
+        self._shutdown_deadline = self.clock() + _SHUTDOWN_SECONDS
         if "migration" in self.children:
             order = ("migration", "nginx")
         else:
             order = ("gunicorn", "nginx")
         for role in order:
             record = self.children.get(role)
-            if record is None or record.process.poll() is not None:
-                continue
-            try:
-                if self._signal_record(record, signum):
-                    self._shutdown_signaled.add(role)
-            except SupervisorError:
-                pass
+            self._send_term_record(record)
 
     def _cleanup(self):
-        for role in ("migration", "gunicorn", "nginx"):
-            self._terminate_record(self.children.get(role))
+        deadline = self._shutdown_deadline
+        if deadline is None:
+            deadline = self.clock() + _SHUTDOWN_SECONDS
+        self._terminate_records(
+            [
+                self.children.get(role)
+                for role in ("migration", "gunicorn", "nginx")
+            ],
+            deadline=deadline,
+        )
         if os.getpid() == 1:
             while True:
                 try:
@@ -1007,17 +1099,24 @@ class RuntimeSupervisor(object):
     def run(self):
         result = 1
         try:
+            self._raise_if_shutdown()
             self.status_store.prepare_runtime_gate()
+            self._raise_if_shutdown()
             self.nginx = self._spawn_nginx()
             if not self._child_survived_start(self.nginx):
                 return 1
+            self._raise_if_shutdown()
             self._project_status(self.status_store.initialize)
+            self._raise_if_shutdown()
             try:
                 self.startup_lock = self._acquire_lock()
             except BaseException as error:
                 if not isinstance(error, Exception):
                     raise
+                if isinstance(error, _ShutdownRequested):
+                    raise
                 return self._hold_failed(_safe_error_code(error))
+            self._raise_if_shutdown()
             self.worker, self.progress_reader = self._spawn_worker(
                 self.startup_lock.fileno()
             )
@@ -1028,8 +1127,11 @@ class RuntimeSupervisor(object):
                 return 1
             if worker_result != 0:
                 return self._hold_failed(self.last_worker_error)
+            self._raise_if_shutdown()
             result = self._start_application_and_serve()
             return result
+        except _ShutdownRequested:
+            return 0
         except SupervisorError as error:
             if self.nginx is not None and self.nginx.process.poll() is None:
                 return self._hold_failed(_safe_error_code(error))
