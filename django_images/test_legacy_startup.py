@@ -16,6 +16,7 @@ from django_images.services.legacy_startup import (
     LegacyStartupCoordinator,
     LegacyStartupError,
     _atomic_write_summary,
+    _summary_target_kind,
 )
 from django_images.services.migration_batch_log import (
     JOURNAL_FILENAME,
@@ -1241,15 +1242,25 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         os.chmod(str(summary_path), 0o644)
         return run, summary_path
 
-    def test_completed_separate_start_uses_only_durable_summary(self):
-        run, summary_path = self._completed_run_with_summary()
+    def test_completed_history_is_verified_before_current_noop_start(self):
+        _run, summary_path = self._completed_run_with_summary()
         original_summary = summary_path.read_bytes()
         coordinator = self.coordinator()
+        current_evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
 
         with mock.patch(
             "django_images.services.legacy_startup."
             "startup_preflight.inspect_legacy_evidence",
-            side_effect=AssertionError("completed run legacy scan"),
+            return_value=current_evidence,
         ) as inspect_evidence, mock.patch(
             "django_images.services.legacy_startup."
             "AutoV2ManifestLog.open",
@@ -1278,17 +1289,201 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             resumed = coordinator.prepare_before_schema()
             result = coordinator.converge_after_schema(resumed)
 
-        self.assertEqual(result.run_id, run.run_id)
+        self.assertIsNone(resumed)
+        self.assertIsNone(result)
         self.assertEqual(summary_path.read_bytes(), original_summary)
         self.assertEqual(stat.S_IMODE(summary_path.stat().st_mode), 0o644)
         self.assertEqual(summary_path.stat().st_uid, os.geteuid())
         self.assertEqual(summary_path.stat().st_gid, os.getegid())
-        inspect_evidence.assert_not_called()
+        inspect_evidence.assert_called_once()
         manifest_open.assert_not_called()
         journal_open.assert_not_called()
         load_media.assert_not_called()
         load_backfill.assert_not_called()
         seal.assert_not_called()
+
+    def test_completed_previous_summary_contract_is_promoted_on_update(self):
+        _run, summary_path = self._completed_run_with_summary()
+        original_summary = summary_path.read_bytes()
+        os.chmod(str(summary_path), 0o600)
+        coordinator = self.coordinator()
+        current_evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=current_evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_configuration_preflight",
+            return_value=PreflightResult(ok=True),
+        ):
+            resumed = coordinator.prepare_before_schema()
+            result = coordinator.converge_after_schema(resumed)
+
+        self.assertIsNone(resumed)
+        self.assertIsNone(result)
+        self.assertEqual(summary_path.read_bytes(), original_summary)
+        self.assertEqual(stat.S_IMODE(summary_path.stat().st_mode), 0o644)
+        self.assertEqual(summary_path.stat().st_uid, os.geteuid())
+        self.assertEqual(summary_path.stat().st_gid, os.getegid())
+
+    def test_previous_summary_promotion_rejects_replaced_verified_inode(self):
+        _run, summary_path = self._completed_run_with_summary()
+        original_summary = summary_path.read_bytes()
+        os.chmod(str(summary_path), 0o600)
+        coordinator = self.coordinator()
+        current_evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+
+        def replace_before_promotion(run, payload, **kwargs):
+            summary_path.unlink()
+            summary_path.write_bytes(original_summary)
+            os.chmod(str(summary_path), 0o600)
+            return _atomic_write_summary(run, payload, **kwargs)
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=current_evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup._atomic_write_summary",
+            side_effect=replace_before_promotion,
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^unsafe_migration_summary$",
+        ):
+            coordinator.prepare_before_schema()
+
+        self.assertEqual(summary_path.read_bytes(), original_summary)
+        self.assertEqual(stat.S_IMODE(summary_path.stat().st_mode), 0o600)
+
+    def test_previous_summary_promotion_rejects_in_place_mutation(self):
+        _run, summary_path = self._completed_run_with_summary()
+        original_summary = summary_path.read_bytes()
+        os.chmod(str(summary_path), 0o600)
+        coordinator = self.coordinator()
+        current_evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+
+        def mutate_before_promotion(run, payload, **kwargs):
+            summary_path.write_bytes(original_summary[:-1] + b" ")
+            os.chmod(str(summary_path), 0o600)
+            return _atomic_write_summary(run, payload, **kwargs)
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=current_evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup._atomic_write_summary",
+            side_effect=mutate_before_promotion,
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^unsafe_migration_summary$",
+        ):
+            coordinator.prepare_before_schema()
+
+        self.assertEqual(
+            summary_path.read_bytes(),
+            original_summary[:-1] + b" ",
+        )
+        self.assertEqual(stat.S_IMODE(summary_path.stat().st_mode), 0o600)
+
+    def test_previous_summary_contract_requires_exact_service_identity(self):
+        target = SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600,
+            st_nlink=1,
+            st_uid=33,
+            st_gid=44,
+        )
+        run = SimpleNamespace(service_uid=33, service_gid=44)
+
+        with mock.patch(
+            "django_images.services.legacy_startup.os.geteuid",
+            return_value=0,
+        ), mock.patch(
+            "django_images.services.legacy_startup.os.getegid",
+            return_value=0,
+        ):
+            self.assertEqual(
+                _summary_target_kind(target, run, allow_legacy=True),
+                "legacy",
+            )
+            with self.assertRaisesRegex(
+                LegacyStartupError,
+                "^unsafe_migration_summary$",
+            ):
+                _summary_target_kind(target, run)
+            target.st_uid = 34
+            with self.assertRaisesRegex(
+                LegacyStartupError,
+                "^unsafe_migration_summary$",
+            ):
+                _summary_target_kind(target, run, allow_legacy=True)
+
+    def test_completed_history_does_not_skip_new_pending_schema(self):
+        completed_run, summary_path = self._completed_run_with_summary()
+        original_summary = summary_path.read_bytes()
+        coordinator = self.coordinator()
+        pending_evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                    pending=("core.0017",),
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=pending_evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.available_space_bytes",
+            return_value=10 ** 9,
+        ), mock.patch(
+            "django_images.services.legacy_startup.snapshot_sqlite",
+            return_value=object(),
+        ):
+            upgrade_run = coordinator.prepare_before_schema()
+
+        self.assertIsNotNone(upgrade_run)
+        self.assertNotEqual(upgrade_run.run_id, completed_run.run_id)
+        self.assertEqual(
+            migration_state.read_run_status(upgrade_run).phase,
+            "snapshot_complete",
+        )
+        self.assertEqual(summary_path.read_bytes(), original_summary)
 
     def test_completed_separate_start_rejects_tampered_summary(self):
         run, summary_path = self._completed_run_with_summary()
@@ -1404,6 +1599,37 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             _atomic_write_summary(run, {"phase": "initialized"})
 
         self.assertEqual(temp_path.read_bytes(), b"replacement-sentinel")
+        self.assertTrue(retained.exists())
+
+    def test_summary_rejects_replaced_temp_inode_after_install(self):
+        run = self._summary_run()
+        temp_name = ".migration-summary.json.tmp-{}".format(
+            "11111111-1111-4111-8111-111111111111"
+        )
+        temp_path = Path(run.path, temp_name)
+        retained = temp_path.with_name(temp_path.name + ".retained")
+        summary_path = Path(run.path, "migration-summary.json")
+        real_replace = os.replace
+
+        def swap_then_replace(source, destination, **kwargs):
+            temp_path.rename(retained)
+            temp_path.write_bytes(b"replacement-sentinel")
+            os.chmod(str(temp_path), 0o644)
+            real_replace(source, destination, **kwargs)
+
+        with mock.patch(
+            "django_images.services.legacy_startup.uuid.uuid4",
+            return_value="11111111-1111-4111-8111-111111111111",
+        ), mock.patch(
+            "django_images.services.legacy_startup.os.replace",
+            side_effect=swap_then_replace,
+        ), self.assertRaisesRegex(
+            LegacyStartupError,
+            "^unsafe_migration_summary$",
+        ):
+            _atomic_write_summary(run, {"phase": "initialized"})
+
+        self.assertEqual(summary_path.read_bytes(), b"replacement-sentinel")
         self.assertTrue(retained.exists())
 
     def test_summary_cleanup_removes_owned_temp_after_fchown_failure(self):

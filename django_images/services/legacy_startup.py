@@ -229,7 +229,11 @@ class LegacyStartupCoordinator(object):
                 raise LegacyStartupError(
                     "migration_state_missing_or_invalid"
                 )
-            return inventory.completed[-1]
+            completed_run = inventory.completed[-1]
+            self._read_completed_summary(
+                completed_run,
+                migration_state.read_run_status(completed_run),
+            )
         evidence = startup_preflight.inspect_legacy_evidence(
             self._database_path(),
             None,
@@ -478,7 +482,15 @@ class LegacyStartupCoordinator(object):
         return run
 
     def _read_completed_summary(self, run, status):
-        payload = _read_verified_summary(run)
+        (
+            payload,
+            legacy_target,
+            verified_target,
+            verified_content,
+        ) = _read_verified_summary(
+            run,
+            allow_legacy=True,
+        )
         if (
             frozenset(payload) != _SUMMARY_KEYS
             or payload["format_version"] != 1
@@ -539,6 +551,14 @@ class LegacyStartupCoordinator(object):
             or sum(reasons.values()) != payload["backfill_skipped"]
         ):
             raise LegacyStartupError("unsafe_migration_summary")
+        if legacy_target:
+            _atomic_write_summary(
+                run,
+                payload,
+                allow_legacy_target=True,
+                expected_existing_target=verified_target,
+                expected_existing_content=verified_content,
+            )
         return payload
 
     def adjust_ownership(self, startup_lock_descriptor):
@@ -1439,7 +1459,13 @@ class LegacyStartupCoordinator(object):
             self.fault_injector(point)
 
 
-def _atomic_write_summary(run, payload):
+def _atomic_write_summary(
+    run,
+    payload,
+    allow_legacy_target=False,
+    expected_existing_target=None,
+    expected_existing_content=None,
+):
     directory = None
     temp_descriptor = None
     temp_identity = None
@@ -1455,11 +1481,41 @@ def _atomic_write_summary(run, payload):
             or stat.S_IMODE(directory_stat.st_mode) != 0o700
         ):
             raise LegacyStartupError("unsafe_migration_summary")
-        existing_identity = _verified_summary_target(directory, run)
+        existing_target = _verified_summary_target(
+            directory,
+            run,
+            allow_legacy=allow_legacy_target,
+        )
         content = (
             json.dumps(payload, sort_keys=True, separators=(",", ":"))
             + "\n"
         ).encode("utf-8")
+        expecting_existing = expected_existing_target is not None
+        if (
+            expecting_existing != (expected_existing_content is not None)
+            or (expecting_existing and not allow_legacy_target)
+            or (
+                expecting_existing
+                and existing_target != expected_existing_target
+            )
+            or (
+                expecting_existing
+                and expected_existing_content != content
+            )
+        ):
+            raise LegacyStartupError("unsafe_migration_summary")
+        if expecting_existing:
+            observed_content, target_kind = _read_summary_content(
+                directory,
+                run,
+                expected_existing_target,
+                allow_legacy=True,
+            )
+            if (
+                target_kind != "legacy"
+                or observed_content != expected_existing_content
+            ):
+                raise LegacyStartupError("unsafe_migration_summary")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
@@ -1483,11 +1539,26 @@ def _atomic_write_summary(run, payload):
         temp_stat = os.fstat(temp_descriptor)
         if (temp_stat.st_dev, temp_stat.st_ino) != temp_identity:
             raise LegacyStartupError("unsafe_migration_summary")
-        os.close(temp_descriptor)
-        temp_descriptor = None
         directory.verify_current()
-        if _verified_summary_target(directory, run) != existing_identity:
+        current_target = _verified_summary_target(
+            directory,
+            run,
+            allow_legacy=allow_legacy_target,
+        )
+        if current_target != existing_target:
             raise LegacyStartupError("unsafe_migration_summary")
+        if expecting_existing:
+            observed_content, target_kind = _read_summary_content(
+                directory,
+                run,
+                expected_existing_target,
+                allow_legacy=True,
+            )
+            if (
+                target_kind != "legacy"
+                or observed_content != expected_existing_content
+            ):
+                raise LegacyStartupError("unsafe_migration_summary")
         named_temp = os.stat(
             temp_name,
             dir_fd=directory.descriptor,
@@ -1507,7 +1578,22 @@ def _atomic_write_summary(run, payload):
             dst_dir_fd=directory.descriptor,
         )
         os.fsync(directory.descriptor)
-        _verified_summary_target(directory, run, required=True)
+        final_target = _verified_summary_target(
+            directory,
+            run,
+            required=True,
+        )
+        if final_target[:2] != temp_identity:
+            raise LegacyStartupError("unsafe_migration_summary")
+        installed_stat = os.fstat(temp_descriptor)
+        if (
+            (installed_stat.st_dev, installed_stat.st_ino)
+            != temp_identity
+            or _summary_target_kind(installed_stat, run) != "current"
+        ):
+            raise LegacyStartupError("unsafe_migration_summary")
+        os.close(temp_descriptor)
+        temp_descriptor = None
     except LegacyStartupError:
         raise
     except Exception as error:
@@ -1535,7 +1621,48 @@ def _atomic_write_summary(run, payload):
             directory.close()
 
 
-def _verified_summary_target(directory, run, required=False):
+def _summary_target_kind(target_stat, run, allow_legacy=False):
+    if (
+        not stat.S_ISREG(target_stat.st_mode)
+        or target_stat.st_nlink != 1
+    ):
+        raise LegacyStartupError("unsafe_migration_summary")
+    if (
+        target_stat.st_uid == os.geteuid()
+        and target_stat.st_gid == os.getegid()
+        and stat.S_IMODE(target_stat.st_mode) == 0o644
+    ):
+        return "current"
+    if (
+        allow_legacy
+        and target_stat.st_uid == run.service_uid
+        and target_stat.st_gid == run.service_gid
+        and stat.S_IMODE(target_stat.st_mode) == 0o600
+    ):
+        return "legacy"
+    raise LegacyStartupError("unsafe_migration_summary")
+
+
+def _summary_target_snapshot(target_stat):
+    return (
+        target_stat.st_dev,
+        target_stat.st_ino,
+        target_stat.st_uid,
+        target_stat.st_gid,
+        stat.S_IMODE(target_stat.st_mode),
+        target_stat.st_nlink,
+        target_stat.st_size,
+        target_stat.st_mtime_ns,
+        target_stat.st_ctime_ns,
+    )
+
+
+def _verified_summary_target(
+    directory,
+    run,
+    required=False,
+    allow_legacy=False,
+):
     try:
         named_stat = os.stat(
             SUMMARY_FILENAME,
@@ -1546,14 +1673,12 @@ def _verified_summary_target(directory, run, required=False):
         if required:
             raise LegacyStartupError("unsafe_migration_summary")
         return None
-    if (
-        not stat.S_ISREG(named_stat.st_mode)
-        or named_stat.st_nlink != 1
-        or named_stat.st_uid != os.geteuid()
-        or named_stat.st_gid != os.getegid()
-        or stat.S_IMODE(named_stat.st_mode) != 0o644
-    ):
-        raise LegacyStartupError("unsafe_migration_summary")
+    named_kind = _summary_target_kind(
+        named_stat,
+        run,
+        allow_legacy=allow_legacy,
+    )
+    named_target = _summary_target_snapshot(named_stat)
     descriptor = None
     try:
         descriptor = os.open(
@@ -1562,34 +1687,30 @@ def _verified_summary_target(directory, run, required=False):
             dir_fd=directory.descriptor,
         )
         opened_stat = os.fstat(descriptor)
-        identity = (opened_stat.st_dev, opened_stat.st_ino)
-        if identity != (named_stat.st_dev, named_stat.st_ino):
+        opened_kind = _summary_target_kind(
+            opened_stat,
+            run,
+            allow_legacy=allow_legacy,
+        )
+        if (
+            opened_kind != named_kind
+            or _summary_target_snapshot(opened_stat) != named_target
+        ):
             raise LegacyStartupError("unsafe_migration_summary")
-        return identity
+        return named_target
     finally:
         if descriptor is not None:
             os.close(descriptor)
 
 
-def _read_verified_summary(run):
-    directory = None
+def _read_summary_content(
+    directory,
+    run,
+    expected_target,
+    allow_legacy=False,
+):
     descriptor = None
     try:
-        directory = file_ops.open_verified_media_root(run.path)
-        directory_stat = os.fstat(directory.descriptor)
-        if (
-            (directory_stat.st_dev, directory_stat.st_ino)
-            != (run.directory_device, run.directory_inode)
-            or directory_stat.st_uid != run.service_uid
-            or directory_stat.st_gid != run.service_gid
-            or stat.S_IMODE(directory_stat.st_mode) != 0o700
-        ):
-            raise LegacyStartupError("unsafe_migration_summary")
-        expected_identity = _verified_summary_target(
-            directory,
-            run,
-            required=True,
-        )
         flags = os.O_RDONLY | os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
@@ -1599,15 +1720,12 @@ def _read_verified_summary(run):
             dir_fd=directory.descriptor,
         )
         opened_stat = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened_stat.st_mode)
-            or opened_stat.st_nlink != 1
-            or (opened_stat.st_dev, opened_stat.st_ino)
-            != expected_identity
-            or opened_stat.st_uid != os.geteuid()
-            or opened_stat.st_gid != os.getegid()
-            or stat.S_IMODE(opened_stat.st_mode) != 0o644
-        ):
+        target_kind = _summary_target_kind(
+            opened_stat,
+            run,
+            allow_legacy=allow_legacy,
+        )
+        if _summary_target_snapshot(opened_stat) != expected_target:
             raise LegacyStartupError("unsafe_migration_summary")
         chunks = []
         remaining = _SUMMARY_MAX_BYTES + 1
@@ -1620,13 +1738,47 @@ def _read_verified_summary(run):
         content = b"".join(chunks)
         if not content or len(content) > _SUMMARY_MAX_BYTES:
             raise LegacyStartupError("unsafe_migration_summary")
+        if _summary_target_snapshot(os.fstat(descriptor)) != expected_target:
+            raise LegacyStartupError("unsafe_migration_summary")
         directory.verify_current()
         if _verified_summary_target(
             directory,
             run,
             required=True,
-        ) != expected_identity:
+            allow_legacy=allow_legacy,
+        ) != expected_target:
             raise LegacyStartupError("unsafe_migration_summary")
+        return content, target_kind
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _read_verified_summary(run, allow_legacy=False):
+    directory = None
+    try:
+        directory = file_ops.open_verified_media_root(run.path)
+        directory_stat = os.fstat(directory.descriptor)
+        if (
+            (directory_stat.st_dev, directory_stat.st_ino)
+            != (run.directory_device, run.directory_inode)
+            or directory_stat.st_uid != run.service_uid
+            or directory_stat.st_gid != run.service_gid
+            or stat.S_IMODE(directory_stat.st_mode) != 0o700
+        ):
+            raise LegacyStartupError("unsafe_migration_summary")
+        expected_target = _verified_summary_target(
+            directory,
+            run,
+            required=True,
+            allow_legacy=allow_legacy,
+        )
+        content, target_kind = _read_summary_content(
+            directory,
+            run,
+            expected_target,
+            allow_legacy=allow_legacy,
+        )
         try:
             payload = json.loads(content.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
@@ -1639,14 +1791,17 @@ def _read_verified_summary(run):
         ).encode("utf-8")
         if content != canonical:
             raise LegacyStartupError("unsafe_migration_summary")
-        return payload
+        return (
+            payload,
+            target_kind == "legacy",
+            expected_target,
+            content,
+        )
     except LegacyStartupError:
         raise
     except Exception as error:
         raise LegacyStartupError("unsafe_migration_summary") from error
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
         if directory is not None:
             directory.close()
 
