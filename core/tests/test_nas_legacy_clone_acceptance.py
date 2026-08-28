@@ -1292,6 +1292,8 @@ def _write_backfill_contract(
     decisions,
     summary_overrides=None,
     plan_overrides=None,
+    terminal_manifest=False,
+    terminal_image_ids=None,
 ):
     run_id = "fixture-run"
     run_root = data_root / "legacy-backup" / run_id
@@ -1418,7 +1420,13 @@ def _write_backfill_contract(
         for event in events
     )
     plan_sha256 = hashlib.sha256(plan_payload).hexdigest()
-    for image_id, decision in sorted(decisions.items()):
+    manifest_events = list(events)
+    if terminal_manifest:
+        terminal_image_ids = sorted(decisions)
+    else:
+        terminal_image_ids = list(terminal_image_ids or ())
+    for image_id in terminal_image_ids:
+        decision = decisions[image_id]
         if decision == "register":
             event_name = "registered"
         elif decision == "already_registered":
@@ -1433,19 +1441,19 @@ def _write_backfill_contract(
         )
         if event_name == "skipped":
             event["reason_code"] = decision
-        events.append(event)
+        manifest_events.append(event)
     manifest_payload = b"".join(
         (
             json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("ascii")
-        for event in events
+        for event in manifest_events
     )
     (run_root / "media-asset-backfill.jsonl").write_bytes(manifest_payload)
     reason_counts = {}
     for decision in decisions.values():
         if decision not in ("register", "already_registered"):
             reason_counts[decision] = reason_counts.get(decision, 0) + 1
-    summary = {
+    contract_summary = {
         "format_version": 1,
         "source_commit": "a" * 40,
         "run_id": run_id,
@@ -1475,12 +1483,220 @@ def _write_backfill_contract(
         ),
         "reason_counts": dict(sorted(reason_counts.items())),
     }
+    summary = dict(contract_summary)
     if summary_overrides:
         summary.update(summary_overrides)
     (run_root / "migration-summary.json").write_text(
         json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="ascii",
     )
+    _write_linear_journal_contract(
+        run_root,
+        run_id,
+        contract_summary,
+        database_signatures,
+        file_identities,
+        thumbnail_rows,
+        terminal_image_ids=(
+            () if terminal_manifest else terminal_image_ids
+        ),
+    )
+
+
+def _write_linear_journal_contract(
+    run_root,
+    run_id,
+    summary,
+    database_signatures,
+    file_identities,
+    thumbnail_rows,
+    terminal_image_ids=(),
+):
+    thumbnail_ids = {
+        (row[3], row[2]): row[0]
+        for row in thumbnail_rows
+    }
+    receipts = []
+    for image_id, identities in sorted(file_identities.items()):
+        for identity in identities:
+            kind = identity[0]
+            if kind == "original":
+                file_key = "original:{}".format(image_id)
+            else:
+                file_key = "thumbnail:{}:{}".format(
+                    image_id,
+                    thumbnail_ids[(image_id, kind)],
+                )
+            receipts.append({
+                "file_key": file_key,
+                "relative_path": identity[1],
+                "operation": "verify",
+                "size": identity[4],
+                "image_format": identity[7],
+                "width": identity[8],
+                "height": identity[9],
+                "source_device": identity[2],
+                "source_inode": identity[3],
+                "destination_device": identity[2],
+                "destination_inode": identity[3],
+                "sha256": identity[6],
+                "database_signature": "4" * 64,
+            })
+
+    image_ids = sorted(database_signatures)
+    events = [
+        {
+            "event": "header",
+            "format_version": 1,
+            "run_id": run_id,
+            "started_at": "2026-01-01T00:00:00Z",
+            "source_manifest_sha256": summary["media_manifest_sha256"],
+            "source_plan_sha256": summary["media_plan_sha256"],
+        },
+        {
+            "event": "attempt_started",
+            "attempt": 1,
+            "resume_count": 0,
+            "started_at": "2026-01-01T00:00:00Z",
+        },
+        {
+            "event": "work_totals",
+            "images_total": len(image_ids),
+            "files_total": len(receipts),
+            "backfill_total": summary["backfill_scanned"],
+        },
+    ]
+
+    def append_batch(
+        phase,
+        number,
+        pre_signature,
+        post_signature,
+        receipt_database_signature,
+        selected_image_ids=None,
+        batch_prefix=None,
+    ):
+        if selected_image_ids is None:
+            selected_image_ids = image_ids
+        selected_image_ids = tuple(selected_image_ids)
+        selected = set(selected_image_ids)
+        selected_receipts = [
+            receipt for receipt in receipts
+            if int(receipt["file_key"].split(":")[1]) in selected
+        ]
+        intent = {
+            "batch_id": "{}:{}-{}".format(
+                batch_prefix or phase,
+                selected_image_ids[0],
+                selected_image_ids[-1],
+            ),
+            "batch_number": number,
+            "phase": phase,
+            "first_pk": selected_image_ids[0],
+            "last_pk": selected_image_ids[-1],
+            "receipts": [dict(
+                receipt,
+                database_signature=receipt_database_signature,
+            ) for receipt in selected_receipts],
+            "pre_signature": pre_signature,
+            "post_signature": post_signature,
+            "images": len(selected_image_ids),
+            "files": len(selected_receipts),
+            "total_bytes": sum(
+                receipt["size"] for receipt in selected_receipts
+            ),
+            "total_pixels": sum(
+                receipt["width"] * receipt["height"]
+                for receipt in selected_receipts
+            ),
+        }
+        events.append({"event": "batch_intent", "intent": intent})
+        events.append({
+            "event": "batch_commit",
+            "batch_id": intent["batch_id"],
+            "phase": phase,
+            "post_signature": post_signature,
+        })
+
+    append_batch("paths", 1, "3" * 64, "4" * 64, "4" * 64)
+    events.append({
+        "event": "phase_complete",
+        "phase": "paths",
+        "summary": {
+            "image_count": summary["media_image_count"],
+            "md5_legacy": summary["media_md5_legacy"],
+            "fixed_slot": summary["media_fixed_slot"],
+            "named_canonical": summary["media_named_canonical"],
+            "copy_required_bytes": 0,
+        },
+    })
+    events.append({
+        "event": "source_binding",
+        "phase": "backfill",
+        "plan_sha256": summary["backfill_plan_sha256"],
+        "manifest_sha256": summary["backfill_manifest_sha256"],
+    })
+    terminal_image_ids = frozenset(terminal_image_ids)
+    if terminal_image_ids:
+        for number, image_id in enumerate(image_ids, 1):
+            append_batch(
+                "backfill",
+                number,
+                "5" * 64,
+                "6" * 64,
+                "4" * 64,
+                selected_image_ids=(image_id,),
+                batch_prefix=(
+                    "upgrade-backfill"
+                    if image_id in terminal_image_ids
+                    else "backfill"
+                ),
+            )
+    else:
+        append_batch("backfill", 1, "5" * 64, "6" * 64, "4" * 64)
+    events.append({
+        "event": "phase_complete",
+        "phase": "backfill",
+        "summary": {
+            "scanned": summary["backfill_scanned"],
+            "registered": summary["backfill_registered"],
+            "already_registered": summary[
+                "backfill_already_registered"
+            ],
+            "skipped": summary["backfill_skipped"],
+            "reason_counts": summary["reason_counts"],
+        },
+    })
+    _write_linear_journal_events(run_root, events)
+
+
+def _write_linear_journal_events(run_root, events):
+    frames = []
+    for event in events:
+        payload = json.dumps(
+            event,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        frames.append(json.dumps(
+            {
+                "checksum": hashlib.sha256(payload).hexdigest(),
+                "payload": event,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n")
+    (run_root / "linear-migration-v1.jsonl").write_bytes(b"".join(frames))
+
+
+def _read_linear_journal_events(run_root):
+    return [
+        json.loads(line.decode("utf-8"))["payload"]
+        for line in (run_root / "linear-migration-v1.jsonl")
+        .read_bytes().splitlines()
+    ]
 
 
 def _append_canonical_media_image(
@@ -2376,6 +2592,210 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
         self.assertNotEqual(same_count_substitution.returncode, 0)
         self.assertEqual(
             same_count_substitution.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_invalid_linear_journal(self):
+        completed = self._run(run_id="canonical-linear-journal-invalid")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+
+        for case in (
+            "missing",
+            "checksum",
+            "torn",
+            "uncommitted",
+            "empty-batches",
+            "summary",
+        ):
+            with self.subTest(case=case):
+                data_root = self.temporary_root / (
+                    "canonical-linear-journal-{}".format(case)
+                )
+                data_root.mkdir()
+                legacy_pin_sample = _create_canonical_media_fixture(data_root)
+                _append_canonical_media_image(
+                    data_root, legacy_pin_sample, 2,
+                )
+                _write_backfill_contract(
+                    data_root,
+                    {1: "register", 2: "orphan"},
+                )
+                run_root = (
+                    data_root / "legacy-backup" / "fixture-run"
+                )
+                journal_path = run_root / "linear-migration-v1.jsonl"
+                if case == "missing":
+                    journal_path.unlink()
+                elif case == "checksum":
+                    lines = journal_path.read_bytes().splitlines()
+                    frame = json.loads(lines[0].decode("utf-8"))
+                    frame["checksum"] = "0" * 64
+                    lines[0] = json.dumps(
+                        frame,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    journal_path.write_bytes(b"\n".join(lines) + b"\n")
+                elif case == "torn":
+                    journal_path.write_bytes(journal_path.read_bytes()[:-1])
+                else:
+                    events = _read_linear_journal_events(run_root)
+                    if case == "uncommitted":
+                        events = [
+                            event for event in events
+                            if not (
+                                event["event"] == "batch_commit"
+                                and event["phase"] == "backfill"
+                            )
+                        ]
+                    elif case == "empty-batches":
+                        events = [
+                            event for event in events
+                            if event["event"] not in (
+                                "batch_intent", "batch_commit",
+                            )
+                        ]
+                    else:
+                        backfill = events[-1]["summary"]
+                        backfill.update({
+                            "registered": 2,
+                            "skipped": 0,
+                            "reason_counts": {},
+                        })
+                    _write_linear_journal_events(run_root, events)
+
+                verified = self._run_canonical_media_verifier(
+                    helper, data_root, legacy_pin_sample,
+                )
+
+                self.assertNotEqual(verified.returncode, 0)
+                self.assertEqual(
+                    verified.stdout.decode("ascii").strip(),
+                    "nas_canonical_media_invalid",
+                )
+
+    def test_canonical_media_verifier_allows_terminal_manifest_without_journal(
+        self,
+    ):
+        completed = self._run(run_id="canonical-terminal-manifest")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-terminal-manifest"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        _write_backfill_contract(
+            data_root,
+            {1: "register"},
+            terminal_manifest=True,
+        )
+        (
+            data_root / "legacy-backup" / "fixture-run"
+            / "linear-migration-v1.jsonl"
+        ).unlink()
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertEqual(verified.returncode, 0, verified.stderr.decode("utf-8"))
+
+    def test_canonical_media_verifier_allows_partial_v2_terminal_prefix(self):
+        completed = self._run(run_id="canonical-partial-terminal-prefix")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-partial-terminal-prefix"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        _append_canonical_media_image(data_root, legacy_pin_sample, 2)
+        _write_backfill_contract(
+            data_root,
+            {1: "register", 2: "orphan"},
+            terminal_image_ids=(1,),
+        )
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertEqual(verified.returncode, 0, verified.stderr.decode("utf-8"))
+
+    def test_canonical_media_verifier_rejects_partial_v2_non_prefix(self):
+        completed = self._run(run_id="canonical-partial-terminal-non-prefix")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-partial-terminal-non-prefix"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        _append_canonical_media_image(data_root, legacy_pin_sample, 2)
+        _write_backfill_contract(
+            data_root,
+            {1: "register", 2: "orphan"},
+            terminal_image_ids=(2,),
+        )
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_incomplete_upgrade_receipts(self):
+        completed = self._run(run_id="canonical-incomplete-upgrade-receipts")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-incomplete-upgrade-receipts"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        _append_canonical_media_image(data_root, legacy_pin_sample, 2)
+        _write_backfill_contract(
+            data_root,
+            {1: "register", 2: "orphan"},
+            terminal_image_ids=(1,),
+        )
+        run_root = data_root / "legacy-backup" / "fixture-run"
+        events = _read_linear_journal_events(run_root)
+        intents = [
+            event["intent"]
+            for event in events
+            if event["event"] == "batch_intent"
+        ]
+        upgrade_intent = next(
+            intent for intent in intents
+            if intent["batch_id"].startswith("upgrade-backfill:")
+        )
+        normal_intent = next(
+            intent for intent in intents
+            if intent["batch_id"].startswith("backfill:")
+        )
+        moved_receipt = next(
+            receipt for receipt in upgrade_intent["receipts"]
+            if receipt["file_key"].startswith("thumbnail:1:")
+        )
+        upgrade_intent["receipts"].remove(moved_receipt)
+        normal_intent["receipts"].append(moved_receipt)
+        for intent in (upgrade_intent, normal_intent):
+            intent["files"] = len(intent["receipts"])
+            intent["total_bytes"] = sum(
+                receipt["size"] for receipt in intent["receipts"]
+            )
+            intent["total_pixels"] = sum(
+                receipt["width"] * receipt["height"]
+                for receipt in intent["receipts"]
+            )
+        _write_linear_journal_events(run_root, events)
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
             "nas_canonical_media_invalid",
         )
 

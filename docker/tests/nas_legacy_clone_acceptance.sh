@@ -1664,6 +1664,10 @@ import uuid
 import warnings
 
 from PIL import Image as PILImage
+from django_images.services.migration_batch_log import (
+    MigrationBatchJournal,
+    MigrationBatchLogError,
+)
 
 data_root = "/data"
 media_root = os.path.join(data_root, "static", "media")
@@ -2114,6 +2118,13 @@ for image_id, image in images.items():
         )
         for size in ("thumbnail", "standard", "square")
     ]
+expected_receipt_keys = {
+    "original:{}".format(image_id)
+    for image_id in images
+} | {
+    "thumbnail:{}:{}".format(row[3], row[0])
+    for row in thumbnail_rows
+}
 
 assets = {}
 assets_by_pk = {}
@@ -2248,6 +2259,8 @@ if (
         type(summary[key]) is not int or summary[key] < 0
         for key in count_keys
     )
+    or not valid_digest(summary["media_plan_sha256"])
+    or not valid_digest(summary["media_manifest_sha256"])
     or not valid_digest(summary["backfill_plan_sha256"])
     or not valid_digest(summary["backfill_manifest_sha256"])
     or summary["media_image_count"] != len(images)
@@ -2449,11 +2462,16 @@ for raw_line in manifest_raw.splitlines(True):
         terminals[event["image_id"]] = event
     offset += len(raw_line)
 
+plan_image_ids = tuple(plans)
 if (
     not plan_complete
     or set(plans) != set(images)
-    or set(terminals) != set(plans)
     or plan_sha256 != summary["backfill_plan_sha256"]
+    or set(terminals) != set(plan_image_ids[:len(terminals)])
+    or (
+        not terminals
+        and summary["backfill_manifest_sha256"] != plan_sha256
+    )
 ):
     fail()
 for image_id, plan in plans.items():
@@ -2484,24 +2502,28 @@ for image_ids in groups.values():
 expected_asset_ids = set()
 reason_counts = {}
 for image_id, decision in decisions.items():
-    terminal = terminals[image_id]
-    event_name = terminal["event"]
     if decision == "register":
-        if event_name not in ("registered", "recovered_registered"):
-            fail()
         expected_asset_ids.add(image_id)
     elif decision == "already_registered":
-        if event_name != "already_registered":
-            fail()
         expected_asset_ids.add(image_id)
     else:
-        if (
-            decision not in safe_skip_reasons
-            or event_name != "skipped"
+        if decision not in safe_skip_reasons:
+            fail()
+        reason_counts[decision] = reason_counts.get(decision, 0) + 1
+    if image_id in terminals:
+        terminal = terminals[image_id]
+        event_name = terminal["event"]
+        if decision == "register":
+            if event_name not in ("registered", "recovered_registered"):
+                fail()
+        elif decision == "already_registered":
+            if event_name != "already_registered":
+                fail()
+        elif (
+            event_name != "skipped"
             or terminal.get("reason_code") != decision
         ):
             fail()
-        reason_counts[decision] = reason_counts.get(decision, 0) + 1
 if set(assets) != expected_asset_ids:
     fail()
 for image_id, decision in decisions.items():
@@ -2547,6 +2569,126 @@ if (
     or summary["reason_counts"] != dict(sorted(reason_counts.items()))
 ):
     fail()
+if len(terminals) < len(plans):
+    try:
+        journal_raw = safe_read_file(
+            os.path.join(run_root, "linear-migration-v1.jsonl")
+        )
+        journal_state = MigrationBatchJournal._load_state(
+            journal_raw, run_name,
+        )
+    except (OSError, MigrationBatchLogError):
+        fail()
+    expected_backfill_phase = {
+        "scanned": expected_summary["backfill_scanned"],
+        "registered": expected_summary["backfill_registered"],
+        "already_registered": expected_summary[
+            "backfill_already_registered"
+        ],
+        "skipped": expected_summary["backfill_skipped"],
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+    paths_phase = journal_state.phase_summaries.get("paths")
+    phase_targets = {
+        "paths": len(images),
+        "backfill": len(plans),
+    }
+    phase_batches_valid = True
+    upgraded_terminal_ids = set()
+    upgraded_receipt_keys = set()
+    expected_upgraded_receipt_keys = {
+        receipt_key
+        for receipt_key in expected_receipt_keys
+        if int(receipt_key.split(":")[1]) in terminals
+    }
+    for phase, image_total in phase_targets.items():
+        phase_intents = [
+            (batch_id, intent)
+            for batch_id, intent in journal_state.intents.items()
+            if intent.phase == phase
+        ]
+        phase_receipts = [
+            receipt
+            for batch_id, intent in phase_intents
+            for receipt in journal_state.receipt_overlays[batch_id]
+        ]
+        receipt_keys = [receipt.file_key for receipt in phase_receipts]
+        if (
+            sum(intent.images for _, intent in phase_intents)
+            != image_total
+            or sum(intent.files for _, intent in phase_intents)
+            != len(expected_files)
+            or len(receipt_keys) != len(set(receipt_keys))
+            or set(receipt_keys) != expected_receipt_keys
+        ):
+            phase_batches_valid = False
+        if phase == "backfill":
+            for batch_id, intent in phase_intents:
+                if not batch_id.startswith("upgrade-backfill:"):
+                    continue
+                receipt_image_ids = set()
+                for receipt in journal_state.receipt_overlays[batch_id]:
+                    upgraded_receipt_keys.add(receipt.file_key)
+                    parts = receipt.file_key.split(":")
+                    if not (
+                        (len(parts) == 2 and parts[0] == "original")
+                        or (len(parts) == 3 and parts[0] == "thumbnail")
+                    ):
+                        phase_batches_valid = False
+                        continue
+                    try:
+                        receipt_image_id = int(parts[1])
+                    except ValueError:
+                        phase_batches_valid = False
+                        continue
+                    if receipt_image_id not in plans:
+                        phase_batches_valid = False
+                        continue
+                    receipt_image_ids.add(receipt_image_id)
+                if (
+                    batch_id != "upgrade-backfill:{}-{}".format(
+                        intent.first_pk, intent.last_pk,
+                    )
+                    or len(receipt_image_ids) != intent.images
+                    or min(receipt_image_ids, default=0) != intent.first_pk
+                    or max(receipt_image_ids, default=0) != intent.last_pk
+                ):
+                    phase_batches_valid = False
+                upgraded_terminal_ids.update(receipt_image_ids)
+    if (
+        journal_state.source_bindings != {
+            "paths": {
+                "plan_sha256": summary["media_plan_sha256"],
+                "manifest_sha256": summary["media_manifest_sha256"],
+            },
+            "backfill": {
+                "plan_sha256": plan_sha256,
+                "manifest_sha256": summary[
+                    "backfill_manifest_sha256"
+                ],
+            },
+        }
+        or journal_state.work_totals != {
+            "images_total": len(images),
+            "files_total": len(expected_files),
+            "backfill_total": len(plans),
+        }
+        or not journal_state.attempts
+        or set(journal_state.intents) != journal_state.commits
+        or not phase_batches_valid
+        or upgraded_terminal_ids != set(terminals)
+        or upgraded_receipt_keys != expected_upgraded_receipt_keys
+        or set(journal_state.phase_summaries) != {"paths", "backfill"}
+        or journal_state.phase_summaries.get("backfill")
+        != expected_backfill_phase
+        or not isinstance(paths_phase, dict)
+        or paths_phase.get("image_count") != summary["media_image_count"]
+        or paths_phase.get("md5_legacy") != summary["media_md5_legacy"]
+        or paths_phase.get("fixed_slot") != summary["media_fixed_slot"]
+        or paths_phase.get("named_canonical")
+        != summary["media_named_canonical"]
+    ):
+        fail()
 
 pins = {}
 public_sample = None

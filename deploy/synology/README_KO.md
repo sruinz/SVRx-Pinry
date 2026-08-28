@@ -121,7 +121,7 @@ source project나 `data/` 자체·하위 또는 더 넓은 조상 경로를 bind
 으로 중단한다.
 
 아래 명령의 수량은 검증된 기준 source workload다. Pin 345개, 물리 media
-regular file 1,434개, Image 346행, Thumbnail 1,038행, DB가 참조하는 활성
+regular file 1,442개, Image 346행, Thumbnail 1,038행, DB가 참조하는 활성
 원본·파생 파일 1,384개를 각각 독립적으로 고정한다. 다른 source를 검증할
 때는 다섯 값을 그 source의 실제 값으로 모두 바꾼다. `run-id`에 해당하는
 clone과 결과 JSON은 실행 전에 존재하지 않아야 한다.
@@ -136,7 +136,7 @@ bash accept-tools/nas_legacy_clone_acceptance.sh \
   --image svrx-pinry:latest \
   --result-root /volume1/docker \
   --expected-pins 345 \
-  --expected-files 1434 \
+  --expected-files 1442 \
   --expected-images 346 \
   --expected-thumbnails 1038 \
   --expected-active-files 1384 \
@@ -146,7 +146,7 @@ bash accept-tools/nas_legacy_clone_acceptance.sh \
 성공하면 마지막 줄에 `NAS_LEGACY_CLONE_ACCEPTANCE_OK`가 표시되고
 `svrx-pinry-accept-<run-id>.json`에 source·최종 수량, 실행 image identity,
 소요 시간, 재시작 no-op과 백업 보존 결과가 기록된다. reference workload의
-물리 1,434개에는 DB가 참조하지 않는 고아 파일 50개도 포함되며, 이 payload는
+물리 1,442개에는 DB가 참조하지 않는 고아 파일 58개도 포함되며, 이 payload는
 레거시 backup에 정확히 보존되어야 한다. DB snapshot은 무결성 검사와 핵심
 row count(Pin 345, Image 346, Thumbnail 1,038)를 모두 통과해야 한다.
 
