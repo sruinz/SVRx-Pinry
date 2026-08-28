@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import socket
 import sqlite3
@@ -273,8 +274,9 @@ class LegacyFixtureContractTests(unittest.TestCase):
             headers = module._ensure_fixture_authentication(
                 session,
                 "http://app",
-                "migrated",
+                "new",
                 str(data_root),
+                require_existing=True,
             )
 
         self.assertEqual(
@@ -316,6 +318,55 @@ class LegacyFixtureContractTests(unittest.TestCase):
             {"Authorization": "Token {}".format(token)},
         )
         session.post.assert_called_once()
+
+    def test_api_authentication_requires_existing_token_when_requested(self):
+        module = self.load_fixture_module()
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            data_root = Path(temporary, "data")
+            data_root.mkdir()
+            self.write_auth_database(data_root)
+            session = mock.Mock()
+            session.get.return_value = self.api_response(403, {})
+
+            with self.assertRaises(module.FixtureError) as raised:
+                module._ensure_fixture_authentication(
+                    session,
+                    "http://app",
+                    "new",
+                    str(data_root),
+                    require_existing=True,
+                )
+
+        self.assertEqual(str(raised.exception), "api_auth_probe_failed")
+        session.post.assert_not_called()
+
+    def test_api_authentication_required_mode_does_not_use_basic_auth(self):
+        module = self.load_fixture_module()
+        fixture_token = "f" * 40
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            data_root = Path(temporary, "data")
+            data_root.mkdir()
+            self.write_auth_database(data_root)
+            session = mock.Mock()
+            session.get.return_value = self.api_response(200, [{
+                "username": "fixture-reviewer",
+                "token": fixture_token,
+            }])
+
+            with self.assertRaises(module.FixtureError) as raised:
+                module._ensure_fixture_authentication(
+                    session,
+                    "http://app",
+                    "new",
+                    str(data_root),
+                    require_existing=True,
+                )
+
+        self.assertEqual(str(raised.exception), "api_auth_probe_failed")
+        session.get.assert_not_called()
+        session.post.assert_not_called()
 
     def test_api_authentication_rejects_wrong_basic_identity(self):
         module = self.load_fixture_module()
@@ -384,6 +435,117 @@ class LegacyFixtureContractTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "api_auth_probe_failed")
         self.assertNotIn(token, str(raised.exception))
         session.post.assert_not_called()
+
+    def test_configure_settings_preserves_existing_private_configuration(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            data_root = Path(temporary, "data")
+            data_root.mkdir()
+            settings_path = data_root / "local_settings.py"
+            original = (
+                b"# -*- coding: cp949 -*-\n"
+                b"SECRET_KEY = 'legacy-secret'\n"
+                b"PUBLIC = False\n"
+                b"# " + "레거시 설정".encode("cp949") + b"\n"
+                b"PINRY_FETCH_PRIVATE_ALLOWLIST = []"
+            )
+            settings_path.write_bytes(original)
+
+            completed = self.run_fixture(
+                "configure-settings",
+                "--data-root", str(data_root),
+                "--allow-host", "image-source",
+                "--preserve-existing",
+            )
+
+            self.assertEqual(
+                completed.returncode, 0, completed.stderr.decode("utf-8")
+            )
+            self.assertEqual(
+                completed.stdout.decode("ascii").strip(),
+                "FIXTURE_SETTINGS_OK",
+            )
+            repeated = self.run_fixture(
+                "configure-settings",
+                "--data-root", str(data_root),
+                "--allow-host", "image-source",
+                "--preserve-existing",
+            )
+            self.assertEqual(
+                repeated.returncode, 0, repeated.stderr.decode("utf-8")
+            )
+            configured = settings_path.read_bytes()
+            self.assertTrue(configured.startswith(original))
+            self.assertIn(b"PUBLIC = False", configured)
+            self.assertIn(b"SECRET_KEY = 'legacy-secret'", configured)
+            self.assertTrue(configured.endswith(
+                b"PINRY_FETCH_PRIVATE_ALLOWLIST = ['image-source']\n"
+            ))
+            self.assertEqual(configured.count(
+                b"# SVRx Pinry NAS acceptance override\n"
+            ), 1)
+            self.assertEqual(settings_path.stat().st_mode & 0o777, 0o600)
+            namespace = {}
+            exec(compile(configured, str(settings_path), "exec"), namespace)
+            self.assertIs(namespace["PUBLIC"], False)
+            self.assertEqual(namespace["SECRET_KEY"], "legacy-secret")
+            self.assertEqual(
+                namespace["PINRY_FETCH_PRIVATE_ALLOWLIST"],
+                ["image-source"],
+            )
+
+    def test_configure_settings_preserve_mode_rejects_invalid_existing_file(self):
+        settings_prefix = (
+            b"SECRET_KEY = 'legacy-secret'\nPUBLIC = False\n#"
+        )
+        expanded_oversized = settings_prefix + b"x" * (
+            1024 * 1024 - len(settings_prefix)
+        )
+        cases = (
+            ("missing", None),
+            ("empty", b""),
+            ("placeholder", b"SECRET_KEY = 'secret_key_place_holder'\n"),
+            ("oversized", b"x" * (1024 * 1024 + 1)),
+            ("expanded_oversized", expanded_oversized),
+            ("symlink", b"PUBLIC = False\n"),
+            ("hardlink", b"PUBLIC = False\n"),
+        )
+
+        for name, payload in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory(
+                dir="/private/tmp"
+            ) as temporary:
+                data_root = Path(temporary, "data")
+                data_root.mkdir()
+                settings_path = data_root / "local_settings.py"
+                backing_path = data_root / "backing.py"
+                if payload is not None:
+                    if name in ("symlink", "hardlink"):
+                        backing_path.write_bytes(payload)
+                        if name == "symlink":
+                            settings_path.symlink_to(backing_path)
+                        else:
+                            os.link(str(backing_path), str(settings_path))
+                    else:
+                        settings_path.write_bytes(payload)
+
+                completed = self.run_fixture(
+                    "configure-settings",
+                    "--data-root", str(data_root),
+                    "--allow-host", "image-source",
+                    "--preserve-existing",
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    completed.stderr.decode("ascii").strip(),
+                    "FIXTURE_ERROR:existing_settings_invalid",
+                )
+                if payload is None:
+                    self.assertFalse(settings_path.exists())
+                elif name in ("symlink", "hardlink"):
+                    self.assertEqual(backing_path.read_bytes(), payload)
+                else:
+                    self.assertEqual(settings_path.read_bytes(), payload)
 
     def test_linear_fixture_records_exact_workload_distribution(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:

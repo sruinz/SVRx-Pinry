@@ -163,6 +163,7 @@ def _write_fake_docker(path):
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 
@@ -537,7 +538,17 @@ if arguments and arguments[0] == "run":
             raise SystemExit(71)
         print("FIXTURE_MAINTENANCE_HTTP_OK")
         raise SystemExit(0)
+    if "configure-settings" in arguments:
+        print("FIXTURE_SETTINGS_OK")
+        raise SystemExit(0)
     if "api-check" in arguments:
+        fixture_error = os.environ.get("PINRY_API_FIXTURE_ERROR")
+        if fixture_error:
+            print("FIXTURE_ERROR:" + fixture_error, file=sys.stderr)
+            raise SystemExit(71)
+        stderr_noise = os.environ.get("PINRY_API_STDERR_NOISE")
+        if stderr_noise:
+            print(stderr_noise, file=sys.stderr)
         print("FIXTURE_API_OK")
         raise SystemExit(0)
     if "-d" in arguments:
@@ -587,11 +598,33 @@ if arguments and arguments[0] == "run":
                         for field in argument.split(",")
                         if "=" in field
                     )
-                    with open(
+                    database_path = os.path.join(
+                        fields["src"], "production.db"
+                    )
+                    connection = sqlite3.connect(database_path)
+                    try:
+                        connection.execute(
+                            "INSERT INTO parent (id) VALUES (2)"
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+            if (
+                os.environ.get("PINRY_SECOND_START_CHMOD_DATABASE") == "1"
+                and starts == 2
+            ):
+                for argument in arguments:
+                    if "dst=/data" not in argument:
+                        continue
+                    fields = dict(
+                        field.split("=", 1)
+                        for field in argument.split(",")
+                        if "=" in field
+                    )
+                    os.chmod(
                         os.path.join(fields["src"], "production.db"),
-                        "ab",
-                    ) as stream:
-                        stream.write(b"noop-mutation")
+                        0o777,
+                    )
             if (
                 os.environ.get("PINRY_SECOND_START_MUTATE_MEDIA") == "1"
                 and starts == 2
@@ -613,6 +646,60 @@ if arguments and arguments[0] == "run":
                     payload = bytearray(Path(media_path).read_bytes())
                     payload[0] ^= 1
                     Path(media_path).write_bytes(payload)
+            if (
+                os.environ.get("PINRY_SECOND_START_REPLACE_SETTINGS") == "1"
+                and starts == 2
+            ):
+                for argument in arguments:
+                    if "dst=/data" not in argument:
+                        continue
+                    fields = dict(
+                        field.split("=", 1)
+                        for field in argument.split(",")
+                        if "=" in field
+                    )
+                    settings_path = Path(fields["src"]) / "local_settings.py"
+                    replacement = settings_path.with_suffix(".replacement")
+                    replacement.write_bytes(settings_path.read_bytes())
+                    os.replace(str(replacement), str(settings_path))
+            if (
+                os.environ.get("PINRY_SECOND_START_MUTATE_SETTINGS") == "1"
+                and starts == 2
+            ):
+                for argument in arguments:
+                    if "dst=/data" not in argument:
+                        continue
+                    fields = dict(
+                        field.split("=", 1)
+                        for field in argument.split(",")
+                        if "=" in field
+                    )
+                    settings_path = Path(fields["src"]) / "local_settings.py"
+                    settings_path.write_bytes(
+                        settings_path.read_bytes() + b"MUTATED = True\\n"
+                    )
+            if (
+                os.environ.get("PINRY_SECOND_START_HARDLINK_SETTINGS") == "1"
+                and starts == 2
+            ):
+                for argument in arguments:
+                    if "dst=/data" not in argument:
+                        continue
+                    fields = dict(
+                        field.split("=", 1)
+                        for field in argument.split(",")
+                        if "=" in field
+                    )
+                    settings_path = Path(fields["src"]) / "local_settings.py"
+                    backing_path = Path(
+                        os.environ["PINRY_DOCKER_STATE"]
+                    ).with_name("settings-hardlink-source")
+                    backing_path.write_bytes(settings_path.read_bytes())
+                    os.chmod(
+                        str(backing_path), settings_path.stat().st_mode & 0o777,
+                    )
+                    settings_path.unlink()
+                    os.link(str(backing_path), str(settings_path))
         if alias == "image-source":
             print("3" * 64)
         elif starts == 1:
@@ -4870,6 +4957,124 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
             "nas_migration_legacy_startup_failed",
         )
 
+    def test_acceptance_configures_only_fixture_remote_host_before_app(self):
+        completed = self._run(run_id="fixture-host-allowlist")
+
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        calls = self._docker_calls()
+        configure_indices = [
+            index for index, call in enumerate(calls)
+            if "configure-settings" in call
+        ]
+        app_indices = [
+            index for index, call in enumerate(calls)
+            if "--network-alias" in call
+            and call[call.index("--network-alias") + 1] == "app"
+        ]
+        self.assertEqual(len(configure_indices), 1)
+        self.assertGreaterEqual(len(app_indices), 1)
+        self.assertLess(configure_indices[0], app_indices[0])
+        configure_call = calls[configure_indices[0]]
+        self.assertIn("--preserve-existing", configure_call)
+        allow_index = configure_call.index("--allow-host")
+        self.assertEqual(configure_call[allow_index + 1], "image-source")
+        api_calls = [call for call in calls if "api-check" in call]
+        self.assertEqual(len(api_calls), 1)
+        self.assertIn("--require-existing-auth", api_calls[0])
+
+    def test_api_failure_preserves_only_allowlisted_diagnostic_codes(self):
+        cases = (
+            "api_auth_probe_failed",
+            "api_local_upload_failed",
+            "api_duplicate_upload_failed",
+            "api_remote_upload_failed",
+            "api_delete_failed",
+            "api_asset_file_not_removed",
+            "database_read_failed",
+            "path_escape",
+            "unsafe_fixture_file",
+        )
+
+        for fixture_error in cases:
+            with self.subTest(fixture_error=fixture_error):
+                environment = self.environment.copy()
+                environment["PINRY_API_FIXTURE_ERROR"] = fixture_error
+                run_id = "api-error-{}".format(fixture_error)
+                completed = self._run(
+                    run_id=run_id,
+                    environment=environment,
+                )
+                expected_error = "nas_{}".format(fixture_error)
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    completed.stderr.decode("utf-8").strip(),
+                    expected_error,
+                )
+                result = self._assert_canonical_result(
+                    self._result_path(run_id)
+                )
+                self.assertEqual(result["error_code"], expected_error)
+                self.assertIsNone(result["temporary_pin_check"])
+                self.assertEqual(
+                    list(self._clone_path(run_id).glob(
+                        ".acceptance-api-*"
+                    )),
+                    [],
+                )
+                self._assert_public_output(
+                    completed,
+                    self._result_path(run_id),
+                )
+
+    def test_api_failure_hides_unknown_or_noisy_fixture_output(self):
+        cases = (
+            {
+                "PINRY_API_FIXTURE_ERROR": (
+                    "private-photo-secret.png-unexpected"
+                ),
+            },
+            {
+                "PINRY_API_STDERR_NOISE": (
+                    "fixture-secret-token private-photo-secret.png"
+                ),
+            },
+        )
+
+        for index, overrides in enumerate(cases):
+            with self.subTest(overrides=overrides):
+                environment = self.environment.copy()
+                environment.update(overrides)
+                run_id = "api-private-output-{}".format(index)
+                completed = self._run(
+                    run_id=run_id,
+                    environment=environment,
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    completed.stderr.decode("utf-8").strip(),
+                    "nas_api_contract_failed",
+                )
+                result = self._assert_canonical_result(
+                    self._result_path(run_id)
+                )
+                self.assertEqual(
+                    result["error_code"], "nas_api_contract_failed"
+                )
+                self.assertEqual(
+                    list(self._clone_path(run_id).glob(
+                        ".acceptance-api-*"
+                    )),
+                    [],
+                )
+                self._assert_public_output(
+                    completed,
+                    self._result_path(run_id),
+                )
+
     def test_ready_wait_failure_causes_are_mapped_separately(self):
         cases = {
             "status_unavailable": "nas_app_status_unavailable",
@@ -5408,6 +5613,27 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
         self.assertEqual(payload["source_commit"], "a" * 40)
         self._assert_public_output(completed, result_path)
 
+    def test_noop_restart_rejects_clone_database_permission_change(self):
+        environment = self.environment.copy()
+        environment["PINRY_SECOND_START_CHMOD_DATABASE"] = "1"
+        completed = self._run(
+            run_id="noop-database-permission",
+            environment=environment,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stderr.decode("utf-8").strip(),
+            "nas_noop_restart_changed_data",
+        )
+        payload = self._assert_canonical_result(
+            self._result_path("noop-database-permission")
+        )
+        self.assertEqual(payload["state"], "failed")
+        self.assertEqual(
+            payload["error_code"], "nas_noop_restart_changed_data"
+        )
+
     def test_noop_restart_rejects_same_size_media_mutation(self):
         environment = self.environment.copy()
         environment["PINRY_SECOND_START_MUTATE_MEDIA"] = "1"
@@ -5430,3 +5656,55 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
         )
         self.assertEqual(payload["restart_count"], 1)
         self._assert_public_output(completed, result_path)
+
+    def test_noop_restart_allows_same_settings_content_replacement(self):
+        environment = self.environment.copy()
+        environment["PINRY_SECOND_START_REPLACE_SETTINGS"] = "1"
+        completed = self._run(
+            run_id="noop-settings-replacement",
+            environment=environment,
+        )
+
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        payload = self._assert_canonical_result(
+            self._result_path("noop-settings-replacement")
+        )
+        self.assertEqual(payload["state"], "succeeded")
+        self.assertTrue(payload["noop_restart"])
+
+    def test_noop_restart_rejects_settings_content_mutation(self):
+        environment = self.environment.copy()
+        environment["PINRY_SECOND_START_MUTATE_SETTINGS"] = "1"
+        completed = self._run(
+            run_id="noop-settings-mutation",
+            environment=environment,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stderr.decode("utf-8").strip(),
+            "nas_noop_restart_changed_data",
+        )
+
+    def test_noop_restart_rejects_settings_hardlink_replacement(self):
+        environment = self.environment.copy()
+        environment["PINRY_SECOND_START_HARDLINK_SETTINGS"] = "1"
+        completed = self._run(
+            run_id="noop-settings-hardlink",
+            environment=environment,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stderr.decode("utf-8").strip(),
+            "nas_noop_restart_changed_data",
+        )
+        payload = self._assert_canonical_result(
+            self._result_path("noop-settings-hardlink")
+        )
+        self.assertEqual(payload["state"], "failed")
+        self.assertEqual(
+            payload["error_code"], "nas_noop_restart_changed_data"
+        )

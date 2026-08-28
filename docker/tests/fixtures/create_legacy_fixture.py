@@ -78,6 +78,7 @@ _HOST_PATTERN = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$"
 )
 _MAX_JSON_BYTES = 16 * 1024 * 1024
+_MAX_SETTINGS_BYTES = 1024 * 1024
 _FIXTURE_USERNAME = "fixture-reviewer"
 _FIXTURE_PASSWORD = "fixture-review-password"
 _MEDIA_MANIFEST = "media-migration.jsonl"
@@ -4069,7 +4070,7 @@ def _audit_linear_io(  # noqa: C901
     )
 
 
-def _configure_settings(data_root, allow_hosts):
+def _configure_settings(data_root, allow_hosts, preserve_existing=False):
     data_root = os.path.abspath(os.fspath(data_root))
     os.makedirs(data_root, mode=0o770, exist_ok=True)
     normalized = []
@@ -4079,6 +4080,33 @@ def _configure_settings(data_root, allow_hosts):
         value = host.rstrip(".").lower()
         if value not in normalized:
             normalized.append(value)
+    settings_path = os.path.join(data_root, "local_settings.py")
+    if preserve_existing:
+        if not os.path.lexists(settings_path):
+            raise FixtureError("existing_settings_invalid")
+        try:
+            contents, _file_stat = _read_regular_file(
+                settings_path,
+                maximum=_MAX_SETTINGS_BYTES,
+            )
+        except FixtureError:
+            raise FixtureError("existing_settings_invalid") from None
+        if not contents or b"secret_key_place_holder" in contents:
+            raise FixtureError("existing_settings_invalid")
+        suffix = (
+            b"\n# SVRx Pinry NAS acceptance override\n"
+            b"PINRY_FETCH_PRIVATE_ALLOWLIST = "
+            + repr(normalized).encode("ascii")
+            + b"\n"
+        )
+        if not contents.endswith(suffix):
+            if contents and not contents.endswith(b"\n"):
+                contents += b"\n"
+            contents += suffix
+        if len(contents) > _MAX_SETTINGS_BYTES:
+            raise FixtureError("existing_settings_invalid")
+        _atomic_write(settings_path, contents, mode=0o600)
+        return
     template_path = (
         _repo_root() / "pinry/settings/local_settings.example.py"
     )
@@ -4098,7 +4126,7 @@ def _configure_settings(data_root, allow_hosts):
         normalized
     )
     _atomic_write(
-        os.path.join(data_root, "local_settings.py"),
+        settings_path,
         contents.encode("utf-8"),
         mode=0o600,
     )
@@ -4858,7 +4886,7 @@ def _assert_asset_storage_removed(data_root, relative_paths):
 
 
 def _ensure_fixture_authentication(  # noqa: C901
-    session, base_url, mode, data_root
+    session, base_url, mode, data_root, require_existing=False
 ):
     basic_auth = (_FIXTURE_USERNAME, _FIXTURE_PASSWORD)
     profile_url = "{}/api/v2/profile/users/".format(base_url)
@@ -4904,12 +4932,13 @@ def _ensure_fixture_authentication(  # noqa: C901
             raise FixtureError("api_auth_probe_failed")
         return {"Authorization": "Token {}".format(payload[0]["token"])}
 
-    headers = token_headers(
-        auth=basic_auth,
-        expected_username=_FIXTURE_USERNAME,
-    )
-    if headers is not None:
-        return headers
+    if not require_existing:
+        headers = token_headers(
+            auth=basic_auth,
+            expected_username=_FIXTURE_USERNAME,
+        )
+        if headers is not None:
+            return headers
     try:
         connection = _open_sqlite_read_only(
             os.path.join(data_root, "production.db")
@@ -4939,6 +4968,8 @@ def _ensure_fixture_authentication(  # noqa: C901
         )
         if headers is not None:
             return headers
+    if require_existing:
+        raise FixtureError("api_auth_probe_failed")
     if mode != "new":
         raise FixtureError("migrated_auth_failed")
     try:
@@ -4979,7 +5010,8 @@ def _response_pin_identity(response):
 
 
 def _api_check(  # noqa: C901
-    mode, base_url, remote_url, data_root, receipt_path=None
+    mode, base_url, remote_url, data_root, receipt_path=None,
+    require_existing_auth=False,
 ):
     base_url = _validate_http_url(base_url)
     remote_url = _validate_http_url(remote_url, required_host="image-source")
@@ -4999,7 +5031,11 @@ def _api_check(  # noqa: C901
     session = requests.Session()
     session.trust_env = False
     headers = _ensure_fixture_authentication(
-        session, base_url, mode, data_root
+        session,
+        base_url,
+        mode,
+        data_root,
+        require_existing=require_existing_auth,
     )
     created_pins = []
     connection = _open_sqlite_read_only(
@@ -5989,6 +6025,10 @@ def _build_parser():
         action="append",
         default=[],
     )
+    settings_parser.add_argument(
+        "--preserve-existing",
+        action="store_true",
+    )
 
     image_parser = subparsers.add_parser("write-http-fixture")
     image_parser.add_argument("--output", required=True)
@@ -6127,6 +6167,10 @@ def _build_parser():
     api_parser.add_argument("--remote-url", required=True)
     api_parser.add_argument("--receipt")
     api_parser.add_argument("--data-root", required=True)
+    api_parser.add_argument(
+        "--require-existing-auth",
+        action="store_true",
+    )
 
     runtime_parser = subparsers.add_parser("assert-runtime")
     runtime_parser.add_argument("--data-root", required=True)
@@ -6173,7 +6217,11 @@ def _build_parser():
 
 def _dispatch(arguments):  # noqa: C901
     if arguments.command == "configure-settings":
-        _configure_settings(arguments.data_root, arguments.allow_host)
+        _configure_settings(
+            arguments.data_root,
+            arguments.allow_host,
+            preserve_existing=arguments.preserve_existing,
+        )
     elif arguments.command == "write-http-fixture":
         _atomic_write(
             arguments.output,
@@ -6283,6 +6331,7 @@ def _dispatch(arguments):  # noqa: C901
             arguments.remote_url,
             arguments.data_root,
             receipt_path=arguments.receipt,
+            require_existing_auth=arguments.require_existing_auth,
         )
     elif arguments.command == "assert-runtime":
         _assert_runtime(arguments.data_root, arguments.project_settings)

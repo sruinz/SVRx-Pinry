@@ -222,6 +222,8 @@ first_app_id=""
 second_app_id=""
 watch_pid=""
 watch_output_file=""
+api_stdout_file=""
+api_stderr_file=""
 wait_metrics=""
 legacy_database_logical_sha=""
 legacy_pin_sample=""
@@ -252,11 +254,23 @@ remove_watch_output() {
     fi
 }
 
+remove_api_output() {
+    if [ -n "${api_stdout_file}" ]; then
+        rm -f "${api_stdout_file}" >/dev/null 2>&1 || true
+        api_stdout_file=""
+    fi
+    if [ -n "${api_stderr_file}" ]; then
+        rm -f "${api_stderr_file}" >/dev/null 2>&1 || true
+        api_stderr_file=""
+    fi
+}
+
 cleanup() {
     local container_id
 
     stop_watch_process
     remove_watch_output
+    remove_api_output
     protect_clone_root >/dev/null 2>&1 || true
     for container_id in ${created_container_ids}; do
         docker rm -f -v "${container_id}" >/dev/null 2>&1 || true
@@ -1341,6 +1355,123 @@ try:
 finally:
     connection.close()
 PY
+}
+
+fingerprint_clone_logical_data() {
+    local database_digest=""
+    local tree_digest=""
+    local media_fingerprint=""
+    local data_root="$1"
+
+    database_digest="$(
+        logical_database_digest "${data_root}/production.db"
+    )" || return 1
+    media_fingerprint="$(
+        payload_fingerprint "${data_root}/static/media"
+    )" || return 1
+    tree_digest="$(python3 - "${data_root}" 2>/dev/null <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+root = os.path.realpath(sys.argv[1])
+root_stat = os.stat(root, follow_symlinks=False)
+if not stat.S_ISDIR(root_stat.st_mode):
+    raise OSError("data_root_invalid")
+
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+database_files = {
+    "production.db",
+    "production.db-journal",
+    "production.db-shm",
+    "production.db-wal",
+}
+volatile_directories = {
+    "static/media/.pinry-locks",
+    "static/media/.staging",
+}
+digest = hashlib.sha256()
+
+
+def add_fields(*fields):
+    digest.update(b"\0".join(fields) + b"\0")
+
+
+def visit(path, relative):
+    entry_stat = os.stat(path, follow_symlinks=False)
+    mode = entry_stat.st_mode
+    relative_bytes = os.fsencode(relative)
+    stable_metadata = (
+        str(stat.S_IMODE(mode)).encode("ascii"),
+        str(entry_stat.st_uid).encode("ascii"),
+        str(entry_stat.st_gid).encode("ascii"),
+        str(entry_stat.st_nlink).encode("ascii"),
+    )
+    if stat.S_ISREG(mode):
+        if relative in database_files:
+            if relative == "production.db":
+                add_fields(b"database", relative_bytes, *stable_metadata)
+            return
+        descriptor = os.open(path, os.O_RDONLY | nofollow)
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (entry_stat.st_dev, entry_stat.st_ino)
+            ):
+                raise OSError("entry_changed")
+            content = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                content.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        current = os.stat(path, follow_symlinks=False)
+        if (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+        ) != (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+        ):
+            raise OSError("entry_changed")
+        add_fields(
+            b"file", relative_bytes, *stable_metadata,
+            str(after.st_size).encode("ascii"), content.digest()
+        )
+        return
+    if stat.S_ISLNK(mode):
+        add_fields(
+            b"symlink", relative_bytes, *stable_metadata,
+            os.fsencode(os.readlink(path)),
+        )
+        return
+    if not stat.S_ISDIR(mode):
+        raise OSError("special_entry_invalid")
+    add_fields(b"directory", relative_bytes, *stable_metadata)
+    if relative in volatile_directories:
+        return
+    with os.scandir(path) as iterator:
+        children = sorted(iterator, key=lambda item: os.fsencode(item.name))
+    for child in children:
+        child_relative = (
+            os.path.join(relative, child.name) if relative else child.name
+        )
+        visit(child.path, child_relative)
+
+
+visit(root, "")
+print(digest.hexdigest())
+PY
+)" || return 1
+    printf '%s %s %s\n' \
+        "${database_digest}" "${tree_digest}" "${media_fingerprint}"
 }
 
 validate_backup_preservation() {
@@ -3084,6 +3215,20 @@ clone_settings_mount_read_only+="dst=/pinry/pinry/settings/local_settings.py,rea
 fixture_mount="type=bind,src=${fixture_script},"
 fixture_mount+="dst=/tmp/create_legacy_fixture.py,readonly"
 
+if ! fixture_settings_output="$(
+    docker run --rm --network none \
+        --mount "${fixture_mount}" \
+        --mount "${clone_mount_read_write}" \
+        "${runtime_image}" \
+        python /tmp/create_legacy_fixture.py configure-settings \
+            --data-root /data \
+            --allow-host image-source \
+            --preserve-existing \
+        2>/dev/null
+)" || [ "${fixture_settings_output}" != "FIXTURE_SETTINGS_OK" ]; then
+    fatal "nas_fixture_settings_failed"
+fi
+
 if ! docker run --rm --network none --read-only \
     --mount "${clone_mount_read_only}" \
     --entrypoint python "${runtime_image}" -c '
@@ -3828,6 +3973,65 @@ map_wait_failure_code() {
     esac
 }
 
+classify_api_contract() {
+    local command_status="$1"
+    local stdout_path="$2"
+    local stderr_path="$3"
+
+    python3 - "${command_status}" "${stdout_path}" "${stderr_path}" \
+        2>/dev/null <<'PY'
+import os
+import stat
+import sys
+
+status = int(sys.argv[1])
+paths = sys.argv[2:]
+payloads = []
+for path in paths:
+    file_stat = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > 4096:
+        print("nas_api_contract_failed")
+        raise SystemExit(0)
+    with open(path, "rb") as stream:
+        payloads.append(stream.read(4097))
+stdout, stderr = payloads
+if status == 0 and stdout == b"FIXTURE_API_OK\n" and not stderr:
+    print("ok")
+    raise SystemExit(0)
+allowed = {
+    b"FIXTURE_ERROR:api_auth_probe_failed\n": "nas_api_auth_probe_failed",
+    b"FIXTURE_ERROR:api_registration_failed\n": "nas_api_registration_failed",
+    b"FIXTURE_ERROR:api_local_upload_failed\n": "nas_api_local_upload_failed",
+    b"FIXTURE_ERROR:api_duplicate_upload_failed\n": "nas_api_duplicate_upload_failed",
+    b"FIXTURE_ERROR:api_remote_upload_failed\n": "nas_api_remote_upload_failed",
+    b"FIXTURE_ERROR:api_response_invalid\n": "nas_api_response_invalid",
+    b"FIXTURE_ERROR:api_dedup_failed\n": "nas_api_dedup_failed",
+    b"FIXTURE_ERROR:api_historical_dedup_failed\n": "nas_api_historical_dedup_failed",
+    b"FIXTURE_ERROR:api_asset_closure_invalid\n": "nas_api_asset_closure_invalid",
+    b"FIXTURE_ERROR:api_asset_file_empty\n": "nas_api_asset_file_empty",
+    b"FIXTURE_ERROR:api_asset_original_mismatch\n": "nas_api_asset_original_mismatch",
+    b"FIXTURE_ERROR:api_asset_derivative_invalid\n": "nas_api_asset_derivative_invalid",
+    b"FIXTURE_ERROR:api_delete_failed\n": "nas_api_delete_failed",
+    b"FIXTURE_ERROR:api_delete_incomplete\n": "nas_api_delete_incomplete",
+    b"FIXTURE_ERROR:api_historical_asset_deleted\n": "nas_api_historical_asset_deleted",
+    b"FIXTURE_ERROR:api_remote_delete_incomplete\n": "nas_api_remote_delete_incomplete",
+    b"FIXTURE_ERROR:api_asset_file_not_removed\n": "nas_api_asset_file_not_removed",
+    b"FIXTURE_ERROR:api_asset_directory_not_removed\n": "nas_api_asset_directory_not_removed",
+    b"FIXTURE_ERROR:api_asset_count_changed\n": "nas_api_asset_count_changed",
+    b"FIXTURE_ERROR:api_staging_leak\n": "nas_api_staging_leak",
+    b"FIXTURE_ERROR:api_request_failed\n": "nas_api_request_failed",
+    b"FIXTURE_ERROR:migrated_media_changed\n": "nas_migrated_media_changed",
+    b"FIXTURE_ERROR:database_read_failed\n": "nas_database_read_failed",
+    b"FIXTURE_ERROR:path_escape\n": "nas_path_escape",
+    b"FIXTURE_ERROR:unsafe_fixture_file\n": "nas_unsafe_fixture_file",
+}
+if status != 0 and not stdout and stderr in allowed:
+    print(allowed[stderr])
+else:
+    print("nas_api_contract_failed")
+PY
+}
+
 start_app "${first_app_name}" "nas_app_start_failed"
 first_app_id="${started_app_id}"
 migration_deadline_epoch="$(( $(date +%s) + 2400 ))"
@@ -3888,8 +4092,16 @@ validate_canonical_media
 validate_existing_pin_orm
 validate_existing_pin_http
 
-if ! api_output="$(
-    docker run --rm \
+if ! api_stdout_file="$(
+    mktemp "${clone_project}/.acceptance-api-stdout-XXXXXX"
+)" || ! api_stderr_file="$(
+    mktemp "${clone_project}/.acceptance-api-stderr-XXXXXX"
+)"; then
+    remove_api_output
+    fatal "nas_api_contract_failed"
+fi
+api_command_status=0
+docker run --rm \
         --network "${network_name}" \
         --read-only \
         --mount "${fixture_mount}" \
@@ -3900,9 +4112,18 @@ if ! api_output="$(
             --data-root /data \
             --base-url http://app \
             --remote-url http://image-source:8080/remote.png \
-        2>/dev/null
-)" || [ "${api_output}" != "FIXTURE_API_OK" ]; then
-    fatal "nas_api_contract_failed"
+            --require-existing-auth \
+        >"${api_stdout_file}" 2>"${api_stderr_file}" \
+    || api_command_status="$?"
+if ! api_contract_result="$(
+    classify_api_contract \
+        "${api_command_status}" "${api_stdout_file}" "${api_stderr_file}"
+)"; then
+    api_contract_result="nas_api_contract_failed"
+fi
+remove_api_output
+if [ "${api_contract_result}" != "ok" ]; then
+    fatal "${api_contract_result}"
 fi
 temporary_pin_check="passed"
 
@@ -3960,7 +4181,9 @@ if ! docker stop --time 30 "${first_app_id}" >/dev/null 2>&1 \
     || ! docker rm -v "${first_app_id}" >/dev/null 2>&1; then
     fatal "nas_app_stop_failed"
 fi
-if ! before_restart_fingerprint="$(fingerprint_data "${clone_data}")"; then
+if ! before_restart_fingerprint="$(
+    fingerprint_clone_logical_data "${clone_data}"
+)"; then
     fatal "nas_noop_restart_verification_failed"
 fi
 
@@ -4002,7 +4225,9 @@ if ! docker stop --time 30 "${second_app_id}" >/dev/null 2>&1 \
     || ! docker rm -v "${second_app_id}" >/dev/null 2>&1; then
     fatal "nas_app_stop_failed"
 fi
-if ! after_restart_fingerprint="$(fingerprint_data "${clone_data}")"; then
+if ! after_restart_fingerprint="$(
+    fingerprint_clone_logical_data "${clone_data}"
+)"; then
     fatal "nas_noop_restart_verification_failed"
 fi
 if [ "${before_restart_fingerprint}" != "${after_restart_fingerprint}" ]; then
