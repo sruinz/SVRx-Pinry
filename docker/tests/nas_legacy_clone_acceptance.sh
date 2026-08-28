@@ -226,6 +226,7 @@ wait_metrics=""
 legacy_database_logical_sha=""
 legacy_pin_sample=""
 canonical_pin_sample=""
+existing_pin_site_public=""
 
 remember_container_id() {
     created_container_ids="${created_container_ids} $1"
@@ -2844,7 +2845,10 @@ try:
     import django
     django.setup()
     from core.models import Pin
+    from django.conf import settings
     from django_images.models import Image
+    if type(settings.PUBLIC) is not bool:
+        fail()
     expected_pins = {
         entry["pin_id"]: (entry["image_id"], entry["private"])
         for entry in sample["pins"]
@@ -2883,13 +2887,31 @@ try:
             fail()
 except Exception:
     fail()
-print("NAS_EXISTING_PIN_ORM_OK")
+print("NAS_EXISTING_PIN_ORM_OK:{}".format(
+    "true" if settings.PUBLIC else "false",
+))
 ' 2>/dev/null
     )" || verifier_status="$?"
-    if [ "${verifier_status}" -ne 0 ] \
-        || [ "${verifier_output}" != "NAS_EXISTING_PIN_ORM_OK" ]; then
+    if [ "${verifier_status}" -ne 0 ]; then
         fatal "nas_existing_pin_orm_failed"
     fi
+    local detected_site_public=""
+    case "${verifier_output}" in
+        NAS_EXISTING_PIN_ORM_OK:true)
+            detected_site_public="true"
+            ;;
+        NAS_EXISTING_PIN_ORM_OK:false)
+            detected_site_public="false"
+            ;;
+        *)
+            fatal "nas_existing_pin_orm_failed"
+            ;;
+    esac
+    if [ -n "${existing_pin_site_public}" ] \
+        && [ "${existing_pin_site_public}" != "${detected_site_public}" ]; then
+        fatal "nas_existing_pin_orm_failed"
+    fi
+    existing_pin_site_public="${detected_site_public}"
 }
 
 validate_existing_pin_http() {
@@ -2899,10 +2921,12 @@ validate_existing_pin_http() {
         printf '%s' "${canonical_pin_sample}" | docker run --rm -i \
             --network "${network_name}" \
             --read-only \
+            --env "PINRY_SITE_PUBLIC=${existing_pin_site_public}" \
             --entrypoint python "${runtime_image}" -c '
 _NAS_EXISTING_MEDIA_HTTP = True
 import hashlib
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -2912,6 +2936,18 @@ import urllib.request
 def fail():
     print("nas_existing_pin_http_invalid")
     raise SystemExit(1)
+
+
+def get(path):
+    try:
+        with urllib.request.urlopen(
+            "http://app{}".format(path), timeout=10,
+        ) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+    except (OSError, urllib.error.URLError, ValueError):
+        fail()
 
 
 try:
@@ -2924,37 +2960,65 @@ required = {
 }
 if not isinstance(sample, dict) or set(sample) != required:
     fail()
+site_public_value = os.environ.get("PINRY_SITE_PUBLIC")
+if site_public_value not in ("true", "false"):
+    fail()
+site_public = site_public_value == "true"
 path = urllib.parse.quote(sample["image_path"], safe="/")
-try:
-    with urllib.request.urlopen(
-        "http://app/media/{}".format(path), timeout=10,
-    ) as response:
-        payload = response.read()
-        if response.status != 200:
-            fail()
-except (OSError, urllib.error.URLError, ValueError):
+media_status, payload = get("/media/{}".format(path))
+if media_status != 200:
     fail()
 if hashlib.sha256(payload).hexdigest() != sample["image_sha256"]:
+    fail()
+
+version_status, version_payload = get("/api/v2/version/")
+if version_status != 200:
+    fail()
+try:
+    version = json.loads(version_payload.decode("utf-8"))
+except (UnicodeError, ValueError):
+    fail()
+if not isinstance(version, dict):
     fail()
 
 public_pin_id = sample["public_pin_id"]
 public_image_id = sample["public_image_id"]
 if (public_pin_id is None) != (public_image_id is None):
     fail()
-if public_pin_id is not None:
+if site_public and public_pin_id is not None:
     if type(public_pin_id) is not int or type(public_image_id) is not int:
         fail()
-    try:
-        with urllib.request.urlopen(
-            "http://app/api/v2/pins/{}/".format(public_pin_id), timeout=10,
-        ) as response:
-            if response.status != 200:
-                fail()
-            pin = json.loads(response.read().decode("utf-8"))
-    except (OSError, UnicodeError, urllib.error.URLError, ValueError):
+    detail_status, detail_payload = get(
+        "/api/v2/pins/{}/".format(public_pin_id),
+    )
+    if site_public:
+        if detail_status != 200:
+            fail()
+        try:
+            pin = json.loads(detail_payload.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            fail()
+        image = pin.get("image") if isinstance(pin, dict) else None
+        if (
+            pin.get("id") != public_pin_id
+            or not isinstance(image, dict)
+            or image.get("id") != public_image_id
+        ):
+            fail()
+if not site_public:
+    existing_pin_id = sample["pin_id"]
+    if type(existing_pin_id) is not int:
         fail()
-    image = pin.get("image") if isinstance(pin, dict) else None
-    if pin.get("id") != public_pin_id or not isinstance(image, dict) or image.get("id") != public_image_id:
+    detail_status, _ = get(
+        "/api/v2/pins/{}/".format(existing_pin_id),
+    )
+    list_status, _ = get("/api/v2/pins/")
+    boundary_status, _ = get("/api/v2/version/not-allowed/")
+    if (
+        detail_status != 403
+        or list_status != 403
+        or boundary_status != 403
+    ):
         fail()
 print("NAS_EXISTING_MEDIA_HTTP_OK")
 ' 2>/dev/null

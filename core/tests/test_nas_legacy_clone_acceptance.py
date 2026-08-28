@@ -1,6 +1,7 @@
 import ast
 import contextlib
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -11,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -446,7 +448,10 @@ if arguments and arguments[0] == "run":
         }, sort_keys=True, separators=(",", ":")))
         raise SystemExit(0)
     if "NAS_EXISTING_PIN_ORM" in joined:
-        print("NAS_EXISTING_PIN_ORM_OK")
+        site_public = os.environ.get(
+            "PINRY_FIXTURE_SITE_PUBLIC", "true"
+        )
+        print("NAS_EXISTING_PIN_ORM_OK:{}".format(site_public))
         raise SystemExit(0)
     if "NAS_EXISTING_MEDIA_HTTP" in joined:
         print("NAS_EXISTING_MEDIA_HTTP_OK")
@@ -1950,6 +1955,101 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 1)
         return calls[-1][calls[-1].index("-c") + 1]
 
+    def _existing_pin_http_verifier_source(self):
+        calls = [
+            call for call in self._docker_calls()
+            if "_NAS_EXISTING_MEDIA_HTTP" in "\n".join(call)
+        ]
+        self.assertGreaterEqual(len(calls), 1)
+        return calls[-1][calls[-1].index("-c") + 1]
+
+    def _run_existing_pin_http_verifier(
+        self,
+        helper,
+        site_public=True,
+        has_public_pin=True,
+        detail_status=200,
+        list_status=200,
+        version_status=200,
+        version_boundary_status=403,
+    ):
+        media_payload = b"existing-media"
+        sample = {
+            "image_id": 7,
+            "image_path": "originals/existing/image.png",
+            "image_sha256": hashlib.sha256(media_payload).hexdigest(),
+            "pin_id": 11,
+            "public_image_id": 7 if has_public_pin else None,
+            "public_pin_id": 11 if has_public_pin else None,
+            "pins": [],
+            "images": [],
+        }
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/media/originals/existing/image.png":
+                    status = 200
+                    payload = media_payload
+                elif self.path == "/api/v2/pins/11/":
+                    status = detail_status
+                    payload = json.dumps({
+                        "id": 11,
+                        "image": {"id": 7},
+                    }).encode("ascii")
+                elif self.path == "/api/v2/pins/":
+                    status = list_status
+                    payload = b"{}"
+                elif self.path == "/api/v2/version/":
+                    status = version_status
+                    payload = b"{}"
+                elif self.path == "/api/v2/version/not-allowed/":
+                    status = version_boundary_status
+                    payload = b"{}"
+                else:
+                    status = 404
+                    payload = b""
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format_, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), Handler,
+        )
+        thread = threading.Thread(target=server.serve_forever)
+        thread.daemon = True
+        thread.start()
+
+        def stop_server():
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+        self.addCleanup(stop_server)
+
+        helper = helper.replace(
+            '"http://app',
+            '"http://127.0.0.1:{}'.format(server.server_port),
+        )
+        environment = os.environ.copy()
+        environment["PINRY_SITE_PUBLIC"] = (
+            "true" if site_public else "false"
+        )
+        return subprocess.run(
+            [sys.executable, "-c", helper],
+            input=json.dumps(
+                sample,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii"),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
     def _run_backup_verifier(
         self,
         helper,
@@ -2535,6 +2635,184 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
                 self.assertIn("-i", call)
                 helper_index = call.index("-c") + 1
                 self.assertEqual(call[helper_index + 1:], [])
+
+    def test_existing_pin_http_accepts_private_site_access_gate(self):
+        completed = self._run(run_id="private-http-gate")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        helper = self._existing_pin_http_verifier_source()
+
+        verified = self._run_existing_pin_http_verifier(
+            helper,
+            site_public=False,
+            detail_status=403,
+            list_status=403,
+            version_status=200,
+            version_boundary_status=403,
+        )
+
+        self.assertEqual(
+            verified.returncode,
+            0,
+            verified.stdout.decode("ascii"),
+        )
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "NAS_EXISTING_MEDIA_HTTP_OK",
+        )
+
+    def test_existing_pin_http_rejects_unexplained_forbidden_detail(self):
+        completed = self._run(run_id="invalid-private-http-gate")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        helper = self._existing_pin_http_verifier_source()
+
+        verified = self._run_existing_pin_http_verifier(
+            helper,
+            site_public=True,
+            detail_status=403,
+            list_status=403,
+            version_status=200,
+            version_boundary_status=403,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_existing_pin_http_invalid",
+        )
+
+    def test_existing_pin_http_rejects_private_site_boundary_regression(self):
+        completed = self._run(run_id="private-http-boundary-regression")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        helper = self._existing_pin_http_verifier_source()
+
+        verified = self._run_existing_pin_http_verifier(
+            helper,
+            site_public=False,
+            detail_status=403,
+            list_status=200,
+            version_status=200,
+            version_boundary_status=403,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_existing_pin_http_invalid",
+        )
+
+    def test_existing_pin_http_rejects_private_site_detail_exposure(self):
+        completed = self._run(run_id="private-http-detail-exposure")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        helper = self._existing_pin_http_verifier_source()
+
+        verified = self._run_existing_pin_http_verifier(
+            helper,
+            site_public=False,
+            detail_status=200,
+            list_status=403,
+            version_status=200,
+            version_boundary_status=403,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_existing_pin_http_invalid",
+        )
+
+    def test_existing_pin_http_checks_detail_when_all_pins_are_private(self):
+        completed = self._run(run_id="private-http-no-public-pin")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        helper = self._existing_pin_http_verifier_source()
+
+        verified = self._run_existing_pin_http_verifier(
+            helper,
+            site_public=False,
+            has_public_pin=False,
+            detail_status=200,
+            list_status=403,
+            version_status=200,
+            version_boundary_status=403,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_existing_pin_http_invalid",
+        )
+
+    def test_existing_pin_http_preserves_public_site_contract(self):
+        completed = self._run(run_id="public-http-contract")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        helper = self._existing_pin_http_verifier_source()
+
+        verified = self._run_existing_pin_http_verifier(
+            helper,
+            site_public=True,
+            detail_status=200,
+            list_status=200,
+            version_status=200,
+            version_boundary_status=404,
+        )
+
+        self.assertEqual(
+            verified.returncode,
+            0,
+            verified.stdout.decode("ascii"),
+        )
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "NAS_EXISTING_MEDIA_HTTP_OK",
+        )
+
+    def test_existing_pin_http_uses_runtime_public_setting(self):
+        environment = self.environment.copy()
+        environment["PINRY_FIXTURE_SITE_PUBLIC"] = "false"
+        completed = self._run(
+            run_id="runtime-private-setting",
+            environment=environment,
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        calls = [
+            call for call in self._docker_calls()
+            if "_NAS_EXISTING_MEDIA_HTTP" in "\n".join(call)
+        ]
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            environment_index = call.index("--env")
+            self.assertEqual(
+                call[environment_index + 1],
+                "PINRY_SITE_PUBLIC=false",
+            )
 
     def test_canonical_media_verifier_rejects_same_count_corruption(self):
         completed = self._run(run_id="canonical-media-corruption")
