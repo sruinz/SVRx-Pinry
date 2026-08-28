@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
@@ -63,6 +64,118 @@ class LegacyFixtureContractTests(unittest.TestCase):
                 sort_keys=False,
             )
         return serialized.encode("ascii") + b"\n"
+
+    @staticmethod
+    def maintenance_status(state="migrating", **overrides):
+        phases = {
+            "starting": ("preparing", "이전 준비"),
+            "recovering": ("recovery", "이전 상태 확인"),
+            "migrating": ("copying", "이미지 파일 이전"),
+            "starting_service": ("complete", "이전 완료"),
+            "ready": ("complete", "준비 완료"),
+            "failed": ("copying", "이전 실패"),
+        }
+        phase, phase_label = phases[state]
+        terminal = state in ("starting_service", "ready")
+        failed = state == "failed"
+        status = {
+            "schema_version": 1,
+            "state": state,
+            "phase": phase,
+            "phase_label": phase_label,
+            "run_id": "fixture-run",
+            "attempt": 1,
+            "resume_count": 1,
+            "started_at": "2026-08-28T00:00:00Z",
+            "phase_started_at": "2026-08-28T00:00:00Z",
+            "heartbeat_at": "2026-08-28T00:00:01Z" if terminal else (
+                "2026-08-28T00:00:00Z"
+            ),
+            "progress_at": "2026-08-28T00:00:01Z" if terminal else (
+                "2026-08-28T00:00:00Z"
+            ),
+            "last_committed_batch": 5 if terminal else 4,
+            "images_done": 346 if terminal else 300,
+            "images_total": 346,
+            "files_done": 1384 if terminal else 1200,
+            "files_total": 1384,
+            "backfill_done": 346 if terminal else 300,
+            "backfill_total": 346,
+            "phase_percent": 100.0 if terminal else 80.0,
+            "overall_percent": 100.0 if terminal else 70.0,
+            "error_class": "fatal" if failed else None,
+            "error_code": "fixture_failed" if failed else None,
+        }
+        status.update(overrides)
+        return status
+
+    def run_maintenance_statuses(
+        self, statuses, timeout="0.5", expected_state="migrating",
+        require_terminal=False,
+    ):
+        class Handler(BaseHTTPRequestHandler):
+            status_reads = 0
+
+            def do_GET(self):
+                if self.path == "/migration/":
+                    body = (
+                        "기존 Pinry 데이터를 이전하고 있습니다."
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header(
+                        "Content-Type", "text/html; charset=utf-8"
+                    )
+                elif self.path == "/migration-status.json":
+                    index = min(
+                        type(self).status_reads,
+                        len(statuses) - 1,
+                    )
+                    type(self).status_reads += 1
+                    body = json.dumps(statuses[index]).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                elif self.path in (
+                    "/api/v2/version/", "/media/private"
+                ):
+                    body = b"blocked"
+                    self.send_response(503)
+                    self.send_header("Retry-After", "5")
+                else:
+                    body = b"not found"
+                    self.send_response(404)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            arguments = [
+                "assert-maintenance-http",
+                "--base-url",
+                "http://127.0.0.1:{}".format(server.server_port),
+                "--expected-state",
+                expected_state,
+                "--timeout",
+                timeout,
+                "--expected-images",
+                "346",
+                "--expected-files",
+                "1384",
+            ]
+            if require_terminal:
+                arguments.append("--require-terminal")
+            completed = self.run_fixture(*arguments)
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+        return completed, Handler.status_reads
 
     def record_first_linear_commit(self, data_root, journal_payload):
         journal_path = data_root / "linear-migration-v1.jsonl"
@@ -340,14 +453,23 @@ class LegacyFixtureContractTests(unittest.TestCase):
                     type(self).status_reads += 1
                     recovering = type(self).status_reads == 1
                     changed = type(self).status_reads > 2
-                    body = json.dumps({
-                        "state": "recovering" if recovering else "migrating",
-                        "resume_count": 1,
-                        "images_done": 1 if changed else 0,
-                        "files_done": 4 if changed else 0,
-                        "heartbeat_at": "2026-08-27T00:00:01Z" if changed else "2026-08-27T00:00:00Z",
-                        "last_committed_batch": 1 if changed else 0,
-                    }).encode()
+                    body = json.dumps(
+                        LegacyFixtureContractTests.maintenance_status(
+                            "recovering" if recovering else "migrating",
+                            images_done=1 if changed else 0,
+                            files_done=4 if changed else 0,
+                            backfill_done=1 if changed else 0,
+                            heartbeat_at=(
+                                "2026-08-28T00:00:01Z" if changed else
+                                "2026-08-28T00:00:00Z"
+                            ),
+                            progress_at=(
+                                "2026-08-28T00:00:01Z" if changed else
+                                "2026-08-28T00:00:00Z"
+                            ),
+                            last_committed_batch=1 if changed else 0,
+                        )
+                    ).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Cache-Control", "no-store")
@@ -390,14 +512,261 @@ class LegacyFixtureContractTests(unittest.TestCase):
         )
         self.assertGreaterEqual(Handler.status_reads, 2)
 
+    def test_assert_maintenance_http_accepts_phase_or_single_field_progress(
+        self,
+    ):
+        cases = (
+            (
+                self.maintenance_status(
+                    "migrating", phase_percent=100.0
+                ),
+                self.maintenance_status(
+                    "migrating",
+                    phase="database",
+                    phase_label="데이터베이스 반영",
+                    phase_percent=0.0,
+                ),
+            ),
+            (
+                self.maintenance_status("migrating"),
+                self.maintenance_status(
+                    "migrating", files_done=1201
+                ),
+            ),
+        )
+
+        for baseline, progressed in cases:
+            with self.subTest(progressed=progressed):
+                completed, _status_reads = self.run_maintenance_statuses((
+                    baseline,
+                    progressed,
+                ))
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr.decode("utf-8"),
+                )
+
+    def test_assert_maintenance_http_accepts_actual_phase_cycles(self):
+        statuses = (
+            self.maintenance_status(
+                "migrating", phase="planning", phase_label="이전 계획"
+            ),
+            self.maintenance_status(
+                "migrating", phase="recovery", phase_label="이전 복구"
+            ),
+            self.maintenance_status(
+                "migrating", phase="copying", phase_label="파일 복사"
+            ),
+            self.maintenance_status(
+                "migrating", phase="database", phase_label="DB 반영"
+            ),
+            self.maintenance_status(
+                "migrating", phase="copying", phase_label="파일 복사",
+                images_done=301, files_done=1204,
+                last_committed_batch=5,
+            ),
+            self.maintenance_status("ready"),
+        )
+
+        completed, status_reads = self.run_maintenance_statuses(
+            statuses, require_terminal=True
+        )
+
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        self.assertGreaterEqual(status_reads, len(statuses))
+
+    def test_assert_maintenance_http_rejects_invalid_phase_reversal(self):
+        completed, _status_reads = self.run_maintenance_statuses((
+            self.maintenance_status(
+                "migrating", phase="finalizing", phase_label="최종 검증"
+            ),
+            self.maintenance_status(
+                "migrating", phase="copying", phase_label="파일 복사"
+            ),
+        ), require_terminal=True)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(
+            completed.stderr.decode("utf-8").strip(),
+            "FIXTURE_ERROR:maintenance_progress_regressed",
+        )
+
+    def test_assert_maintenance_http_terminal_mode_checks_after_progress(self):
+        malformed = self.maintenance_status("ready")
+        del malformed["phase_label"]
+        completed, status_reads = self.run_maintenance_statuses((
+            self.maintenance_status("migrating"),
+            self.maintenance_status(
+                "migrating", phase="database", phase_label="DB 반영"
+            ),
+            malformed,
+        ), require_terminal=True)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertGreaterEqual(status_reads, 3)
+        self.assertEqual(
+            completed.stderr.decode("utf-8").strip(),
+            "FIXTURE_ERROR:maintenance_status_invalid",
+        )
+
+    def test_assert_maintenance_http_all_states_require_full_schema(self):
+        for expected_state in ("recovering", "failed"):
+            with self.subTest(expected_state=expected_state):
+                invalid = self.maintenance_status(expected_state)
+                del invalid["last_committed_batch"]
+                completed, _status_reads = self.run_maintenance_statuses(
+                    (invalid,), expected_state=expected_state
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(
+                    completed.stderr.decode("utf-8").strip(),
+                    "FIXTURE_ERROR:maintenance_status_invalid",
+                )
+
+    def test_assert_maintenance_http_accepts_fast_completed_migration(self):
+        for completed_state in ("starting_service", "ready"):
+            with self.subTest(completed_state=completed_state):
+                completed, status_reads = self.run_maintenance_statuses((
+                    self.maintenance_status("migrating"),
+                    self.maintenance_status(completed_state),
+                ))
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr.decode("utf-8"),
+                )
+                self.assertGreaterEqual(status_reads, 2)
+
+    def test_assert_maintenance_http_accepts_completion_when_migration_was_fast(self):
+        cases = (
+            (
+                self.maintenance_status("starting"),
+                self.maintenance_status("ready"),
+            ),
+            (
+                self.maintenance_status("recovering"),
+                self.maintenance_status("starting_service"),
+            ),
+            (self.maintenance_status("ready"),),
+        )
+
+        for statuses in cases:
+            with self.subTest(first_state=statuses[0]["state"]):
+                completed, _status_reads = self.run_maintenance_statuses(
+                    statuses
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr.decode("utf-8"),
+                )
+
+    def test_assert_maintenance_http_rejects_invalid_terminal_schema(self):
+        missing = self.maintenance_status("ready")
+        del missing["phase_label"]
+        cases = (
+            missing,
+            self.maintenance_status("ready", schema_version=True),
+            self.maintenance_status(
+                "starting_service", images_done="346"
+            ),
+            self.maintenance_status("ready", phase="finalizing"),
+            self.maintenance_status("ready", phase_percent=99.0),
+            self.maintenance_status("ready", overall_percent=99.0),
+            self.maintenance_status(
+                "ready", images_done=345, images_total=345
+            ),
+            self.maintenance_status(
+                "ready", files_done=1383, files_total=1383
+            ),
+            self.maintenance_status("ready", backfill_done=345),
+            self.maintenance_status(
+                "ready", backfill_done=347, backfill_total=346
+            ),
+        )
+
+        for terminal in cases:
+            with self.subTest(terminal=terminal):
+                completed, _status_reads = self.run_maintenance_statuses((
+                    self.maintenance_status("migrating"),
+                    terminal,
+                ))
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(
+                    completed.stderr.decode("utf-8").strip(),
+                    "FIXTURE_ERROR:maintenance_status_invalid",
+                )
+
+    def test_assert_maintenance_http_rejects_terminal_progress_regression(self):
+        cases = {
+            "images_done": self.maintenance_status(
+                "migrating", images_done=350, images_total=400
+            ),
+            "files_done": self.maintenance_status(
+                "migrating", files_done=1400, files_total=1500
+            ),
+            "last_committed_batch": self.maintenance_status(
+                "migrating", last_committed_batch=6
+            ),
+            "backfill_done": self.maintenance_status(
+                "migrating", backfill_done=350, backfill_total=400
+            ),
+            "heartbeat_at": self.maintenance_status(
+                "migrating",
+                heartbeat_at="2026-08-28T00:00:02Z",
+                progress_at="2026-08-28T00:00:02Z",
+            ),
+            "progress_at": self.maintenance_status(
+                "migrating",
+                progress_at="2026-08-28T00:00:02Z",
+            ),
+            "attempt": self.maintenance_status(
+                "migrating", attempt=2
+            ),
+            "resume_count": self.maintenance_status(
+                "migrating", resume_count=2
+            ),
+        }
+
+        for field, migrating in cases.items():
+            with self.subTest(field=field):
+                completed, _status_reads = self.run_maintenance_statuses((
+                    migrating,
+                    self.maintenance_status("ready"),
+                ))
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(
+                    completed.stderr.decode("utf-8").strip(),
+                    "FIXTURE_ERROR:maintenance_progress_regressed",
+                )
+
+    def test_assert_maintenance_http_rejects_private_completed_status(self):
+        terminal = self.maintenance_status("ready")
+        terminal["private_path"] = "/private/source"
+        completed, _status_reads = self.run_maintenance_statuses((
+            self.maintenance_status("migrating"),
+            terminal,
+        ))
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(
+            completed.stderr.decode("utf-8").strip(),
+            "FIXTURE_ERROR:maintenance_status_private",
+        )
+
     def test_assert_maintenance_http_retries_until_listener_ready(self):
+        failed_status = self.maintenance_status("failed")
+
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 if self.path == "/migration/":
                     body = "기존 Pinry 데이터를 이전하고 있습니다.".encode()
                     self.send_response(200)
                 elif self.path == "/migration-status.json":
-                    body = json.dumps({"state": "failed"}).encode()
+                    body = json.dumps(failed_status).encode()
                     self.send_response(200)
                     self.send_header("Cache-Control", "no-store")
                 elif self.path in ("/api/v2/version/", "/media/private"):
@@ -449,6 +818,109 @@ class LegacyFixtureContractTests(unittest.TestCase):
 
         self.assertEqual(
             completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+
+    def test_assert_maintenance_http_reports_request_stage(self):
+        module = self.load_fixture_module()
+        import requests
+        migrating_status = self.maintenance_status("migrating")
+
+        class Response:
+            def __init__(self, status_code):
+                self.status_code = status_code
+                self.text = (
+                    "기존 Pinry 데이터를 이전하고 있습니다."
+                )
+                self.headers = {
+                    "Cache-Control": "no-store",
+                    "Retry-After": "5",
+                }
+
+            def json(self):
+                return migrating_status
+
+        cases = (
+            ((), "maintenance_page_unavailable"),
+            ((Response(200),), "maintenance_blocking_unavailable"),
+            (
+                (Response(200), Response(503), Response(503)),
+                "maintenance_status_unavailable",
+            ),
+        )
+        for initial_responses, expected_error in cases:
+            responses = iter(initial_responses)
+
+            def fail_after_responses(*_args, **_kwargs):
+                try:
+                    return next(responses)
+                except StopIteration:
+                    raise requests.ConnectionError()
+
+            with self.subTest(expected_error=expected_error), mock.patch(
+                "requests.Session.get", side_effect=fail_after_responses
+            ), mock.patch("time.sleep", return_value=None):
+                with self.assertRaises(module.FixtureError) as raised:
+                    module._assert_maintenance_http(
+                        "http://127.0.0.1:8000",
+                        "migrating",
+                        0.01,
+                        expected_images=346,
+                        expected_files=1384,
+                    )
+                self.assertEqual(str(raised.exception), expected_error)
+
+    def test_assert_maintenance_http_preserves_failed_terminal_code(self):
+        module = self.load_fixture_module()
+        failed = self.maintenance_status(
+            "failed", error_code="legacy_startup_failed"
+        )
+
+        class Response:
+            status_code = 200
+            text = "기존 Pinry 데이터를 이전하고 있습니다."
+            headers = {"Cache-Control": "no-store", "Retry-After": "5"}
+
+            def __init__(self, status=None, status_code=None):
+                self.status = status
+                if status_code is not None:
+                    self.status_code = status_code
+
+            def json(self):
+                return self.status
+
+        responses = iter((
+            Response(),
+            Response(status_code=503),
+            Response(status_code=503),
+        ))
+
+        def response_sequence(*_args, **_kwargs):
+            try:
+                return next(responses)
+            except StopIteration:
+                return Response(failed)
+
+        session = mock.Mock()
+        session.get.side_effect = response_sequence
+        requests_module = types.SimpleNamespace(
+            Session=mock.Mock(return_value=session),
+            RequestException=Exception,
+        )
+        with mock.patch.dict(
+            sys.modules, {"requests": requests_module}
+        ), mock.patch("time.sleep", return_value=None):
+            with self.assertRaises(module.FixtureError) as raised:
+                module._assert_maintenance_http(
+                    "http://127.0.0.1:8000",
+                    "migrating",
+                    0.01,
+                    expected_images=346,
+                    expected_files=1384,
+                )
+
+        self.assertEqual(
+            str(raised.exception),
+            "maintenance_failed:legacy_startup_failed",
         )
 
     def test_maintenance_status_uses_allowlist_and_rejects_locations(self):
@@ -515,6 +987,28 @@ class LegacyFixtureContractTests(unittest.TestCase):
             server.shutdown()
             thread.join()
             server.server_close()
+
+    def test_public_maintenance_status_allows_utc_timestamp_fields(self):
+        fixture = self.load_fixture_module()
+        original_urlsplit = fixture.urlsplit
+
+        status = self.maintenance_status("migrating")
+        timestamps = {
+            status[field]
+            for field in fixture._MAINTENANCE_TIMESTAMP_FIELDS
+            if status[field] is not None
+        }
+
+        def legacy_urlsplit(value):
+            parsed = original_urlsplit(value)
+            if value in timestamps:
+                return parsed._replace(scheme="2026-08-28t00")
+            return parsed
+
+        with mock.patch.object(
+            fixture, "urlsplit", side_effect=legacy_urlsplit
+        ):
+            fixture._assert_public_status(status, "migrating")
 
     def test_observe_maintenance_service_records_public_heartbeat(self):
         class Handler(BaseHTTPRequestHandler):
@@ -2605,12 +3099,29 @@ class LegacyFixtureContractTests(unittest.TestCase):
         self,
     ):
         fixture = self.load_fixture_module()
+        from django.conf import settings
+        from django.db import connections
+
+        original_settings_name = settings.DATABASES["default"]["NAME"]
+        original_connection_name = connections["default"].settings_dict[
+            "NAME"
+        ]
 
         with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
             connection, _database_path, _media_root = (
                 fixture._configure_django(temporary)
             )
             self.addCleanup(connection.close)
+            self.addCleanup(
+                settings.DATABASES["default"].__setitem__,
+                "NAME",
+                original_settings_name,
+            )
+            self.addCleanup(
+                connections["default"].settings_dict.__setitem__,
+                "NAME",
+                original_connection_name,
+            )
             from django_images.services.legacy_startup import (
                 LegacyStartupError,
             )
@@ -2753,6 +3264,12 @@ class LegacyFixtureContractTests(unittest.TestCase):
             contents,
         )
         self.assertIn('[ "${exit_code}" = 0 ]', contents)
+        self.assertIn(
+            'http://app migrating 180 1 "" 512 2048', contents
+        )
+        self.assertIn(
+            'http://app migrating 180 "" "" 512 2048', contents
+        )
 
     def test_legacy_md5_fixture_covers_every_root_and_orphan_sentinel(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:

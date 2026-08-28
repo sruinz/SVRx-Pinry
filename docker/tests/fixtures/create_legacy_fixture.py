@@ -8,6 +8,7 @@ import ast
 import collections
 from contextlib import ExitStack
 from contextvars import ContextVar
+import datetime
 import errno
 import fcntl
 from functools import wraps
@@ -16,6 +17,7 @@ import hashlib
 import glob
 import inspect
 import json
+import math
 import os
 from pathlib import Path
 import pwd
@@ -134,6 +136,96 @@ _PUBLIC_MAINTENANCE_STATUS_FIELDS = frozenset((
     "error_class",
     "error_code",
 ))
+_MAINTENANCE_STATUS_STATES = frozenset((
+    "starting",
+    "recovering",
+    "migrating",
+    "starting_service",
+    "ready",
+    "failed",
+))
+_MAINTENANCE_PHASES = frozenset((
+    "preparing",
+    "recovery",
+    "upgrade_v2",
+    "snapshot",
+    "planning",
+    "copying",
+    "database",
+    "backfill_planning",
+    "backfill_registering",
+    "archive",
+    "finalizing",
+    "complete",
+))
+_MAINTENANCE_PHASE_TRANSITIONS = {
+    "preparing": frozenset((
+        "preparing", "snapshot", "planning", "recovery", "upgrade_v2",
+        "copying", "database", "backfill_planning",
+        "backfill_registering", "archive", "finalizing", "complete",
+    )),
+    "snapshot": frozenset((
+        "snapshot", "planning", "recovery", "upgrade_v2", "copying",
+        "database", "backfill_planning", "backfill_registering",
+        "archive", "finalizing", "complete",
+    )),
+    "planning": frozenset((
+        "planning", "recovery", "upgrade_v2", "copying", "database",
+        "backfill_planning", "backfill_registering", "archive",
+        "finalizing", "complete",
+    )),
+    "recovery": frozenset((
+        "recovery", "upgrade_v2", "copying", "database",
+        "backfill_planning", "backfill_registering", "archive",
+        "finalizing", "complete",
+    )),
+    "upgrade_v2": frozenset((
+        "upgrade_v2", "copying", "database", "backfill_planning",
+        "backfill_registering", "archive", "finalizing", "complete",
+    )),
+    "copying": frozenset((
+        "copying", "database", "backfill_planning",
+        "backfill_registering", "archive", "finalizing", "complete",
+    )),
+    "database": frozenset((
+        "database", "copying", "backfill_planning",
+        "backfill_registering", "archive", "finalizing", "complete",
+    )),
+    "backfill_planning": frozenset((
+        "backfill_planning", "backfill_registering", "archive",
+        "finalizing", "complete",
+    )),
+    "backfill_registering": frozenset((
+        "backfill_registering", "archive", "finalizing", "complete",
+    )),
+    "archive": frozenset(("archive", "finalizing", "complete")),
+    "finalizing": frozenset(("finalizing", "complete")),
+    "complete": frozenset(("complete",)),
+}
+_MAINTENANCE_ERROR_CLASSES = frozenset((
+    "retryable",
+    "operator_action_required",
+    "fatal",
+))
+_MAINTENANCE_INTEGER_FIELDS = (
+    "attempt",
+    "resume_count",
+    "last_committed_batch",
+    "images_done",
+    "files_done",
+    "backfill_done",
+)
+_MAINTENANCE_TOTAL_FIELDS = (
+    "images_total",
+    "files_total",
+    "backfill_total",
+)
+_MAINTENANCE_TIMESTAMP_FIELDS = (
+    "started_at",
+    "phase_started_at",
+    "heartbeat_at",
+    "progress_at",
+)
 
 
 def _is_repository_root(path):
@@ -883,7 +975,7 @@ def _assert_public_status(value, expected_state):
     if not isinstance(value, dict) or value.get("state") != expected_state:
         raise FixtureError("maintenance_status_invalid")
 
-    def visit(current):
+    def visit(current, field=None):
         if isinstance(current, dict):
             for key, nested in current.items():
                 if (
@@ -891,11 +983,16 @@ def _assert_public_status(value, expected_state):
                     or key not in _PUBLIC_MAINTENANCE_STATUS_FIELDS
                 ):
                     raise FixtureError("maintenance_status_private")
-                visit(nested)
+                visit(nested, key)
         elif isinstance(current, list):
             for nested in current:
-                visit(nested)
+                visit(nested, field)
         elif isinstance(current, str):
+            if (
+                field in _MAINTENANCE_TIMESTAMP_FIELDS
+                and _is_maintenance_timestamp(current)
+            ):
+                return
             parsed = urlsplit(current)
             if (
                 os.path.isabs(current)
@@ -910,9 +1007,203 @@ def _assert_public_status(value, expected_state):
     visit(value)
 
 
+def _is_maintenance_timestamp(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.datetime.strptime(
+            value, "%Y-%m-%dT%H:%M:%SZ"
+        )
+    except ValueError:
+        return False
+    return parsed.strftime("%Y-%m-%dT%H:%M:%SZ") == value
+
+
+def _is_maintenance_percent(value):
+    return (
+        value is None
+        or (
+            type(value) in (int, float)
+            and math.isfinite(value)
+            and 0 <= value <= 100
+        )
+    )
+
+
+def _assert_full_public_status(value, expected_state):  # noqa: C901
+    _assert_public_status(value, expected_state)
+    if set(value) != _PUBLIC_MAINTENANCE_STATUS_FIELDS:
+        raise FixtureError("maintenance_status_invalid")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if value["state"] not in _MAINTENANCE_STATUS_STATES:
+        raise FixtureError("maintenance_status_invalid")
+    if value["phase"] not in _MAINTENANCE_PHASES:
+        raise FixtureError("maintenance_status_invalid")
+    if (
+        not isinstance(value["phase_label"], str)
+        or not 1 <= len(value["phase_label"]) <= 160
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if value["run_id"] is not None and (
+        not isinstance(value["run_id"], str)
+        or not 1 <= len(value["run_id"]) <= 128
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if any(
+        type(value[field]) is not int or value[field] < 0
+        for field in _MAINTENANCE_INTEGER_FIELDS
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if any(
+        value[field] is not None
+        and (type(value[field]) is not int or value[field] < 0)
+        for field in _MAINTENANCE_TOTAL_FIELDS
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if any(
+        value[field] is not None
+        and not _is_maintenance_timestamp(value[field])
+        for field in _MAINTENANCE_TIMESTAMP_FIELDS
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if not all(
+        _is_maintenance_timestamp(value[field])
+        for field in ("phase_started_at", "heartbeat_at")
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if not all(
+        _is_maintenance_percent(value[field])
+        for field in ("phase_percent", "overall_percent")
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if (
+        value["error_class"] is not None
+        and value["error_class"] not in _MAINTENANCE_ERROR_CLASSES
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if value["error_code"] is not None and (
+        not isinstance(value["error_code"], str)
+        or re.fullmatch(r"[a-z0-9_]{1,128}", value["error_code"])
+        is None
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if value["state"] == "failed":
+        if value["error_class"] is None or value["error_code"] is None:
+            raise FixtureError("maintenance_status_invalid")
+    elif value["error_class"] is not None or value["error_code"] is not None:
+        raise FixtureError("maintenance_status_invalid")
+    for done_field, total_field in (
+        ("images_done", "images_total"),
+        ("files_done", "files_total"),
+        ("backfill_done", "backfill_total"),
+    ):
+        total = value[total_field]
+        if total is not None and value[done_field] > total:
+            raise FixtureError("maintenance_status_invalid")
+
+
+def _maintenance_progress(value):
+    return {
+        "phase": value["phase"],
+        "heartbeat_at": value["heartbeat_at"],
+        "progress_at": value["progress_at"],
+        "attempt": value["attempt"],
+        "resume_count": value["resume_count"],
+        "last_committed_batch": value["last_committed_batch"],
+        "images_done": value["images_done"],
+        "files_done": value["files_done"],
+        "backfill_done": value["backfill_done"],
+        "phase_percent": value["phase_percent"],
+        "overall_percent": value["overall_percent"],
+    }
+
+
+def _assert_progress_not_regressed(previous, current):
+    numeric_fields = (
+        "attempt",
+        "resume_count",
+        "last_committed_batch",
+        "images_done",
+        "files_done",
+        "backfill_done",
+    )
+    if (
+        any(current[field] < previous[field] for field in numeric_fields)
+        or current["phase"] not in _MAINTENANCE_PHASE_TRANSITIONS[
+            previous["phase"]
+        ]
+        or current["heartbeat_at"] < previous["heartbeat_at"]
+    ):
+        raise FixtureError("maintenance_progress_regressed")
+    if (
+        previous["progress_at"] is not None
+        and current["progress_at"] is not None
+        and current["progress_at"] < previous["progress_at"]
+    ):
+        raise FixtureError("maintenance_progress_regressed")
+    for field in ("overall_percent",):
+        if (
+            previous[field] is not None
+            and current[field] is not None
+            and current[field] < previous[field]
+        ):
+            raise FixtureError("maintenance_progress_regressed")
+    if (
+        current["phase"] == previous["phase"]
+        and previous["phase_percent"] is not None
+        and current["phase_percent"] is not None
+        and current["phase_percent"] < previous["phase_percent"]
+    ):
+        raise FixtureError("maintenance_progress_regressed")
+
+
+def _maintenance_progress_advanced(previous, current):
+    if current["phase"] != previous["phase"]:
+        return True
+    for field in (
+        "last_committed_batch",
+        "images_done",
+        "files_done",
+        "backfill_done",
+        "phase_percent",
+        "overall_percent",
+    ):
+        before = previous[field]
+        after = current[field]
+        if after is not None and (before is None or after > before):
+            return True
+    return False
+
+
+def _assert_completed_status(
+    value, previous, expected_images, expected_files,
+):
+    if (
+        expected_images is None
+        or expected_files is None
+        or value["phase"] != "complete"
+        or value["phase_percent"] != 100
+        or value["overall_percent"] != 100
+        or value["images_total"] != expected_images
+        or value["images_done"] != expected_images
+        or value["files_total"] != expected_files
+        or value["files_done"] != expected_files
+        or value["backfill_total"] is None
+        or value["backfill_done"] != value["backfill_total"]
+    ):
+        raise FixtureError("maintenance_status_invalid")
+    if previous is not None:
+        _assert_progress_not_regressed(previous, _maintenance_progress(value))
+
+
 def _assert_maintenance_http(  # noqa: C901
     base_url, expected_state, timeout, minimum_resume_count=None,
-    expected_error_code=None,
+    expected_error_code=None, expected_images=None, expected_files=None,
+    require_terminal=False,
 ):
     if expected_state not in ("recovering", "migrating", "failed"):
         raise FixtureError("maintenance_state_invalid")
@@ -925,11 +1216,11 @@ def _assert_maintenance_http(  # noqa: C901
     session.trust_env = False
     deadline = time.monotonic() + timeout
 
-    def request(path, retry_startup=False):
+    def request(path, unavailable_code, retry_startup=False):
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise FixtureError("maintenance_http_failed")
+                raise FixtureError(unavailable_code)
             try:
                 return session.get(
                     "{}{}".format(base_url, path),
@@ -938,18 +1229,21 @@ def _assert_maintenance_http(  # noqa: C901
                 )
             except requests.RequestException:
                 if not retry_startup or time.monotonic() >= deadline:
-                    raise FixtureError("maintenance_http_failed") from None
+                    raise FixtureError(unavailable_code) from None
                 time.sleep(0.05)
 
     try:
-        page = request("/migration/", retry_startup=True)
+        page = request(
+            "/migration/", "maintenance_page_unavailable",
+            retry_startup=True,
+        )
         if (
             page.status_code != 200
             or "기존 Pinry 데이터를 이전하고 있습니다." not in page.text
         ):
             raise FixtureError("maintenance_page_invalid")
         for path in ("/api/v2/version/", "/media/private"):
-            response = request(path)
+            response = request(path, "maintenance_blocking_unavailable")
             if (
                 response.status_code != 503
                 or not response.headers.get("Retry-After")
@@ -957,8 +1251,11 @@ def _assert_maintenance_http(  # noqa: C901
                 raise FixtureError("maintenance_blocking_invalid")
 
         first = None
+        previous = None
         while True:
-            response = request("/migration-status.json")
+            response = request(
+                "/migration-status.json", "maintenance_status_unavailable"
+            )
             try:
                 status = response.json()
             except ValueError:
@@ -966,12 +1263,70 @@ def _assert_maintenance_http(  # noqa: C901
             cache_control = response.headers.get("Cache-Control", "").lower()
             if response.status_code != 200 or "no-store" not in cache_control:
                 raise FixtureError("maintenance_status_invalid")
-            if status.get("state") != expected_state:
+            observed_state = status.get("state")
+            if expected_state == "migrating" and observed_state == "failed":
+                _assert_full_public_status(status, observed_state)
+                current = _maintenance_progress(status)
+                if previous is not None:
+                    _assert_progress_not_regressed(previous, current)
+                raise FixtureError(
+                    "maintenance_failed:{}".format(status["error_code"])
+                )
+            if (
+                expected_state == "migrating"
+                and observed_state in (
+                    "starting",
+                    "recovering",
+                    "migrating",
+                    "starting_service",
+                    "ready",
+                )
+            ):
+                _assert_full_public_status(status, observed_state)
+                current = _maintenance_progress(status)
+                if previous is not None:
+                    _assert_progress_not_regressed(previous, current)
+                if observed_state in ("starting_service", "ready"):
+                    _assert_completed_status(
+                        status,
+                        previous,
+                        expected_images,
+                        expected_files,
+                    )
+                    return
+                if observed_state != "migrating":
+                    previous = current
+                    if time.monotonic() >= deadline:
+                        raise FixtureError(
+                            "maintenance_state_not_observed"
+                        )
+                    time.sleep(0.05)
+                    continue
+                if (
+                    minimum_resume_count is not None
+                    and status["resume_count"] < minimum_resume_count
+                ):
+                    raise FixtureError("maintenance_resume_count_invalid")
+                if first is None:
+                    first = current
+                elif (
+                    _maintenance_progress_advanced(first, current)
+                    and not require_terminal
+                ):
+                    return
+                previous = current
+                if time.monotonic() >= deadline:
+                    raise FixtureError(
+                        "maintenance_progress_not_observed"
+                    )
+                time.sleep(0.05)
+                continue
+            if observed_state != expected_state:
                 if time.monotonic() >= deadline:
                     raise FixtureError("maintenance_state_not_observed")
                 time.sleep(0.05)
                 continue
-            _assert_public_status(status, expected_state)
+            _assert_full_public_status(status, expected_state)
             if (
                 expected_error_code is not None
                 and status.get("error_code") != expected_error_code
@@ -987,29 +1342,6 @@ def _assert_maintenance_http(  # noqa: C901
                 raise FixtureError("maintenance_resume_count_invalid")
             if expected_state != "migrating":
                 return
-            current = (
-                status.get("images_done"),
-                status.get("files_done"),
-                status.get("heartbeat_at"),
-                status.get("last_committed_batch"),
-            )
-            if any(
-                type(value) is not int or value < 0
-                for value in (current[0], current[1], current[3])
-            ) or not isinstance(current[2], str) or not current[2]:
-                raise FixtureError("maintenance_status_invalid")
-            if first is None:
-                first = current
-            elif (
-                current[0] > first[0]
-                and current[1] > first[1]
-                and current[2] != first[2]
-                and current[3] > first[3]
-            ):
-                return
-            if time.monotonic() >= deadline:
-                raise FixtureError("maintenance_progress_not_observed")
-            time.sleep(0.05)
     finally:
         session.close()
 
@@ -5646,6 +5978,11 @@ def _build_parser():
     maintenance_parser.add_argument("--timeout", type=float, default=30.0)
     maintenance_parser.add_argument("--min-resume-count", type=int)
     maintenance_parser.add_argument("--expected-error-code")
+    maintenance_parser.add_argument("--expected-images", type=int)
+    maintenance_parser.add_argument("--expected-files", type=int)
+    maintenance_parser.add_argument(
+        "--require-terminal", action="store_true"
+    )
 
     fallback_parser = subparsers.add_parser(
         "assert-maintenance-fallback-http"
@@ -5821,6 +6158,9 @@ def _dispatch(arguments):  # noqa: C901
             arguments.timeout,
             minimum_resume_count=arguments.min_resume_count,
             expected_error_code=arguments.expected_error_code,
+            expected_images=arguments.expected_images,
+            expected_files=arguments.expected_files,
+            require_terminal=arguments.require_terminal,
         )
     elif arguments.command == "assert-maintenance-fallback-http":
         _assert_maintenance_fallback_http(

@@ -18,6 +18,40 @@ REQUIRED_STARTUP_PATHS = (
     "docker/scripts/normalize_persistent_file.py",
     "docker/scripts/_start_gunicorn.sh",
 )
+REQUIRED_SYNOLOGY_CONTEXT_PATHS = (
+    "docker/scripts/migration_worker.py",
+    "docker/scripts/migration_status.py",
+    "docker/scripts/supervisor.py",
+    "docker/migration/index.html",
+    "docker/migration/migration.css",
+    "docker/migration/migration.js",
+    "docker/migration/svrx-pinry-dark-ui.png",
+    "docker/migration/svrx-pinry-light-ui.png",
+)
+SERVICE_WORKER_PATH = "pinry-spa/src/service-worker.js"
+TRANSITION_COMPOSE_SOURCE_PATH = (
+    "deploy/synology/docker-compose.sw-transition.yml"
+)
+ACCEPTANCE_RUNNER_PATH = "docker/tests/nas_legacy_clone_acceptance.sh"
+ACCEPTANCE_FIXTURE_PATH = (
+    "docker/tests/fixtures/create_legacy_fixture.py"
+)
+PACKAGED_SOURCE_SENTINELS = (
+    "Dockerfile.autobuild",
+    "core/models.py",
+    "docker/nginx/sites-enabled/default",
+    "docker/scripts/startup.py",
+    SERVICE_WORKER_PATH,
+)
+SW_TRANSITION_PATHS = (
+    "Dockerfile.sw-transition",
+    "docker/sw-transition/index.html",
+    "docker/sw-transition/nginx.conf",
+    "LICENSE.md",
+    "NOTICE.md",
+    "UPSTREAM.md",
+    SERVICE_WORKER_PATH,
+)
 TASK_PRODUCTION_PATHS = (
     ".github/workflows/node.js.yml",
     ".gitignore",
@@ -28,18 +62,27 @@ TASK_PRODUCTION_PATHS = (
     "UPSTREAM.md",
     "docker/scripts/start.sh",
     *REQUIRED_STARTUP_PATHS,
+    *REQUIRED_SYNOLOGY_CONTEXT_PATHS,
+    *SW_TRANSITION_PATHS,
     "pinry-spa/package.json",
     "pinry-spa/pnpm-lock.yaml",
     "scripts/create_synology_output.sh",
     "deploy/synology/build-image.sh",
     "deploy/synology/docker-compose.synology.yml",
+    TRANSITION_COMPOSE_SOURCE_PATH,
     "deploy/synology/README_KO.md",
+    ACCEPTANCE_RUNNER_PATH,
+    ACCEPTANCE_FIXTURE_PATH,
+    "docker/nginx/sites-enabled/default",
 )
 PACKAGE_CONTROL_PATHS = (
     "scripts/create_synology_output.sh",
     "deploy/synology/build-image.sh",
     "deploy/synology/docker-compose.synology.yml",
+    TRANSITION_COMPOSE_SOURCE_PATH,
     "deploy/synology/README_KO.md",
+    ACCEPTANCE_RUNNER_PATH,
+    ACCEPTANCE_FIXTURE_PATH,
     "LICENSE.md",
     "NOTICE.md",
     "UPSTREAM.md",
@@ -61,6 +104,11 @@ def _git_output(repository, *arguments):
     return subprocess.check_output(
         ["git"] + list(arguments), cwd=str(repository)
     ).decode("utf-8").strip()
+
+
+def _unlink_if_present(path):
+    if path.exists() or path.is_symlink():
+        path.unlink()
 
 
 def _write_fake_docker(path):
@@ -161,12 +209,242 @@ def _write_archive_publish_failure_wrapper(path):
         "set -eu\n"
         "for argument in \"$@\"; do\n"
         "    case \"$argument\" in\n"
-        "        */.svrx-pinry.archive.*)\n"
+        "        *.tar.gz)\n"
         "            exit 43\n"
         "            ;;\n"
         "    esac\n"
         "done\n"
-        "exec \"$PINRY_REAL_MV\" \"$@\"\n"
+        "exec \"$PINRY_REAL_PYTHON3\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_default_bundle_hard_exit_python_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "destination=\n"
+        "for argument in \"$@\"; do\n"
+        "    destination=$argument\n"
+        "done\n"
+        "if [ \"$destination\" = \"$PINRY_DEFAULT_FINAL_ROOT\" ] "
+        "&& [ ! -e \"$PINRY_HARD_EXIT_MARKER\" ]; then\n"
+        "    : > \"$PINRY_HARD_EXIT_MARKER\"\n"
+        "    kill -KILL \"$PPID\"\n"
+        "    exit 99\n"
+        "fi\n"
+        "exec \"$PINRY_REAL_PYTHON3\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_sync_tree_failure_python_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "if [ \"${3:-}\" = tree ]; then\n"
+        "    exit 74\n"
+        "fi\n"
+        "exec \"$PINRY_REAL_PYTHON3\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_cleanup_child_injection_python_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "cleanup_path=${3:-}\n"
+        "cleanup_kind=${5:-}\n"
+        "if [ \"$cleanup_kind\" = directory ] "
+        "&& [ ! -e \"$PINRY_CLEANUP_INJECTION_MARKER\" ]; then\n"
+        "    case \"$cleanup_path\" in\n"
+        "        */.svrx-pinry*.tmp.*)\n"
+        "            : > \"$PINRY_CLEANUP_INJECTION_MARKER\"\n"
+        "            printf '%s' \"$cleanup_path\" > "
+        "\"$PINRY_CLEANUP_PATH_CAPTURE\"\n"
+        "            mv \"$PINRY_CLEANUP_VICTIM\" "
+        "\"$cleanup_path/injected-victim\"\n"
+        "            ;;\n"
+        "    esac\n"
+        "fi\n"
+        "exec \"$PINRY_REAL_PYTHON3\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_publish_race_python_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -u\n"
+        "destination=\n"
+        "source=\n"
+        "injected=0\n"
+        "for argument in \"$@\"; do\n"
+        "    source=$destination\n"
+        "    destination=$argument\n"
+        "done\n"
+        "if [ \"$destination\" = \"${PINRY_PUBLISH_RACE_DESTINATION}\" ] "
+        "&& [ ! -e \"$PINRY_PUBLISH_RACE_MARKER\" ]; then\n"
+        "    injected=1\n"
+        "    : > \"$PINRY_PUBLISH_RACE_MARKER\"\n"
+        "    case \"$PINRY_PUBLISH_RACE_KIND\" in\n"
+        "        directory)\n"
+        "            mkdir \"$PINRY_PUBLISH_RACE_DESTINATION\"\n"
+        "            printf '%s' preserve > "
+        "\"$PINRY_PUBLISH_RACE_DESTINATION/sentinel\"\n"
+        "            ;;\n"
+        "        symlink)\n"
+        "            ln -s \"$PINRY_PUBLISH_RACE_TARGET\" "
+        "\"$PINRY_PUBLISH_RACE_DESTINATION\"\n"
+        "            ;;\n"
+        "        dangling-symlink)\n"
+        "            ln -s \"$PINRY_PUBLISH_RACE_TARGET\" "
+        "\"$PINRY_PUBLISH_RACE_DESTINATION\"\n"
+        "            ;;\n"
+        "    esac\n"
+        "fi\n"
+        "\"$PINRY_REAL_PYTHON3\" \"$@\"\n"
+        "publish_status=$?\n"
+        "if [ \"$injected\" = 1 ] "
+        "&& [ \"${PINRY_REPLACE_PUBLISH_SOURCE:-0}\" = 1 ] "
+        "&& [ \"$publish_status\" != 0 ]; then\n"
+        "    mv \"$source\" \"$PINRY_CLEANUP_REPLACEMENT_TARGET\"\n"
+        "    mkdir \"$source\"\n"
+        "    printf '%s' preserve > \"$source/sentinel\"\n"
+        "    printf '%s' \"$source\" > \"$PINRY_CLEANUP_REPLACED_PATH\"\n"
+        "fi\n"
+        "if [ \"$injected\" = 1 ]; then\n"
+        "case \"$PINRY_PUBLISH_RACE_KIND\" in\n"
+        "    directory|symlink)\n"
+        "        entry_count=$(find \"$PINRY_PUBLISH_RACE_WATCH_PATH\" "
+        "-mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')\n"
+        "        if [ ! -f \"$PINRY_PUBLISH_RACE_WATCH_PATH/sentinel\" ] "
+        "|| [ \"$entry_count\" != 1 ]; then\n"
+        "            printf 'status=%s sentinel=%s entries=%s' "
+        "\"$publish_status\" "
+        "\"$(test -f \"$PINRY_PUBLISH_RACE_WATCH_PATH/sentinel\" && echo yes || echo no)\" "
+        "\"$entry_count\" > \"$PINRY_PUBLISH_RACE_MUTATION\"\n"
+        "        fi\n"
+        "        ;;\n"
+        "    dangling-symlink)\n"
+        "        if [ -e \"$PINRY_PUBLISH_RACE_WATCH_PATH\" ] "
+        "|| [ -L \"$PINRY_PUBLISH_RACE_WATCH_PATH\" ]; then\n"
+        "            : > \"$PINRY_PUBLISH_RACE_MUTATION\"\n"
+        "        fi\n"
+        "        ;;\n"
+        "esac\n"
+        "fi\n"
+        "exit \"$publish_status\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_publish_source_swap_python_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "previous=\n"
+        "source=\n"
+        "for argument in \"$@\"; do\n"
+        "    if [ \"$argument\" = \"$PINRY_SOURCE_SWAP_DESTINATION\" ]; "
+        "then\n"
+        "        source=$previous\n"
+        "    fi\n"
+        "    previous=$argument\n"
+        "done\n"
+        "if [ -n \"$source\" ] "
+        "&& [ ! -e \"$PINRY_SOURCE_SWAP_MARKER\" ]; then\n"
+        "    : > \"$PINRY_SOURCE_SWAP_MARKER\"\n"
+        "    mv \"$source\" \"$PINRY_SOURCE_SWAP_QUARANTINE\"\n"
+        "    ln -s \"$PINRY_SOURCE_SWAP_TARGET\" \"$source\"\n"
+        "fi\n"
+        "exec \"$PINRY_REAL_PYTHON3\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_recording_mktemp_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "created=$(\"$PINRY_REAL_MKTEMP\" \"$@\")\n"
+        "case \"$created\" in\n"
+        "    */.svrx-pinry.archive.*)\n"
+        "        printf '%s' \"$created\" > \"$PINRY_ARCHIVE_PATH_CAPTURE\"\n"
+        "        ;;\n"
+        "esac\n"
+        "printf '%s\\n' \"$created\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_archive_file_swap_python_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "if [ -f \"$PINRY_ARCHIVE_PATH_CAPTURE\" ] "
+        "&& [ ! -e \"$PINRY_ARCHIVE_SWAP_MARKER\" ] "
+        "&& [ \"$#\" -ge 8 ]; then\n"
+        "    archive=$(cat \"$PINRY_ARCHIVE_PATH_CAPTURE\")\n"
+        "    swap=0\n"
+        "    for argument in \"$@\"; do\n"
+        "        if [ \"$argument\" = \"$archive\" ]; then\n"
+        "            swap=1\n"
+        "        fi\n"
+        "    done\n"
+        "    if [ \"$swap\" = 1 ]; then\n"
+        "        : > \"$PINRY_ARCHIVE_SWAP_MARKER\"\n"
+        "        mv \"$archive\" \"$PINRY_ARCHIVE_SWAP_QUARANTINE\"\n"
+        "        case \"$PINRY_ARCHIVE_SWAP_KIND\" in\n"
+        "            regular)\n"
+        "                cp \"$PINRY_ARCHIVE_SWAP_TARGET\" \"$archive\"\n"
+        "                ;;\n"
+        "            hardlink)\n"
+        "                ln \"$PINRY_ARCHIVE_SWAP_TARGET\" \"$archive\"\n"
+        "                ;;\n"
+        "            *)\n"
+        "                exit 97\n"
+        "                ;;\n"
+        "        esac\n"
+        "    fi\n"
+        "fi\n"
+        "exec \"$PINRY_REAL_PYTHON3\" \"$@\"\n"
+    )
+    path.chmod(0o700)
+
+
+def _write_archive_source_swap_tar_wrapper(path):
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "create=0\n"
+        "for argument in \"$@\"; do\n"
+        "    if [ \"$argument\" = -czf ]; then\n"
+        "        create=1\n"
+        "    fi\n"
+        "done\n"
+        "if [ \"$create\" = 1 ] "
+        "&& [ ! -e \"$PINRY_ARCHIVE_SWAP_MARKER\" ]; then\n"
+        "    archive=$(cat \"$PINRY_ARCHIVE_PATH_CAPTURE\")\n"
+        "    : > \"$PINRY_ARCHIVE_SWAP_MARKER\"\n"
+        "    mv \"$archive\" \"$PINRY_ARCHIVE_SWAP_QUARANTINE\"\n"
+        "    case \"${PINRY_ARCHIVE_SWAP_KIND:-symlink}\" in\n"
+        "        symlink)\n"
+        "            ln -s \"$PINRY_ARCHIVE_SWAP_TARGET\" \"$archive\"\n"
+        "            ;;\n"
+        "        regular)\n"
+        "            cp \"$PINRY_ARCHIVE_SWAP_TARGET\" \"$archive\"\n"
+        "            ;;\n"
+        "        hardlink)\n"
+        "            ln \"$PINRY_ARCHIVE_SWAP_TARGET\" \"$archive\"\n"
+        "            ;;\n"
+        "        *)\n"
+        "            exit 97\n"
+        "            ;;\n"
+        "    esac\n"
+        "fi\n"
+        "exec \"$PINRY_REAL_TAR\" \"$@\"\n"
     )
     path.chmod(0o700)
 
@@ -367,6 +645,8 @@ class SynologyPackageTests(unittest.TestCase):
         self.package_name = "svrx-pinry"
         self.package_directory = self.output_root / self.package_name
         self.context_directory = self.package_directory / "context"
+        self.transition_directory = self.output_root / "sw-transition"
+        self.accept_tools_directory = self.output_root / "accept-tools"
         self.archive_path = self.output_root / "{}-{}.tar.gz".format(
             self.package_name, self.short_sha
         )
@@ -430,6 +710,18 @@ class SynologyPackageTests(unittest.TestCase):
         environment["PINRY_REAL_MV"] = real_mv
         return environment
 
+    def _python_environment(self, wrapper):
+        environment = os.environ.copy()
+        real_python = shutil.which("python3")
+        self.assertIsNotNone(real_python)
+        environment["PATH"] = "{}{}{}".format(
+            wrapper.parent,
+            os.pathsep,
+            environment.get("PATH", ""),
+        )
+        environment["PINRY_REAL_PYTHON3"] = real_python
+        return environment
+
     def _mktemp_environment(self, wrapper, fail_on):
         environment = os.environ.copy()
         real_mktemp = shutil.which("mktemp")
@@ -464,6 +756,36 @@ class SynologyPackageTests(unittest.TestCase):
             completed.returncode, 0, completed.stderr.decode("utf-8")
         )
         return repository
+
+    def _commit_all(self, repository, message):
+        completed = subprocess.run(
+            ["git", "add", "-A"],
+            cwd=str(repository),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        completed = subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Package Test",
+                "-c",
+                "user.email=package-test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                message,
+            ],
+            cwd=str(repository),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
 
     def _clone_with_tracked_finder_metadata(self):
         repository = self._clone_repository("finder-fixture-repository")
@@ -559,8 +881,25 @@ class SynologyPackageTests(unittest.TestCase):
         canonical = self._run_packager_in(self.repository_root)
 
         self.assertEqual(canonical.returncode, 0, canonical.stderr.decode("utf-8"))
+        self.assertEqual(
+            canonical.stdout.decode("utf-8").splitlines(),
+            [
+                "upload_directory={}".format(expected_package.resolve()),
+                "upload_archive={}".format(expected_archive.resolve()),
+            ],
+        )
         self.assertTrue(expected_package.is_dir())
         self.assertTrue(expected_archive.is_file())
+        self.assertTrue((default_output / "sw-transition").is_dir())
+        self.assertTrue((default_output / "accept-tools").is_dir())
+        self.assertEqual(
+            (expected_package / "BUILD_INFO").read_text().splitlines()[0],
+            "source_commit={}".format(self.full_sha),
+        )
+        self.assertEqual(
+            expected_archive.name,
+            "svrx-pinry-{}.tar.gz".format(self.full_sha[:12]),
+        )
 
         linked_worktree = self.temporary_root / "linked-worktree"
         completed = subprocess.run(
@@ -611,6 +950,22 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertEqual(sentinel.read_text(), "preserve")
         self.assertFalse((default_output / self.package_name).exists())
 
+    def test_default_output_rejects_symlinked_workspace_output_parent(self):
+        output_parent = self.repository_root.parent / "output"
+        external_output = self.temporary_root / "external-output"
+        external_output.mkdir()
+        if output_parent.exists():
+            self.assertEqual(tuple(output_parent.iterdir()), ())
+            output_parent.rmdir()
+        output_parent.symlink_to(external_output, target_is_directory=True)
+        self.addCleanup(_unlink_if_present, output_parent)
+
+        completed = self._run_packager_in(self.repository_root)
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"output_parent_invalid", completed.stderr)
+        self.assertEqual(tuple(external_output.iterdir()), ())
+
     def _assert_default_output_recovers_from_mktemp_failure(self, fail_on):
         default_output = (
             self.repository_root.parent
@@ -649,6 +1004,94 @@ class SynologyPackageTests(unittest.TestCase):
     def test_default_output_recovers_when_second_mktemp_fails(self):
         self._assert_default_output_recovers_from_mktemp_failure(2)
 
+    def test_default_output_is_not_partially_published_on_hard_exit(self):
+        output_parent = self.repository_root.parent / "output"
+        default_output = output_parent / "svrx-pinry-server-{}".format(
+            self.short_sha
+        )
+        self.addCleanup(shutil.rmtree, default_output, ignore_errors=True)
+        staging_pattern = ".svrx-pinry-server-{}.tmp.*".format(
+            self.short_sha
+        )
+
+        def remove_abandoned_staging():
+            for staging_path in output_parent.glob(staging_pattern):
+                shutil.rmtree(staging_path, ignore_errors=True)
+
+        self.addCleanup(remove_abandoned_staging)
+        binary_directory = self.temporary_root / "hard-exit-python"
+        binary_directory.mkdir()
+        wrapper = binary_directory / "python3"
+        marker = self.temporary_root / "hard-exit-marker"
+        _write_default_bundle_hard_exit_python_wrapper(wrapper)
+        environment = self._python_environment(wrapper)
+        environment.update(
+            {
+                "PINRY_DEFAULT_FINAL_ROOT": str(default_output.resolve()),
+                "PINRY_HARD_EXIT_MARKER": str(marker),
+            }
+        )
+
+        failed = self._run_packager_in(
+            self.repository_root, environment=environment
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertTrue(marker.is_file())
+        self.assertFalse(default_output.exists())
+        self.assertFalse(default_output.is_symlink())
+
+        retried = self._run_packager_in(self.repository_root)
+
+        self.assertEqual(
+            retried.returncode, 0, retried.stderr.decode("utf-8")
+        )
+        self.assertEqual(
+            {path.name for path in default_output.iterdir()},
+            {
+                "accept-tools",
+                "svrx-pinry",
+                "sw-transition",
+                "svrx-pinry-{}.tar.gz".format(self.short_sha),
+            },
+        )
+
+    def test_default_output_sync_failure_leaves_no_partial_destination(self):
+        default_output = (
+            self.repository_root.parent
+            / "output"
+            / "svrx-pinry-server-{}".format(self.short_sha)
+        )
+        self.addCleanup(shutil.rmtree, default_output, ignore_errors=True)
+        binary_directory = self.temporary_root / "sync-failure-python"
+        binary_directory.mkdir()
+        wrapper = binary_directory / "python3"
+        _write_sync_tree_failure_python_wrapper(wrapper)
+
+        failed = self._run_packager_in(
+            self.repository_root,
+            environment=self._python_environment(wrapper),
+        )
+
+        self.assertEqual(failed.returncode, 74)
+        self.assertFalse(default_output.exists())
+        self.assertFalse(default_output.is_symlink())
+
+        retried = self._run_packager_in(self.repository_root)
+
+        self.assertEqual(
+            retried.returncode, 0, retried.stderr.decode("utf-8")
+        )
+        self.assertEqual(
+            {path.name for path in default_output.iterdir()},
+            {
+                "accept-tools",
+                "svrx-pinry",
+                "sw-transition",
+                "svrx-pinry-{}.tar.gz".format(self.short_sha),
+            },
+        )
+
     def test_explicit_output_directory_overrides_shared_default(self):
         explicit_output = self.temporary_root / "explicit-output"
 
@@ -658,11 +1101,213 @@ class SynologyPackageTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
         self.assertTrue((explicit_output / self.package_name).is_dir())
+        self.assertTrue((explicit_output / "accept-tools").is_dir())
         self.assertTrue(
             (
                 explicit_output
                 / "{}-{}.tar.gz".format(self.package_name, self.short_sha)
             ).is_file()
+        )
+        self.assertEqual(
+            {path.name for path in explicit_output.iterdir()},
+            {
+                "accept-tools",
+                "svrx-pinry",
+                "sw-transition",
+                "svrx-pinry-{}.tar.gz".format(self.short_sha),
+            },
+        )
+
+    def test_explicit_output_is_not_partially_published_on_hard_exit(self):
+        explicit_output = self.temporary_root / "explicit-hard-exit"
+        staging_pattern = ".svrx-pinry-server-{}.tmp.*".format(
+            self.short_sha
+        )
+
+        def remove_abandoned_staging():
+            for staging_path in self.temporary_root.glob(staging_pattern):
+                shutil.rmtree(staging_path, ignore_errors=True)
+
+        self.addCleanup(remove_abandoned_staging)
+        binary_directory = self.temporary_root / "explicit-hard-exit-bin"
+        binary_directory.mkdir()
+        wrapper = binary_directory / "python3"
+        marker = self.temporary_root / "explicit-hard-exit-marker"
+        _write_default_bundle_hard_exit_python_wrapper(wrapper)
+        environment = self._python_environment(wrapper)
+        environment.update(
+            {
+                "PINRY_DEFAULT_FINAL_ROOT": str(explicit_output.resolve()),
+                "PINRY_HARD_EXIT_MARKER": str(marker),
+            }
+        )
+
+        failed = self._run_packager_in(
+            self.repository_root, explicit_output, environment
+        )
+
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertTrue(marker.is_file())
+        self.assertFalse(explicit_output.exists())
+        self.assertFalse(explicit_output.is_symlink())
+
+        retried = self._run_packager_in(
+            self.repository_root, explicit_output
+        )
+
+        self.assertEqual(
+            retried.returncode, 0, retried.stderr.decode("utf-8")
+        )
+        self.assertEqual(
+            {path.name for path in explicit_output.iterdir()},
+            {
+                "accept-tools",
+                "svrx-pinry",
+                "sw-transition",
+                "svrx-pinry-{}.tar.gz".format(self.short_sha),
+            },
+        )
+
+    def test_explicit_output_sync_failure_leaves_no_partial_destination(self):
+        explicit_output = self.temporary_root / "explicit-sync-failure"
+        binary_directory = self.temporary_root / "explicit-sync-failure-bin"
+        binary_directory.mkdir()
+        wrapper = binary_directory / "python3"
+        _write_sync_tree_failure_python_wrapper(wrapper)
+
+        failed = self._run_packager_in(
+            self.repository_root,
+            explicit_output,
+            self._python_environment(wrapper),
+        )
+
+        self.assertEqual(failed.returncode, 74)
+        self.assertFalse(explicit_output.exists())
+        self.assertFalse(explicit_output.is_symlink())
+
+        retried = self._run_packager_in(
+            self.repository_root, explicit_output
+        )
+
+        self.assertEqual(
+            retried.returncode, 0, retried.stderr.decode("utf-8")
+        )
+        self.assertEqual(
+            {path.name for path in explicit_output.iterdir()},
+            {
+                "accept-tools",
+                "svrx-pinry",
+                "sw-transition",
+                "svrx-pinry-{}.tar.gz".format(self.short_sha),
+            },
+        )
+
+    def test_explicit_output_rejects_existing_targets_without_mutation(self):
+        empty_output = self.temporary_root / "existing-empty"
+        empty_output.mkdir()
+
+        empty_result = self._run_packager_in(
+            self.repository_root, empty_output
+        )
+
+        self.assertNotEqual(empty_result.returncode, 0)
+        self.assertIn(b"output_already_exists", empty_result.stderr)
+        self.assertEqual(tuple(empty_output.iterdir()), ())
+
+        nonempty_output = self.temporary_root / "existing-nonempty"
+        nonempty_output.mkdir()
+        nonempty_sentinel = nonempty_output / "sentinel"
+        nonempty_sentinel.write_text("preserve")
+
+        nonempty_result = self._run_packager_in(
+            self.repository_root, nonempty_output
+        )
+
+        self.assertNotEqual(nonempty_result.returncode, 0)
+        self.assertIn(b"output_already_exists", nonempty_result.stderr)
+        self.assertEqual(
+            {path.name for path in nonempty_output.iterdir()}, {"sentinel"}
+        )
+        self.assertEqual(nonempty_sentinel.read_text(), "preserve")
+
+        symlink_target = self.temporary_root / "symlink-target"
+        symlink_target.mkdir()
+        symlink_sentinel = symlink_target / "sentinel"
+        symlink_sentinel.write_text("preserve")
+        symlink_output = self.temporary_root / "existing-symlink"
+        symlink_output.symlink_to(symlink_target, target_is_directory=True)
+
+        symlink_result = self._run_packager_in(
+            self.repository_root, symlink_output
+        )
+
+        self.assertNotEqual(symlink_result.returncode, 0)
+        self.assertIn(b"output_already_exists", symlink_result.stderr)
+        self.assertTrue(symlink_output.is_symlink())
+        self.assertEqual(symlink_output.resolve(), symlink_target.resolve())
+        self.assertEqual(
+            {path.name for path in symlink_target.iterdir()}, {"sentinel"}
+        )
+        self.assertEqual(symlink_sentinel.read_text(), "preserve")
+
+    def test_cleanup_preserves_renamed_in_child_and_retry_succeeds(self):
+        explicit_output = self.temporary_root / "cleanup-injection-output"
+        binary_directory = self.temporary_root / "cleanup-injection-bin"
+        binary_directory.mkdir()
+        python_wrapper = binary_directory / "python3"
+        tar_wrapper = binary_directory / "tar"
+        _write_cleanup_child_injection_python_wrapper(python_wrapper)
+        _write_final_tar_failure_wrapper(tar_wrapper)
+        real_tar = shutil.which("tar")
+        self.assertIsNotNone(real_tar)
+        marker = self.temporary_root / "cleanup-injection-marker"
+        capture = self.temporary_root / "cleanup-path"
+        victim = self.temporary_root / "cleanup-victim"
+        victim.mkdir()
+        sentinel = victim / "sentinel"
+        sentinel.write_text("preserve")
+        environment = self._python_environment(python_wrapper)
+        environment.update(
+            {
+                "PINRY_REAL_TAR": real_tar,
+                "PINRY_CLEANUP_INJECTION_MARKER": str(marker),
+                "PINRY_CLEANUP_PATH_CAPTURE": str(capture),
+                "PINRY_CLEANUP_VICTIM": str(victim),
+            }
+        )
+
+        failed = self._run_packager_in(
+            self.repository_root, explicit_output, environment
+        )
+
+        self.assertEqual(failed.returncode, 42)
+        self.assertTrue(marker.is_file(), failed.stderr.decode("utf-8"))
+        cleanup_path = Path(capture.read_text())
+        self.addCleanup(shutil.rmtree, cleanup_path, ignore_errors=True)
+        injected_sentinel = cleanup_path / "injected-victim/sentinel"
+        self.assertTrue(injected_sentinel.is_file())
+        self.assertEqual(injected_sentinel.read_text(), "preserve")
+        self.assertIn(
+            "cleanup_deferred={}".format(cleanup_path),
+            failed.stderr.decode("utf-8"),
+        )
+        self.assertFalse(explicit_output.exists())
+
+        retried = self._run_packager_in(
+            self.repository_root, explicit_output
+        )
+
+        self.assertEqual(
+            retried.returncode, 0, retried.stderr.decode("utf-8")
+        )
+        self.assertEqual(
+            {path.name for path in explicit_output.iterdir()},
+            {
+                "accept-tools",
+                "svrx-pinry",
+                "sw-transition",
+                "svrx-pinry-{}.tar.gz".format(self.short_sha),
+            },
         )
 
     def test_packager_creates_minimal_build_context_from_head(self):
@@ -692,6 +1337,8 @@ class SynologyPackageTests(unittest.TestCase):
             "docker/nginx/nginx.conf",
             "docker/scripts/start.sh",
             *REQUIRED_STARTUP_PATHS,
+            *REQUIRED_SYNOLOGY_CONTEXT_PATHS,
+            SERVICE_WORKER_PATH,
         )
         for relative_path in required_context:
             with self.subTest(relative_path=relative_path):
@@ -763,7 +1410,7 @@ class SynologyPackageTests(unittest.TestCase):
                 path.name
                 for path in (self.context_directory / "docker").iterdir()
             },
-            {"nginx", "scripts"},
+            {"migration", "nginx", "scripts"},
         )
         for path in self.context_directory.rglob("*"):
             relative = path.relative_to(self.context_directory)
@@ -823,9 +1470,17 @@ class SynologyPackageTests(unittest.TestCase):
             "{}/docker-compose.yml".format(self.package_name), names
         )
         self.assertNotIn("{}/.env".format(self.package_name), names)
+        self.assertFalse(any("accept-tools" in name for name in names))
         self.assertIn(
             "{}/context/core/models.py".format(self.package_name), names
         )
+        for relative_path in REQUIRED_SYNOLOGY_CONTEXT_PATHS + (
+            SERVICE_WORKER_PATH,
+        ):
+            self.assertIn(
+                "{}/context/{}".format(self.package_name, relative_path),
+                names,
+            )
         self.assertTrue(
             all(
                 ".." not in Path(name).parts
@@ -844,6 +1499,170 @@ class SynologyPackageTests(unittest.TestCase):
                 for name in names
             )
         )
+
+    def test_acceptance_tools_are_separate_exact_head_artifacts(self):
+        self._create_package()
+
+        self.assertEqual(
+            {
+                str(path.relative_to(self.accept_tools_directory))
+                for path in self.accept_tools_directory.rglob("*")
+            },
+            {
+                "BUILD_INFO",
+                "fixtures",
+                "fixtures/create_legacy_fixture.py",
+                "nas_legacy_clone_acceptance.sh",
+            },
+        )
+        expected_build_info = (
+            "source_commit={}\n"
+            "default_image=svrx-pinry:latest\n".format(self.full_sha)
+        ).encode("utf-8")
+        self.assertEqual(
+            (self.accept_tools_directory / "BUILD_INFO").read_bytes(),
+            expected_build_info,
+        )
+        self.assertEqual(
+            (
+                self.accept_tools_directory
+                / "nas_legacy_clone_acceptance.sh"
+            ).read_bytes(),
+            _git_blob(
+                self.repository_root,
+                self.full_sha,
+                ACCEPTANCE_RUNNER_PATH,
+            ),
+        )
+        self.assertEqual(
+            (
+                self.accept_tools_directory
+                / "fixtures/create_legacy_fixture.py"
+            ).read_bytes(),
+            _git_blob(
+                self.repository_root,
+                self.full_sha,
+                ACCEPTANCE_FIXTURE_PATH,
+            ),
+        )
+        self.assertEqual(
+            (
+                self.accept_tools_directory
+                / "nas_legacy_clone_acceptance.sh"
+            ).stat().st_mode
+            & 0o777,
+            0o755,
+        )
+        self.assertEqual(
+            (
+                self.accept_tools_directory
+                / "fixtures/create_legacy_fixture.py"
+            ).stat().st_mode
+            & 0o777,
+            0o644,
+        )
+        self.assertEqual(
+            (self.accept_tools_directory / "BUILD_INFO").stat().st_mode
+            & 0o777,
+            0o644,
+        )
+
+    def test_context_contains_maintenance_assets_and_supervisor(self):
+        self._create_package()
+
+        required = REQUIRED_SYNOLOGY_CONTEXT_PATHS + (
+            SERVICE_WORKER_PATH,
+        )
+        for relative_path in required:
+            with self.subTest(relative_path=relative_path):
+                self.assertTrue(
+                    (self.context_directory / relative_path).is_file(),
+                    relative_path,
+                )
+        self.assertEqual(
+            len(list(self.package_directory.iterdir())),
+            8,
+        )
+
+    def test_sw_transition_context_is_separate_and_uses_same_worker(self):
+        self._create_package()
+
+        self.assertTrue(self.transition_directory.is_dir())
+        self.assertEqual(
+            {path.name for path in self.transition_directory.iterdir()},
+            {
+                "Dockerfile.sw-transition",
+                "LICENSE.md",
+                "NOTICE.md",
+                "UPSTREAM.md",
+                "docker-compose.yml",
+                "docker",
+                "pinry-spa",
+            },
+        )
+        for relative_path in SW_TRANSITION_PATHS:
+            with self.subTest(relative_path=relative_path):
+                packaged = self.transition_directory / relative_path
+                self.assertTrue(packaged.is_file(), relative_path)
+                self.assertEqual(
+                    packaged.read_bytes(),
+                    _git_blob(
+                        self.repository_root,
+                        self.full_sha,
+                        relative_path,
+                    ),
+                )
+        transition_compose = self.transition_directory / "docker-compose.yml"
+        self.assertEqual(
+            transition_compose.read_bytes(),
+            _git_blob(
+                self.repository_root,
+                self.full_sha,
+                TRANSITION_COMPOSE_SOURCE_PATH,
+            ),
+        )
+        compose_text = transition_compose.read_text()
+        self.assertIn("build:", compose_text)
+        self.assertIn("context: .", compose_text)
+        self.assertIn("dockerfile: Dockerfile.sw-transition", compose_text)
+        self.assertIn('"2048:80"', compose_text)
+        self.assertIn("restart: unless-stopped", compose_text)
+        self.assertNotIn("volumes:", compose_text)
+        self.assertEqual(
+            (self.transition_directory / SERVICE_WORKER_PATH).read_bytes(),
+            (self.context_directory / SERVICE_WORKER_PATH).read_bytes(),
+        )
+        dockerfile_lines = set(
+            (
+                self.transition_directory / "Dockerfile.sw-transition"
+            ).read_text().splitlines()
+        )
+        self.assertTrue(
+            {
+                "COPY LICENSE.md /licenses/LICENSE.md",
+                "COPY NOTICE.md /licenses/NOTICE.md",
+                "COPY UPSTREAM.md /licenses/UPSTREAM.md",
+            }.issubset(dockerfile_lines)
+        )
+
+    def test_transition_guide_requires_the_existing_service_origin(self):
+        self._create_package()
+
+        guide = (self.package_directory / "README_KO.md").read_text()
+
+        self.assertNotIn("`http://NAS주소:2048`을 한 번 열어", guide)
+        self.assertIn(
+            "scheme(HTTP/HTTPS), host, port가 모두 정확히 같은 origin",
+            guide,
+        )
+        self.assertIn("리버스 프록시를 임시로 전환 project에 연결", guide)
+        self.assertIn(
+            "평문 HTTP만 사용했고 서비스 워커가 등록된 적이 없다면",
+            guide,
+        )
+        self.assertIn("전환 단계는 필요하지 않다", guide)
+        self.assertIn("loopback 자동화 테스트", guide)
+        self.assertIn("운영 HTTPS 설정을 검증하지 않는다", guide)
 
     def test_packager_excludes_finder_metadata_from_context_and_archive(self):
         repository = self._clone_with_tracked_finder_metadata()
@@ -924,8 +1743,7 @@ class SynologyPackageTests(unittest.TestCase):
         )
 
     def test_packager_cleans_failed_publish_and_allows_immediate_retry(self):
-        self.output_root.mkdir()
-        sentinel = self.output_root / "unrelated-sentinel"
+        sentinel = self.temporary_root / "unrelated-sentinel"
         sentinel.write_text("preserve")
         binary_directory = self.temporary_root / "failing-tar"
         binary_directory.mkdir()
@@ -936,16 +1754,21 @@ class SynologyPackageTests(unittest.TestCase):
 
         self.assertEqual(failed.returncode, 42)
         self.assertFalse(self.package_directory.exists())
+        self.assertFalse(self.accept_tools_directory.exists())
         self.assertFalse(self.archive_path.exists())
         self.assertEqual(sentinel.read_text(), "preserve")
-        self.assertEqual(
-            {
-                path.name
-                for path in self.output_root.iterdir()
-                if path.name.startswith(".svrx-pinry.tmp.")
-                or path.name.startswith(".svrx-pinry.archive.")
-            },
-            set(),
+        abandoned_staging = tuple(
+            self.temporary_root.glob(
+                ".svrx-pinry-server-{}.tmp.*".format(self.short_sha)
+            )
+        )
+        self.assertEqual(len(abandoned_staging), 1)
+        self.addCleanup(
+            shutil.rmtree, abandoned_staging[0], ignore_errors=True
+        )
+        self.assertIn(
+            "cleanup_deferred={}".format(abandoned_staging[0].resolve()),
+            failed.stderr.decode("utf-8"),
         )
 
         self._create_package()
@@ -958,18 +1781,8 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertTrue((self.context_directory / "core/models.py").is_file())
         self.assertTrue(self.archive_path.is_file())
         self.assertEqual(sentinel.read_text(), "preserve")
-        self.assertEqual(
-            {
-                path.name
-                for path in self.output_root.iterdir()
-                if path.name.startswith(".svrx-pinry.tmp.")
-                or path.name.startswith(".svrx-pinry.archive.")
-            },
-            set(),
-        )
 
     def test_packager_rejects_top_level_change_during_archive_creation(self):
-        self.output_root.mkdir()
         binary_directory = self.temporary_root / "top-level-race-tar"
         binary_directory.mkdir()
         wrapper = binary_directory / "tar"
@@ -985,46 +1798,204 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertIn(b"package_layout_changed", completed.stderr)
         self.assertFalse(self.package_directory.exists())
         self.assertFalse(self.archive_path.exists())
-        self.assertEqual(
-            {
-                path.name
-                for path in self.output_root.iterdir()
-                if path.name.startswith(".svrx-pinry.tmp.")
-                or path.name.startswith(".svrx-pinry.archive.")
-            },
-            set(),
-        )
+        for staging_path in self.temporary_root.glob(
+            ".svrx-pinry-server-{}.tmp.*".format(self.short_sha)
+        ):
+            self.addCleanup(shutil.rmtree, staging_path, ignore_errors=True)
 
-    def test_packager_rolls_back_directory_when_archive_publish_fails(self):
-        self.output_root.mkdir()
-        sentinel = self.output_root / "unrelated-sentinel"
-        sentinel.write_text("preserve")
-        binary_directory = self.temporary_root / "failing-mv"
+    def test_packager_leaves_no_output_when_archive_publish_fails(self):
+        binary_directory = self.temporary_root / "failing-python"
         binary_directory.mkdir()
-        wrapper = binary_directory / "mv"
+        wrapper = binary_directory / "python3"
         _write_archive_publish_failure_wrapper(wrapper)
 
-        failed = self._run_packager(self._move_environment(wrapper))
+        failed = self._run_packager(self._python_environment(wrapper))
 
-        self.assertEqual(failed.returncode, 43)
-        self.assertFalse(self.package_directory.exists())
-        self.assertFalse(self.archive_path.exists())
-        self.assertEqual(sentinel.read_text(), "preserve")
-        self.assertEqual(
-            {
-                path.name
-                for path in self.output_root.iterdir()
-                if path.name.startswith(".svrx-pinry.tmp.")
-                or path.name.startswith(".svrx-pinry.archive.")
-            },
-            set(),
-        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(b"publish_destination_raced", failed.stderr)
+        self.assertFalse(self.output_root.exists())
+        for staging_path in self.temporary_root.glob(
+            ".svrx-pinry-server-{}.tmp.*".format(self.short_sha)
+        ):
+            self.addCleanup(shutil.rmtree, staging_path, ignore_errors=True)
 
         self._create_package()
 
         self.assertTrue(self.package_directory.is_dir())
         self.assertTrue(self.archive_path.is_file())
-        self.assertEqual(sentinel.read_text(), "preserve")
+
+    def test_packager_rejects_replaced_private_publish_sources(self):
+        output_root = self.temporary_root / "source-swap-output"
+        binary_directory = self.temporary_root / "source-swap-bin"
+        binary_directory.mkdir()
+        wrapper = binary_directory / "python3"
+        _write_publish_source_swap_python_wrapper(wrapper)
+        marker = self.temporary_root / "source-swap-marker"
+        target = self.temporary_root / "external-target"
+        target.mkdir()
+        (target / "sentinel").write_text("preserve")
+        quarantine = self.temporary_root / "source-quarantine"
+        self.addCleanup(shutil.rmtree, quarantine, ignore_errors=True)
+        environment = self._python_environment(wrapper)
+        environment.update(
+            {
+                "PINRY_SOURCE_SWAP_DESTINATION": str(output_root.resolve()),
+                "PINRY_SOURCE_SWAP_MARKER": str(marker),
+                "PINRY_SOURCE_SWAP_TARGET": str(target),
+                "PINRY_SOURCE_SWAP_QUARANTINE": str(quarantine),
+            }
+        )
+
+        completed = self._run_packager_in(
+            self.repository_root, output_root, environment
+        )
+
+        self.assertTrue(marker.is_file(), completed.stderr.decode("utf-8"))
+        self.assertNotEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        self.assertIn(b"publish_destination_raced", completed.stderr)
+        self.assertEqual({path.name for path in target.iterdir()}, {"sentinel"})
+        self.assertEqual((target / "sentinel").read_text(), "preserve")
+        self.assertFalse(output_root.exists())
+        staging_symlinks = tuple(
+            path
+            for path in self.temporary_root.glob(
+                ".svrx-pinry-server-{}.tmp.*".format(self.short_sha)
+            )
+            if path.is_symlink()
+        )
+        self.assertEqual(len(staging_symlinks), 1)
+        self.assertEqual(staging_symlinks[0].resolve(), target.resolve())
+        self.addCleanup(staging_symlinks[0].unlink, missing_ok=True)
+
+    def test_packager_does_not_follow_replaced_temporary_archive(self):
+        binary_directory = self.temporary_root / "archive-swap-bin"
+        binary_directory.mkdir()
+        _write_recording_mktemp_wrapper(binary_directory / "mktemp")
+        _write_archive_source_swap_tar_wrapper(binary_directory / "tar")
+        real_mktemp = shutil.which("mktemp")
+        real_tar = shutil.which("tar")
+        self.assertIsNotNone(real_mktemp)
+        self.assertIsNotNone(real_tar)
+        archive_capture = self.temporary_root / "archive-path"
+        marker = self.temporary_root / "archive-swap-marker"
+        target = self.temporary_root / "external-archive"
+        target.write_bytes(b"preserve")
+        quarantine = self.temporary_root / "archive-quarantine"
+        self.addCleanup(_unlink_if_present, quarantine)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PATH": "{}{}{}".format(
+                    binary_directory,
+                    os.pathsep,
+                    environment.get("PATH", ""),
+                ),
+                "PINRY_REAL_MKTEMP": real_mktemp,
+                "PINRY_REAL_TAR": real_tar,
+                "PINRY_ARCHIVE_PATH_CAPTURE": str(archive_capture),
+                "PINRY_ARCHIVE_SWAP_MARKER": str(marker),
+                "PINRY_ARCHIVE_SWAP_TARGET": str(target),
+                "PINRY_ARCHIVE_SWAP_QUARANTINE": str(quarantine),
+            }
+        )
+
+        completed = self._run_packager(environment)
+
+        self.assertTrue(marker.is_file(), completed.stderr.decode("utf-8"))
+        self.assertNotEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
+        )
+        self.assertEqual(target.read_bytes(), b"preserve")
+        self.assertFalse(self.output_root.exists())
+        deferred_roots = tuple(
+            self.temporary_root.glob(
+                ".svrx-pinry-server-{}.tmp.*".format(self.short_sha)
+            )
+        )
+        self.assertEqual(len(deferred_roots), 1)
+        self.assertIn(
+            "cleanup_deferred={}".format(deferred_roots[0].resolve()).encode(
+                "utf-8"
+            ),
+            completed.stderr,
+        )
+        self.addCleanup(shutil.rmtree, deferred_roots[0], ignore_errors=True)
+
+    def test_packager_does_not_truncate_replaced_temporary_archive_files(self):
+        for index, replacement_kind in enumerate(("regular", "hardlink")):
+            with self.subTest(replacement_kind=replacement_kind):
+                output_root = self.temporary_root / "archive-file-swap-{}".format(
+                    index
+                )
+                binary_directory = self.temporary_root / "archive-file-bin-{}".format(
+                    index
+                )
+                binary_directory.mkdir()
+                _write_recording_mktemp_wrapper(binary_directory / "mktemp")
+                python_wrapper = binary_directory / "python3"
+                _write_archive_file_swap_python_wrapper(python_wrapper)
+                real_mktemp = shutil.which("mktemp")
+                self.assertIsNotNone(real_mktemp)
+                archive_capture = self.temporary_root / "archive-path-{}".format(
+                    index
+                )
+                marker = self.temporary_root / "archive-swap-marker-{}".format(
+                    index
+                )
+                target = self.temporary_root / "external-archive-{}".format(
+                    index
+                )
+                target.write_bytes(b"preserve")
+                quarantine = self.temporary_root / "archive-quarantine-{}".format(
+                    index
+                )
+                self.addCleanup(_unlink_if_present, quarantine)
+                environment = self._python_environment(python_wrapper)
+                environment.update(
+                    {
+                        "PINRY_REAL_MKTEMP": real_mktemp,
+                        "PINRY_ARCHIVE_PATH_CAPTURE": str(archive_capture),
+                        "PINRY_ARCHIVE_SWAP_MARKER": str(marker),
+                        "PINRY_ARCHIVE_SWAP_TARGET": str(target),
+                        "PINRY_ARCHIVE_SWAP_QUARANTINE": str(quarantine),
+                        "PINRY_ARCHIVE_SWAP_KIND": replacement_kind,
+                    }
+                )
+
+                completed = self._run_packager_in(
+                    self.repository_root, output_root, environment
+                )
+
+                self.assertTrue(
+                    marker.is_file(), completed.stderr.decode("utf-8")
+                )
+                self.assertNotEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr.decode("utf-8"),
+                )
+                replaced_archive = Path(archive_capture.read_text())
+                self.assertEqual(replaced_archive.read_bytes(), b"preserve")
+                self.assertEqual(target.read_bytes(), b"preserve")
+                self.assertFalse(output_root.exists())
+                deferred_roots = tuple(
+                    self.temporary_root.glob(
+                        ".svrx-pinry-server-{}.tmp.*".format(self.short_sha)
+                    )
+                )
+                self.assertEqual(len(deferred_roots), 1)
+                self.assertIn(
+                    "cleanup_deferred={}".format(
+                        deferred_roots[0].resolve()
+                    ).encode("utf-8"),
+                    completed.stderr,
+                )
+                self.addCleanup(
+                    shutil.rmtree, deferred_roots[0], ignore_errors=True
+                )
+                shutil.rmtree(deferred_roots[0])
 
     def test_final_image_copies_only_runtime_application_paths(self):
         sources = _final_stage_copy_sources(
@@ -1042,6 +2013,7 @@ class SynologyPackageTests(unittest.TestCase):
                 "pinry_plugins",
                 "users",
                 "docker/scripts",
+                "docker/migration",
                 "LICENSE.md",
                 "NOTICE.md",
                 "UPSTREAM.md",
@@ -1130,6 +2102,126 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertIn(b"output_already_exists", completed.stderr)
         self.assertEqual(sentinel.read_text(), "preserve")
         self.assertEqual(self.archive_path.read_bytes(), archive_before)
+
+    def test_packager_rejects_publish_destination_swaps_without_touching_targets(self):
+        """최종 mv 직전 목적지가 바뀌어도 외부 대상에는 쓰지 않아야 한다."""
+        race_kinds = ("directory", "symlink", "dangling-symlink")
+        for index, race_kind in enumerate(race_kinds):
+            with self.subTest(race_kind=race_kind):
+                output_root = self.temporary_root / "publish-race-{}".format(
+                    race_kind
+                )
+                binary_directory = self.temporary_root / "publish-bin-{}".format(
+                    race_kind
+                )
+                binary_directory.mkdir()
+                wrapper = binary_directory / "python3"
+                _write_publish_race_python_wrapper(wrapper)
+                destination = output_root.resolve()
+                marker = self.temporary_root / "race-marker-{}".format(index)
+                target = self.temporary_root / "external-target-{}".format(
+                    index
+                )
+                mutation = self.temporary_root / "external-mutation-{}".format(
+                    index
+                )
+                if race_kind == "symlink":
+                    target.mkdir()
+                    (target / "sentinel").write_text("preserve")
+
+                environment = os.environ.copy()
+                environment.update(
+                    {
+                        "PATH": "{}:{}".format(
+                            binary_directory, environment["PATH"]
+                        ),
+                        "PINRY_REAL_PYTHON3": shutil.which("python3"),
+                        "PINRY_PUBLISH_RACE_DESTINATION": str(destination),
+                        "PINRY_PUBLISH_RACE_KIND": race_kind,
+                        "PINRY_PUBLISH_RACE_MARKER": str(marker),
+                        "PINRY_PUBLISH_RACE_TARGET": str(target),
+                        "PINRY_PUBLISH_RACE_WATCH_PATH": str(
+                            destination
+                            if race_kind == "directory"
+                            else target
+                        ),
+                        "PINRY_PUBLISH_RACE_MUTATION": str(mutation),
+                    }
+                )
+
+                completed = self._run_packager_in(
+                    self.repository_root, output_root, environment
+                )
+
+                self.assertTrue(
+                    marker.is_file(), completed.stderr.decode("utf-8")
+                )
+                self.assertNotEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr.decode("utf-8"),
+                )
+                self.assertIn(b"publish_destination_raced", completed.stderr)
+                self.assertFalse(mutation.exists())
+                if race_kind == "directory":
+                    self.assertTrue(destination.is_dir())
+                    self.assertEqual(
+                        {path.name for path in destination.iterdir()},
+                        {"sentinel"},
+                    )
+                    self.assertEqual(
+                        (destination / "sentinel").read_text(), "preserve"
+                    )
+                elif race_kind == "symlink":
+                    self.assertTrue(destination.is_symlink())
+                    self.assertEqual(destination.resolve(), target.resolve())
+                    self.assertEqual(
+                        {path.name for path in target.iterdir()}, {"sentinel"}
+                    )
+                    self.assertEqual(
+                        (target / "sentinel").read_text(), "preserve"
+                    )
+                else:
+                    self.assertTrue(destination.is_symlink())
+                    self.assertFalse(target.exists())
+
+                deferred_roots = tuple(
+                    path
+                    for path in self.temporary_root.glob(
+                        ".svrx-pinry-server-{}.tmp.*".format(self.short_sha)
+                    )
+                    if path.is_dir() and not path.is_symlink()
+                )
+                self.assertEqual(len(deferred_roots), 1)
+                self.assertIn(
+                    "cleanup_deferred={}".format(
+                        deferred_roots[0].resolve()
+                    ).encode("utf-8"),
+                    completed.stderr,
+                )
+
+                if race_kind == "directory":
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+                retried = self._run_packager_in(
+                    self.repository_root, output_root, os.environ.copy()
+                )
+                self.assertEqual(
+                    retried.returncode, 0, retried.stderr.decode("utf-8")
+                )
+                self.assertEqual(
+                    {path.name for path in output_root.iterdir()},
+                    {
+                        self.package_name,
+                        "{}-{}.tar.gz".format(
+                            self.package_name, self.short_sha
+                        ),
+                        "sw-transition",
+                        "accept-tools",
+                    },
+                )
+                shutil.rmtree(deferred_roots[0])
 
     def test_packager_root_controls_are_exact_blobs_from_source_commit(self):
         self._create_package()
@@ -1245,38 +2337,126 @@ class SynologyPackageTests(unittest.TestCase):
                 self.assertFalse(output_root.exists())
                 self.assertFalse((output_root / self.package_name).exists())
 
-    def test_packager_rejects_source_missing_startup_runtime(self):
-        repository = self._clone_repository("missing-startup-runtime")
-        relative_path = "docker/scripts/startup.py"
-        (repository / relative_path).unlink()
-        completed = subprocess.run(
-            [
-                "git",
-                "-c",
-                "user.name=Package Test",
-                "-c",
-                "user.email=package-test@example.invalid",
-                "commit",
-                "--quiet",
-                "-am",
-                "remove required startup runtime",
-            ],
-            cwd=str(repository),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        self.assertEqual(
-            completed.returncode, 0, completed.stderr.decode("utf-8")
-        )
-        output_root = self.temporary_root / "missing-startup-output"
+    def test_packager_rejects_dirty_packaged_source_before_output(self):
+        for index, relative_path in enumerate(PACKAGED_SOURCE_SENTINELS):
+            with self.subTest(relative_path=relative_path):
+                repository = self._clone_repository(
+                    "dirty-packaged-source-{}".format(index)
+                )
+                dirty_path = repository / relative_path
+                dirty_path.write_bytes(
+                    dirty_path.read_bytes() + b"\n# dirty source\n"
+                )
+                output_root = self.temporary_root / (
+                    "dirty-source-output-{}".format(index)
+                )
+
+                completed = self._run_packager_in(
+                    repository, output_root, os.environ.copy()
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(
+                    b"tracked_package_control_mismatch",
+                    completed.stderr,
+                )
+                self.assertFalse(output_root.exists())
+
+    def test_packager_rejects_source_missing_required_context(self):
+        required_paths = (
+            "docker/scripts/startup.py",
+        ) + REQUIRED_SYNOLOGY_CONTEXT_PATHS
+        for index, relative_path in enumerate(required_paths):
+            with self.subTest(relative_path=relative_path):
+                repository = self._clone_repository(
+                    "missing-required-context-{}".format(index)
+                )
+                (repository / relative_path).unlink()
+                completed = subprocess.run(
+                    [
+                        "git",
+                        "-c",
+                        "user.name=Package Test",
+                        "-c",
+                        "user.email=package-test@example.invalid",
+                        "commit",
+                        "--quiet",
+                        "-am",
+                        "remove required package context",
+                    ],
+                    cwd=str(repository),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stderr.decode("utf-8"),
+                )
+                output_root = (
+                    self.temporary_root
+                    / "missing-required-output-{}".format(index)
+                )
+
+                completed = self._run_packager_in(
+                    repository,
+                    output_root,
+                    os.environ.copy(),
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(
+                    b"package_layout_changed",
+                    completed.stderr,
+                )
+                self.assertFalse(
+                    (output_root / self.package_name).exists()
+                )
+                self.assertFalse(
+                    (output_root / "sw-transition").exists()
+                )
+
+    def test_packager_rejects_required_file_symlink_from_source(self):
+        repository = self._clone_repository("symlinked-required-file")
+        required = repository / "docker/scripts/supervisor.py"
+        required.unlink()
+        required.symlink_to("migration_status.py")
+        self._commit_all(repository, "replace required file with symlink")
+        output_root = self.temporary_root / "symlinked-file-output"
 
         completed = self._run_packager_in(
-            repository, output_root, os.environ.copy()
+            repository,
+            output_root,
+            os.environ.copy(),
         )
 
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn(b"package_layout_changed", completed.stderr)
+        self.assertTrue(required.is_symlink())
         self.assertFalse((output_root / self.package_name).exists())
+        self.assertFalse((output_root / "sw-transition").exists())
+
+    def test_packager_rejects_required_parent_symlink_from_source(self):
+        repository = self._clone_repository("symlinked-required-parent")
+        migration = repository / "docker/migration"
+        replacement = repository / "docker/scripts/migration-source"
+        shutil.copytree(migration, replacement)
+        shutil.rmtree(migration)
+        migration.symlink_to("scripts/migration-source", target_is_directory=True)
+        self._commit_all(repository, "replace required parent with symlink")
+        output_root = self.temporary_root / "symlinked-parent-output"
+
+        completed = self._run_packager_in(
+            repository,
+            output_root,
+            os.environ.copy(),
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"package_layout_changed", completed.stderr)
+        self.assertTrue(migration.is_symlink())
+        self.assertFalse((output_root / self.package_name).exists())
+        self.assertFalse((output_root / "sw-transition").exists())
 
     def test_packager_rejects_staged_only_control_before_output(self):
         repository = self._clone_repository("staged-control")
@@ -1745,6 +2925,144 @@ class SynologyPackageTests(unittest.TestCase):
                 )
                 self.assertFalse(capture.exists())
                 self.assertEqual(_docker_call_count(capture), 0)
+
+    def test_build_rejects_incomplete_synology_context_before_docker(self):
+        self._create_package()
+        for relative_path in REQUIRED_SYNOLOGY_CONTEXT_PATHS:
+            required = self.context_directory / relative_path
+            required.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.repository_root / relative_path, required)
+        environment, capture, _working_directory = (
+            self._docker_environment()
+        )
+
+        for relative_path in REQUIRED_SYNOLOGY_CONTEXT_PATHS:
+            with self.subTest(relative_path=relative_path):
+                required = self.context_directory / relative_path
+                hidden = required.with_name(required.name + ".missing")
+                required.rename(hidden)
+                try:
+                    completed = subprocess.run(
+                        [
+                            "sh",
+                            str(self.package_directory / "build-image.sh"),
+                        ],
+                        env=environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                finally:
+                    hidden.rename(required)
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(
+                    b"synology_context_incomplete",
+                    completed.stderr,
+                )
+                self.assertFalse(capture.exists())
+                self.assertEqual(_docker_call_count(capture), 0)
+
+    def test_build_rejects_non_file_synology_context_before_docker(self):
+        self._create_package()
+        relative_path = "docker/migration/migration.js"
+        required = self.context_directory / relative_path
+        required.unlink()
+        required.mkdir()
+        self.addCleanup(
+            shutil.copy2,
+            self.repository_root / relative_path,
+            required,
+        )
+        self.addCleanup(required.rmdir)
+        environment, capture, _working_directory = (
+            self._docker_environment()
+        )
+
+        completed = subprocess.run(
+            ["sh", str(self.package_directory / "build-image.sh")],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"synology_context_incomplete", completed.stderr)
+        self.assertFalse(capture.exists())
+        self.assertEqual(_docker_call_count(capture), 0)
+
+    def test_build_rejects_symlinked_required_inputs_before_docker(self):
+        self._create_package()
+        environment, capture, _working_directory = (
+            self._docker_environment()
+        )
+        fixtures = (
+            (
+                self.package_directory / "BUILD_INFO",
+                b"missing_build_input=BUILD_INFO",
+            ),
+            (
+                self.context_directory / "docker/scripts/startup.py",
+                b"missing_build_input=docker/scripts/startup.py",
+            ),
+            (
+                self.context_directory / "docker/migration/migration.js",
+                b"synology_context_incomplete",
+            ),
+        )
+
+        for index, (required, expected_error) in enumerate(fixtures):
+            with self.subTest(required=str(required)):
+                for artifact in (
+                    capture,
+                    Path(str(capture) + ".calls"),
+                ):
+                    if artifact.exists():
+                        artifact.unlink()
+                hidden = required.with_name(
+                    "{}.symlink-target-{}".format(required.name, index)
+                )
+                required.rename(hidden)
+                required.symlink_to(hidden.name)
+                try:
+                    completed = subprocess.run(
+                        [
+                            "sh",
+                            str(self.package_directory / "build-image.sh"),
+                        ],
+                        env=environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                finally:
+                    required.unlink()
+                    hidden.rename(required)
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected_error, completed.stderr)
+                self.assertFalse(capture.exists())
+                self.assertEqual(_docker_call_count(capture), 0)
+
+    def test_build_rejects_symlinked_context_parent_before_docker(self):
+        self._create_package()
+        migration = self.context_directory / "docker/migration"
+        replacement = self.context_directory / "docker/migration.real"
+        migration.rename(replacement)
+        migration.symlink_to(replacement.name, target_is_directory=True)
+        environment, capture, _working_directory = (
+            self._docker_environment()
+        )
+
+        completed = subprocess.run(
+            ["sh", str(self.package_directory / "build-image.sh")],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"synology_context_incomplete", completed.stderr)
+        self.assertFalse(capture.exists())
+        self.assertEqual(_docker_call_count(capture), 0)
 
     def test_generated_synology_output_is_ignored_by_git(self):
         completed = subprocess.run(

@@ -228,6 +228,18 @@ for method in GET HEAD; do
         assert_header Cache-Control no-store
     done
 
+    request "$method" /migration/
+    assert_status 200
+    assert_header Content-Type 'text/html; charset=utf-8'
+
+    request "$method" /migration/migration.css
+    assert_status 200
+    assert_header Content-Type 'text/css; charset=utf-8'
+
+    request "$method" /migration/migration.js
+    assert_status 200
+    assert_header Content-Type 'application/javascript; charset=utf-8'
+
     request "$method" /readyz
     assert_status 503
     assert_header Retry-After 5
@@ -262,6 +274,7 @@ for method in GET HEAD; do
         request "$method" "$path"
         assert_status 200
         assert_header Cache-Control no-store
+        assert_header Content-Type 'text/html; charset=utf-8'
         if [[ "$method" == GET ]] && ! grep -q '기존 Pinry 데이터를 이전하고 있습니다.' "$body"; then
             echo "maintenance fallback body is missing" >&2
             exit 1

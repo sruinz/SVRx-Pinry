@@ -175,40 +175,34 @@ assert_maintenance_http() {
     local timeout="${4:-30}"
     local minimum_resume_count="${5:-}"
     local expected_error_code="${6:-}"
+    local expected_images="${7:-}"
+    local expected_files="${8:-}"
+    local arguments=(
+        assert-maintenance-http
+        --base-url "${base_url}"
+        --expected-state "${expected_state}"
+        --timeout "${timeout}"
+    )
 
     if [ -n "${expected_error_code}" ]; then
-        expect_output \
-            "FIXTURE_MAINTENANCE_HTTP_OK" \
-            "smoke_maintenance_http_invalid" \
-            run_read_only_helper "${data_root}" \
-                assert-maintenance-http \
-                --base-url "${base_url}" \
-                --expected-state "${expected_state}" \
-                --timeout "${timeout}" \
-                --expected-error-code "${expected_error_code}"
-        return
+        arguments+=(--expected-error-code "${expected_error_code}")
     fi
-
     if [ -n "${minimum_resume_count}" ]; then
-        expect_output \
-            "FIXTURE_MAINTENANCE_HTTP_OK" \
-            "smoke_maintenance_http_invalid" \
-            run_read_only_helper "${data_root}" \
-                assert-maintenance-http \
-                --base-url "${base_url}" \
-                --expected-state "${expected_state}" \
-                --timeout "${timeout}" \
-                --min-resume-count "${minimum_resume_count}"
-        return
+        arguments+=(--min-resume-count "${minimum_resume_count}")
+    fi
+    if [ -n "${expected_images}" ] || [ -n "${expected_files}" ]; then
+        [ -n "${expected_images}" ] && [ -n "${expected_files}" ] \
+            || fail "smoke_maintenance_expected_counts_invalid"
+        arguments+=(
+            --expected-images "${expected_images}"
+            --expected-files "${expected_files}"
+        )
     fi
     expect_output \
         "FIXTURE_MAINTENANCE_HTTP_OK" \
         "smoke_maintenance_http_invalid" \
         run_read_only_helper "${data_root}" \
-            assert-maintenance-http \
-            --base-url "${base_url}" \
-            --expected-state "${expected_state}" \
-            --timeout "${timeout}"
+            "${arguments[@]}"
 }
 
 assert_maintenance_fallback_http() {
@@ -476,7 +470,8 @@ run_resume_mode() {
     if ! docker start "${first}" >/dev/null 2>&1; then
         fail "smoke_resume_restart_failed"
     fi
-    assert_maintenance_http "${data_root}" http://app migrating 180 1
+    assert_maintenance_http \
+        "${data_root}" http://app migrating 180 1 "" 512 2048
     wait_for_app 300
     expect_output \
         "FIXTURE_LINEAR_COMMIT_VERIFIED" \
@@ -571,7 +566,8 @@ run_corrupt_manifest_mode() {
     prepare_data_root "${data_root}"
     create_fixture legacy-md5 "${data_root}" 512 "${receipt}"
     start_app "${data_root}" "${migrating}"
-    assert_maintenance_http "${data_root}" http://app migrating 180
+    assert_maintenance_http \
+        "${data_root}" http://app migrating 180 "" "" 512 2048
     stop_and_remove "${migrating}"
     expect_output \
         "FIXTURE_MANIFEST_CORRUPTED" \

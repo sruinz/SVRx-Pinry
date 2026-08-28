@@ -295,6 +295,21 @@ def _assert_nginx_maintenance_contract(source):
     if len(error_logs) != 1 or error_logs[0][:1] != ["/dev/stderr"]:
         raise AssertionError("nginx error log must use stderr")
 
+    fallback = _single_nginx_location(server, ["@migration_page"])
+    if _direct_values(fallback, "charset") != [["utf-8"]]:
+        raise AssertionError("maintenance fallback HTML must declare UTF-8")
+
+    assets = _single_nginx_location(server, ["^~", "/migration/"])
+    if _direct_values(assets, "charset") != [["utf-8"]]:
+        raise AssertionError("maintenance assets must declare UTF-8")
+    charset_types = {
+        value
+        for arguments in _direct_values(assets, "charset_types")
+        for value in arguments
+    }
+    if not {"text/css", "application/javascript"}.issubset(charset_types):
+        raise AssertionError("maintenance text assets need UTF-8 MIME coverage")
+
     public_locations = (
         ["=", "/migration"],
         ["^~", "/migration/"],

@@ -1,0 +1,12 @@
+version: "3.8"
+
+services:
+  svrx-pinry-sw-transition:
+    build:
+      context: .
+      dockerfile: Dockerfile.sw-transition
+    image: svrx-pinry-sw-transition:latest
+    container_name: svrx-pinry-sw-transition
+    ports:
+      - "2048:80"
+    restart: unless-stopped

@@ -16,8 +16,9 @@ Compose로 실행하는 방법과 기존 Pinry 데이터를 자동 이관하는 
 기본 산출물 경로는 canonical checkout의 저장소 루트 기준
 `../output/svrx-pinry-server-<커밋 앞 12자리 SHA>/`이다. 그 아래에 NAS로
 업로드할 `svrx-pinry/` 폴더와 `svrx-pinry-<커밋 앞 12자리 SHA>.tar.gz`
-파일이 생성된다. linked worktree에서 실행해도 같은 workspace의 공통
-`output/` 경로를 사용한다.
+파일, 같은 커밋의 `sw-transition/` 빌드 context와 선택 검증용
+`accept-tools/`가 생성된다. linked worktree에서 실행해도 같은 workspace의
+공통 `output/` 경로를 사용한다.
 
 다른 위치가 필요하면 경로를 직접 지정한다.
 
@@ -25,13 +26,44 @@ Compose로 실행하는 방법과 기존 Pinry 데이터를 자동 이관하는 
 ./scripts/create_synology_output.sh /원하는/산출물/경로
 ```
 
+직접 지정하는 산출물 경로도 아직 존재하지 않는 새 경로여야 한다. 같은
+경로에 빈 디렉터리, 파일, 내용이 있는 디렉터리 또는 심볼릭 링크가 하나라도
+있으면 기존 항목을 변경하지 않고 중단한다. 기존 폴더 안에 산출물 네 항목을
+추가하는 방식은 지원하지 않는다.
+
 패키지는 시작 시점의 Git `HEAD` 커밋 하나에서만 만든다. 생성기,
 `build-image.sh`, Compose, 이 안내 문서 또는 법적 고지 파일에 tracked
 미커밋 변경이 있으면 서로 다른 revision이 섞이지 않도록 생성 전에
 중단한다. 테스트, 설계 문서, GitHub 설정과 개발용 파일은 포함하지 않는다.
-같은 커밋의 기존 기본 산출물이 있으면 덮어쓰지 않고 중단한다.
+같은 커밋의 기존 기본 산출물이 있으면 덮어쓰지 않고 중단한다. 기본 경로와
+직접 지정한 경로 모두 완성된 네 항목을 부모의 비공개 임시 디렉터리에 먼저
+만들어 동기화한 뒤, 최상위 디렉터리를 한 번에 공개한다. 생성 도중 실패하거나
+강제 종료되면 최종 산출물 경로는 생기지 않으므로 같은 명령을 즉시 다시
+실행할 수 있다.
 
-산출물과 압축 파일 내부의 최상위 구조는 모두 다음과 같다.
+실패 시 외부에서 임시 디렉터리 안에 항목을 삽입했을 가능성이 있으면 안전을
+위해 재귀 삭제하지 않고 `cleanup_deferred=<경로>`를 표준 오류에 표시한다.
+이 숨김 임시 디렉터리는 최종 산출물이 아니며 다음 실행은 새 임시 디렉터리를
+사용한다. 해당 생성 프로세스가 더 이상 실행 중이지 않은 것을 확인한 뒤
+내용을 검토하고 수동으로 삭제할 수 있다.
+
+전체 산출물의 최상위 구조는 다음과 같다.
+
+```text
+svrx-pinry-server-<커밋 앞 12자리 SHA>/
+├── svrx-pinry/
+├── svrx-pinry-<커밋 앞 12자리 SHA>.tar.gz
+├── sw-transition/
+└── accept-tools/
+    ├── BUILD_INFO
+    ├── nas_legacy_clone_acceptance.sh
+    └── fixtures/
+        └── create_legacy_fixture.py
+```
+
+압축 파일에는 아래 `svrx-pinry/`만 들어 있고 `sw-transition/`과
+`accept-tools/`는 포함되지 않는다. 본 이미지 업로드 폴더와 압축 파일
+내부의 구조는 다음과 같다.
 
 ```text
 svrx-pinry/
@@ -61,6 +93,114 @@ svrx-pinry/
 Docker는 `context/`만 build context로 사용한다. 바깥의 실행 안내와 법적
 고지 파일은 최종 이미지에 복사되지 않는다. 이미지가 배포해야 하는 법적
 고지는 `context/`에도 별도로 들어 있다.
+
+`sw-transition/`은 본 이미지와 섞지 않는 별도 Container Manager project이다.
+데이터 마운트 없이 기존 Pinry 또는 SVRx Pinry에서 서비스 워커를 등록한
+것과 정확히 같은 origin에 임시로 실행해 브라우저의
+기존 서비스 워커와 캐시를 네트워크 전용 버전으로 바꾸는 용도로만 사용한다.
+
+`accept-tools/`는 실제 레거시 데이터의 **복제본**으로 이관 계약을 확인하는
+선택 도구다. 일반 설치와 자동 이관에는 필요하지 않으며, 사용할 때만
+디렉터리째 NAS에 별도로 업로드한다. `BUILD_INFO`는 본 패키지와 같은
+40자리 source commit을 기록하며, script는 같은 디렉터리 아래의
+`fixtures/create_legacy_fixture.py`를 상대 경로로 찾아 사용한다.
+
+## 선택: 실제 NAS 복제 acceptance
+
+이 절차는 정상 설치 절차가 아니라 배포 후보 이미지를 실제 NAS 데이터의
+격리된 복제본으로 검증하는 관리자용 절차다. Docker CLI를 실행할 수 있는
+SSH 또는 동등한 터미널 환경이 필요하다. script는 source의 `data/`를 고유한
+clone으로 복사하고 source fingerprint를 전후 비교하며, 실패해도 clone과
+결과 JSON을 자동 삭제하지 않는다.
+
+실행 전에 기존 Pinry container를 정상 중지한다. 실행 중인 다른 container가
+source project나 `data/` 자체·하위 또는 더 넓은 조상 경로를 bind mount하면
+읽기 전용 여부와 관계없이 중단한다. 단, `dirname(source_project)`와 정확히
+같은 parent bind mount는 `RW=false`인 경우에만 허용한다. 같은 정확한 parent를
+`RW=true`로 mount한 container가 하나라도 있으면 `nas_source_container_running`
+으로 중단한다.
+
+아래 명령의 수량은 검증된 기준 source workload다. Pin 345개, 물리 media
+regular file 1,434개, Image 346행, Thumbnail 1,038행, DB가 참조하는 활성
+원본·파생 파일 1,384개를 각각 독립적으로 고정한다. 다른 source를 검증할
+때는 다섯 값을 그 source의 실제 값으로 모두 바꾼다. `run-id`에 해당하는
+clone과 결과 JSON은 실행 전에 존재하지 않아야 한다.
+
+```sh
+cd /volume1/docker/svrx-pinry-upload
+source_commit="$(sed -n 's/^source_commit=//p' accept-tools/BUILD_INFO)"
+bash accept-tools/nas_legacy_clone_acceptance.sh \
+  --source-project /volume1/docker/pinry \
+  --run-root /volume1/docker \
+  --run-id 20260828-01 \
+  --image svrx-pinry:latest \
+  --result-root /volume1/docker \
+  --expected-pins 345 \
+  --expected-files 1434 \
+  --expected-images 346 \
+  --expected-thumbnails 1038 \
+  --expected-active-files 1384 \
+  --expected-source-commit "${source_commit}"
+```
+
+성공하면 마지막 줄에 `NAS_LEGACY_CLONE_ACCEPTANCE_OK`가 표시되고
+`svrx-pinry-accept-<run-id>.json`에 source·최종 수량, 실행 image identity,
+소요 시간, 재시작 no-op과 백업 보존 결과가 기록된다. reference workload의
+물리 1,434개에는 DB가 참조하지 않는 고아 파일 50개도 포함되며, 이 payload는
+레거시 backup에 정확히 보존되어야 한다. DB snapshot은 무결성 검사와 핵심
+row count(Pin 345, Image 346, Thumbnail 1,038)를 모두 통과해야 한다.
+
+## 서비스 워커 전환 context 업로드와 실행
+
+기존 Pinry 또는 SVRx Pinry를 교체하며 같은 origin에 서비스 워커가
+등록된 경우에는 NAS의 같은 작업 폴더에 main package와
+`sw-transition/` 디렉터리를 **함께** 업로드한다. 압축 파일
+`svrx-pinry-<커밋 앞 12자리 SHA>.tar.gz`에는 `svrx-pinry/`만 들어 있고
+`sw-transition/`은 포함하지 않는다. 따라서 압축 파일로 main package를
+옮겼더라도 `sw-transition/`은 디렉터리째 별도로 업로드해야 한다.
+
+기존 main project를 중지해 2048 포트를 비운 뒤 DSM Container Manager에서
+다음 순서로 전환 project를 실행한다. 이 project는 데이터 마운트를 사용하지
+않으며 기존 데이터 폴더를 읽거나 변경하지 않는다.
+
+1. **프로젝트 → 생성**을 선택한다.
+2. 프로젝트 이름을 `svrx-pinry-sw-transition`으로 입력한다.
+3. 경로에서 업로드한 `sw-transition/` 폴더를 선택한다.
+4. 폴더에 포함된 `docker-compose.yml`을 사용해 project를 빌드·실행한다.
+5. 컨테이너 상태가 실행 중인지 확인한다.
+
+전환 화면은 기존 Pinry 또는 SVRx Pinry에서 서비스 워커를 등록한 외부 URL과
+**scheme(HTTP/HTTPS), host, port가 모두 정확히 같은 origin**으로 열어야
+한다. HTTPS 리버스 프록시나 사용자 도메인을 사용했다면 기존 외부
+URL을 유지한 채 리버스 프록시를 임시로 전환 project에 연결한다.
+NAS IP의 직접 URL이나 다른 포트를 열면 기존 origin의 서비스 워커와
+캐시는 전환되지 않는다.
+
+기존 서비스에서 평문 HTTP만 사용했고 서비스 워커가 등록된 적이 없다면
+전환할 대상이 없으므로 이 전환 단계는 필요하지 않다. `127.0.0.1`과
+`localhost`를 사용하는 loopback 자동화 테스트는 브라우저의 보안 origin
+예외에서 전환 스크립트만 확인하며 운영 HTTPS 설정을 검증하지 않는다.
+
+기존에 사용하던 모든 브라우저 프로필에서 이 기존 외부 URL을 한 번 열어
+전환 화면의 **전환 준비 완료**를 확인한다. 모든 프로필에서 이 문구를
+확인한 뒤 Container Manager에서 전환 project를 중지한다. 이어서 main
+package의 본 이미지를 빌드하고 기존 Compose project를 다시 실행한다.
+
+터미널 사용이 가능한 관리자는 같은 작업을 아래 명령으로 수행할 수도 있다.
+이는 선택 절차이며 서비스 워커 전환에 SSH 접속은 필수 조건이 아니다.
+
+```sh
+cd sw-transition
+docker build -f Dockerfile.sw-transition -t svrx-pinry-sw-transition:latest .
+docker run --rm --name svrx-pinry-sw-transition -p 2048:80 svrx-pinry-sw-transition:latest
+```
+
+```sh
+cd ../svrx-pinry
+chmod +x build-image.sh
+./build-image.sh
+docker compose up -d --force-recreate
+```
 
 ## 준비 사항
 
@@ -139,9 +279,12 @@ SQLite 데이터베이스, 이미지, 정적 파일, `local_settings.py`와 비�
 시작하지 않는다. Container Manager에서 기존 project 또는 container를
 먼저 중지한다.
 
-기존 `/volume1/docker/pinry-custom/data`를 계속 바인드 마운트해도 되고,
-File Station에서 그 폴더의 **내용 전체**를
-`/volume1/docker/svrx-pinry/data`로 복사해도 된다. 새 경로로 복사할 때
+기존 Compose 파일에서 컨테이너의 `/data`로 바인드된 실제 NAS
+경로를 먼저 확인한다. 기본 Pinry 예시 경로는
+`/volume1/docker/pinry/data`이지만 기존 project 설정에 따라 다를 수 있다.
+확인한 기존 경로를 계속 바인드 마운트해도 되고, File Station에서
+그 폴더의 **내용 전체**를 `/volume1/docker/svrx-pinry/data`로
+복사해도 된다. 새 경로로 복사할 때
 `data` 폴더 자체를 넣어 `data/data`가 되지 않도록 주의한다. 이 작업 전에
 중지된 기존 데이터 폴더 전체를 NAS 밖에도 백업한다.
 
@@ -149,6 +292,37 @@ File Station이 복사한 `local_settings.py`와 비밀키는 `data` 폴더와 �
 다르거나 권한 표시가 달라도 시작할 때 컨테이너 root 소유 `0600`으로 자동
 정규화된다. 심볼릭 링크·하드 링크·일반 파일이 아닌 항목과 잘못된 내용은
 원본을 바꾸지 않고 거부한다.
+
+### 기존 Pinry 데이터 최초 이전
+
+기존 Pinry 또는 SVRx Pinry에서 같은 origin에 서비스 워커가 등록된
+경우에는 먼저 서비스 워커 전환 이미지를 같은 origin에 실행하고,
+기존에 사용하던 브라우저 프로필로
+**전환 준비 완료**를 확인한다. 이 단계는 데이터 폴더를 열지 않는다.
+
+기존 데이터가 있으면 첫 실행 동안 같은 주소에 이전 진행 화면이
+표시된다. 브라우저를 닫아도 작업은 계속되며, 완료 전에는 컨테이너를
+중지하거나 project·데이터 폴더를 삭제하지 않는다. 정상 중지 후 다시
+시작하면 마지막 확정 배치부터 이어서 작업한다. 오류 화면이 표시되면
+오류 코드를 복사하고 DSM Container Manager의 컨테이너 로그를 확인한다.
+완료 후 생성된 레거시 백업은 충분히 검증한 뒤 사용자가 직접 삭제할
+때까지 보존된다.
+
+검증 목표는 동일 NAS에서 **350개 40분 이내**, **1,000개 2시간 이내**다.
+이 시간은 검증 기준이며 모든 장비에서의 보장값이 아니다.
+스토리지·CPU·이미지 크기에 따라 소요 시간이 달라질 수 있다.
+
+| 경로 | 의미 |
+| --- | --- |
+| `/migration/` | 한국어 이전 진행·정체·오류 화면 |
+| `/migration-status.json` | 비밀값을 제외한 공개 진행 상태 |
+| `/healthz` | Nginx 프로세스가 응답하는지 확인 |
+| `/readyz` | 일반 SVRx Pinry 서비스가 준비됐는지 확인 |
+
+이전 중에는 일반 API와 미디어 요청에 `503` 응답과 재시도 안내가
+반환된다. 오류 화면은 **재시도 가능**, **사용자 조치 필요**, **치명적**
+세 분류로만 안내한다. 내부 traceback, 절대 경로, 원본 파일명은 공개
+상태나 화면에 표시하지 않는다.
 
 ## 자동 이관과 서버 시작
 

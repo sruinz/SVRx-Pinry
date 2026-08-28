@@ -42,6 +42,17 @@ SVRx Pinry Server는 개인 서버나 NAS에 설치해 이미지를 보드와 �
 지원하고 Firefox는 공식 지원 대상이 아닙니다. 기존 Pinry용 Chrome·Firefox
 레거시 확장은 단건 Pin 생성용입니다.
 
+[확장 저장소](https://github.com/sruinz/SVRx-Pinry-Extention)의 소스로 수동
+배포 후보를 만들려면 확장 저장소 루트에서 다음을 실행합니다.
+
+```sh
+bash scripts/package.sh
+```
+
+확장 ZIP은 서버 산출물과 같은 작업공간의 공통 `output/` 아래
+`svrx-pinry-extension-<커밋 앞 12자리>/svrx-pinry-extension-0.1.0.zip`으로
+생성됩니다.
+
 ## Synology Docker 이미지 만들기
 
 현재 저장소는 완성된 Docker Hub 이미지를 전제로 하지 않습니다. 개발
@@ -61,9 +72,13 @@ PC에서 Synology용 산출물을 만든 뒤 NAS에 업로드해 이미지를 �
 <작업공간>/
 ├── <서버 저장소>/
 └── output/
-    └── svrx-pinry-server-<커밋 앞 12자리>/
-        ├── svrx-pinry/
-        └── svrx-pinry-<커밋 앞 12자리>.tar.gz
+    ├── svrx-pinry-server-<서버 커밋 앞 12자리>/
+    │   ├── svrx-pinry/
+    │   ├── svrx-pinry-<서버 커밋 앞 12자리>.tar.gz
+    │   ├── sw-transition/
+    │   └── accept-tools/
+    └── svrx-pinry-extension-<확장 커밋 앞 12자리>/
+        └── svrx-pinry-extension-0.1.0.zip
 ```
 
 생성된 압축 파일 또는 `svrx-pinry/` 폴더를 NAS에 업로드합니다. 이미지
@@ -71,8 +86,38 @@ PC에서 Synology용 산출물을 만든 뒤 NAS에 업로드해 이미지를 �
 [Synology 이미지 빌드 및 실행 안내](deploy/synology/README_KO.md)를
 따르세요.
 
-산출물에는 이미지 빌드와 실행에 필요한 파일만 들어갑니다. 데이터베이스,
+산출물에는 본 이미지 빌드·실행 파일, 기존 브라우저 캐시를
+안전하게 전환하는 별도 `sw-transition/` context, 실제 NAS 복제본을
+검증하는 선택 도구 `accept-tools/`가 들어갑니다. 데이터베이스,
 업로드 이미지와 비밀키는 포함하지 않습니다.
+
+기존 Pinry 또는 SVRx Pinry를 교체하며 같은 origin에 서비스 워커가
+등록된 경우, NAS의 같은 작업 폴더에 main package와
+`sw-transition/`을 **함께** 올립니다. `svrx-pinry-<커밋>.tar.gz`에는 main
+package인 `svrx-pinry/`만 들어 있으므로, 압축 파일을 사용해도
+`sw-transition/`은 디렉터리째 별도로 업로드해야 합니다. NAS에서 먼저
+기존 main container를 중지해 2048 포트를 비운 뒤, Container Manager에서
+`sw-transition/docker-compose.yml`을 사용하는 임시 project를 실행합니다.
+이 project에는 데이터 마운트가 없으며 SSH 접속 없이 만들고 중지할 수
+있습니다.
+
+기존에 사용하던 모든 브라우저·확장 프로그램 클라이언트에서 전환 화면의
+**전환 준비 완료**를 확인한 뒤 Container Manager에서 전환 project를
+중지합니다. 그 다음 `svrx-pinry/`에서 본 이미지를 빌드하고 기존 Compose
+project를 다시 실행합니다.
+전체 명령과 이관 순서는
+[Synology 이미지 빌드 및 실행 안내](deploy/synology/README_KO.md)를 따르세요.
+
+기존 Pinry 데이터가 있으면 첫 실행 동안 같은 접속 주소에 한국어 이전
+진행 화면이 표시되고 일반 쓰기·API·미디어 요청은 차단됩니다. 브라우저를
+닫아도 이전은 계속되며, 정상 중지 후 다시 시작하면 마지막 확정 배치부터
+재개합니다. 완료 후에는 서비스로 자동 전환되며 레거시 백업은 충분히
+검증한 뒤 사용자가 직접 삭제할 때까지 보존됩니다. 상세 절차와
+`/migration/`, `/migration-status.json`, `/healthz`, `/readyz` 상태의
+의미는 [Synology 이미지 빌드 및 실행 안내](deploy/synology/README_KO.md)를
+따르세요.
+이전 오류는 **재시도 가능**, **사용자 조치 필요**, **치명적**으로 구분해
+표시하므로 화면의 안내와 DSM Container Manager 로그를 함께 확인하세요.
 
 ## 실행 버전 확인
 
