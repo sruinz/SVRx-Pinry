@@ -1648,6 +1648,76 @@ class StoragePreflightTests(SimpleTestCase):
         self.assertTrue(result.ok)
         service_probe.assert_not_called()
 
+    def test_configuration_preflight_creates_secure_lock_directory(self):
+        result = startup_preflight.validate_storage_configuration_preflight(
+            str(self.media_root),
+            self._storage(),
+            self._storage(),
+            VALID_IMAGE_SIZES,
+            os.geteuid(),
+            os.getegid(),
+        )
+
+        self.assertTrue(result.ok)
+        lock_stat = self.lock_directory.stat()
+        self.assertTrue(stat.S_ISDIR(lock_stat.st_mode))
+        self.assertEqual(stat.S_IMODE(lock_stat.st_mode), 0o700)
+        self.assertEqual(lock_stat.st_uid, os.geteuid())
+        self.assertEqual(lock_stat.st_gid, os.getegid())
+        self.assertEqual(tuple(self.lock_directory.iterdir()), ())
+
+    def test_configuration_preflight_normalizes_inherited_lock_mode(self):
+        self.lock_directory.mkdir(mode=0o700)
+        os.chmod(str(self.lock_directory), 0o777)
+
+        result = startup_preflight.validate_storage_configuration_preflight(
+            str(self.media_root),
+            self._storage(),
+            self._storage(),
+            VALID_IMAGE_SIZES,
+            os.geteuid(),
+            os.getegid(),
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            stat.S_IMODE(self.lock_directory.stat().st_mode),
+            0o700,
+        )
+
+    def test_lock_directory_creation_race_with_symlink_fails_closed(self):
+        outside = self.media_root / "outside-locks"
+        outside.mkdir(mode=0o755)
+
+        def race_with_symlink(*_args, **_kwargs):
+            self.lock_directory.symlink_to(
+                outside,
+                target_is_directory=True,
+            )
+            raise FileExistsError()
+
+        with mock.patch.object(
+            file_ops,
+            "_require_lifecycle_lock_support",
+        ), mock.patch.object(
+            file_ops.os,
+            "mkdir",
+            side_effect=race_with_symlink,
+        ):
+            result = startup_preflight.validate_storage_configuration_preflight(
+                str(self.media_root),
+                self._storage(),
+                self._storage(),
+                VALID_IMAGE_SIZES,
+                os.geteuid(),
+                os.getegid(),
+            )
+
+        self.assertEqual(result.reason_code, "unsafe_media_lock_state")
+        self.assertTrue(self.lock_directory.is_symlink())
+        self.assertEqual(tuple(outside.iterdir()), ())
+        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o755)
+
     def test_runtime_preflight_only_runs_the_service_identity_probe(self):
         with mock.patch.object(
             startup_preflight.file_ops,
@@ -2154,6 +2224,7 @@ class StoragePreflightTests(SimpleTestCase):
     def test_actual_service_child_distinguishes_write_failure(self):
         if os.geteuid() == 0:
             self.skipTest("root can write through owner permission probes")
+        self.lock_directory.mkdir(mode=0o700)
         os.chmod(str(self.media_root), 0o500)
         self.addCleanup(lambda: os.chmod(str(self.media_root), 0o700))
 

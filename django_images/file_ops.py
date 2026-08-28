@@ -1294,7 +1294,19 @@ def recover_media_lock_state(  # noqa: C901
                 follow_symlinks=False,
             )
         except FileNotFoundError:
-            return False
+            try:
+                os.mkdir(
+                    ".pinry-locks",
+                    0o700,
+                    dir_fd=root_directory.descriptor,
+                )
+            except FileExistsError:
+                pass
+            named_directory = os.stat(
+                ".pinry-locks",
+                dir_fd=root_directory.descriptor,
+                follow_symlinks=False,
+            )
         if not stat.S_ISDIR(named_directory.st_mode):
             raise MediaPathError("unsafe_media_lock_state")
         flags = (
