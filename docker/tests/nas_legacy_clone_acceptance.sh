@@ -1661,6 +1661,9 @@ import stat
 import sys
 import unicodedata
 import uuid
+import warnings
+
+from PIL import Image as PILImage
 
 data_root = "/data"
 media_root = os.path.join(data_root, "static", "media")
@@ -1668,6 +1671,14 @@ allowed_extensions = frozenset((
     ".jpg", ".png", ".gif", ".webp", ".bmp", ".tif",
 ))
 derivative_names = frozenset(("thumbnail", "standard", "square"))
+format_extensions = {
+    "JPEG": ".jpg",
+    "PNG": ".png",
+    "GIF": ".gif",
+    "WEBP": ".webp",
+    "BMP": ".bmp",
+    "TIFF": ".tif",
+}
 invalid_chars = frozenset("<>:\"/\\|?*")
 reserved_stems = frozenset(
     ("CON", "PRN", "AUX", "NUL")
@@ -1783,6 +1794,130 @@ def safe_file_sha256(path):
     return digest.hexdigest()
 
 
+def safe_read_file(path):
+    before = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode):
+        fail()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            fail()
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    current = os.stat(path, follow_symlinks=False)
+    identity = (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+    )
+    if identity != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+    ) or identity != (
+        current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns,
+    ):
+        fail()
+    return b"".join(chunks)
+
+
+def safe_media_identity(kind, relative_path, db_width, db_height):
+    path = os.path.join(media_root, *relative_path.split("/"))
+    try:
+        before = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            fail()
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (before.st_dev, before.st_ino)
+                or opened.st_nlink != 1
+            ):
+                fail()
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            with warnings.catch_warnings():
+                warnings.simplefilter(
+                    "ignore", PILImage.DecompressionBombWarning,
+                )
+                with os.fdopen(os.dup(descriptor), "rb") as file_obj:
+                    with PILImage.open(file_obj) as image:
+                        image_format = image.format
+                        width, height = image.size
+                        image.verify()
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        current = os.stat(path, follow_symlinks=False)
+    except SystemExit:
+        raise
+    except Exception:
+        fail()
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_nlink,
+        before.st_mtime_ns,
+    )
+    if (
+        identity != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_nlink,
+            opened.st_mtime_ns,
+        )
+        or identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_nlink,
+            after.st_mtime_ns,
+        )
+        or identity != (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_nlink,
+            current.st_mtime_ns,
+        )
+        or (width, height) != (db_width, db_height)
+        or format_extensions.get(image_format)
+        != os.path.splitext(relative_path)[1]
+    ):
+        fail()
+    return [
+        kind,
+        relative_path,
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_nlink,
+        digest.hexdigest(),
+        image_format,
+        width,
+        height,
+    ]
+
+
 try:
     sample = json.loads(sys.stdin.read())
 except (TypeError, ValueError):
@@ -1860,8 +1995,13 @@ try:
     pin_rows = connection.execute(
         "SELECT id, image_id, private FROM core_pin ORDER BY id"
     ).fetchall()
+    pin_owner_rows = connection.execute(
+        "SELECT image_id, submitter_id FROM core_pin "
+        "ORDER BY image_id, submitter_id"
+    ).fetchall()
     asset_rows = connection.execute(
-        "SELECT image_id, content_sha256 FROM core_mediaasset ORDER BY image_id"
+        "SELECT id, image_id, submitter_id, content_sha256 "
+        "FROM core_mediaasset ORDER BY image_id"
     ).fetchall()
 finally:
     try:
@@ -1894,11 +2034,15 @@ for row in image_rows:
     images[row[0]] = {
         "asset_uuid": asset_uuid,
         "path": row[1],
+        "original_filename": row[3],
+        "width": row[5],
+        "height": row[4],
     }
     expected_files[row[1]] = ("image", row[0])
     expected_directories.add("originals/{}".format(asset_uuid))
 
 thumbnail_keys = set()
+thumbnail_signatures = {image_id: [] for image_id in images}
 for row in thumbnail_rows:
     if (
         len(row) != 6
@@ -1927,6 +2071,9 @@ for row in thumbnail_rows:
         fail()
     expected_files[row[1]] = ("thumbnail", row[0])
     expected_directories.add("derivatives/{}".format(asset_uuid))
+    thumbnail_signatures[row[3]].append([
+        row[0], row[2], row[1], row[5], row[4],
+    ])
 if thumbnail_keys != {
     (image_id, size)
     for image_id in images
@@ -1934,19 +2081,471 @@ if thumbnail_keys != {
 }:
     fail()
 
+database_signatures = {}
+file_rows = {}
+for image_id, image in images.items():
+    signatures = sorted(
+        thumbnail_signatures[image_id],
+        key=lambda signature: (signature[1], signature[0]),
+    )
+    database_signatures[image_id] = [
+        image_id,
+        image["asset_uuid"],
+        image["original_filename"],
+        image["path"],
+        image["width"],
+        image["height"],
+        signatures,
+    ]
+    signatures_by_size = {
+        signature[1]: signature for signature in signatures
+    }
+    file_rows[image_id] = [(
+        "original",
+        image["path"],
+        image["width"],
+        image["height"],
+    )] + [
+        (
+            size,
+            signatures_by_size[size][2],
+            signatures_by_size[size][3],
+            signatures_by_size[size][4],
+        )
+        for size in ("thumbnail", "standard", "square")
+    ]
+
 assets = {}
-for image_id, content_sha256 in asset_rows:
+assets_by_pk = {}
+for asset_id, image_id, submitter_id, content_sha256 in asset_rows:
+    signature = (asset_id, image_id, submitter_id, content_sha256)
     if (
-        type(image_id) is not int
+        type(asset_id) is not int
+        or asset_id <= 0
+        or asset_id in assets_by_pk
+        or type(image_id) is not int
         or image_id not in images
         or image_id in assets
+        or type(submitter_id) is not int
+        or submitter_id <= 0
         or not isinstance(content_sha256, str)
         or len(content_sha256) != 64
         or any(character not in "0123456789abcdef" for character in content_sha256)
     ):
         fail()
-    assets[image_id] = content_sha256
-if set(assets) != set(images):
+    assets[image_id] = signature
+    assets_by_pk[asset_id] = signature
+
+owners_by_image = {}
+for image_id, submitter_id in pin_owner_rows:
+    if (
+        type(image_id) is not int
+        or image_id not in images
+        or type(submitter_id) is not int
+        or submitter_id <= 0
+    ):
+        fail()
+    owners_by_image.setdefault(image_id, set()).add(submitter_id)
+
+safe_skip_reasons = frozenset((
+    "extra_derivative",
+    "file_identity_mismatch",
+    "invalid_dimensions",
+    "invalid_media_file",
+    "invalid_named_leaf",
+    "missing_derivative",
+    "multi_owner",
+    "orphan",
+    "pipeline_closure_mismatch",
+    "processing_pixel_limit_exceeded",
+    "unsafe_media_file",
+    "existing_registry_collision",
+    "duplicate_registry_collision",
+))
+preliminary_reasons = frozenset((
+    "multi_owner",
+    "orphan",
+))
+structural_reasons = frozenset((
+    "extra_derivative",
+    "invalid_dimensions",
+    "invalid_named_leaf",
+    "missing_derivative",
+    "multi_owner",
+    "orphan",
+))
+
+
+def valid_digest(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+backup_root = os.path.join(data_root, "legacy-backup")
+try:
+    run_names = []
+    for name in sorted(os.listdir(backup_root)):
+        path = os.path.join(backup_root, name)
+        path_stat = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISDIR(path_stat.st_mode):
+            fail()
+        run_names.append(name)
+except OSError:
+    fail()
+if len(run_names) != 1:
+    fail()
+run_name = run_names[0]
+run_root = os.path.join(backup_root, run_name)
+try:
+    summary = json.loads(
+        safe_read_file(
+            os.path.join(run_root, "migration-summary.json")
+        ).decode("ascii")
+    )
+except (OSError, UnicodeError, ValueError):
+    fail()
+summary_keys = {
+    "format_version",
+    "source_commit",
+    "run_id",
+    "phase",
+    "backup_relative_name",
+    "media_plan_sha256",
+    "media_manifest_sha256",
+    "backfill_plan_sha256",
+    "backfill_manifest_sha256",
+    "media_image_count",
+    "media_md5_legacy",
+    "media_fixed_slot",
+    "media_named_canonical",
+    "backfill_scanned",
+    "backfill_registered",
+    "backfill_already_registered",
+    "backfill_skipped",
+    "reason_counts",
+}
+count_keys = {
+    "media_image_count",
+    "media_md5_legacy",
+    "media_fixed_slot",
+    "media_named_canonical",
+    "backfill_scanned",
+    "backfill_registered",
+    "backfill_already_registered",
+    "backfill_skipped",
+}
+if (
+    not isinstance(summary, dict)
+    or set(summary) != summary_keys
+    or summary["format_version"] != 1
+    or summary["run_id"] != run_name
+    or summary["phase"] != "complete"
+    or summary["backup_relative_name"] != "legacy-backup"
+    or any(
+        type(summary[key]) is not int or summary[key] < 0
+        for key in count_keys
+    )
+    or not valid_digest(summary["backfill_plan_sha256"])
+    or not valid_digest(summary["backfill_manifest_sha256"])
+    or summary["media_image_count"] != len(images)
+    or summary["media_image_count"] != (
+        summary["media_md5_legacy"]
+        + summary["media_fixed_slot"]
+        + summary["media_named_canonical"]
+    )
+):
+    fail()
+
+try:
+    manifest_raw = safe_read_file(
+        os.path.join(run_root, "media-asset-backfill.jsonl")
+    )
+except OSError:
+    fail()
+if (
+    not manifest_raw
+    or not manifest_raw.endswith(b"\n")
+    or hashlib.sha256(manifest_raw).hexdigest()
+    != summary["backfill_manifest_sha256"]
+):
+    fail()
+
+plans = {}
+terminals = {}
+plan_complete = False
+plan_sha256 = None
+offset = 0
+base_event_keys = {
+    "event", "format_version", "target_signature", "run_id",
+}
+plan_keys = {
+    "image_id",
+    "submitter_id",
+    "content_sha256",
+    "database_signature",
+    "file_identities",
+    "owner_ids",
+    "registry_signature",
+    "key_registry_signature",
+    "preliminary_reason",
+}
+for raw_line in manifest_raw.splitlines(True):
+    try:
+        event = json.loads(raw_line.decode("ascii"))
+    except (UnicodeError, ValueError):
+        fail()
+    if (
+        not isinstance(event, dict)
+        or event.get("format_version") != 2
+        or event.get("target_signature") != "media-asset-backfill-v2"
+        or event.get("run_id") != run_name
+    ):
+        fail()
+    event_name = event.get("event")
+    if event_name == "planned":
+        if plan_complete or set(event) != base_event_keys | {"plan"}:
+            fail()
+        plan = event["plan"]
+        if not isinstance(plan, dict) or set(plan) != plan_keys:
+            fail()
+        image_id = plan["image_id"]
+        owner_ids = plan["owner_ids"]
+        database_signature = plan["database_signature"]
+        if (
+            type(image_id) is not int
+            or image_id <= 0
+            or image_id in plans
+            or not isinstance(database_signature, list)
+            or database_signature != database_signatures.get(image_id)
+            or not isinstance(owner_ids, list)
+            or len(owner_ids) > 2
+            or owner_ids != sorted(set(owner_ids))
+            or any(
+                type(owner_id) is not int or owner_id <= 0
+                for owner_id in owner_ids
+            )
+        ):
+            fail()
+        for signature_name in (
+            "registry_signature", "key_registry_signature",
+        ):
+            signature = plan[signature_name]
+            if signature is not None and (
+                not isinstance(signature, list)
+                or len(signature) != 4
+                or any(type(value) is not int for value in signature[:3])
+                or not valid_digest(signature[3])
+            ):
+                fail()
+        registry_signature = plan["registry_signature"]
+        key_registry_signature = plan["key_registry_signature"]
+        preliminary_reason = plan["preliminary_reason"]
+        recorded_file_identities = plan["file_identities"]
+        if (
+            not isinstance(recorded_file_identities, list)
+            or len(recorded_file_identities) > 4
+            or (
+                preliminary_reason is None
+                and len(recorded_file_identities) != 4
+            )
+            or (
+                isinstance(preliminary_reason, str)
+                and preliminary_reason in structural_reasons
+                and recorded_file_identities != []
+            )
+        ):
+            fail()
+        actual_file_identities = [
+            safe_media_identity(*row)
+            for row in file_rows[image_id][
+                :len(recorded_file_identities)
+            ]
+        ]
+        if recorded_file_identities != actual_file_identities:
+            fail()
+        if preliminary_reason is None:
+            if (
+                type(plan["submitter_id"]) is not int
+                or plan["submitter_id"] <= 0
+                or owner_ids != [plan["submitter_id"]]
+                or not valid_digest(plan["content_sha256"])
+                or plan["content_sha256"]
+                != actual_file_identities[0][6]
+                or (
+                    registry_signature is not None
+                    and key_registry_signature != registry_signature
+                )
+                or (
+                    registry_signature is not None
+                    and registry_signature[1:] != [
+                        image_id,
+                        plan["submitter_id"],
+                        plan["content_sha256"],
+                    ]
+                )
+                or (
+                    registry_signature is None
+                    and key_registry_signature is not None
+                    and tuple(key_registry_signature[2:]) != (
+                        plan["submitter_id"], plan["content_sha256"],
+                    )
+                )
+            ):
+                fail()
+        elif (
+            preliminary_reason not in preliminary_reasons
+            or plan["submitter_id"] is not None
+            or plan["content_sha256"] is not None
+            or registry_signature is not None
+            or key_registry_signature is not None
+            or (
+                preliminary_reason == "orphan"
+                and owner_ids != []
+            )
+            or (
+                preliminary_reason == "multi_owner"
+                and len(owner_ids) != 2
+            )
+            or (
+                preliminary_reason not in ("orphan", "multi_owner")
+                and len(owner_ids) != 1
+            )
+        ):
+            fail()
+        plans[image_id] = plan
+    elif event_name == "plan_complete":
+        if (
+            plan_complete
+            or set(event) != base_event_keys | {"scanned"}
+            or event["scanned"] != len(plans)
+        ):
+            fail()
+        plan_complete = True
+        plan_sha256 = hashlib.sha256(
+            manifest_raw[:offset + len(raw_line)]
+        ).hexdigest()
+    else:
+        if not plan_complete or event_name not in (
+            "registered",
+            "recovered_registered",
+            "already_registered",
+            "skipped",
+        ):
+            fail()
+        expected_keys = base_event_keys | {"image_id", "plan_sha256"}
+        if event_name == "skipped":
+            expected_keys.add("reason_code")
+        if (
+            set(event) != expected_keys
+            or type(event["image_id"]) is not int
+            or event["image_id"] not in plans
+            or event["image_id"] in terminals
+            or event["plan_sha256"] != plan_sha256
+        ):
+            fail()
+        terminals[event["image_id"]] = event
+    offset += len(raw_line)
+
+if (
+    not plan_complete
+    or set(plans) != set(images)
+    or set(terminals) != set(plans)
+    or plan_sha256 != summary["backfill_plan_sha256"]
+):
+    fail()
+for image_id, plan in plans.items():
+    if sorted(owners_by_image.get(image_id, set()))[:2] != plan["owner_ids"]:
+        fail()
+
+decisions = {}
+groups = {}
+for image_id, plan in plans.items():
+    if plan["preliminary_reason"] is not None:
+        decisions[image_id] = plan["preliminary_reason"]
+    elif plan["registry_signature"] is not None:
+        decisions[image_id] = "already_registered"
+    elif plan["key_registry_signature"] is not None:
+        decisions[image_id] = "existing_registry_collision"
+    else:
+        key = plan["submitter_id"], plan["content_sha256"]
+        groups.setdefault(key, []).append(image_id)
+for image_ids in groups.values():
+    decision = (
+        "register"
+        if len(image_ids) == 1
+        else "duplicate_registry_collision"
+    )
+    for image_id in image_ids:
+        decisions[image_id] = decision
+
+expected_asset_ids = set()
+reason_counts = {}
+for image_id, decision in decisions.items():
+    terminal = terminals[image_id]
+    event_name = terminal["event"]
+    if decision == "register":
+        if event_name not in ("registered", "recovered_registered"):
+            fail()
+        expected_asset_ids.add(image_id)
+    elif decision == "already_registered":
+        if event_name != "already_registered":
+            fail()
+        expected_asset_ids.add(image_id)
+    else:
+        if (
+            decision not in safe_skip_reasons
+            or event_name != "skipped"
+            or terminal.get("reason_code") != decision
+        ):
+            fail()
+        reason_counts[decision] = reason_counts.get(decision, 0) + 1
+if set(assets) != expected_asset_ids:
+    fail()
+for image_id, decision in decisions.items():
+    plan = plans[image_id]
+    if decision == "register":
+        if assets[image_id][1:] != (
+            image_id, plan["submitter_id"], plan["content_sha256"],
+        ):
+            fail()
+    elif decision == "already_registered":
+        if assets[image_id] != tuple(plan["registry_signature"]):
+            fail()
+    elif decision == "existing_registry_collision":
+        target_signature = tuple(plan["key_registry_signature"])
+        target_image_id = target_signature[1]
+        target_plan = plans.get(target_image_id)
+        if (
+            assets_by_pk.get(target_signature[0]) != target_signature
+            or decisions.get(target_image_id) != "already_registered"
+            or target_plan is None
+            or tuple(target_plan["registry_signature"] or ())
+            != target_signature
+        ):
+            fail()
+for image_id in expected_asset_ids:
+    if assets[image_id][3] != plans[image_id]["content_sha256"]:
+        fail()
+expected_summary = {
+    "backfill_scanned": len(plans),
+    "backfill_registered": sum(
+        decision == "register" for decision in decisions.values()
+    ),
+    "backfill_already_registered": sum(
+        decision == "already_registered" for decision in decisions.values()
+    ),
+    "backfill_skipped": sum(reason_counts.values()),
+}
+if (
+    not isinstance(summary["reason_counts"], dict)
+    or any(
+        summary[key] != value for key, value in expected_summary.items()
+    )
+    or summary["reason_counts"] != dict(sorted(reason_counts.items()))
+):
     fail()
 
 pins = {}
@@ -2015,8 +2614,15 @@ if (
 for relative, record_key in expected_files.items():
     if actual_files.get(relative) != legacy_hashes[record_key]:
         fail()
-for image_id, image in images.items():
-    if actual_files.get(image["path"]) != assets[image_id]:
+for image_id, plan in plans.items():
+    if (
+        plan["preliminary_reason"] is None
+        and actual_files.get(images[image_id]["path"])
+        != plan["content_sha256"]
+    ):
+        fail()
+for image_id, signature in assets.items():
+    if actual_files.get(images[image_id]["path"]) != signature[3]:
         fail()
 
 sample_path = images[sample["image_id"]]["path"]

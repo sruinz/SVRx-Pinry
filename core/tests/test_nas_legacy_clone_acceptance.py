@@ -15,6 +15,8 @@ import time
 import unittest
 from unittest import mock
 
+from PIL import Image as PILImage
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 ACCEPTANCE_SCRIPT = (
@@ -23,6 +25,14 @@ ACCEPTANCE_SCRIPT = (
 FIXTURE_SCRIPT = (
     REPOSITORY_ROOT / "docker/tests/fixtures/create_legacy_fixture.py"
 )
+
+
+def _png_payload(red, green=0, blue=0):
+    stream = io.BytesIO()
+    PILImage.new("RGB", (1, 1), (red, green, blue)).save(
+        stream, format="PNG",
+    )
+    return stream.getvalue()
 
 
 def _maintenance_status(state="migrating", **overrides):
@@ -1201,7 +1211,7 @@ def _create_canonical_media_fixture(data_root):
     derivatives = data_root / "static/media/derivatives" / asset_uuid
     originals.mkdir(parents=True)
     derivatives.mkdir(parents=True)
-    original_payload = b"canonical-original"
+    original_payload = _png_payload(1)
     (data_root / "static/media" / original_relative).write_bytes(
         original_payload
     )
@@ -1215,7 +1225,7 @@ def _create_canonical_media_fixture(data_root):
         ("thumbnail", "standard", "square"), start=1
     ):
         relative = "derivatives/{}/{}.png".format(asset_uuid, size)
-        thumbnail_payload = ("canonical-{}".format(size)).encode("ascii")
+        thumbnail_payload = _png_payload(thumbnail_id + 10)
         (data_root / "static/media" / relative).write_bytes(thumbnail_payload)
         thumbnail_rows.append((thumbnail_id, relative, size, 1, 1, 1))
         manifest.append({
@@ -1242,11 +1252,12 @@ def _create_canonical_media_fixture(data_root):
         connection.execute(
             "CREATE TABLE core_pin ("
             "id INTEGER PRIMARY KEY, image_id INTEGER NOT NULL, "
-            "private INTEGER NOT NULL)"
+            "private INTEGER NOT NULL, submitter_id INTEGER NOT NULL)"
         )
         connection.execute(
             "CREATE TABLE core_mediaasset ("
             "id INTEGER PRIMARY KEY, image_id INTEGER NOT NULL, "
+            "submitter_id INTEGER NOT NULL, "
             "content_sha256 TEXT NOT NULL)"
         )
         connection.execute(
@@ -1257,14 +1268,15 @@ def _create_canonical_media_fixture(data_root):
             "INSERT INTO django_images_thumbnail VALUES (?, ?, ?, ?, ?, ?)",
             thumbnail_rows,
         )
-        connection.execute("INSERT INTO core_pin VALUES (1, 1, 0)")
+        connection.execute("INSERT INTO core_pin VALUES (1, 1, 0, 1)")
         connection.execute(
-            "INSERT INTO core_mediaasset VALUES (?, ?, ?)",
-            (1, 1, hashlib.sha256(original_payload).hexdigest()),
+            "INSERT INTO core_mediaasset VALUES (?, ?, ?, ?)",
+            (1, 1, 1, hashlib.sha256(original_payload).hexdigest()),
         )
         connection.commit()
     finally:
         connection.close()
+    _write_backfill_contract(data_root, {1: "register"})
     return {
         "image_id": 1,
         "image_path": "legacy/source.png",
@@ -1273,6 +1285,278 @@ def _create_canonical_media_fixture(data_root):
         "pin_id": 1,
         "pins": [{"image_id": 1, "pin_id": 1, "private": False}],
     }
+
+
+def _write_backfill_contract(
+    data_root,
+    decisions,
+    summary_overrides=None,
+    plan_overrides=None,
+):
+    run_id = "fixture-run"
+    run_root = data_root / "legacy-backup" / run_id
+    run_root.mkdir(parents=True, exist_ok=True)
+    common = {
+        "format_version": 2,
+        "target_signature": "media-asset-backfill-v2",
+        "run_id": run_id,
+    }
+    connection = sqlite3.connect(str(data_root / "production.db"))
+    try:
+        image_rows = connection.execute(
+            "SELECT id, image, asset_uuid, original_filename, height, width "
+            "FROM django_images_image ORDER BY id"
+        ).fetchall()
+        thumbnail_rows = connection.execute(
+            "SELECT id, image, size, original_id, height, width "
+            "FROM django_images_thumbnail ORDER BY original_id, size, id"
+        ).fetchall()
+    finally:
+        connection.close()
+    image_paths = {row[0]: row[1] for row in image_rows}
+    thumbnails_by_image = {image_id: [] for image_id in image_paths}
+    for row in thumbnail_rows:
+        thumbnails_by_image[row[3]].append(row)
+    database_signatures = {
+        row[0]: [
+            row[0],
+            row[2],
+            row[3],
+            row[1],
+            row[5],
+            row[4],
+            [
+                [
+                    thumbnail[0],
+                    thumbnail[2],
+                    thumbnail[1],
+                    thumbnail[5],
+                    thumbnail[4],
+                ]
+                for thumbnail in thumbnails_by_image[row[0]]
+            ],
+        ]
+        for row in image_rows
+    }
+    media_root = data_root / "static/media"
+    file_identities = {}
+    for image_id, image_path in image_paths.items():
+        rows = [("original", image_path)] + [
+            (kind, next(
+                thumbnail[1]
+                for thumbnail in thumbnails_by_image[image_id]
+                if thumbnail[2] == kind
+            ))
+            for kind in ("thumbnail", "standard", "square")
+        ]
+        identities = []
+        for kind, relative_path in rows:
+            path = media_root / relative_path
+            path_stat = path.stat()
+            with PILImage.open(str(path)) as image:
+                image_format = image.format
+                width, height = image.size
+                image.verify()
+            identities.append([
+                kind,
+                relative_path,
+                path_stat.st_dev,
+                path_stat.st_ino,
+                path_stat.st_size,
+                path_stat.st_nlink,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+                image_format,
+                width,
+                height,
+            ])
+        file_identities[image_id] = identities
+    content_digests = {
+        image_id: hashlib.sha256(
+            (data_root / "static/media" / relative).read_bytes()
+        ).hexdigest()
+        for image_id, relative in image_paths.items()
+    }
+    events = []
+    for image_id, decision in sorted(decisions.items()):
+        plan = {
+            "image_id": image_id,
+            "submitter_id": 1,
+            "content_sha256": content_digests[image_id],
+            "database_signature": database_signatures[image_id],
+            "file_identities": file_identities[image_id],
+            "owner_ids": [1],
+            "registry_signature": None,
+            "key_registry_signature": None,
+            "preliminary_reason": None,
+        }
+        if decision in ("orphan", "multi_owner"):
+            plan.update({
+                "submitter_id": None,
+                "content_sha256": None,
+                "file_identities": [],
+                "owner_ids": [] if decision == "orphan" else [1, 2],
+                "preliminary_reason": decision,
+            })
+        elif decision == "existing_registry_collision":
+            plan["key_registry_signature"] = [
+                1, 1, 1, content_digests[image_id],
+            ]
+        elif decision == "already_registered":
+            signature = [
+                image_id, image_id, 1, content_digests[image_id],
+            ]
+            plan["registry_signature"] = signature
+            plan["key_registry_signature"] = signature
+        if plan_overrides and image_id in plan_overrides:
+            plan.update(plan_overrides[image_id])
+        events.append(dict(common, event="planned", plan=plan))
+    events.append(dict(common, event="plan_complete", scanned=len(decisions)))
+    plan_payload = b"".join(
+        (
+            json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        for event in events
+    )
+    plan_sha256 = hashlib.sha256(plan_payload).hexdigest()
+    for image_id, decision in sorted(decisions.items()):
+        if decision == "register":
+            event_name = "registered"
+        elif decision == "already_registered":
+            event_name = "already_registered"
+        else:
+            event_name = "skipped"
+        event = dict(
+            common,
+            event=event_name,
+            image_id=image_id,
+            plan_sha256=plan_sha256,
+        )
+        if event_name == "skipped":
+            event["reason_code"] = decision
+        events.append(event)
+    manifest_payload = b"".join(
+        (
+            json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        for event in events
+    )
+    (run_root / "media-asset-backfill.jsonl").write_bytes(manifest_payload)
+    reason_counts = {}
+    for decision in decisions.values():
+        if decision not in ("register", "already_registered"):
+            reason_counts[decision] = reason_counts.get(decision, 0) + 1
+    summary = {
+        "format_version": 1,
+        "source_commit": "a" * 40,
+        "run_id": run_id,
+        "phase": "complete",
+        "backup_relative_name": "legacy-backup",
+        "media_plan_sha256": "1" * 64,
+        "media_manifest_sha256": "2" * 64,
+        "backfill_plan_sha256": plan_sha256,
+        "backfill_manifest_sha256": hashlib.sha256(
+            manifest_payload
+        ).hexdigest(),
+        "media_image_count": len(decisions),
+        "media_md5_legacy": 0,
+        "media_fixed_slot": 0,
+        "media_named_canonical": len(decisions),
+        "backfill_scanned": len(decisions),
+        "backfill_registered": sum(
+            decision == "register" for decision in decisions.values()
+        ),
+        "backfill_already_registered": sum(
+            decision == "already_registered"
+            for decision in decisions.values()
+        ),
+        "backfill_skipped": sum(
+            decision not in ("register", "already_registered")
+            for decision in decisions.values()
+        ),
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+    if summary_overrides:
+        summary.update(summary_overrides)
+    (run_root / "migration-summary.json").write_text(
+        json.dumps(summary, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+
+
+def _append_canonical_media_image(
+    data_root, legacy_pin_sample, image_id, original_payload=None,
+):
+    asset_uuid = "00000000-0000-4000-8000-{:012d}".format(image_id)
+    original_relative = "originals/{}/image-{}.png".format(
+        asset_uuid, image_id,
+    )
+    originals = data_root / "static/media/originals" / asset_uuid
+    derivatives = data_root / "static/media/derivatives" / asset_uuid
+    originals.mkdir()
+    derivatives.mkdir()
+    if original_payload is None:
+        original_payload = _png_payload(image_id % 256)
+    (data_root / "static/media" / original_relative).write_bytes(
+        original_payload
+    )
+    legacy_pin_sample["manifest"].append({
+        "kind": "image",
+        "record_id": image_id,
+        "sha256": hashlib.sha256(original_payload).hexdigest(),
+    })
+    thumbnail_rows = []
+    for offset, size in enumerate(("thumbnail", "standard", "square"), 1):
+        thumbnail_id = (image_id - 1) * 3 + offset
+        relative = "derivatives/{}/{}.png".format(asset_uuid, size)
+        payload = _png_payload((image_id * 4 + offset) % 256)
+        (data_root / "static/media" / relative).write_bytes(payload)
+        thumbnail_rows.append((thumbnail_id, relative, size, image_id, 1, 1))
+        legacy_pin_sample["manifest"].append({
+            "kind": "thumbnail",
+            "record_id": thumbnail_id,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    connection = sqlite3.connect(str(data_root / "production.db"))
+    try:
+        connection.execute(
+            "INSERT INTO django_images_image VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                image_id,
+                original_relative,
+                asset_uuid,
+                "image-{}.png".format(image_id),
+                1,
+                1,
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO django_images_thumbnail VALUES (?, ?, ?, ?, ?, ?)",
+            thumbnail_rows,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return hashlib.sha256(original_payload).hexdigest()
+
+
+def _append_canonical_pin(
+    data_root, legacy_pin_sample, pin_id, image_id, submitter_id,
+    private=False,
+):
+    connection = sqlite3.connect(str(data_root / "production.db"))
+    try:
+        connection.execute(
+            "INSERT INTO core_pin VALUES (?, ?, ?, ?)",
+            (pin_id, image_id, int(private), submitter_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    legacy_pin_sample["pins"].append({
+        "image_id": image_id,
+        "pin_id": pin_id,
+        "private": private,
+    })
 
 
 class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
@@ -2029,6 +2313,442 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
             "nas_canonical_media_invalid",
         )
 
+    def test_canonical_media_verifier_allows_backfill_skipped_image(self):
+        completed = self._run(run_id="canonical-media-orphan")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-media-orphan"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        orphan_sha256 = _append_canonical_media_image(
+            data_root, legacy_pin_sample, 2,
+        )
+        _write_backfill_contract(data_root, {1: "register", 2: "orphan"})
+
+        valid = self._run_canonical_media_verifier(
+            helper,
+            data_root,
+            legacy_pin_sample,
+        )
+
+        self.assertEqual(valid.returncode, 0, valid.stderr.decode("utf-8"))
+        payload = json.loads(valid.stdout.decode("ascii"))
+        self.assertEqual(
+            {image["image_id"] for image in payload["images"]},
+            {1, 2},
+        )
+
+        connection = sqlite3.connect(str(data_root / "production.db"))
+        try:
+            connection.execute(
+                "INSERT INTO core_mediaasset VALUES (?, ?, ?, ?)",
+                (2, 2, 1, orphan_sha256),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        invalid_orphan_asset = self._run_canonical_media_verifier(
+            helper,
+            data_root,
+            legacy_pin_sample,
+        )
+        self.assertNotEqual(invalid_orphan_asset.returncode, 0)
+        self.assertEqual(
+            invalid_orphan_asset.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+        connection = sqlite3.connect(str(data_root / "production.db"))
+        try:
+            connection.execute("DELETE FROM core_mediaasset WHERE image_id = 1")
+            connection.commit()
+        finally:
+            connection.close()
+        same_count_substitution = self._run_canonical_media_verifier(
+            helper,
+            data_root,
+            legacy_pin_sample,
+        )
+        self.assertNotEqual(same_count_substitution.returncode, 0)
+        self.assertEqual(
+            same_count_substitution.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_backfill_summary_tamper(self):
+        completed = self._run(run_id="canonical-backfill-summary-tamper")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-backfill-summary-tamper"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        _append_canonical_media_image(data_root, legacy_pin_sample, 2)
+        _write_backfill_contract(
+            data_root,
+            {1: "register", 2: "orphan"},
+            summary_overrides={"reason_counts": {}},
+        )
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_backfill_owner_mismatch(self):
+        completed = self._run(run_id="canonical-backfill-owner-mismatch")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-backfill-owner-mismatch"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        connection = sqlite3.connect(str(data_root / "production.db"))
+        try:
+            connection.execute(
+                "UPDATE core_pin SET submitter_id = 2 WHERE id = 1"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_orphan_with_owner(self):
+        completed = self._run(run_id="canonical-orphan-with-owner")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-orphan-with-owner"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        connection = sqlite3.connect(str(data_root / "production.db"))
+        try:
+            connection.execute("DELETE FROM core_mediaasset WHERE image_id = 1")
+            connection.commit()
+        finally:
+            connection.close()
+        _write_backfill_contract(
+            data_root,
+            {1: "orphan"},
+            plan_overrides={1: {"owner_ids": [1]}},
+        )
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_forged_nonstructural_skip(self):
+        completed = self._run(run_id="canonical-forged-nonstructural-skip")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+
+        for reason in (
+            "file_identity_mismatch",
+            "invalid_media_file",
+            "pipeline_closure_mismatch",
+            "processing_pixel_limit_exceeded",
+            "unsafe_media_file",
+        ):
+            with self.subTest(reason=reason):
+                data_root = self.temporary_root / (
+                    "canonical-forged-{}".format(reason)
+                )
+                data_root.mkdir()
+                legacy_pin_sample = _create_canonical_media_fixture(data_root)
+                connection = sqlite3.connect(str(data_root / "production.db"))
+                try:
+                    connection.execute(
+                        "DELETE FROM core_mediaasset WHERE image_id = 1"
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+                _write_backfill_contract(
+                    data_root,
+                    {1: reason},
+                    plan_overrides={1: {
+                        "submitter_id": None,
+                        "content_sha256": None,
+                        "file_identities": [],
+                        "preliminary_reason": reason,
+                    }},
+                )
+
+                verified = self._run_canonical_media_verifier(
+                    helper, data_root, legacy_pin_sample,
+                )
+
+                self.assertNotEqual(verified.returncode, 0)
+                self.assertEqual(
+                    verified.stdout.decode("ascii").strip(),
+                    "nas_canonical_media_invalid",
+                )
+
+    def test_canonical_media_verifier_rejects_database_signature_tamper(self):
+        completed = self._run(run_id="canonical-database-signature-tamper")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-database-signature-tamper"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        forged_signature = [
+            1,
+            "00000000-0000-4000-8000-000000000001",
+            "source.png",
+            "originals/00000000-0000-4000-8000-000000000001/source.png",
+            99,
+            1,
+            [],
+        ]
+        _write_backfill_contract(
+            data_root,
+            {1: "register"},
+            plan_overrides={1: {"database_signature": forged_signature}},
+        )
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_file_identity_tamper(self):
+        completed = self._run(run_id="canonical-file-identity-tamper")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-file-identity-tamper"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        _write_backfill_contract(
+            data_root,
+            {1: "register"},
+            plan_overrides={1: {"file_identities": [["forged"]] * 4}},
+        )
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_database_change_after_plan(self):
+        completed = self._run(run_id="canonical-database-change-after-plan")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-database-change-after-plan"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        connection = sqlite3.connect(str(data_root / "production.db"))
+        try:
+            connection.execute(
+                "UPDATE django_images_image SET width = 2 WHERE id = 1"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_inode_change_after_plan(self):
+        completed = self._run(run_id="canonical-inode-change-after-plan")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-inode-change-after-plan"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        original = (
+            data_root / "static/media/originals"
+            / "00000000-0000-4000-8000-000000000001/source.png"
+        )
+        replacement = original.parent / "replacement.tmp"
+        replacement.write_bytes(original.read_bytes())
+        os.replace(str(replacement), str(original))
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_allows_safe_collision_skips(self):
+        completed = self._run(run_id="canonical-safe-collision-skips")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-safe-collision-skips"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        decisions = {
+            1: "already_registered",
+            2: "multi_owner",
+            3: "existing_registry_collision",
+            4: "duplicate_registry_collision",
+            5: "duplicate_registry_collision",
+            6: "register",
+        }
+        collision_payloads = {
+            3: _png_payload(1),
+            4: _png_payload(200),
+            5: _png_payload(200),
+        }
+        content_digests = {}
+        for image_id in range(2, 7):
+            content_digests[image_id] = _append_canonical_media_image(
+                data_root,
+                legacy_pin_sample,
+                image_id,
+                original_payload=collision_payloads.get(image_id),
+            )
+        _append_canonical_pin(data_root, legacy_pin_sample, 2, 2, 1)
+        _append_canonical_pin(data_root, legacy_pin_sample, 3, 2, 2)
+        _append_canonical_pin(data_root, legacy_pin_sample, 8, 2, 3)
+        for pin_id, image_id in enumerate(range(3, 7), start=4):
+            _append_canonical_pin(
+                data_root, legacy_pin_sample, pin_id, image_id, 1,
+            )
+        connection = sqlite3.connect(str(data_root / "production.db"))
+        try:
+            connection.execute(
+                "INSERT INTO core_mediaasset VALUES (?, ?, ?, ?)",
+                (6, 6, 1, content_digests[6]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        _write_backfill_contract(data_root, decisions)
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertEqual(verified.returncode, 0, verified.stderr.decode("utf-8"))
+
+        connection = sqlite3.connect(str(data_root / "production.db"))
+        try:
+            connection.execute(
+                "UPDATE core_mediaasset SET id = 99 WHERE image_id = 1"
+            )
+            connection.execute(
+                "UPDATE core_mediaasset SET submitter_id = 2 "
+                "WHERE image_id = 6"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        invalid_registry_signatures = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+        self.assertNotEqual(invalid_registry_signatures.returncode, 0)
+        self.assertEqual(
+            invalid_registry_signatures.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_new_collision_target(self):
+        completed = self._run(run_id="canonical-new-collision-target")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-new-collision-target"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        _append_canonical_media_image(
+            data_root,
+            legacy_pin_sample,
+            2,
+            original_payload=_png_payload(1),
+        )
+        _append_canonical_pin(data_root, legacy_pin_sample, 2, 2, 1)
+        _write_backfill_contract(
+            data_root,
+            {1: "register", 2: "existing_registry_collision"},
+        )
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
+    def test_canonical_media_verifier_rejects_registry_owner_mismatch(self):
+        completed = self._run(run_id="canonical-registry-owner-mismatch")
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        helper = self._canonical_media_verifier_source()
+        data_root = self.temporary_root / "canonical-registry-owner-mismatch"
+        data_root.mkdir()
+        legacy_pin_sample = _create_canonical_media_fixture(data_root)
+        digest = legacy_pin_sample["image_sha256"]
+        connection = sqlite3.connect(str(data_root / "production.db"))
+        try:
+            connection.execute(
+                "UPDATE core_mediaasset SET submitter_id = 2 WHERE image_id = 1"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        forged_signature = [1, 1, 2, digest]
+        _write_backfill_contract(
+            data_root,
+            {1: "already_registered"},
+            plan_overrides={1: {
+                "registry_signature": forged_signature,
+                "key_registry_signature": forged_signature,
+            }},
+        )
+
+        verified = self._run_canonical_media_verifier(
+            helper, data_root, legacy_pin_sample,
+        )
+
+        self.assertNotEqual(verified.returncode, 0)
+        self.assertEqual(
+            verified.stdout.decode("ascii").strip(),
+            "nas_canonical_media_invalid",
+        )
+
     def test_canonical_media_verifier_rejects_same_count_path_substitution(self):
         completed = self._run(run_id="canonical-media-path-substitution")
         self.assertEqual(
@@ -2102,7 +2822,7 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
         legacy_pin_sample = _create_canonical_media_fixture(data_root)
         connection = sqlite3.connect(str(data_root / "production.db"))
         try:
-            connection.execute("INSERT INTO core_pin VALUES (2, 1, 1)")
+            connection.execute("INSERT INTO core_pin VALUES (2, 1, 1, 1)")
             connection.commit()
         finally:
             connection.close()
