@@ -12,6 +12,7 @@ from django.db.models.query import QuerySet
 import mock
 from PIL import Image as PILImage
 from rest_framework import serializers as drf_serializers, status
+from rest_framework.authtoken.models import Token
 from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.test import APITestCase, APITransactionTestCase
 
@@ -542,6 +543,32 @@ class PinTests(TemporaryMediaMixin, APITransactionTestCase):
 
     def tearDown(self):
         _teardown_models()
+
+    @override_settings(PUBLIC=False)
+    def test_private_site_token_can_create_and_delete_pin(self):
+        self.client.logout()
+        token = Token.objects.get(user=self.user)
+        self.client.credentials(
+            HTTP_AUTHORIZATION="Token {}".format(token.key)
+        )
+
+        with self._strong_publish_support():
+            created = self.client.post(
+                reverse("pin-list"),
+                {"image_file": _png_upload("private-token.png")},
+                format="multipart",
+            )
+
+        self.assertEqual(
+            created.status_code,
+            status.HTTP_201_CREATED,
+            getattr(created, "data", None),
+        )
+        deleted = self.client.delete(
+            reverse("pin-detail", kwargs={"pk": created.json()["id"]})
+        )
+        self.assertEqual(deleted.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(Pin.objects.count(), 0)
 
     def test_multipart_upload_creates_one_complete_owned_asset(self):
         board = Board.objects.create(

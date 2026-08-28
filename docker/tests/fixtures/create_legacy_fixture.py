@@ -4857,33 +4857,88 @@ def _assert_asset_storage_removed(data_root, relative_paths):
         raise FixtureError("api_asset_directory_not_removed")
 
 
-def _ensure_fixture_authentication(session, base_url, mode):
+def _ensure_fixture_authentication(  # noqa: C901
+    session, base_url, mode, data_root
+):
     basic_auth = (_FIXTURE_USERNAME, _FIXTURE_PASSWORD)
     profile_url = "{}/api/v2/profile/users/".format(base_url)
 
-    def token_headers():
+    def token_headers(
+        auth=None, headers=None, expected_token=None,
+        expected_username=None,
+    ):
         try:
             response = session.get(
                 profile_url,
-                auth=basic_auth,
+                auth=auth,
+                headers=headers,
                 timeout=10,
+                allow_redirects=False,
             )
-            payload = response.json() if response.status_code == 200 else None
+            if response.status_code in (401, 403):
+                return None
+            if response.status_code != 200:
+                raise FixtureError("api_auth_probe_failed")
+            payload = response.json()
         except Exception:
             raise FixtureError("api_auth_probe_failed") from None
         if (
             not isinstance(payload, list)
             or len(payload) != 1
-            or payload[0].get("username") != _FIXTURE_USERNAME
+            or not isinstance(payload[0], dict)
+            or not isinstance(payload[0].get("username"), str)
+            or not payload[0]["username"]
             or not isinstance(payload[0].get("token"), str)
-            or not payload[0]["token"]
+            or re.fullmatch(r"[0-9a-f]{40}", payload[0]["token"]) is None
+        ):
+            raise FixtureError("api_auth_probe_failed")
+        if (
+            expected_username is not None
+            and payload[0]["username"] != expected_username
         ):
             return None
+        if (
+            expected_token is not None
+            and payload[0]["token"] != expected_token
+        ):
+            raise FixtureError("api_auth_probe_failed")
         return {"Authorization": "Token {}".format(payload[0]["token"])}
 
-    headers = token_headers()
+    headers = token_headers(
+        auth=basic_auth,
+        expected_username=_FIXTURE_USERNAME,
+    )
     if headers is not None:
         return headers
+    try:
+        connection = _open_sqlite_read_only(
+            os.path.join(data_root, "production.db")
+        )
+        try:
+            rows = connection.execute(
+                "SELECT token.key "
+                "FROM authtoken_token AS token "
+                "JOIN auth_user AS user ON user.id = token.user_id "
+                "WHERE user.is_active = 1 "
+                "ORDER BY token.key LIMIT 32"
+            ).fetchall()
+        finally:
+            connection.close()
+    except (FixtureError, sqlite3.Error):
+        raise FixtureError("api_auth_probe_failed") from None
+    for row in rows:
+        token = row[0]
+        if (
+            not isinstance(token, str)
+            or re.fullmatch(r"[0-9a-f]{40}", token) is None
+        ):
+            continue
+        headers = token_headers(
+            headers={"Authorization": "Token {}".format(token)},
+            expected_token=token,
+        )
+        if headers is not None:
+            return headers
     if mode != "new":
         raise FixtureError("migrated_auth_failed")
     try:
@@ -4896,12 +4951,16 @@ def _ensure_fixture_authentication(session, base_url, mode):
                 "password_repeat": _FIXTURE_PASSWORD,
             },
             timeout=10,
+            allow_redirects=False,
         )
     except Exception:
         raise FixtureError("api_registration_failed") from None
     if registered.status_code not in (201, 400):
         raise FixtureError("api_registration_failed")
-    headers = token_headers()
+    headers = token_headers(
+        auth=basic_auth,
+        expected_username=_FIXTURE_USERNAME,
+    )
     if headers is None:
         raise FixtureError("api_auth_probe_failed")
     return headers
@@ -4938,7 +4997,10 @@ def _api_check(  # noqa: C901
     import requests
 
     session = requests.Session()
-    headers = _ensure_fixture_authentication(session, base_url, mode)
+    session.trust_env = False
+    headers = _ensure_fixture_authentication(
+        session, base_url, mode, data_root
+    )
     created_pins = []
     connection = _open_sqlite_read_only(
         os.path.join(data_root, "production.db")

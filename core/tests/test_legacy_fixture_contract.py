@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,37 @@ class LegacyFixtureContractTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
+
+    @staticmethod
+    def write_auth_database(data_root, users=(), tokens=()):
+        database = data_root / "production.db"
+        connection = sqlite3.connect(str(database))
+        try:
+            connection.execute(
+                "CREATE TABLE auth_user ("
+                "id INTEGER PRIMARY KEY, is_active INTEGER NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE authtoken_token ("
+                "key TEXT PRIMARY KEY, user_id INTEGER NOT NULL)"
+            )
+            connection.executemany(
+                "INSERT INTO auth_user (id, is_active) VALUES (?, ?)",
+                users,
+            )
+            connection.executemany(
+                "INSERT INTO authtoken_token (key, user_id) VALUES (?, ?)",
+                tokens,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    @staticmethod
+    def api_response(status_code, payload):
+        response = mock.Mock(status_code=status_code)
+        response.json.return_value = payload
+        return response
 
     @staticmethod
     def linear_journal_frame(payload, compact=True):
@@ -210,6 +242,148 @@ class LegacyFixtureContractTests(unittest.TestCase):
         }), encoding="ascii")
         observation_path.chmod(0o600)
         return observation_path
+
+    def test_api_authentication_uses_existing_clone_token_when_private(self):
+        module = self.load_fixture_module()
+        token = "a" * 40
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            data_root = Path(temporary, "data")
+            data_root.mkdir()
+            self.write_auth_database(
+                data_root,
+                users=((1, 1),),
+                tokens=((token, 1),),
+            )
+
+            session = mock.Mock()
+
+            def get_profile(_url, **kwargs):
+                if kwargs.get("headers") == {
+                    "Authorization": "Token {}".format(token)
+                }:
+                    return self.api_response(200, [{
+                        "username": "legacy-owner",
+                        "token": token,
+                    }])
+                return self.api_response(403, {})
+
+            session.get.side_effect = get_profile
+
+            headers = module._ensure_fixture_authentication(
+                session,
+                "http://app",
+                "migrated",
+                str(data_root),
+            )
+
+        self.assertEqual(
+            headers,
+            {"Authorization": "Token {}".format(token)},
+        )
+        session.post.assert_not_called()
+
+    def test_api_authentication_falls_back_to_registration_without_clone_token(self):
+        module = self.load_fixture_module()
+        token = "b" * 40
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            data_root = Path(temporary, "data")
+            data_root.mkdir()
+            self.write_auth_database(data_root)
+            session = mock.Mock()
+
+            def get_profile(_url, **kwargs):
+                if session.post.called:
+                    return self.api_response(200, [{
+                        "username": "fixture-reviewer",
+                        "token": token,
+                    }])
+                return self.api_response(403, {})
+
+            session.get.side_effect = get_profile
+            session.post.return_value = self.api_response(201, {})
+
+            headers = module._ensure_fixture_authentication(
+                session,
+                "http://app",
+                "new",
+                str(data_root),
+            )
+
+        self.assertEqual(
+            headers,
+            {"Authorization": "Token {}".format(token)},
+        )
+        session.post.assert_called_once()
+
+    def test_api_authentication_rejects_wrong_basic_identity(self):
+        module = self.load_fixture_module()
+        fixture_token = "c" * 40
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            data_root = Path(temporary, "data")
+            data_root.mkdir()
+            self.write_auth_database(data_root)
+            session = mock.Mock()
+
+            def get_profile(_url, **kwargs):
+                username = (
+                    "fixture-reviewer" if session.post.called else "other-user"
+                )
+                return self.api_response(200, [{
+                    "username": username,
+                    "token": fixture_token,
+                }])
+
+            session.get.side_effect = get_profile
+            session.post.return_value = self.api_response(201, {})
+
+            headers = module._ensure_fixture_authentication(
+                session,
+                "http://app",
+                "new",
+                str(data_root),
+            )
+
+        self.assertEqual(
+            headers,
+            {"Authorization": "Token {}".format(fixture_token)},
+        )
+        session.post.assert_called_once()
+
+    def test_api_authentication_fails_closed_without_leaking_clone_token(self):
+        module = self.load_fixture_module()
+        token = "d" * 40
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            data_root = Path(temporary, "data")
+            data_root.mkdir()
+            self.write_auth_database(
+                data_root,
+                users=((1, 1),),
+                tokens=((token, 1),),
+            )
+            session = mock.Mock()
+
+            def get_profile(_url, **kwargs):
+                if kwargs.get("headers") is not None:
+                    return self.api_response(500, {"token": token})
+                return self.api_response(403, {})
+
+            session.get.side_effect = get_profile
+
+            with self.assertRaises(module.FixtureError) as raised:
+                module._ensure_fixture_authentication(
+                    session,
+                    "http://app",
+                    "migrated",
+                    str(data_root),
+                )
+
+        self.assertEqual(str(raised.exception), "api_auth_probe_failed")
+        self.assertNotIn(token, str(raised.exception))
+        session.post.assert_not_called()
 
     def test_linear_fixture_records_exact_workload_distribution(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
