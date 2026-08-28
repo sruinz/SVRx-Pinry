@@ -83,6 +83,28 @@ def _maintenance_status(state="migrating", **overrides):
     return status
 
 
+def _noop_maintenance_status(**overrides):
+    status = _maintenance_status(
+        "ready",
+        run_id=None,
+        attempt=0,
+        resume_count=0,
+        started_at=None,
+        progress_at=None,
+        last_committed_batch=0,
+        images_done=0,
+        images_total=None,
+        files_done=0,
+        files_total=None,
+        backfill_done=0,
+        backfill_total=None,
+        phase_percent=100.0,
+        overall_percent=100.0,
+    )
+    status.update(overrides)
+    return status
+
+
 def _write_executable(path, payload):
     path.write_text(payload, encoding="utf-8")
     path.chmod(0o700)
@@ -2391,7 +2413,9 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
             if "_NAS_WAIT_STATUS" in "\n".join(call)
         ]
         self.assertEqual(len(wait_checks), 2)
-        self.assertTrue(all(call[-1] == "1" for call in wait_checks))
+        for call in wait_checks:
+            helper_index = call.index("-c")
+            self.assertEqual(call[helper_index + 4], "1")
 
     def test_metrics_ignore_top_level_runtime_media_directories(self):
         media_root = self.source_project / "data/static/media"
@@ -4695,6 +4719,8 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
         remaining = first_deadline - int(time.time())
         self.assertGreaterEqual(remaining, 2300)
         self.assertLessEqual(remaining, 2400)
+        self.assertEqual(wait_calls[0][-1], "migration")
+        self.assertEqual(wait_calls[1][-1], "noop")
 
     def test_ready_wait_allows_starting_service_transition(self):
         completed = self._run(run_id="starting-service-wait")
@@ -4732,7 +4758,7 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
         ), mock.patch("time.sleep", return_value=None), mock.patch.object(
             sys,
             "argv",
-            ["-c", str(int(time.time()) + 5), "1", "1"],
+            ["-c", str(int(time.time()) + 5), "1", "1", "migration"],
         ), contextlib.redirect_stdout(output):
             with self.assertRaises(SystemExit) as raised:
                 exec(compile(helper, "<nas-wait-status>", "exec"), {})
@@ -4768,7 +4794,7 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
         ), mock.patch("time.sleep", return_value=None), mock.patch.object(
             sys,
             "argv",
-            ["-c", str(int(time.time()) + 5), "1", "1"],
+            ["-c", str(int(time.time()) + 5), "1", "1", "migration"],
         ), contextlib.redirect_stdout(output):
             with self.assertRaises(SystemExit) as raised:
                 exec(compile(helper, "<nas-wait-status>", "exec"), {})
@@ -4778,6 +4804,130 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
             "batches": 7,
             "max_heartbeat_gap_seconds": 0.0,
         })
+
+    def test_ready_wait_accepts_strict_noop_restart_status(self):
+        completed = self._run(run_id="ready-noop-status")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        wait_calls = [
+            call for call in self._docker_calls()
+            if "_NAS_WAIT_STATUS" in "\n".join(call)
+        ]
+        self.assertEqual(len(wait_calls), 2)
+        helper = wait_calls[1][wait_calls[1].index("-c") + 1].replace(
+            "/tmp/create_legacy_fixture.py", str(FIXTURE_SCRIPT)
+        )
+        response = io.BytesIO(json.dumps(
+            _noop_maintenance_status()
+        ).encode("ascii"))
+        output = io.StringIO()
+
+        with mock.patch(
+            "urllib.request.urlopen", return_value=response
+        ), mock.patch("time.sleep", return_value=None), mock.patch.object(
+            sys,
+            "argv",
+            ["-c", str(int(time.time()) + 5), "1", "1", "noop"],
+        ), contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit) as raised:
+                exec(compile(helper, "<nas-wait-status>", "exec"), {})
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(json.loads(output.getvalue()), {
+            "batches": 0,
+            "max_heartbeat_gap_seconds": 0.0,
+        })
+
+    def test_ready_wait_rejects_nonempty_noop_restart_status(self):
+        completed = self._run(run_id="ready-noop-nonempty")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        wait_call = [
+            call for call in self._docker_calls()
+            if "_NAS_WAIT_STATUS" in "\n".join(call)
+        ][1]
+        helper = wait_call[wait_call.index("-c") + 1].replace(
+            "/tmp/create_legacy_fixture.py", str(FIXTURE_SCRIPT)
+        )
+        cases = {
+            "batch": {"last_committed_batch": 1},
+            "total": {"images_total": 1},
+            "identity": {"run_id": "unexpected-run", "attempt": 1},
+            "percent": {"overall_percent": 99.0},
+        }
+
+        for name, overrides in cases.items():
+            with self.subTest(name=name):
+                response = io.BytesIO(json.dumps(
+                    _noop_maintenance_status(**overrides)
+                ).encode("ascii"))
+                output = io.StringIO()
+                with mock.patch(
+                    "urllib.request.urlopen", return_value=response
+                ), mock.patch(
+                    "time.sleep", return_value=None
+                ), mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "-c",
+                        str(int(time.time()) + 5),
+                        "1",
+                        "1",
+                        "noop",
+                    ],
+                ), contextlib.redirect_stdout(output):
+                    with self.assertRaises(SystemExit) as raised:
+                        exec(
+                            compile(helper, "<nas-wait-status>", "exec"),
+                            {},
+                        )
+
+                self.assertEqual(raised.exception.code, 1)
+                self.assertEqual(
+                    output.getvalue().strip(),
+                    "WAIT_ERROR:status_invalid",
+                )
+
+    def test_ready_wait_rejects_noop_status_in_migration_mode(self):
+        completed = self._run(run_id="ready-noop-as-migration")
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        wait_call = next(
+            call for call in self._docker_calls()
+            if "_NAS_WAIT_STATUS" in "\n".join(call)
+        )
+        helper = wait_call[wait_call.index("-c") + 1].replace(
+            "/tmp/create_legacy_fixture.py", str(FIXTURE_SCRIPT)
+        )
+        response = io.BytesIO(json.dumps(
+            _noop_maintenance_status()
+        ).encode("ascii"))
+        output = io.StringIO()
+
+        with mock.patch(
+            "urllib.request.urlopen", return_value=response
+        ), mock.patch("time.sleep", return_value=None), mock.patch.object(
+            sys,
+            "argv",
+            ["-c", str(int(time.time()) + 5), "1", "1", "migration"],
+        ), contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit) as raised:
+                exec(compile(helper, "<nas-wait-status>", "exec"), {})
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(
+            output.getvalue().strip(), "WAIT_ERROR:status_invalid"
+        )
 
     def test_ready_wait_rejects_missing_batch_or_heartbeat(self):
         completed = self._run(run_id="ready-required-fields")
@@ -4807,7 +4957,13 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
                     with mock.patch.object(
                         sys,
                         "argv",
-                        ["-c", str(int(time.time()) + 5), "1", "1"],
+                        [
+                            "-c",
+                            str(int(time.time()) + 5),
+                            "1",
+                            "1",
+                            "migration",
+                        ],
                     ), contextlib.redirect_stdout(output):
                         with self.assertRaises(SystemExit) as raised:
                             exec(
@@ -4849,7 +5005,7 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
         ), mock.patch("time.sleep", return_value=None), mock.patch.object(
             sys,
             "argv",
-            ["-c", str(int(time.time()) + 5), "1", "1"],
+            ["-c", str(int(time.time()) + 5), "1", "1", "migration"],
         ), contextlib.redirect_stdout(output):
             with self.assertRaises(SystemExit) as raised:
                 exec(compile(helper, "<nas-wait-status>", "exec"), {})
@@ -4881,7 +5037,7 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
         ), mock.patch("time.sleep", return_value=None), mock.patch.object(
             sys,
             "argv",
-            ["-c", str(int(time.time()) + 5), "1", "1"],
+            ["-c", str(int(time.time()) + 5), "1", "1", "migration"],
         ), contextlib.redirect_stdout(output):
             with self.assertRaises(SystemExit) as raised:
                 exec(compile(helper, "<nas-wait-status>", "exec"), {})

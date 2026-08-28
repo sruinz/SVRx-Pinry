@@ -3737,10 +3737,19 @@ wait_for_ready() {
     local expected_images="$2"
     local expected_files="$3"
     local app_id="$4"
+    local ready_mode="$5"
     local command_status=0
     local wait_output=""
 
     wait_metrics=""
+    case "${ready_mode}" in
+        migration|noop)
+            ;;
+        *)
+            wait_metrics="WAIT_ERROR:status_invalid"
+            return 1
+            ;;
+    esac
     if ! watch_output_file="$(
         mktemp "${clone_project}/.acceptance-watch-XXXXXX"
     )"; then
@@ -3765,6 +3774,10 @@ import urllib.request
 deadline = int(sys.argv[1])
 expected_images = int(sys.argv[2])
 expected_files = int(sys.argv[3])
+ready_mode = sys.argv[4]
+if ready_mode not in ("migration", "noop"):
+    print("WAIT_ERROR:status_invalid")
+    raise SystemExit(1)
 spec = importlib.util.spec_from_file_location(
     "svrx_pinry_legacy_fixture",
     "/tmp/create_legacy_fixture.py",
@@ -3781,6 +3794,33 @@ status_observed = False
 def fail(reason):
     print("WAIT_ERROR:" + reason)
     raise SystemExit(1)
+
+
+def assert_noop_completed_status(value):
+    null_fields = (
+        "run_id",
+        "started_at",
+        "progress_at",
+        "images_total",
+        "files_total",
+        "backfill_total",
+    )
+    zero_fields = (
+        "attempt",
+        "resume_count",
+        "last_committed_batch",
+        "images_done",
+        "files_done",
+        "backfill_done",
+    )
+    if (
+        value["phase"] != "complete"
+        or value["phase_percent"] != 100
+        or value["overall_percent"] != 100
+        or any(value[name] is not None for name in null_fields)
+        or any(value[name] != 0 for name in zero_fields)
+    ):
+        raise contract.FixtureError("maintenance_status_invalid")
 
 
 while time.time() < deadline:
@@ -3805,9 +3845,12 @@ while time.time() < deadline:
         if previous is not None:
             contract._assert_progress_not_regressed(previous, current)
         if state in ("starting_service", "ready"):
-            contract._assert_completed_status(
-                status, previous, expected_images, expected_files,
-            )
+            if ready_mode == "migration":
+                contract._assert_completed_status(
+                    status, previous, expected_images, expected_files,
+                )
+            else:
+                assert_noop_completed_status(status)
     except contract.FixtureError as error:
         if error.code == "maintenance_progress_regressed":
             fail("progress_regressed")
@@ -3849,6 +3892,7 @@ if status_observed:
     fail("deadline_exceeded")
 fail("status_unavailable")
 ' "${deadline_epoch}" "${expected_images}" "${expected_files}" \
+        "${ready_mode}" \
         || command_status="$?"
     wait_output="$(cat "${watch_output_file}" 2>/dev/null || true)"
     remove_watch_output
@@ -4078,7 +4122,7 @@ fi
 wait_command_status=0
 wait_for_ready \
     "${migration_deadline_epoch}" "${legacy_images}" \
-    "${legacy_planned_files}" "${first_app_id}" \
+    "${legacy_planned_files}" "${first_app_id}" migration \
     || wait_command_status="$?"
 if [ "${wait_command_status}" -ne 0 ]; then
     fatal "$(map_wait_failure_code "${wait_metrics}")"
@@ -4194,7 +4238,7 @@ restart_deadline_epoch="$(( $(date +%s) + 300 ))"
 restart_wait_status=0
 wait_for_ready \
     "${restart_deadline_epoch}" "${legacy_images}" \
-    "${legacy_planned_files}" "${second_app_id}" \
+    "${legacy_planned_files}" "${second_app_id}" noop \
     || restart_wait_status="$?"
 restart_wait="${wait_metrics}"
 if [ "${restart_wait_status}" -ne 0 ]; then
