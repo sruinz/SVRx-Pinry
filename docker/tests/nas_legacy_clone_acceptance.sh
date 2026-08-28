@@ -2806,10 +2806,14 @@ print(json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":"
 validate_existing_pin_orm() {
     local verifier_output=""
     local verifier_status=0
+    [ -f "${clone_data}/local_settings.py" ] \
+        && [ ! -L "${clone_data}/local_settings.py" ] \
+        || fatal "nas_existing_pin_settings_invalid"
     verifier_output="$(
         printf '%s' "${canonical_pin_sample}" | docker run --rm -i \
             --network none --read-only \
             --mount "${clone_mount_read_only}" \
+            --mount "${clone_settings_mount_read_only}" \
             --entrypoint python "${runtime_image}" -c '
 _NAS_EXISTING_PIN_ORM = True
 import hashlib
@@ -3011,6 +3015,8 @@ read -r clone_database_sha _clone_inventory_sha clone_media_sha \
 
 clone_mount_read_only="type=bind,src=${clone_data},dst=/data,readonly"
 clone_mount_read_write="type=bind,src=${clone_data},dst=/data"
+clone_settings_mount_read_only="type=bind,src=${clone_data}/local_settings.py,"
+clone_settings_mount_read_only+="dst=/pinry/pinry/settings/local_settings.py,readonly"
 fixture_mount="type=bind,src=${fixture_script},"
 fixture_mount+="dst=/tmp/create_legacy_fixture.py,readonly"
 

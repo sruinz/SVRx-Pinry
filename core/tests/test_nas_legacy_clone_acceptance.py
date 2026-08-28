@@ -541,6 +541,20 @@ if arguments and arguments[0] == "run":
             index = arguments.index("--network-alias")
             alias = arguments[index + 1]
         if alias == "app":
+            if os.environ.get("PINRY_DOCKER_SKIP_LOCAL_SETTINGS") != "1":
+                for argument in arguments:
+                    if "dst=/data" not in argument:
+                        continue
+                    fields = dict(
+                        field.split("=", 1)
+                        for field in argument.split(",")
+                        if "=" in field
+                    )
+                    settings_path = Path(fields["src"]) / "local_settings.py"
+                    if not settings_path.exists():
+                        settings_path.write_text(
+                            "# fixture settings\\n", encoding="ascii",
+                        )
             state_path = Path(os.environ["PINRY_DOCKER_STATE"])
             starts = int(state_path.read_text() or "0")
             starts += 1
@@ -2454,6 +2468,45 @@ class NasLegacyCloneAcceptanceContractTests(unittest.TestCase):
                 helper,
             )
             self.assertNotIn("pinry.settings.development", helper)
+
+    def test_existing_pin_orm_mounts_persistent_local_settings_read_only(self):
+        run_id = "orm-persistent-settings"
+        completed = self._run(run_id=run_id)
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8"),
+        )
+        clone_data = str(self._clone_path(run_id).resolve() / "data")
+        expected_mount = (
+            "type=bind,src={}/local_settings.py,"
+            "dst=/pinry/pinry/settings/local_settings.py,readonly"
+        ).format(clone_data)
+        calls = [
+            call for call in self._docker_calls()
+            if "_NAS_EXISTING_PIN_ORM" in "\n".join(call)
+        ]
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            mounts = [
+                call[index + 1]
+                for index, argument in enumerate(call)
+                if argument == "--mount"
+            ]
+            self.assertIn(expected_mount, mounts)
+
+    def test_existing_pin_orm_rejects_missing_persistent_local_settings(self):
+        environment = self.environment.copy()
+        environment["PINRY_DOCKER_SKIP_LOCAL_SETTINGS"] = "1"
+        completed = self._run(
+            run_id="orm-settings-missing",
+            environment=environment,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stderr.decode("ascii").strip(),
+            "nas_existing_pin_settings_invalid",
+        )
 
     def test_reference_size_manifest_is_streamed_without_argv(self):
         environment = self.environment.copy()
