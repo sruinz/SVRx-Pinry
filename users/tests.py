@@ -1,12 +1,22 @@
-from django.test import TestCase
-from django.test.utils import override_settings
+import queue
+import threading
 
 import mock
+from django.db import (
+    DatabaseError,
+    close_old_connections,
+    connection,
+    connections,
+)
+from django.db.models.query import QuerySet
+from django.test import Client, TestCase, TransactionTestCase
+from django.test.utils import override_settings
 from django.urls import reverse
 from rest_framework.reverse import reverse as drf_reverse
 
 from .auth.backends import CombinedAuthBackend
-from .models import User
+from .models import AdminBootstrapState, User
+from .serializers import CurrentUserSerializer
 
 
 def mock_requests_get(url, headers=None):
@@ -36,18 +46,104 @@ class CombinedAuthBackendTest(TestCase):
 
 
 class CreateUserTest(TestCase):
-    def test_create_post(self):
+    def register(self, username, **extra_data):
         data = {
-            'username': 'jdoe',
-            'email': 'jdoe@example.com',
+            'username': username,
+            'email': '{}@example.com'.format(username),
             'password': 'password',
             'password_repeat': 'password',
         }
-        response = self.client.post(
+        data.update(extra_data)
+        return self.client.post(
             reverse('users:user-list'),
             data=data,
         )
+
+    def test_create_post(self):
+        response = self.register('jdoe')
         self.assertEqual(response.status_code, 201)
+
+    def test_first_registered_user_becomes_admin(self):
+        response = self.register('first')
+        first_user = User.objects.get(username='first')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(first_user.is_staff)
+        self.assertTrue(first_user.is_superuser)
+
+    def test_second_registered_user_remains_regular(self):
+        self.register('first')
+
+        response = self.register('second')
+        second_user = User.objects.get(username='second')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(second_user.is_staff)
+        self.assertFalse(second_user.is_superuser)
+
+    def test_registration_after_first_admin_demotion_remains_regular(self):
+        self.register('first')
+        first_user = User.objects.get(username='first')
+        first_user.is_staff = False
+        first_user.is_superuser = False
+        first_user.save(update_fields=['is_staff', 'is_superuser'])
+
+        response = self.register('second')
+        second_user = User.objects.get(username='second')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(second_user.is_staff)
+        self.assertFalse(second_user.is_superuser)
+
+    def test_registration_ignores_submitted_admin_flags(self):
+        self.register('first')
+
+        response = self.register(
+            'second',
+            is_staff=True,
+            is_superuser=True,
+        )
+        second_user = User.objects.get(username='second')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(second_user.is_staff)
+        self.assertFalse(second_user.is_superuser)
+
+    def test_active_existing_user_completes_bootstrap_without_promotion(self):
+        User.objects.create_user(username='cli-user', password='password')
+        AdminBootstrapState.objects.update_or_create(
+            pk=1,
+            defaults={'bootstrap_complete': False},
+        )
+
+        response = self.register('web-user')
+        web_user = User.objects.get(username='web-user')
+
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(web_user.is_staff)
+        self.assertFalse(web_user.is_superuser)
+        self.assertTrue(
+            AdminBootstrapState.objects.get(pk=1).bootstrap_complete,
+        )
+
+    def test_failed_first_registration_rolls_back_bootstrap_claim(self):
+        claim_states_during_save = []
+
+        def fail_save(*args, **kwargs):
+            claim_states_during_save.append(
+                AdminBootstrapState.objects.get(pk=1).bootstrap_complete,
+            )
+            raise DatabaseError('save failed')
+
+        with mock.patch.object(User, 'save', side_effect=fail_save):
+            with self.assertRaises(DatabaseError):
+                self.register('first')
+
+        self.assertEqual(claim_states_during_save, [True])
+        self.assertFalse(
+            AdminBootstrapState.objects.get(pk=1).bootstrap_complete,
+        )
+        self.assertFalse(User.objects.exists())
 
     @override_settings(ALLOW_NEW_REGISTRATIONS=False)
     def test_create_post_not_allowed(self):
@@ -63,6 +159,100 @@ class CreateUserTest(TestCase):
             data=data,
         )
         self.assertEqual(response.status_code, 401)
+
+
+class AdminBootstrapConcurrencyTest(TransactionTestCase):
+    def setUp(self):
+        super(AdminBootstrapConcurrencyTest, self).setUp()
+        if connection.vendor != 'sqlite':
+            self.skipTest('This concurrency contract requires SQLite.')
+        if connection.creation.is_in_memory_db(
+            connection.settings_dict['NAME'],
+        ):
+            self.skipTest('This concurrency contract requires file SQLite.')
+        AdminBootstrapState.objects.update_or_create(
+            pk=1,
+            defaults={'bootstrap_complete': False},
+        )
+
+    def test_two_concurrent_registrations_create_exactly_one_admin(self):
+        start_barrier = threading.Barrier(2)
+        after_state_read_barrier = threading.Barrier(2)
+        before_state_update_barrier = threading.Barrier(2)
+        outcomes = queue.Queue()
+        original_get_or_create = QuerySet.get_or_create
+        original_update = QuerySet.update
+
+        def pause_after_state_read(queryset, *args, **kwargs):
+            result = original_get_or_create(queryset, *args, **kwargs)
+            if queryset.model is AdminBootstrapState:
+                after_state_read_barrier.wait(timeout=5)
+            return result
+
+        def pause_before_state_update(queryset, **kwargs):
+            if queryset.model is AdminBootstrapState:
+                before_state_update_barrier.wait(timeout=5)
+            return original_update(queryset, **kwargs)
+
+        def register(username):
+            close_old_connections()
+            try:
+                client = Client()
+                start_barrier.wait(timeout=5)
+                response = client.post(
+                    reverse('users:user-list'),
+                    data={
+                        'username': username,
+                        'email': '{}@example.com'.format(username),
+                        'password': 'password',
+                        'password_repeat': 'password',
+                    },
+                )
+                outcomes.put(('response', username, response.status_code))
+            except BaseException as error:
+                outcomes.put(('error', username, error))
+            finally:
+                connections['default'].close()
+
+        with mock.patch.object(
+            QuerySet,
+            'get_or_create',
+            autospec=True,
+            side_effect=pause_after_state_read,
+        ), mock.patch.object(
+            QuerySet,
+            'update',
+            autospec=True,
+            side_effect=pause_before_state_update,
+        ):
+            threads = [
+                threading.Thread(target=register, args=(username,))
+                for username in ('first', 'second')
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        self.assertFalse(
+            any(thread.is_alive() for thread in threads),
+            'Concurrent registration threads did not finish.',
+        )
+        collected = [outcomes.get(timeout=1) for _ in range(2)]
+        errors = [item for item in collected if item[0] == 'error']
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            sorted(item[2] for item in collected if item[0] == 'response'),
+            [201, 201],
+        )
+        self.assertEqual(User.objects.count(), 2)
+        self.assertEqual(
+            User.objects.filter(is_staff=True, is_superuser=True).count(),
+            1,
+        )
+        self.assertTrue(
+            AdminBootstrapState.objects.get(pk=1).bootstrap_complete,
+        )
 
 
 class LogoutViewTest(TestCase):
@@ -102,3 +292,19 @@ class ProfileViewTest(TestCase):
         self.assertEqual(response.data[0]['email'], self.first_user.email)
         self.assertEqual(response.data[0]['token'], self.token.key)
         self.assertIs(response.data[0]['can_access_admin'], True)
+
+    def test_active_non_staff_cannot_access_admin(self):
+        self.first_user.is_staff = False
+
+        self.assertIs(
+            CurrentUserSerializer().get_can_access_admin(self.first_user),
+            False,
+        )
+
+    def test_inactive_staff_cannot_access_admin(self):
+        self.first_user.is_active = False
+
+        self.assertIs(
+            CurrentUserSerializer().get_can_access_admin(self.first_user),
+            False,
+        )

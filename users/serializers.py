@@ -1,9 +1,10 @@
 from django.conf import settings
 from django.contrib.auth import login
+from django.db import transaction
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
-from users.models import User, create_token_if_necessary
+from users.models import AdminBootstrapState, User, create_token_if_necessary
 
 
 class PublicUserSerializer(serializers.HyperlinkedModelSerializer):
@@ -66,11 +67,16 @@ class CurrentUserSerializer(serializers.HyperlinkedModelSerializer):
             )
         validated_data.pop('password_repeat')
         password = validated_data.pop('password')
-        user = super(CurrentUserSerializer, self).create(
-            validated_data,
-        )
-        user.set_password(password)
-        user.save()
+        with transaction.atomic():
+            is_initial_admin = AdminBootstrapState.claim_for_initial_admin()
+            if is_initial_admin:
+                validated_data['is_staff'] = True
+                validated_data['is_superuser'] = True
+            user = super(CurrentUserSerializer, self).create(
+                validated_data,
+            )
+            user.set_password(password)
+            user.save()
         login(
             self.context['request'],
             user=user,
