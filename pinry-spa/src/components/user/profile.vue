@@ -15,6 +15,17 @@
         </div>
       </div>
     </div>
+    <a
+      v-if="canAccessAdmin"
+      class="card admin-settings-card"
+      data-test="admin-settings-link"
+      href="/admin/">
+      <div class="card-content">
+        <div class="content">
+          {{ $t("adminSettingsLink") }}
+        </div>
+      </div>
+    </a>
     <div class="card build-info-card">
       <header class="card-header">
         <p class="card-header-title">
@@ -59,7 +70,13 @@ import API from '../api';
 
 export default {
   name: 'profile',
-  props: ['token'],
+  props: {
+    token: String,
+    canAccessAdmin: {
+      type: Boolean,
+      default: false,
+    },
+  },
   data() {
     return {
       componentAlive: true,
@@ -100,9 +117,14 @@ export default {
   box-shadow: 5px 5px 2px 1px rgba(0, 0, 255, .1);
 }
 
+.admin-settings-card,
 .build-info-card,
 .open-source-card {
   margin-top: 1rem;
+}
+
+.admin-settings-card {
+  color: inherit;
 }
 
 [data-test="build-version"] {

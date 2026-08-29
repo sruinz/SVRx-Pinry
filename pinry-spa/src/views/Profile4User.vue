@@ -2,7 +2,10 @@
   <div class="profile-for-user">
     <PHeader></PHeader>
     <UserProfileCard :in-profile="true" :username="filters.userFilter"></UserProfileCard>
-    <Profile v-if="profile.token" :token="profile.token"></Profile>
+    <Profile
+      v-if="profile"
+      :token="profile.token"
+      :can-access-admin="profile.can_access_admin"></Profile>
   </div>
 </template>
 
@@ -17,7 +20,8 @@ export default {
   data() {
     return {
       filters: { userFilter: null },
-      profile: {},
+      profile: null,
+      userRequestSequence: 0,
     };
   },
   components: {
@@ -31,25 +35,33 @@ export default {
   },
   beforeRouteUpdate(to, from, next) {
     this.filters = { userFilter: to.params.username };
+    this.initializeUser(to.params.username);
     next();
+  },
+  beforeDestroy() {
+    this.userRequestSequence += 1;
   },
   methods: {
     initializeBoard() {
       this.filters = { userFilter: this.$route.params.username };
     },
-    initializeUser(username) {
-      const self = this;
-      api.User.fetchUserInfoByName(username).then(
-        (user) => {
-          if (user === null) {
-            self.$router.push(
-              { name: 'PageNotFound' },
-            );
-          } else {
-            self.profile = user;
-          }
-        },
-      );
+    async initializeUser(username) {
+      const requestSequence = this.userRequestSequence + 1;
+      this.userRequestSequence = requestSequence;
+      this.profile = null;
+
+      const publicUser = await api.User.fetchUserInfoByName(username);
+      if (requestSequence !== this.userRequestSequence) return;
+      if (publicUser === null) {
+        this.$router.push({ name: 'PageNotFound' });
+        return;
+      }
+
+      const currentUser = await api.User.fetchUserInfo(true);
+      if (requestSequence !== this.userRequestSequence) return;
+      if (currentUser !== null && currentUser.username === username) {
+        this.profile = currentUser;
+      }
     },
   },
 };

@@ -33,6 +33,7 @@ const EXPECTED_LOCALE_KEYS = [
   'NewPinTitle',
   'SearchPanelBoardOption',
   'SearchPanelTagOption',
+  'adminSettingsLink',
   'boardCoverApply',
   'boardCoverCancel',
   'boardCoverEnter',
@@ -211,6 +212,7 @@ const EXPECTED_LOCALE_KEYS = [
 
 const REQUIRED_KOREAN_TEXT = {
   NewPinTitle: '새 Pin',
+  adminSettingsLink: '관리자 설정',
   closeButton: '닫기',
   pinCreateModalCreatePinButton: 'Pin 만들기',
   pinDeleteConfirm: '이 Pin을 삭제하시겠습니까?',

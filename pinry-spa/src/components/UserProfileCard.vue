@@ -90,6 +90,7 @@ export default {
     return {
       location: window.location.host,
       avatarLoading: true,
+      userRequestSequence: 0,
       user: {
         avatar: '',
         username: '',
@@ -98,6 +99,14 @@ export default {
   },
   beforeMount() {
     this.initializeUser(this.username);
+  },
+  beforeDestroy() {
+    this.userRequestSequence += 1;
+  },
+  watch: {
+    username(username) {
+      this.initializeUser(username);
+    },
   },
   methods: {
     go2UserBoard() {
@@ -125,9 +134,17 @@ export default {
       this.avatarLoading = false;
     },
     initializeUser(username) {
+      const requestSequence = this.userRequestSequence + 1;
+      this.userRequestSequence = requestSequence;
+      this.avatarLoading = true;
+      this.user = {
+        avatar: '',
+        username: '',
+      };
       const self = this;
       api.User.fetchUserInfoByName(username).then(
         (user) => {
+          if (requestSequence !== self.userRequestSequence) return;
           if (user === null) {
             self.$router.push(
               { name: 'PageNotFound' },
