@@ -605,6 +605,7 @@ git archive --format=tar "${source_commit}" -- \
     ':(exclude)pinry/settings/test_sqlite_file.py' \
     ':(exclude)pinry/settings/development.py' \
     ':(exclude)pinry_plugins/tests.py' \
+    ':(exclude)users/test_*.py' \
     ':(exclude)users/tests.py' \
     ':(exclude)pinry-spa/.editorconfig' \
     ':(exclude)pinry-spa/.gitignore' \
