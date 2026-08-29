@@ -32,6 +32,8 @@ class PublicUserViewSet(
     pagination_class = None
 
     def get_queryset(self):
+        if self.action == "retrieve":
+            return User.objects.all()
         username = self.request.GET.get("username", "")
         return User.objects.filter(username=username)
 
@@ -84,8 +86,9 @@ def login_user(request):
             json.dumps({"password": "username and password doesn't match"})
         )
     login(request, user)
+    current_user = User.objects.get(pk=user.pk)
     data = CurrentUserSerializer(
-        user,
+        current_user,
         context={'request': request},
     ).data
     return HttpResponse(

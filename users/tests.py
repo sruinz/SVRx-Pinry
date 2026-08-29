@@ -285,13 +285,72 @@ class ProfileViewTest(TestCase):
             {'username', 'gravatar', 'resource_link'},
         )
 
+    def test_public_user_resource_link_returns_public_detail(self):
+        list_url = drf_reverse('users:public-user-list')
+        list_response = self.client.get(
+            f"{list_url}?username={self.first_user.username}",
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        detail_response = self.client.get(
+            list_response.data[0]['resource_link'],
+        )
+
+        self.assertEqual(detail_response.status_code, 200)
+        self.assertEqual(
+            set(detail_response.data),
+            {'username', 'gravatar', 'resource_link'},
+        )
+
+    def test_public_user_list_without_exact_username_is_empty(self):
+        response = self.client.get(drf_reverse('users:public-user-list'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+
     def test_current_user_list_includes_private_fields_and_admin_access(self):
         response = self.client.get(drf_reverse('users:user-list'))
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            set(response.data[0]),
+            {
+                'username',
+                'token',
+                'email',
+                'gravatar',
+                'can_access_admin',
+                'resource_link',
+            },
+        )
         self.assertEqual(response.data[0]['email'], self.first_user.email)
         self.assertEqual(response.data[0]['token'], self.token.key)
         self.assertIs(response.data[0]['can_access_admin'], True)
+
+    def test_login_response_has_only_current_user_read_fields(self):
+        self.client.logout()
+
+        response = self.client.post(
+            reverse('users:login'),
+            data={
+                'username': self.first_user.username,
+                'password': 'password',
+            },
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            set(response.json()),
+            {
+                'username',
+                'token',
+                'email',
+                'gravatar',
+                'can_access_admin',
+                'resource_link',
+            },
+        )
 
     def test_active_non_staff_cannot_access_admin(self):
         self.first_user.is_staff = False
