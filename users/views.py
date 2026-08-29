@@ -13,8 +13,8 @@ from rest_framework.permissions import BasePermission
 from rest_framework.renderers import JSONRenderer
 from rest_framework.viewsets import GenericViewSet
 
-from core.serializers import UserSerializer
 from users.models import User
+from users.serializers import CurrentUserSerializer, PublicUserSerializer
 
 
 def reverse_lazy(name=None, *args):
@@ -26,7 +26,7 @@ class PublicUserViewSet(
     mixins.ListModelMixin,
     GenericViewSet,
 ):
-    serializer_class = UserSerializer
+    serializer_class = PublicUserSerializer
     filter_backends = (DjangoFilterBackend, )
     filter_fields = ("username", )
     pagination_class = None
@@ -52,7 +52,7 @@ class UserViewSet(
             return request.user == obj
 
     permission_classes = [Permission, ]
-    serializer_class = UserSerializer
+    serializer_class = CurrentUserSerializer
     pagination_class = None
 
     def get_queryset(self):
@@ -84,7 +84,7 @@ def login_user(request):
             json.dumps({"password": "username and password doesn't match"})
         )
     login(request, user)
-    data = UserSerializer(
+    data = CurrentUserSerializer(
         user,
         context={'request': request},
     ).data

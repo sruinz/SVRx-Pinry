@@ -77,19 +77,28 @@ class LogoutViewTest(TestCase):
 
 class ProfileViewTest(TestCase):
     def setUp(self):
+        from rest_framework.authtoken.models import Token
+
         self.first_user = User.objects.create_user(username='jdoe', password='password')
-        self.second_user = User.objects.create_user(username='judy', password='password')
+        self.first_user.is_staff = True
+        self.first_user.save(update_fields=['is_staff'])
+        self.token = Token.objects.get(user=self.first_user)
         self.client.login(username='jdoe', password='password')
 
-    def test_should_have_access_to_token(self):
-        from rest_framework.authtoken.models import Token
+    def test_public_user_list_has_only_public_fields(self):
         url = drf_reverse('users:public-user-list')
         response = self.client.get(f"{url}?username={self.first_user.username}")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data[0]['token'], Token.objects.get(user=self.first_user).key)
 
-    def test_should_have_no_access_to_token_of_other_user(self):
-        url = drf_reverse('users:public-user-list')
-        response = self.client.get(f"{url}?username={self.second_user.username}")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data[0]['token'], None)
+        self.assertEqual(
+            set(response.data[0]),
+            {'username', 'gravatar', 'resource_link'},
+        )
+
+    def test_current_user_list_includes_private_fields_and_admin_access(self):
+        response = self.client.get(drf_reverse('users:user-list'))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data[0]['email'], self.first_user.email)
+        self.assertEqual(response.data[0]['token'], self.token.key)
+        self.assertIs(response.data[0]['can_access_admin'], True)

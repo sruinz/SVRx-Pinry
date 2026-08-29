@@ -16,12 +16,12 @@ class PublicUserSerializer(serializers.HyperlinkedModelSerializer):
         )
         extra_kwargs = {
             settings.DRF_URL_FIELD_NAME: {
-                "view_name": "public-users:user-detail",
+                "view_name": "users:public-user-detail",
             },
         }
 
 
-class UserSerializer(serializers.HyperlinkedModelSerializer):
+class CurrentUserSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = User
         fields = (
@@ -29,6 +29,7 @@ class UserSerializer(serializers.HyperlinkedModelSerializer):
             'token',
             'email',
             'gravatar',
+            'can_access_admin',
             'password',
             'password_repeat',
             settings.DRF_URL_FIELD_NAME,
@@ -54,6 +55,7 @@ class UserSerializer(serializers.HyperlinkedModelSerializer):
         max_length=32,
     )
     token = serializers.SerializerMethodField(read_only=True)
+    can_access_admin = serializers.SerializerMethodField(read_only=True)
 
     def create(self, validated_data):
         if validated_data['password'] != validated_data['password_repeat']:
@@ -64,7 +66,7 @@ class UserSerializer(serializers.HyperlinkedModelSerializer):
             )
         validated_data.pop('password_repeat')
         password = validated_data.pop('password')
-        user = super(UserSerializer, self).create(
+        user = super(CurrentUserSerializer, self).create(
             validated_data,
         )
         user.set_password(password)
@@ -80,3 +82,6 @@ class UserSerializer(serializers.HyperlinkedModelSerializer):
         if self.context['request'].user == obj:
             return create_token_if_necessary(obj).key
         return None
+
+    def get_can_access_admin(self, obj):
+        return bool(obj.is_active and obj.is_staff)

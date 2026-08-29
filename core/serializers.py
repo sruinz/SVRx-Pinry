@@ -15,7 +15,7 @@ from core.services.board_cover import BoardCoverError
 from core.services.pin_import import ImportMetadata, PinImportError
 from core.services.safe_url_fetch import SafeFetchError
 from users.models import User
-from users.serializers import UserSerializer
+from users.serializers import PublicUserSerializer
 
 
 def filter_private_pin(request, query):
@@ -188,7 +188,7 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
             "board_ids",
         )
 
-    submitter = UserSerializer(read_only=True)
+    submitter = PublicUserSerializer(read_only=True)
     tags = TagSerializer(
         many=True,
         source="tag_list",
@@ -429,7 +429,7 @@ class BoardSerializer(serializers.HyperlinkedModelSerializer):
             'submitter': {"view_name": "users:user-detail"},
         }
 
-    submitter = UserSerializer(read_only=True)
+    submitter = PublicUserSerializer(read_only=True)
     total_pins = serializers.SerializerMethodField(
         read_only=True,
     )
