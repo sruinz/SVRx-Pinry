@@ -33,35 +33,60 @@ _DC_NAMESPACE = "http://purl.org/dc/elements/1.1/"
 _DIGIKAM_NAMESPACE = "http://www.digikam.org/ns/1.0/"
 
 
+def _has_malformed_percent_escape(value):
+    hex_digits = frozenset("0123456789abcdefABCDEF")
+    for index, character in enumerate(value):
+        if character == "%" and (
+                index + 2 >= len(value)
+                or value[index + 1] not in hex_digits
+                or value[index + 2] not in hex_digits):
+            return True
+    return False
+
+
+def _valid_hostname(hostname):
+    return hostname and not any(
+        character.isspace()
+        or unicodedata.category(character) in ("Cc", "Cs")
+        or character == "%"
+        for character in hostname
+    )
+
+
 def redact_url(value):
     if not isinstance(value, str):
         return None, True
     try:
+        if _has_malformed_percent_escape(value):
+            return None, True
         parsed = urlsplit(value)
         if parsed.scheme.casefold() not in ("http", "https"):
             return None, True
         hostname = parsed.hostname
         port = parsed.port
-    except ValueError:
-        return None, True
-    if not hostname:
-        return None, True
+        authority = parsed.netloc.rsplit("@", 1)[-1]
+        if authority.endswith(":") or not _valid_hostname(hostname):
+            return None, True
 
-    host = hostname
-    if ":" in host and not host.startswith("["):
-        host = "[{}]".format(host)
-    if port is not None:
-        host = "{}:{}".format(host, port)
+        host = hostname
+        if ":" in host and not host.startswith("["):
+            host = "[{}]".format(host)
+        if port is not None:
+            host = "{}:{}".format(host, port)
 
-    redacted = "@" in parsed.netloc or bool(parsed.fragment)
-    retained_pairs = []
-    for key, item in parse_qsl(parsed.query, keep_blank_values=True):
-        if key.casefold() in SENSITIVE_QUERY_KEYS:
-            redacted = True
-        else:
-            retained_pairs.append((key, item))
-    query = urlencode(retained_pairs, doseq=True)
-    return urlunsplit((parsed.scheme.casefold(), host, parsed.path, query, "")), redacted
+        redacted = "@" in parsed.netloc or bool(parsed.fragment)
+        retained_pairs = []
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+            if key.casefold() in SENSITIVE_QUERY_KEYS:
+                redacted = True
+            else:
+                retained_pairs.append((key, item))
+        query = urlencode(retained_pairs, doseq=True)
+        return urlunsplit(
+            (parsed.scheme.casefold(), host, parsed.path, query, ""),
+        ), redacted
+    except (UnicodeError, ValueError):
+        return None, True
 
 
 def format_utc(value):
@@ -198,8 +223,11 @@ def archive_display_name(scope, board_name, completed_at):
     if scope == "board":
         prefix = _safe_display_stem(board_name)
         repeated_suffix = suffix[:-4]
-        while prefix.endswith(repeated_suffix):
-            prefix = prefix[:-len(repeated_suffix)].strip(" .-")
+        while prefix.endswith(suffix) or prefix.endswith(repeated_suffix):
+            current_suffix = (
+                suffix if prefix.endswith(suffix) else repeated_suffix
+            )
+            prefix = prefix[:-len(current_suffix)].strip(" .-")
         if not _usable_stem(prefix):
             prefix = "board"
     elif scope == "pins":
@@ -272,4 +300,5 @@ def render_xmp(published_at, description, tags):
                 sequence, "{{{}}}li".format(_RDF_NAMESPACE),
             )
             item.text = xml_safe(tag)
-    return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+    document = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+    return document.replace(b"\r", b"&#13;")

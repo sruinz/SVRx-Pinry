@@ -1,10 +1,12 @@
 import logging
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 from uuid import UUID
 from xml.etree import ElementTree
 
 from django.test import SimpleTestCase
 
+from django_images.paths import FORMAT_EXTENSIONS
 from exports.services.metadata import (
     PortableNameAllocator, archive_display_name, format_utc, redact_url,
     render_xmp, zip_datetime,
@@ -65,6 +67,29 @@ class UrlMetadataTests(SimpleTestCase):
 
         self.assertFalse(any(secret in message for message in capture.messages))
 
+    def test_redact_url_fails_closed_for_malformed_authority_and_retained_query(self):
+        secret = "do-not-expose-this-secret"
+        capture = _LogCapture()
+        logger = logging.getLogger()
+        logger.addHandler(capture)
+        try:
+            values = (
+                "https://example.test:/a?token=" + secret,
+                "https://exa mple.test/a?token=" + secret,
+                "https://exa\x01mple.test/a?token=" + secret,
+                "https://exa%ZZmple.test/a?token=" + secret,
+                "https://example.test/a?keep=%ZZ&token=" + secret,
+                "https://example.test/a?keep=\ud800{}&token=hidden".format(secret),
+                "https://[broken/a?token=" + secret,
+                "https://example.test:65536/a?token=" + secret,
+            )
+            for value in values:
+                self.assertEqual(redact_url(value), (None, True))
+        finally:
+            logger.removeHandler(capture)
+
+        self.assertFalse(any(secret in message for message in capture.messages))
+
 
 class TimeMetadataTests(SimpleTestCase):
     def test_format_utc_converts_timezone_and_keeps_microseconds(self):
@@ -99,15 +124,15 @@ class PortableNameTests(SimpleTestCase):
 
     def test_allocator_uses_format_extensions_for_every_supported_mime_type(self):
         fixtures = (
-            ("image/jpeg", "JPEG", ".jpg"),
-            ("image/png", "PNG", ".png"),
-            ("image/gif", "GIF", ".gif"),
-            ("image/webp", "WEBP", ".webp"),
-            ("image/bmp", "BMP", ".bmp"),
-            ("image/tiff", "TIFF", ".tif"),
+            ("image/jpeg", "JPEG"),
+            ("image/png", "PNG"),
+            ("image/gif", "GIF"),
+            ("image/webp", "WEBP"),
+            ("image/bmp", "BMP"),
+            ("image/tiff", "TIFF"),
         )
 
-        for index, (mime_type, _format_name, extension) in enumerate(fixtures, 1):
+        for index, (mime_type, format_name) in enumerate(fixtures, 1):
             allocator = PortableNameAllocator()
             image_path, xmp_path = allocator.reserve(
                 UUID("00000000-0000-4000-8000-{:012d}".format(index)),
@@ -115,8 +140,21 @@ class PortableNameTests(SimpleTestCase):
                 "photo.exe",
                 mime_type,
             )
+            extension = FORMAT_EXTENSIONS[format_name]
             self.assertEqual(image_path, "originals/photo{}".format(extension))
             self.assertEqual(xmp_path, "originals/photo{}.xmp".format(extension))
+
+    def test_allocator_follows_a_runtime_format_extension_change(self):
+        with patch.dict(FORMAT_EXTENSIONS, {"JPEG": ".jpeg-test"}):
+            image_path, xmp_path = PortableNameAllocator().reserve(
+                UUID("a13f9c2d-0000-4000-8000-000000000001"),
+                1,
+                "photo.exe",
+                "image/jpeg",
+            )
+
+        self.assertEqual(image_path, "originals/photo.jpeg-test")
+        self.assertEqual(xmp_path, "originals/photo.jpeg-test.xmp")
 
     def test_allocator_normalizes_casefold_collisions_and_reserves_image_xmp_pair(self):
         allocator = PortableNameAllocator()
@@ -160,6 +198,26 @@ class PortableNameTests(SimpleTestCase):
             second,
             ("originals/caf\u00e9__b24e0d3e.JPG", "originals/caf\u00e9__b24e0d3e.JPG.xmp"),
         )
+
+    def test_allocator_reserves_sidecar_path_against_later_image_path(self):
+        allocator = PortableNameAllocator()
+        allocator.reserve(
+            UUID("a13f9c2d-0000-4000-8000-000000000001"),
+            1,
+            "same.jpg",
+            "image/jpeg",
+        )
+
+        with patch.dict(FORMAT_EXTENSIONS, {"PNG": ".xmp"}):
+            image_path, xmp_path = allocator.reserve(
+                UUID("b24e0d3e-0000-4000-8000-000000000002"),
+                2,
+                "same.jpg.xmp",
+                "image/png",
+            )
+
+        self.assertEqual(image_path, "originals/same.jpg__b24e0d3e.xmp")
+        self.assertEqual(xmp_path, "originals/same.jpg__b24e0d3e.xmp.xmp")
 
     def test_allocator_extends_uuid_suffix_and_truncates_korean_stem_at_utf8_boundary(self):
         allocator = PortableNameAllocator()
@@ -227,11 +285,19 @@ class ArchiveDisplayNameTests(SimpleTestCase):
         self.assertLessEqual(len(display_name.encode("utf-8")), 180)
         self.assertTrue(display_name.endswith(suffix))
 
-    def test_archive_display_name_does_not_duplicate_its_utc_suffix(self):
+    def test_archive_display_name_does_not_duplicate_its_utc_suffix_without_zip(self):
         completed_at = datetime(2026, 8, 1, 2, 3, 4, tzinfo=timezone.utc)
 
         self.assertEqual(
             archive_display_name("board", "여행-내보내기-20260801T020304Z", completed_at),
+            "여행-내보내기-20260801T020304Z.zip",
+        )
+
+    def test_archive_display_name_does_not_duplicate_its_complete_utc_zip_suffix(self):
+        completed_at = datetime(2026, 8, 1, 2, 3, 4, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            archive_display_name("board", "여행-내보내기-20260801T020304Z.zip", completed_at),
             "여행-내보내기-20260801T020304Z.zip",
         )
 
@@ -274,3 +340,29 @@ class XmpMetadataTests(SimpleTestCase):
             )],
             ["apple\ufffd", "zebra", "가"],
         )
+
+    def test_render_xmp_round_trips_allowed_whitespace_and_replaces_invalid_text(self):
+        published_at = datetime(2026, 8, 1, 2, 3, 4, tzinfo=timezone.utc)
+        description = "description\tline\ncarriage\rcontrol\x01surrogate\ud800"
+        tag = "tag\tline\ncarriage\rcontrol\x01surrogate\ud800"
+
+        document = render_xmp(published_at, description, [tag])
+        description_node = ElementTree.fromstring(document).find(
+            ".//{{{}}}Description".format(RDF_NAMESPACE)
+        )
+        description_text = description_node.find(
+            "{{{}}}description/{{{}}}Alt/{{{}}}li".format(
+                DC_NAMESPACE, RDF_NAMESPACE, RDF_NAMESPACE,
+            )
+        )
+        tag_text = description_node.find(
+            "{{{}}}TagsList/{{{}}}Seq/{{{}}}li".format(
+                DIGIKAM_NAMESPACE, RDF_NAMESPACE, RDF_NAMESPACE,
+            )
+        )
+        expected_description = "description\tline\ncarriage\rcontrol\ufffdsurrogate\ufffd"
+        expected_tag = "tag\tline\ncarriage\rcontrol\ufffdsurrogate\ufffd"
+
+        self.assertIn(b"&#13;", document)
+        self.assertEqual(description_text.text, expected_description)
+        self.assertEqual(tag_text.text, expected_tag)
