@@ -8,6 +8,7 @@ from django.db import transaction
 ACTIVE_STATES = frozenset(("queued", "snapshotting", "archiving", "verifying"))
 TERMINAL_STATES = frozenset(("complete", "failed", "expired"))
 JOB_STATES = tuple(sorted(ACTIVE_STATES | TERMINAL_STATES))
+READY_FORBIDDEN_STATES = ("queued", "snapshotting", "archiving", "verifying", "failed")
 SCOPE_VALUES = ("pins", "board")
 ERROR_CLASSES = ("retryable", "operator_action_required", "fatal")
 FILE_STATES = ("writing", "closed")
@@ -21,7 +22,7 @@ ATTEMPT_FILE_STATES = (
 )
 RECEIPT_LEVELS = ("open", "full")
 INCLUSION_STATES = ("included", "excluded")
-WORKER_HEALTH_STATES = ("starting", "healthy", "failed")
+WORKER_HEALTH_STATES = ("starting", "ready", "failed", "stopped")
 
 ERROR_CONTRACTS = {
     "invalid_target": ("fatal", False, "내보낼 대상을 확인할 수 없습니다."),
@@ -41,9 +42,11 @@ ERROR_CONTRACTS = {
     "export_storage_unsafe": ("operator_action_required", False, "내보내기 저장소를 안전하게 사용할 수 없습니다."),
     "export_expired": ("fatal", False, "다운로드 기간이 만료됐습니다."),
 }
-JOB_ERROR_CODES = tuple(code for code in ERROR_CONTRACTS if code not in (
-    "invalid_target", "active_export_exists", "export_not_ready", "export_expired",
-))
+JOB_ERROR_CODES = (
+    "source_missing", "source_changed", "source_unsafe", "snapshot_failed",
+    "insufficient_space", "archive_failed", "permission_changed",
+    "all_items_revoked", "worker_repeated_failure", "export_storage_unsafe",
+)
 
 
 @dataclass(frozen=True)
@@ -74,16 +77,18 @@ class LeaseLost(Exception):
 
 
 class StopRequested(Exception):
-    pass
+    def __init__(self, lease):
+        self.lease = lease
+        super(StopRequested, self).__init__()
 
 
 class ExportError(Exception):
-    def __init__(self, code, token=None):
+    def __init__(self, code, lease):
         if code not in ERROR_CONTRACTS:
             raise ValueError("허용되지 않은 내보내기 오류 코드입니다.")
         self.code = code
         self.error_class, self.retryable, self.message = ERROR_CONTRACTS[code]
-        self.token = token
+        self.lease = lease
         super(ExportError, self).__init__(self.message)
 
 

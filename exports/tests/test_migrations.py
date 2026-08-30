@@ -131,3 +131,52 @@ class ExportInitialMigrationTests(TransactionTestCase):
 
         self.assertIsNone(job_model.objects.get(pk=job.pk).owner_id)
         self.assertTrue(file_model.objects.filter(pk=receipt.pk).exists())
+
+    def test_database_enforces_reviewed_state_receipt_and_sha_contracts(self):
+        user = self.apps.get_model("auth", "User").objects.create(username="review-owner")
+        job_model = self.apps.get_model("exports", "ExportJob")
+        lease_model = self.apps.get_model("exports", "ExportWorkerLease")
+        attempt_model = self.apps.get_model("exports", "ExportAttempt")
+        file_model = self.apps.get_model("exports", "ExportAttemptFile")
+        blob_model = self.apps.get_model("exports", "ExportBlob")
+        ready = {
+            "completed_at": "2026-08-30T12:00:00Z", "expires_at": "2026-08-31T12:00:00Z",
+            "ready_relative_path": "ready/export.zip", "ready_display_name": "export.zip",
+            "ready_size": 10, "ready_sha256": "a" * 64, "ready_dev": 1,
+            "ready_ino": 2, "ready_uid": 3, "ready_gid": 4, "ready_mode": 384,
+            "ready_nlink": 1, "ready_mtime_ns": 5, "ready_ctime_ns": 6,
+        }
+        lease_model.objects.create(id=1, health_state="ready")
+        lease_model.objects.filter(pk=1).update(health_state="stopped")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                lease_model.objects.filter(pk=1).update(health_state="healthy")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                job_model.objects.create(owner=user, scope="pins", state="failed")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                job_model.objects.create(owner=user, scope="pins", state="failed", error_code="export_not_ready", error_class="retryable", error_retryable=True)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                job_model.objects.create(owner=user, scope="pins", **ready)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                job_model.objects.create(owner=user, scope="pins", state="expired", ready_cleanup_state="pending")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                job_model.objects.create(owner=user, scope="pins", state="expired", ready_cleanup_state="cleaned", **ready)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                job_model.objects.create(owner=user, scope="pins", state="complete", ready_cleanup_state="retained", **dict(ready, ready_sha256="NOT-A-SHA"))
+        job = job_model.objects.create(owner=user, scope="pins")
+        attempt = attempt_model.objects.create(job=job, attempt_generation=0, lease_uuid=uuid.uuid4(), state="writing", relative_path="attempts/0")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                attempt_model.objects.create(job=job, attempt_generation=1, lease_uuid=uuid.uuid4(), state="cleaned", relative_path="attempts/1")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                file_model.objects.create(attempt=attempt, kind="quarantine", state="closed", receipt_level="open", relative_path="attempts/0/q", intent_relative_path="dest", receipt_dev=1, receipt_ino=2, receipt_uid=3, receipt_gid=4, receipt_mode=384, receipt_nlink=1)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                blob_model.objects.create(job=job, snapshot_generation=uuid.uuid4(), source_media_asset_id=1, source_image_id=1, source_relative_path="blob", receipt_sha256="UPPER")

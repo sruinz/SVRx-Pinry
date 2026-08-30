@@ -8,8 +8,13 @@ from django.test import TestCase
 from django.utils import timezone
 
 from core.models import Board, Image, Pin
-from exports.models import ExportBlob, ExportItem, ExportJob, ExportSlot, ExportTarget
-from exports.contracts import export_status
+from exports.models import (
+    ExportAttempt, ExportAttemptFile, ExportBlob, ExportItem, ExportJob,
+    ExportSlot, ExportTarget, ExportWorkerLease,
+)
+from exports.contracts import (
+    ExportError, LeaseToken, StopRequested, export_status,
+)
 
 
 class ExportModelConstraintTests(TestCase):
@@ -93,3 +98,72 @@ class ExportModelConstraintTests(TestCase):
         status = export_status(job, now, worker_heartbeat_at=now)
 
         self.assertEqual(status["phase_label"], "작업자 대기 중")
+
+    def test_optional_fields_allow_a_minimal_queued_job_to_validate(self):
+        ExportJob(owner=self.user, scope="pins").full_clean()
+
+    def test_worker_health_accepts_runtime_states_and_rejects_legacy_healthy(self):
+        for health_state in ("starting", "ready", "failed", "stopped"):
+            ExportWorkerLease(health_state=health_state).full_clean()
+        with self.assertRaises(ValidationError):
+            ExportWorkerLease(health_state="healthy").full_clean()
+
+    def test_stop_and_export_errors_keep_the_current_lease(self):
+        lease = LeaseToken(3, uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), 7)
+        stop = StopRequested(lease=lease)
+        error = ExportError("archive_failed", lease=lease)
+
+        self.assertIs(stop.lease, lease)
+        self.assertIs(error.lease, lease)
+        self.assertEqual(error.code, "archive_failed")
+        with self.assertRaises(ValueError):
+            ExportError("not_allowed", lease=lease)
+        with self.assertRaises(TypeError):
+            StopRequested()
+        with self.assertRaises(TypeError):
+            ExportError("archive_failed")
+
+    def test_ready_receipt_state_combinations_validate_exactly(self):
+        ready = {
+            "ready_relative_path": "ready/export.zip",
+            "ready_display_name": "export.zip",
+            "ready_size": 10,
+            "ready_sha256": "a" * 64,
+            "ready_dev": 1,
+            "ready_ino": 2,
+            "ready_uid": 3,
+            "ready_gid": 4,
+            "ready_mode": 0o600,
+            "ready_nlink": 1,
+            "ready_mtime_ns": 5,
+            "ready_ctime_ns": 6,
+        }
+        ExportJob(owner=self.user, scope="pins").full_clean()
+        ExportJob(owner=self.user, scope="pins", state="expired", ready_cleanup_state="cleaned").full_clean()
+        with self.assertRaises(ValidationError):
+            ExportJob(owner=self.user, scope="pins", **ready).full_clean()
+        with self.assertRaises(ValidationError):
+            ExportJob(owner=self.user, scope="pins", state="expired", ready_cleanup_state="pending").full_clean()
+        with self.assertRaises(ValidationError):
+            ExportJob(owner=self.user, scope="pins", state="expired", ready_cleanup_state="cleaned", **ready).full_clean()
+
+    def test_closed_and_cleaned_receipts_validate_their_required_shapes(self):
+        job = ExportJob.objects.create(owner=self.user, scope="pins")
+        attempt = ExportAttempt(
+            job=job, attempt_generation=0, lease_uuid=uuid.uuid4(),
+            state="cleaned", relative_path="attempts/0",
+        )
+        with self.assertRaises(ValidationError):
+            attempt.full_clean()
+        file = ExportAttemptFile(
+            attempt=ExportAttempt.objects.create(
+                job=job, attempt_generation=1, lease_uuid=uuid.uuid4(),
+                state="writing", relative_path="attempts/1",
+            ),
+            kind="quarantine", state="closed", receipt_level="open",
+            relative_path="attempts/1/quarantine.zip", intent_relative_path="dest",
+            receipt_dev=1, receipt_ino=2, receipt_uid=3, receipt_gid=4,
+            receipt_mode=0o600, receipt_nlink=1,
+        )
+        with self.assertRaises(ValidationError):
+            file.full_clean()
