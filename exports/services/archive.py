@@ -360,9 +360,10 @@ class ArchiveService(object):
 
     def _apply_revocation_batches(
         self, revoked, lease, heartbeat, stop_requested, expected_state,
+        after_batch=None,
     ):
         current = None
-        for item_ids in self._chunks(revoked):
+        for batch_number, item_ids in enumerate(self._chunks(revoked), 1):
             current = self._retry_recovery_db(
                 lambda item_ids=item_ids: self._apply_revocation_batch(
                     item_ids, lease, heartbeat, expected_state,
@@ -371,6 +372,8 @@ class ArchiveService(object):
                 heartbeat,
                 stop_requested,
             )
+            if after_batch is not None:
+                after_batch(batch_number, item_ids)
             self._stop(stop_requested, lease)
             heartbeat()
         return current
@@ -648,6 +651,43 @@ class ArchiveService(object):
             current, attempt, attempt_file, lease,
         )
 
+    def _mark_post_build_retiring_intent(
+        self, attempt, attempt_file, lease, heartbeat,
+    ):
+        with heartbeat.foreground_write_guard():
+            with database_write_fence(
+                using=self.using, models=self.FENCE_MODELS,
+            ):
+                current = lock_current_lease(lease, using=self.using)
+                deadline = DatabaseFenceDeadline(self.monotonic)
+                locked_attempt = ExportAttempt.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=attempt.pk)
+                locked_file = ExportAttemptFile.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=attempt_file.pk)
+                if (
+                    current.state != "verifying"
+                    or locked_attempt.job_id != current.pk
+                    or locked_attempt.attempt_generation
+                    != current.attempt_generation
+                    or locked_file.attempt_id != locked_attempt.pk
+                    or (
+                        locked_attempt.state,
+                        locked_file.state,
+                    ) not in (
+                        ("verifying", "verifying"),
+                        ("verifying", "ready_candidate"),
+                        ("retiring", "retiring"),
+                    )
+                ):
+                    raise LeaseLost()
+                locked_attempt.state = "retiring"
+                locked_attempt.save(update_fields=("state",))
+                locked_file.state = "retiring"
+                locked_file.save(update_fields=("state",))
+                deadline.checkpoint()
+
     @staticmethod
     def _rotate_applied_locked(current, attempt, attempt_file, lease):
         attempt.state = "retiring"
@@ -686,8 +726,32 @@ class ArchiveService(object):
         )
         if not revoked:
             return None
+        self._retry_recovery_db(
+            lambda: self._mark_post_build_retiring_intent(
+                attempt, attempt_file, lease, heartbeat,
+            ),
+            lease,
+            heartbeat,
+            stop_requested,
+        )
+        self._fault(
+            "after_post_build_retiring_intent", attempt=attempt,
+            attempt_file=attempt_file, lease=lease,
+        )
+
+        def after_batch(batch_number, item_ids):
+            self._fault(
+                "after_post_build_revocation_batch",
+                batch_number=batch_number, item_ids=item_ids, lease=lease,
+            )
+
         self._apply_revocation_batches(
             revoked, lease, heartbeat, stop_requested, "verifying",
+            after_batch=after_batch,
+        )
+        self._fault(
+            "after_post_build_revocation_batches", attempt=attempt,
+            attempt_file=attempt_file, lease=lease,
         )
 
         def rotate():
@@ -753,7 +817,7 @@ class ArchiveService(object):
         model.receipt_sha256 = receipt.sha256
 
     @staticmethod
-    def _hash_descriptor(descriptor):
+    def _hash_descriptor(descriptor, checkpoint):
         digest = hashlib.sha256()
         try:
             os.lseek(descriptor, 0, os.SEEK_SET)
@@ -761,13 +825,16 @@ class ArchiveService(object):
                 chunk = os.read(descriptor, STREAM_CHUNK_SIZE)
                 if not chunk:
                     break
+                checkpoint()
                 digest.update(chunk)
             os.lseek(descriptor, 0, os.SEEK_SET)
         except OSError:
             raise ExportStorageError("export_storage_unsafe") from None
         return digest.hexdigest()
 
-    def _verify_source_candidate(self, directory, candidate, lease):
+    def _verify_source_candidate(
+        self, directory, candidate, lease, checkpoint,
+    ):
         expected = closed_file_receipt(candidate)
         if expected is None or expected.sha256 is None:
             raise ExportError("export_storage_unsafe", lease)
@@ -780,7 +847,7 @@ class ArchiveService(object):
                 ARCHIVE_PART_NAME, flags, dir_fd=directory.descriptor,
             )
             expected.verify_identity(descriptor)
-            digest = self._hash_descriptor(descriptor)
+            digest = self._hash_descriptor(descriptor, checkpoint)
             expected.verify_identity(descriptor)
             named = os.stat(
                 ARCHIVE_PART_NAME,
@@ -798,7 +865,9 @@ class ArchiveService(object):
                 os.close(descriptor)
         return expected
 
-    def _capture_ready_candidate(self, directory, name, candidate, lease):
+    def _capture_ready_candidate(
+        self, directory, name, candidate, lease, checkpoint,
+    ):
         expected = closed_file_receipt(candidate)
         if expected is None or expected.sha256 is None:
             raise ExportError("export_storage_unsafe", lease)
@@ -819,7 +888,7 @@ class ArchiveService(object):
                 or before.mtime_ns != expected.mtime_ns
             ):
                 raise ExportError("export_storage_unsafe", lease)
-            digest = self._hash_descriptor(descriptor)
+            digest = self._hash_descriptor(descriptor, checkpoint)
             moved = ClosedFileReceipt.from_open_fd(
                 descriptor, opened, digest,
             )
@@ -865,6 +934,9 @@ class ArchiveService(object):
                 ))
         self._fault("after_publishing_intent", attempt_file=attempt_file)
         self._resolve_quarantine(job, attempt, lease, heartbeat)
+        checkpoint = self._cleanup_checkpointer(
+            lease, heartbeat, stop_requested,
+        )
         root = open_export_root(
             settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
         )
@@ -876,12 +948,15 @@ class ArchiveService(object):
                 self._attempt_directory_receipt(attempt),
             )
             ready = self._open_ready_directory(root)
-            self._verify_source_candidate(source, attempt_file, lease)
+            self._verify_source_candidate(
+                source, attempt_file, lease, checkpoint,
+            )
             rename_noreplace(
                 source, ARCHIVE_PART_NAME, ready, "{}.zip".format(job.pk),
             )
             moved = self._capture_ready_candidate(
                 ready, "{}.zip".format(job.pk), attempt_file, lease,
+                checkpoint,
             )
         except FileExistsError:
             raise ExportError("export_storage_unsafe", lease) from None
@@ -2352,6 +2427,51 @@ class ArchiveService(object):
             rotation.replace(rotated)
         return rotated
 
+    def _rotate_recovered_verifying_attempt(
+        self, attempt, lease, heartbeat,
+    ):
+        with heartbeat.job_token_transition(lease) as rotation:
+            with heartbeat.foreground_write_guard():
+                with database_write_fence(
+                    using=self.using, models=self.FENCE_MODELS,
+                ):
+                    current = lock_current_lease(lease, using=self.using)
+                    deadline = DatabaseFenceDeadline(self.monotonic)
+                    locked_attempt = ExportAttempt.objects.using(
+                        self.using,
+                    ).select_for_update().get(pk=attempt.pk)
+                    if (
+                        current.state != "verifying"
+                        or current.attempt_generation
+                        != locked_attempt.attempt_generation
+                        or locked_attempt.state != "cleaned"
+                    ):
+                        raise LeaseLost()
+                    current.state = "archiving"
+                    current.attempt_generation += 1
+                    current.archive_done = 0
+                    current.bytes_done = 0
+                    current.verifying_attempt_generation = None
+                    current.verifying_size = None
+                    current.verifying_sha256 = None
+                    current.verifying_completed_at = None
+                    current.save(update_fields=(
+                        "state", "attempt_generation", "archive_done",
+                        "bytes_done", "verifying_attempt_generation",
+                        "verifying_size", "verifying_sha256",
+                        "verifying_completed_at",
+                    ))
+                    deadline.checkpoint()
+                    rotated = LeaseToken(
+                        lease.worker_generation,
+                        lease.worker_lease_uuid,
+                        lease.job_id,
+                        lease.job_lease_uuid,
+                        current.attempt_generation,
+                    )
+            rotation.replace(rotated)
+        return rotated
+
     def build_and_publish(self, job, lease, heartbeat, stop_requested):
         current_lease = lease
         try:
@@ -2538,6 +2658,38 @@ class ArchiveService(object):
             attempt_generation=lease.attempt_generation,
         )
         candidate = attempt.files.get(kind="archive")
+        if attempt.state in ("retiring", "cleaned"):
+            if candidate.state not in ("retiring", "cleaned"):
+                raise ExportError("export_storage_unsafe", lease)
+            self._cleanup_retiring(
+                attempt, candidate, lease, heartbeat, stop_requested,
+            )
+            attempt.refresh_from_db()
+            rotated = self._retry_recovery_db(
+                lambda: self._rotate_recovered_verifying_attempt(
+                    attempt, lease, heartbeat,
+                ),
+                lease,
+                heartbeat,
+                stop_requested,
+            )
+            self._cleanup_excluded_blobs(
+                rotated, heartbeat, stop_requested,
+            )
+            current = ExportJob.objects.using(self.using).get(
+                pk=lease.job_id,
+            )
+            completed = self.build_and_publish(
+                current, rotated, heartbeat, stop_requested,
+            )
+            current_lease = LeaseToken(
+                rotated.worker_generation,
+                rotated.worker_lease_uuid,
+                rotated.job_id,
+                rotated.job_lease_uuid,
+                completed.attempt_generation,
+            )
+            return RecoveryOutcome(completed, current_lease)
         if candidate.state == "verifying":
             candidate = self._prepare_ready_candidate(
                 current, attempt, candidate, lease,
@@ -2549,6 +2701,7 @@ class ArchiveService(object):
             )
             candidate = self._recover_publishing(
                 current, attempt, candidate, lease, heartbeat,
+                stop_requested,
             )
         rotated = self._final_fence(
             attempt, candidate, attempt.exported_at, lease,
@@ -2585,13 +2738,18 @@ class ArchiveService(object):
         )
         return RecoveryOutcome(completed, current_lease)
 
-    def _recover_publishing(self, job, attempt, candidate, lease, heartbeat):
+    def _recover_publishing(
+        self, job, attempt, candidate, lease, heartbeat, stop_requested,
+    ):
         expected = closed_file_receipt(candidate)
         if expected is None or expected.sha256 is None:
             raise ExportError("export_storage_unsafe", lease)
         source_receipt = OpenFileReceipt(
             expected.dev, expected.ino, expected.uid, expected.gid,
             expected.mode, expected.nlink,
+        )
+        checkpoint = self._cleanup_checkpointer(
+            lease, heartbeat, stop_requested,
         )
         root = open_export_root(
             settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
@@ -2630,13 +2788,16 @@ class ArchiveService(object):
             if source_matches == ready_matches:
                 raise ExportError("export_storage_unsafe", lease)
             if source_matches:
-                self._verify_source_candidate(source, candidate, lease)
+                self._verify_source_candidate(
+                    source, candidate, lease, checkpoint,
+                )
                 rename_noreplace(
                     source, ARCHIVE_PART_NAME, ready,
                     "{}.zip".format(job.pk),
                 )
             moved = self._capture_ready_candidate(
                 ready, "{}.zip".format(job.pk), candidate, lease,
+                checkpoint,
             )
         finally:
             for directory in (ready, source, staging, root):

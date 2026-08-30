@@ -819,6 +819,98 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(observed, [completed.ready_ctime_ns])
         self.assertEqual(candidate.receipt_ctime_ns, completed.ready_ctime_ns)
 
+    def test_source_and_ready_rehash_checkpoint_heartbeat_and_stop(self):
+        for boundary in ("source", "ready"):
+            with self.subTest(boundary=boundary):
+                pin = create_export_pin(
+                    self.owner,
+                    filename="slow-{}-rehash.png".format(boundary),
+                )
+                job, lease, heartbeat = self._snapshot((pin,))
+                clock = FakeMonotonic()
+                ready_path = Path(
+                    self._export_directory.name,
+                    "ready",
+                    "{}.zip".format(job.pk),
+                )
+                enabled = []
+                ready_started_at = []
+                renewals = []
+                stop_checks = []
+                original_read = archive_services.os.read
+
+                def observe(point, context):
+                    del context
+                    if point == "after_publishing_intent":
+                        enabled.append(True)
+
+                def slow_read(descriptor, size):
+                    if not enabled:
+                        return original_read(descriptor, size)
+                    self.assertFalse(connection.in_atomic_block)
+                    self.assertEqual(heartbeat.guard_depth, 0)
+                    self.assertEqual(heartbeat.token_depth, 0)
+                    chunk = original_read(descriptor, 1)
+                    if chunk:
+                        if ready_path.exists() and not ready_started_at:
+                            ready_started_at.append(clock())
+                        clock.advance(1.0)
+                    return chunk
+
+                def renew_now(current):
+                    self.assertEqual(current, lease)
+                    self.assertFalse(connection.in_atomic_block)
+                    self.assertEqual(heartbeat.guard_depth, 0)
+                    self.assertEqual(heartbeat.token_depth, 0)
+                    renewals.append(clock())
+                    heartbeat.lease = current
+                    heartbeat.pulses += 1
+
+                def stop_requested():
+                    stop_checks.append(clock())
+                    if boundary == "source":
+                        return enabled and not ready_started_at and clock() >= 45.0
+                    return (
+                        ready_started_at
+                        and clock() - ready_started_at[0] >= 45.0
+                    )
+
+                heartbeat.renew_now = renew_now
+                service = ArchiveService(
+                    fault_injector=observe, monotonic=clock,
+                )
+                with mock.patch.object(
+                    archive_services.os, "read", new=slow_read,
+                ):
+                    with self.assertRaises(StopRequested) as raised:
+                        service.build_and_publish(
+                            job, lease, heartbeat, stop_requested,
+                        )
+
+                self.assertEqual(raised.exception.lease, lease)
+                self.assertTrue(renewals)
+                observed_times = [0.0] + renewals + [clock()]
+                self.assertLessEqual(max(
+                    later - earlier
+                    for earlier, later in zip(
+                        observed_times, observed_times[1:],
+                    )
+                ), 5.0)
+                active_stop_checks = [
+                    value for value in stop_checks if enabled
+                ]
+                self.assertTrue(active_stop_checks)
+                self.assertLessEqual(max(
+                    later - earlier
+                    for earlier, later in zip(
+                        active_stop_checks, active_stop_checks[1:],
+                    )
+                ), 5.0)
+                job.refresh_from_db()
+                self.assertEqual(job.state, "verifying")
+                self.assertIsNone(job.ready_relative_path)
+                self.assertIsNone(job.ready_sha256)
+
     def test_final_owner_loss_atomically_fails_and_releases_authority(self):
         pin = create_export_pin(self.other, filename="owner-loss.png")
         job, attempt, candidate, lease, heartbeat = self._ready_candidate(pin)
@@ -1049,6 +1141,169 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(retired_file.state, "cleaned")
         self.assertEqual(revoked_blob.cleanup_state, "cleaned")
         self.assertFalse(ready_path.exists())
+
+    def test_post_build_last_batch_crash_retires_before_recovery_rebuild(self):
+        safe = create_export_pin(self.owner, filename="crash-safe.png")
+        revoked = create_export_pin(
+            self.other, private=False, filename="crash-revoked.png",
+        )
+        job, lease, heartbeat = self._snapshot((safe, revoked))
+        revoked_item = job.items.get(pin_id=revoked.pk)
+        revoked_blob = revoked_item.blob
+        changed = []
+
+        def crash(point, context):
+            del context
+            if point == "before_final_permission_check" and not changed:
+                revoked.private = True
+                revoked.save(update_fields=("private",))
+                changed.append(True)
+            if point == "after_post_build_revocation_batches":
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(fault_injector=crash).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+        retired = job.attempts.get(attempt_generation=0)
+        retired_file = retired.files.get(kind="archive")
+        retired.refresh_from_db()
+        retired_file.refresh_from_db()
+        self.assertEqual(retired.state, "retiring")
+        self.assertEqual(retired_file.state, "retiring")
+
+        outcome = ArchiveService().recover_verifying(
+            lease, heartbeat, lambda: False,
+        )
+
+        retired.refresh_from_db()
+        retired_file.refresh_from_db()
+        revoked_blob.refresh_from_db()
+        self.assertEqual(outcome.job.state, "complete")
+        self.assertEqual(outcome.job.attempt_generation, 1)
+        self.assertEqual(outcome.job.attempts.count(), 2)
+        self.assertEqual(retired.state, "cleaned")
+        self.assertEqual(retired_file.state, "cleaned")
+        self.assertEqual(revoked_blob.cleanup_state, "cleaned")
+        with zipfile.ZipFile(self._archive_path(outcome.job)) as archive:
+            self.assertNotIn(
+                revoked_item.archive_image_path, archive.namelist(),
+            )
+            self.assertNotIn(
+                revoked_item.archive_xmp_path, archive.namelist(),
+            )
+
+    def test_post_build_all_revoked_crash_cleans_before_terminal_error(self):
+        revoked = create_export_pin(
+            self.other, private=False, filename="crash-all-revoked.png",
+        )
+        job, lease, heartbeat = self._snapshot((revoked,))
+        revoked_blob = job.items.get(pin_id=revoked.pk).blob
+        changed = []
+
+        def crash(point, context):
+            del context
+            if point == "before_final_permission_check" and not changed:
+                revoked.private = True
+                revoked.save(update_fields=("private",))
+                changed.append(True)
+            if point == "after_post_build_revocation_batches":
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(fault_injector=crash).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+        retired = job.attempts.get(attempt_generation=0)
+        retired_file = retired.files.get(kind="archive")
+
+        with self.assertRaises(ExportError) as raised:
+            ArchiveService().recover_verifying(
+                lease, heartbeat, lambda: False,
+            )
+
+        job.refresh_from_db()
+        retired.refresh_from_db()
+        retired_file.refresh_from_db()
+        revoked_blob.refresh_from_db()
+        self.assertEqual(raised.exception.code, "all_items_revoked")
+        self.assertEqual(job.attempt_generation, 1)
+        self.assertEqual(retired.state, "cleaned")
+        self.assertEqual(retired_file.state, "cleaned")
+        self.assertEqual(revoked_blob.cleanup_state, "cleaned")
+        self.assertFalse(Path(
+            self._export_directory.name, "ready", "{}.zip".format(job.pk),
+        ).exists())
+
+    def test_post_build_first_of_many_batches_crash_is_safe_and_bounded(self):
+        safe = create_export_pin(self.owner, filename="many-safe.png")
+        seed = create_export_pin(
+            self.other, private=False, filename="many-revoked.png",
+        )
+        Pin.objects.bulk_create([
+            Pin(
+                submitter=self.other,
+                image_id=seed.image_id,
+                private=False,
+            )
+            for unused in range(800)
+        ], batch_size=400)
+        revoked = list(Pin.objects.filter(
+            submitter=self.other,
+            image_id=seed.image_id,
+        ).order_by("pk"))
+        self.assertEqual(len(revoked), 801)
+        job, lease, heartbeat = self._snapshot((safe,) + tuple(revoked))
+        revoked_item = job.items.get(pin_id=seed.pk)
+        revoked_blob = revoked_item.blob
+        widths = []
+        changed = []
+
+        def observe(execute, sql, params, many, context):
+            widths.extend(self._in_widths(sql))
+            return execute(sql, params, many, context)
+
+        def crash(point, context):
+            if point == "before_final_permission_check" and not changed:
+                revoked_ids = [pin.pk for pin in revoked]
+                for start in range(0, len(revoked_ids), 400):
+                    Pin.objects.filter(
+                        pk__in=revoked_ids[start:start + 400],
+                    ).update(private=True)
+                changed.append(True)
+            if (
+                point == "after_post_build_revocation_batch"
+                and context["batch_number"] == 1
+            ):
+                raise StopRequested(lease)
+
+        with connection.execute_wrapper(observe):
+            with self.assertRaises(StopRequested):
+                ArchiveService(fault_injector=crash).build_and_publish(
+                    job, lease, heartbeat, lambda: False,
+                )
+            outcome = ArchiveService().recover_verifying(
+                lease, heartbeat, lambda: False,
+            )
+
+        retired = job.attempts.get(attempt_generation=0)
+        retired_file = retired.files.get(kind="archive")
+        revoked_blob.refresh_from_db()
+        self.assertTrue(widths)
+        self.assertLessEqual(max(widths), 400)
+        self.assertEqual(outcome.job.state, "complete")
+        self.assertEqual(outcome.job.attempt_generation, 1)
+        self.assertEqual(outcome.job.attempts.count(), 2)
+        self.assertEqual(retired.state, "cleaned")
+        self.assertEqual(retired_file.state, "cleaned")
+        self.assertEqual(revoked_blob.cleanup_state, "cleaned")
+        with zipfile.ZipFile(self._archive_path(outcome.job)) as archive:
+            self.assertNotIn(
+                revoked_item.archive_image_path, archive.namelist(),
+            )
+            self.assertNotIn(
+                revoked_item.archive_xmp_path, archive.namelist(),
+            )
 
     def test_ready_collision_is_quarantined_once_across_publish_faults(self):
         points = (
