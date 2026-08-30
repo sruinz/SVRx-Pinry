@@ -21,6 +21,7 @@ INSTALLED_APPS = [
     'compressor',
     'django_images',
     'core',
+    'exports.apps.ExportsConfig',
     'users',
     'pinry_plugins.apps.PinryPluginsConfig',
 ]
@@ -70,6 +71,10 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 MEDIA_ROOT = os.path.join(STATIC_ROOT, 'media')
 
 PINRY_DATA_ROOT = '/data'
+PINRY_EXPORT_ROOT = os.path.join(PINRY_DATA_ROOT, 'exports')
+PINRY_EXPORT_MAX_PINS = 50000
+PINRY_EXPORT_RETENTION_SECONDS = 86400
+PINRY_EXPORT_SPACE_MIN_MARGIN_BYTES = 512 * 1024 * 1024
 
 WSGI_APPLICATION = 'pinry.wsgi.application'
 

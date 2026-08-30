@@ -69,6 +69,7 @@ ENV PATH=/root/.local/bin:$PATH
 
 COPY manage.py ./
 COPY core ./core
+COPY exports ./exports
 COPY django_images ./django_images
 COPY pinry ./pinry
 COPY pinry_plugins ./pinry_plugins
