@@ -66,7 +66,7 @@
     "emailPlaceholder": "Your email",
     "repeatPasswordInputPlaceholder": "Your password again",
     "chooseFilterPlaceholder": "Choose Filter",
-    "selectFilterPlaceholder": "select a filter then type to filter",
+    "selectFilterPlaceholder": "Select one or more tags",
     "searchBoardPlaceholder": "type to search board",
     "filterSelectSelectBoardPlaceholder": "Type to filter or Create one",
     "pinCreateModalImageURLPlaceholder": "where to fetch the image",

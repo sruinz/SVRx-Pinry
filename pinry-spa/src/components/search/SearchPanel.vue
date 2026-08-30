@@ -7,18 +7,20 @@
             <option value="Tag">{{ $t("SearchPanelTagOption") }}</option>
             <option value="Board">{{ $t("SearchPanelBoardOption") }}</option>
           </b-select>
-          <b-autocomplete
+          <b-taginput
             v-show="filterType === 'Tag'"
             class="search-input"
-            v-model="name"
+            v-model="selectedTags"
             :data="filteredDataArray"
-            :keep-first="true"
+            autocomplete
+            ellipsis
+            :allow-new="false"
             :open-on-focus="true"
             v-bind:placeholder="$t('selectFilterPlaceholder')"
             icon="magnify"
-            @select="option => selected = option">
+            @typing="updateTagSearch">
             <template slot="empty">{{ $t("noResultsFound") }}</template>
-          </b-autocomplete>
+          </b-taginput>
           <template v-if="filterType === 'Board'">
             <b-input
               class="search-input"
@@ -52,16 +54,20 @@ export default {
       },
       name: '',
       boardText: '',
-      selected: null,
+      selectedTags: [],
     };
   },
   methods: {
     selectOption(filterName) {
       this.name = '';
       this.boardText = '';
+      this.selectedTags = [];
       if (filterName === 'Tag') {
         this.selectedOption = this.options.Tag;
       }
+    },
+    updateTagSearch(value) {
+      this.name = value;
     },
     searchBoard() {
       if (this.boardText === '') {
@@ -77,10 +83,11 @@ export default {
     filterType(newVal) {
       this.selectOption(newVal);
     },
-    selected(newVal) {
+    selectedTags(newVal) {
+      if (this.filterType !== 'Tag') return;
       this.$emit(
         'selected',
-        { filterType: this.filterType, selected: newVal },
+        { filterType: this.filterType, selected: newVal.slice() },
       );
     },
   },
@@ -88,7 +95,7 @@ export default {
     filteredDataArray() {
       return this.selectedOption.filter(
         (option) => {
-          const ret = option
+          const ret = !this.selectedTags.includes(option) && option
             .toString()
             .toLowerCase()
             .indexOf(this.name.toLowerCase()) >= 0;
@@ -107,6 +114,9 @@ export default {
           },
         );
         this.options.Tag = options;
+        if (this.filterType === 'Tag') {
+          this.selectedOption = options;
+        }
       },
     );
   },

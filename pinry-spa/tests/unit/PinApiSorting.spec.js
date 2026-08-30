@@ -28,4 +28,15 @@ describe('Pin list sorting query', () => {
       random_seed: 17,
     });
   });
+
+  it('serializes multiple tags as repeated exact query parameters', async () => {
+    await API.fetchPins(0, ['alpha', 'β tag'], null, null);
+
+    const config = axios.get.mock.calls[0][1];
+    expect(config.params.tags__name).toEqual(['alpha', 'β tag']);
+    expect(config.paramsSerializer(config.params)).toBe(
+      'format=json&limit=30&offset=0&ordering=-id'
+      + '&tags__name=alpha&tags__name=%CE%B2%20tag',
+    );
+  });
 });

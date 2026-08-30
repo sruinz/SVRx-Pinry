@@ -20,6 +20,20 @@ describe('browser-local Pin sorting state', () => {
     expect(pinSortStorageKey({ idFilter: 3 })).toBeNull();
   });
 
+  it('uses an order-independent key for a multiple-tag search', () => {
+    const first = pinSortStorageKey({
+      tagFilter: ['travel', 'night view', 'travel'],
+    });
+    const second = pinSortStorageKey({
+      tagFilter: ['night view', 'travel'],
+    });
+
+    expect(first).toBe('svrx.pinSort.v1:tags:night%20view|travel');
+    expect(second).toBe(first);
+    expect(pinSortStorageKey({ tagFilter: [] }))
+      .toBe('svrx.pinSort.v1:home');
+  });
+
   it('restores valid state and replaces malformed state with latest', () => {
     const key = pinSortStorageKey({});
     localStorage.setItem(key, JSON.stringify({ version: 1, mode: 'random', randomSeed: 9 }));

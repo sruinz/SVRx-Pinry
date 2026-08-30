@@ -12,6 +12,14 @@ export function pinSortStorageKey(filters = {}) {
   if (filters.idFilter) return null;
   if (filters.boardFilter) return `svrx.pinSort.v1:board:${Number(filters.boardFilter)}`;
   if (filters.userFilter) return `svrx.pinSort.v1:user:${encodeURIComponent(filters.userFilter)}`;
+  if (Array.isArray(filters.tagFilter)) {
+    const tagNames = [...new Set(filters.tagFilter.filter(tagName => tagName !== ''))]
+      .sort();
+    if (tagNames.length > 0) {
+      return `svrx.pinSort.v1:tags:${tagNames.map(encodeURIComponent).join('|')}`;
+    }
+    return 'svrx.pinSort.v1:home';
+  }
   if (filters.tagFilter) return `svrx.pinSort.v1:tag:${encodeURIComponent(filters.tagFilter)}`;
   return 'svrx.pinSort.v1:home';
 }

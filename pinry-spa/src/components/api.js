@@ -123,6 +123,17 @@ const Pin = {
 };
 
 
+function serializeQueryParams(params) {
+  const pairs = [];
+  Object.keys(params).forEach((key) => {
+    const values = Array.isArray(params[key]) ? params[key] : [params[key]];
+    values.forEach((value) => {
+      pairs.push(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`);
+    });
+  });
+  return pairs.join('&');
+}
+
 function fetchPins(offset, tagFilter, userFilter, boardFilter, sortState = null) {
   const url = `${API_PREFIX}pins/`;
   const queryArgs = {
@@ -141,7 +152,7 @@ function fetchPins(offset, tagFilter, userFilter, boardFilter, sortState = null)
   if (boardFilter) queryArgs.pins__id = boardFilter;
   return axios.get(
     url,
-    { params: queryArgs },
+    { params: queryArgs, paramsSerializer: serializeQueryParams },
   );
 }
 

@@ -33,7 +33,9 @@ export default {
       this.pinFilters = null;
       this.boardFilters = null;
       if (args.filterType === 'Tag') {
-        this.pinFilters = { tagFilter: args.selected };
+        if (Array.isArray(args.selected) && args.selected.length > 0) {
+          this.pinFilters = { tagFilter: args.selected.slice() };
+        }
       } else if (args.filterType === 'Board') {
         this.boardFilters = { boardNameContains: args.selected };
       }
