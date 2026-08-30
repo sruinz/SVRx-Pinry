@@ -9,7 +9,8 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 import mock
 
-from exports.contracts import LeaseToken, StopRequested
+from core.services.database_fence import DatabaseFenceBusy
+from exports.contracts import LeaseLost, LeaseToken, StopRequested
 from exports.models import ExportJob, ExportTarget, ExportWorkerLease
 from exports.services.archive import ArchiveService
 from exports.services import attempts as attempt_services
@@ -359,6 +360,123 @@ class AttemptServiceTests(ExportStorageMixin, TransactionTestCase):
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+            if directory is not None:
+                directory.close()
+            staging.close()
+            root.close()
+
+    def test_db_only_helper_retries_transient_busy_with_same_receipt_token(self):
+        root, staging = self._directories()
+        directory = None
+        try:
+            directory = self.service.create_directory_fs(
+                staging, self.job, self.lease,
+            )
+            original_fence = attempt_services.database_write_fence
+            calls = []
+            sleeps = []
+
+            @contextmanager
+            def busy_once(*args, **kwargs):
+                calls.append((args, kwargs, directory.receipt, self.lease))
+                if len(calls) == 1:
+                    raise DatabaseFenceBusy()
+                with original_fence(*args, **kwargs) as current:
+                    yield current
+
+            def sleep_outside_guard(seconds):
+                self.assertEqual(self.heartbeat.guard_depth, 0)
+                sleeps.append(seconds)
+
+            service = AttemptService(sleeper=sleep_outside_guard)
+            with mock.patch(
+                "exports.services.attempts.database_write_fence",
+                side_effect=busy_once,
+            ):
+                attempt = service.record_directory_receipt_db_only(
+                    self.job, self.lease, directory, self.heartbeat,
+                    stop_requested=lambda: False,
+                )
+
+            self.assertEqual(attempt.attempt_generation, 0)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0][2:], calls[1][2:])
+            self.assertEqual(sleeps, [0.01])
+            self.assertEqual(self.heartbeat.pulses, 1)
+        finally:
+            if directory is not None:
+                directory.close()
+            staging.close()
+            root.close()
+
+    def test_db_only_helper_budget_and_token_change_stop_retry(self):
+        root, staging = self._directories()
+        directory = None
+        try:
+            directory = self.service.create_directory_fs(
+                staging, self.job, self.lease,
+            )
+            clock = [0.0]
+            calls = []
+
+            @contextmanager
+            def always_busy(*args, **kwargs):
+                del args, kwargs
+                calls.append(True)
+                raise DatabaseFenceBusy()
+                yield
+
+            def monotonic():
+                value = clock[0]
+                clock[0] += 3.0
+                return value
+
+            with mock.patch(
+                "exports.services.attempts.database_write_fence",
+                side_effect=always_busy,
+            ):
+                with self.assertRaises(DatabaseFenceBusy):
+                    AttemptService(
+                        monotonic=monotonic,
+                        sleeper=lambda seconds: None,
+                    ).record_directory_receipt_db_only(
+                        self.job, self.lease, directory, self.heartbeat,
+                        stop_requested=lambda: False,
+                    )
+            self.assertEqual(calls, [True, True])
+            self.assertEqual(self.job.attempts.count(), 0)
+
+            original_fence = attempt_services.database_write_fence
+            calls = []
+
+            @contextmanager
+            def busy_then_real(*args, **kwargs):
+                calls.append(True)
+                if len(calls) == 1:
+                    raise DatabaseFenceBusy()
+                with original_fence(*args, **kwargs) as current:
+                    yield current
+
+            def replace_token(seconds):
+                del seconds
+                ExportJob.objects.filter(pk=self.job.pk).update(
+                    lease_uuid=uuid.uuid4(),
+                )
+
+            with mock.patch(
+                "exports.services.attempts.database_write_fence",
+                side_effect=busy_then_real,
+            ):
+                with self.assertRaises(LeaseLost):
+                    AttemptService(
+                        sleeper=replace_token,
+                    ).record_directory_receipt_db_only(
+                        self.job, self.lease, directory, self.heartbeat,
+                        stop_requested=lambda: False,
+                    )
+            self.assertEqual(calls, [True, True])
+            self.assertEqual(self.job.attempts.count(), 0)
+        finally:
             if directory is not None:
                 directory.close()
             staging.close()

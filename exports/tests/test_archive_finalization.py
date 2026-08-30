@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ from exports.models import (
     ExportBlob,
     ExportItem,
     ExportJob,
+    ExportSlot,
     ExportTarget,
     ExportWorkerLease,
 )
@@ -149,6 +151,48 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
 
     def _archive_path(self, job):
         return Path(self._export_directory.name, job.ready_relative_path)
+
+    def _ready_candidate(self, pin):
+        job, lease, heartbeat = self._snapshot((pin,))
+
+        def stop(point, context):
+            del context
+            if point == "after_ready_candidate":
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(fault_injector=stop).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+        job.refresh_from_db()
+        attempt = job.attempts.get(attempt_generation=0)
+        candidate = attempt.files.get(kind="archive")
+        return job, attempt, candidate, lease, heartbeat
+
+    def _previous_complete(self, candidate):
+        job_id = uuid.uuid4()
+        completed_at = timezone.now()
+        return ExportJob.objects.create(
+            id=job_id,
+            owner=self.owner,
+            scope="pins",
+            state="complete",
+            completed_at=completed_at,
+            expires_at=completed_at,
+            ready_cleanup_state="retained",
+            ready_relative_path="ready/{}.zip".format(job_id),
+            ready_display_name="previous.zip",
+            ready_size=candidate.receipt_size,
+            ready_sha256=candidate.receipt_sha256,
+            ready_dev=candidate.receipt_dev,
+            ready_ino=candidate.receipt_ino,
+            ready_uid=candidate.receipt_uid,
+            ready_gid=candidate.receipt_gid,
+            ready_mode=candidate.receipt_mode,
+            ready_nlink=candidate.receipt_nlink,
+            ready_mtime_ns=candidate.receipt_mtime_ns,
+            ready_ctime_ns=candidate.receipt_ctime_ns,
+        )
 
     def _large_pin(self, filename):
         pin = create_export_pin(self.owner, filename=filename)
@@ -678,6 +722,334 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
                 self.assertEqual(attempt.lease_uuid, provenance)
                 self.assertTrue(self._archive_path(outcome.job).is_file())
 
+    def test_publish_rehash_rejects_same_size_mutation_after_validation(self):
+        pin = create_export_pin(self.owner, filename="publish-mutation.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+        mutated = []
+
+        def mutate(point, context):
+            if point != "after_publishing_intent" or mutated:
+                return
+            attempt_file = context["attempt_file"]
+            path = Path(
+                self._export_directory.name,
+                ".staging",
+                attempt_file.attempt.relative_path,
+                archive_services.ARCHIVE_PART_NAME,
+            )
+            payload = bytearray(path.read_bytes())
+            payload[len(payload) // 2] ^= 1
+            path.write_bytes(bytes(payload))
+            os.chmod(str(path), 0o600)
+            mutated.append(True)
+
+        with self.assertRaises(ExportError) as raised:
+            ArchiveService(fault_injector=mutate).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+
+        self.assertEqual(mutated, [True])
+        self.assertEqual(raised.exception.code, "export_storage_unsafe")
+        self.assertFalse(Path(
+            self._export_directory.name, "ready", "{}.zip".format(job.pk),
+        ).exists())
+
+    def test_recover_publishing_rehashes_actual_bytes(self):
+        pin = create_export_pin(self.owner, filename="recover-rehash.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+
+        def stop(point, context):
+            del context
+            if point == "after_publishing_intent":
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(fault_injector=stop).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+        attempt = job.attempts.get()
+        candidate = attempt.files.get(kind="archive")
+        path = Path(
+            self._export_directory.name,
+            ".staging",
+            attempt.relative_path,
+            archive_services.ARCHIVE_PART_NAME,
+        )
+        payload = bytearray(path.read_bytes())
+        payload[len(payload) // 2] ^= 1
+        path.write_bytes(bytes(payload))
+        os.chmod(str(path), 0o600)
+        changed = os.stat(str(path))
+        candidate.receipt_mtime_ns = changed.st_mtime_ns
+        candidate.receipt_ctime_ns = changed.st_ctime_ns
+        candidate.save(update_fields=(
+            "receipt_mtime_ns", "receipt_ctime_ns",
+        ))
+
+        with self.assertRaises(ExportError) as raised:
+            ArchiveService().recover_verifying(
+                lease, heartbeat, lambda: False,
+            )
+
+        self.assertEqual(raised.exception.code, "export_storage_unsafe")
+        self.assertFalse(Path(
+            self._export_directory.name, "ready", "{}.zip".format(job.pk),
+        ).exists())
+
+    def test_publish_records_actual_ready_ctime_after_rename(self):
+        pin = create_export_pin(self.owner, filename="ready-ctime.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+        observed = []
+
+        def capture(point, context):
+            del context
+            if point == "after_candidate_rename":
+                path = Path(
+                    self._export_directory.name,
+                    "ready",
+                    "{}.zip".format(job.pk),
+                )
+                observed.append(os.stat(str(path)).st_ctime_ns)
+
+        completed = ArchiveService(
+            fault_injector=capture,
+        ).build_and_publish(job, lease, heartbeat, lambda: False)
+        candidate = completed.attempts.get().files.get(kind="archive")
+
+        self.assertEqual(observed, [completed.ready_ctime_ns])
+        self.assertEqual(candidate.receipt_ctime_ns, completed.ready_ctime_ns)
+
+    def test_final_owner_loss_atomically_fails_and_releases_authority(self):
+        pin = create_export_pin(self.other, filename="owner-loss.png")
+        job, attempt, candidate, lease, heartbeat = self._ready_candidate(pin)
+        ExportSlot.objects.create(owner=self.owner, current_job=job)
+        ExportJob.objects.filter(pk=job.pk).update(owner=None)
+
+        result = ArchiveService()._final_fence(
+            attempt, candidate, attempt.exported_at, lease,
+            heartbeat, lambda: False,
+        )
+
+        job.refresh_from_db()
+        attempt.refresh_from_db()
+        candidate.refresh_from_db()
+        slot = ExportSlot.objects.get(owner=self.owner)
+        self.assertIs(result, archive_services.OWNER_DELETED)
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.error_code, "permission_changed")
+        self.assertEqual(job.error_class, "fatal")
+        self.assertFalse(job.error_retryable)
+        self.assertEqual(job.staging_cleanup_state, "pending")
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(job.lease_expires_at)
+        self.assertEqual(attempt.state, "retiring")
+        self.assertEqual(candidate.state, "retiring")
+        self.assertIsNone(slot.current_job_id)
+        self.assertIsNone(heartbeat.lease)
+
+    def test_final_owner_loss_rollback_leaves_no_partial_state(self):
+        pin = create_export_pin(self.other, filename="owner-rollback.png")
+        job, attempt, candidate, lease, heartbeat = self._ready_candidate(pin)
+        ExportSlot.objects.create(owner=self.owner, current_job=job)
+        ExportJob.objects.filter(pk=job.pk).update(owner=None)
+        service = ArchiveService()
+        original = service._record_owner_deleted_locked
+
+        def fail_after_updates(*args, **kwargs):
+            original(*args, **kwargs)
+            raise RuntimeError("rollback")
+
+        with mock.patch.object(
+            service,
+            "_record_owner_deleted_locked",
+            side_effect=fail_after_updates,
+        ):
+            with self.assertRaises(RuntimeError):
+                service._final_fence(
+                    attempt, candidate, attempt.exported_at, lease,
+                    heartbeat, lambda: False,
+                )
+
+        job.refresh_from_db()
+        attempt.refresh_from_db()
+        candidate.refresh_from_db()
+        slot = ExportSlot.objects.get(owner=self.owner)
+        self.assertEqual(job.state, "verifying")
+        self.assertEqual(job.lease_uuid, lease.job_lease_uuid)
+        self.assertEqual(attempt.state, "verifying")
+        self.assertEqual(candidate.state, "ready_candidate")
+        self.assertEqual(slot.current_job_id, job.pk)
+        self.assertEqual(heartbeat.lease, lease)
+
+    def test_recover_owner_deleted_runs_worker_authorized_terminal_cleanup(self):
+        pin = create_export_pin(self.other, filename="owner-cleanup.png")
+        job, attempt, candidate, lease, heartbeat = self._ready_candidate(pin)
+        ready_path = Path(
+            self._export_directory.name,
+            "ready",
+            "{}.zip".format(job.pk),
+        )
+        self.owner.delete()
+
+        outcome = ArchiveService().recover_verifying(
+            lease, heartbeat, lambda: False,
+        )
+
+        job.refresh_from_db()
+        attempt.refresh_from_db()
+        candidate.refresh_from_db()
+        self.assertEqual(outcome.job.state, "failed")
+        self.assertEqual(job.error_code, "permission_changed")
+        self.assertIsNone(job.lease_uuid)
+        self.assertEqual(attempt.state, "cleaned")
+        self.assertEqual(candidate.state, "cleaned")
+        self.assertEqual(job.staging_cleanup_state, "pending")
+        self.assertFalse(ready_path.exists())
+
+    def test_complete_atomically_expires_previous_ready_job(self):
+        pin = create_export_pin(self.owner, filename="new-complete.png")
+        job, attempt, candidate, lease, heartbeat = self._ready_candidate(pin)
+        previous = self._previous_complete(candidate)
+        receipt = tuple(
+            getattr(previous, field)
+            for field in (
+                "ready_relative_path", "ready_size", "ready_sha256",
+                "ready_dev", "ready_ino", "ready_uid", "ready_gid",
+                "ready_mode", "ready_nlink", "ready_mtime_ns",
+                "ready_ctime_ns",
+            )
+        )
+
+        result = ArchiveService()._final_fence(
+            attempt, candidate, attempt.exported_at, lease,
+            heartbeat, lambda: False,
+        )
+
+        job.refresh_from_db()
+        previous.refresh_from_db()
+        self.assertIsNone(result)
+        self.assertEqual(job.state, "complete")
+        self.assertEqual(previous.state, "expired")
+        self.assertEqual(previous.ready_cleanup_state, "pending")
+        self.assertEqual(tuple(
+            getattr(previous, field)
+            for field in (
+                "ready_relative_path", "ready_size", "ready_sha256",
+                "ready_dev", "ready_ino", "ready_uid", "ready_gid",
+                "ready_mode", "ready_nlink", "ready_mtime_ns",
+                "ready_ctime_ns",
+            )
+        ), receipt)
+
+    def test_complete_rollback_keeps_previous_ready_job_valid(self):
+        pin = create_export_pin(self.owner, filename="complete-rollback.png")
+        job, attempt, candidate, lease, heartbeat = self._ready_candidate(pin)
+        previous = self._previous_complete(candidate)
+        service = ArchiveService()
+        original = service._expire_previous_complete_locked
+
+        def fail_after_expiry(current):
+            original(current)
+            raise RuntimeError("rollback")
+
+        with mock.patch.object(
+            service,
+            "_expire_previous_complete_locked",
+            side_effect=fail_after_expiry,
+        ):
+            with self.assertRaises(RuntimeError):
+                service._final_fence(
+                    attempt, candidate, attempt.exported_at, lease,
+                    heartbeat, lambda: False,
+                )
+
+        job.refresh_from_db()
+        attempt.refresh_from_db()
+        candidate.refresh_from_db()
+        previous.refresh_from_db()
+        self.assertEqual(job.state, "verifying")
+        self.assertEqual(attempt.state, "verifying")
+        self.assertEqual(candidate.state, "ready_candidate")
+        self.assertEqual(previous.state, "complete")
+        self.assertEqual(previous.ready_cleanup_state, "retained")
+
+    def test_recover_verifying_revocation_cleans_and_rebuilds_once(self):
+        safe = create_export_pin(self.owner, filename="recover-safe.png")
+        revoked = create_export_pin(
+            self.other, private=False, filename="recover-revoked.png",
+        )
+        job, lease, heartbeat = self._snapshot((safe, revoked))
+
+        def stop(point, context):
+            del context
+            if point == "after_ready_candidate":
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(fault_injector=stop).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+        retired = job.attempts.get(attempt_generation=0)
+        retired_file = retired.files.get(kind="archive")
+        revoked_blob = job.items.get(pin_id=revoked.pk).blob
+        revoked.private = True
+        revoked.save(update_fields=("private",))
+
+        outcome = ArchiveService().recover_verifying(
+            lease, heartbeat, lambda: False,
+        )
+
+        retired.refresh_from_db()
+        retired_file.refresh_from_db()
+        revoked_blob.refresh_from_db()
+        self.assertEqual(outcome.job.state, "complete")
+        self.assertEqual(outcome.lease.attempt_generation, 1)
+        self.assertEqual(outcome.job.attempt_generation, 1)
+        self.assertEqual(retired.state, "cleaned")
+        self.assertEqual(retired_file.state, "cleaned")
+        self.assertEqual(revoked_blob.cleanup_state, "cleaned")
+        self.assertEqual(job.attempts.count(), 2)
+
+    def test_recover_verifying_all_revoked_cleans_before_terminal_error(self):
+        revoked = create_export_pin(
+            self.other, private=False, filename="recover-all-revoked.png",
+        )
+        job, lease, heartbeat = self._snapshot((revoked,))
+
+        def stop(point, context):
+            del context
+            if point == "after_ready_candidate":
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(fault_injector=stop).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+        retired = job.attempts.get(attempt_generation=0)
+        retired_file = retired.files.get(kind="archive")
+        revoked_blob = job.items.get(pin_id=revoked.pk).blob
+        ready_path = Path(
+            self._export_directory.name,
+            "ready",
+            "{}.zip".format(job.pk),
+        )
+        revoked.private = True
+        revoked.save(update_fields=("private",))
+
+        with self.assertRaises(ExportError) as raised:
+            ArchiveService().recover_verifying(
+                lease, heartbeat, lambda: False,
+            )
+
+        retired.refresh_from_db()
+        retired_file.refresh_from_db()
+        revoked_blob.refresh_from_db()
+        self.assertEqual(raised.exception.code, "all_items_revoked")
+        self.assertEqual(retired.state, "cleaned")
+        self.assertEqual(retired_file.state, "cleaned")
+        self.assertEqual(revoked_blob.cleanup_state, "cleaned")
+        self.assertFalse(ready_path.exists())
+
     def test_ready_collision_is_quarantined_once_across_publish_faults(self):
         points = (
             "after_publishing_intent",
@@ -749,6 +1121,64 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
         attempt = job.attempts.get()
         self.assertEqual(attempt.state, "retiring")
         self.assertEqual(attempt.files.get(kind="archive").state, "retiring")
+
+    def test_zip_entry_enospc_is_normalized_and_handed_off_retiring(self):
+        pin = create_export_pin(self.owner, filename="entry-enospc.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+        original_open = zipfile.ZipFile.open
+
+        def fail_entry(archive, name, mode="r", *args, **kwargs):
+            if archive.mode == "w" and mode == "w":
+                raise OSError(errno.ENOSPC, "disk full")
+            return original_open(archive, name, mode, *args, **kwargs)
+
+        with mock.patch.object(
+            zipfile.ZipFile, "open", new=fail_entry,
+        ):
+            with self.assertRaises(ExportError) as raised:
+                ArchiveService().build_and_publish(
+                    job, lease, heartbeat, lambda: False,
+                )
+
+        attempt = job.attempts.get()
+        candidate = attempt.files.get(kind="archive")
+        self.assertEqual(raised.exception.code, "insufficient_space")
+        self.assertEqual(attempt.state, "retiring")
+        self.assertEqual(candidate.state, "retiring")
+        self.assertFalse(Path(
+            self._export_directory.name, "ready", "{}.zip".format(job.pk),
+        ).exists())
+
+    def test_zip_close_enospc_is_normalized_and_handed_off_retiring(self):
+        pin = create_export_pin(self.owner, filename="close-enospc.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+        original_close = zipfile.ZipFile.close
+        fired = []
+
+        def fail_close(archive):
+            if archive.mode == "w" and not fired:
+                fired.append(True)
+                archive.fp = None
+                raise OSError(errno.ENOSPC, "disk full")
+            return original_close(archive)
+
+        with mock.patch.object(
+            zipfile.ZipFile, "close", new=fail_close,
+        ):
+            with self.assertRaises(ExportError) as raised:
+                ArchiveService().build_and_publish(
+                    job, lease, heartbeat, lambda: False,
+                )
+
+        attempt = job.attempts.get()
+        candidate = attempt.files.get(kind="archive")
+        self.assertEqual(fired, [True])
+        self.assertEqual(raised.exception.code, "insufficient_space")
+        self.assertEqual(attempt.state, "retiring")
+        self.assertEqual(candidate.state, "retiring")
+        self.assertFalse(Path(
+            self._export_directory.name, "ready", "{}.zip".format(job.pk),
+        ).exists())
 
     def test_writing_fault_retires_open_receipt_and_rebuilds_with_next_generation(self):
         pin = self._large_pin("writing-fault.png")
@@ -1105,6 +1535,103 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
             job.items.filter(inclusion_state="excluded").count(),
             50000,
         )
+
+    def test_fifty_thousand_initial_revocations_release_guard_each_batch(self):
+        fixture = self._bulk_finalization_fixture(50000)
+        ExportJob.objects.filter(pk=fixture["job"].pk).update(
+            state="archiving",
+            archive_done=0,
+            bytes_done=0,
+            verifying_attempt_generation=None,
+            verifying_size=None,
+            verifying_sha256=None,
+            verifying_completed_at=None,
+        )
+        job = ExportJob.objects.get(pk=fixture["job"].pk)
+        events = []
+        widths = []
+
+        class BatchHeartbeat(ArchiveHeartbeat):
+            def __call__(current):
+                if current.guard_depth != 0:
+                    raise AssertionError("heartbeat under foreground guard")
+                events.append("heartbeat")
+                super(BatchHeartbeat, current).__call__()
+
+        heartbeat = BatchHeartbeat()
+        heartbeat.lease = fixture["lease"]
+
+        def observe(execute, sql, params, many, context):
+            upper = sql.upper()
+            if (
+                "EXPORTS_EXPORTITEM" in upper
+                and upper.lstrip().startswith("UPDATE")
+                and self._in_widths(sql)
+            ):
+                events.append("item_update")
+                widths.extend(self._in_widths(sql))
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(observe):
+            with self.assertRaises(ExportError) as raised:
+                ArchiveService()._initial_permission_check(
+                    job, fixture["lease"], heartbeat, lambda: False,
+                )
+
+        update_positions = [
+            index for index, event in enumerate(events)
+            if event == "item_update"
+        ]
+        self.assertEqual(len(update_positions), 125)
+        self.assertTrue(all(width <= 400 for width in widths))
+        self.assertTrue(all(
+            events[position + 1] == "heartbeat"
+            for position in update_positions
+        ))
+        self.assertEqual(raised.exception.code, "all_items_revoked")
+        current = ExportJob.objects.get(pk=job.pk)
+        self.assertEqual(current.included_total, 0)
+
+    def test_middle_revocations_release_guard_between_real_batches(self):
+        fixture = self._bulk_finalization_fixture(801)
+        events = []
+
+        class BatchHeartbeat(ArchiveHeartbeat):
+            def __call__(current):
+                if current.guard_depth != 0:
+                    raise AssertionError("heartbeat under foreground guard")
+                events.append("heartbeat")
+                super(BatchHeartbeat, current).__call__()
+
+        heartbeat = BatchHeartbeat()
+        heartbeat.lease = fixture["lease"]
+
+        def observe(execute, sql, params, many, context):
+            upper = sql.upper()
+            if (
+                "EXPORTS_EXPORTITEM" in upper
+                and upper.lstrip().startswith("UPDATE")
+                and self._in_widths(sql)
+            ):
+                events.append("item_update")
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(observe):
+            rotated = ArchiveService()._post_build_revocations(
+                fixture["job"], fixture["attempt"], fixture["candidate"],
+                fixture["lease"], heartbeat, lambda: False,
+            )
+
+        update_positions = [
+            index for index, event in enumerate(events)
+            if event == "item_update"
+        ]
+        self.assertEqual(len(update_positions), 3)
+        self.assertTrue(all(
+            events[position + 1] == "heartbeat"
+            for position in update_positions
+        ))
+        self.assertEqual(rotated.attempt_generation, 1)
 
     def test_final_revocation_deadline_rolls_back_db_and_keeps_old_tokens(self):
         fixture = self._bulk_finalization_fixture(801)
