@@ -15,6 +15,7 @@ admin.autodiscover()
 urlpatterns = [
     # drf api
     path('api/v2/version/', version, name='version'),
+    path('api/v2/exports/', include('exports.urls')),
     path('api/v2/', include(drf_router.urls)),
     path('api-auth/', include('rest_framework.urls', namespace="rest_framework")),
     path('api/v2/docs/', include_docs_urls(title='PinryAPI', schema_url='/')),
