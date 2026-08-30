@@ -36,6 +36,40 @@ class ExportModelConstraintTests(TestCase):
             with transaction.atomic():
                 ExportTarget.objects.create(job=job, position=0, pin_id=12)
 
+    def test_target_identity_snapshot_is_all_or_none_in_model_and_database(self):
+        job = ExportJob.objects.create(owner=self.user, scope="pins")
+        published = timezone.now()
+
+        ExportTarget(
+            job=job,
+            position=0,
+            pin_id=11,
+            pin_owner_id_snapshot=self.user.pk,
+            pin_published_at_snapshot=published,
+        ).full_clean()
+        ExportTarget(job=job, position=1, pin_id=12).full_clean()
+
+        for fields in (
+            {"pin_owner_id_snapshot": self.user.pk},
+            {"pin_published_at_snapshot": published},
+        ):
+            with self.subTest(fields=fields):
+                with self.assertRaises(ValidationError):
+                    ExportTarget(
+                        job=job,
+                        position=2,
+                        pin_id=13,
+                        **fields
+                    ).full_clean()
+                with self.assertRaises(IntegrityError):
+                    with transaction.atomic():
+                        ExportTarget.objects.create(
+                            job=job,
+                            position=2,
+                            pin_id=13,
+                            **fields
+                        )
+
     def test_snapshot_models_do_not_reference_live_pin_board_or_image_rows(self):
         live_models = (Pin, Board, Image)
 

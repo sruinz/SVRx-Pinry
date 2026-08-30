@@ -205,8 +205,14 @@ class JobService(object):
         if claimed != 1:
             raise ExportRequestError("active_export_exists", 409)
         ExportTarget.objects.bulk_create(tuple(
-            ExportTarget(job=job, position=position, pin_id=pin_id)
-            for position, pin_id in enumerate(captured.pin_ids)
+            ExportTarget(
+                job=job,
+                position=position,
+                pin_id=identity.pin_id,
+                pin_owner_id_snapshot=identity.owner_id,
+                pin_published_at_snapshot=identity.published,
+            )
+            for position, identity in enumerate(captured.identities)
         ))
         checkpoint()
         return job

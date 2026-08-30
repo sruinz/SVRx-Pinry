@@ -47,6 +47,7 @@ class TargetIdentity(object):
     content_sha256: object
     owner_id: int
     private: bool
+    published: object
 
     @property
     def source_key(self):
@@ -149,6 +150,7 @@ def _identity(pin):
         ),
         owner_id=pin.submitter_id,
         private=pin.private,
+        published=pin.published,
     )
 
 

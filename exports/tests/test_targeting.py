@@ -230,6 +230,14 @@ class TargetingServiceTests(ExportStorageMixin, TransactionTestCase):
                 )
 
         self.assertEqual(captured.pin_ids, tuple(pin.pk for pin in pins))
+        self.assertEqual(
+            tuple(identity.owner_id for identity in captured.identities),
+            tuple(pin.submitter_id for pin in pins),
+        )
+        self.assertEqual(
+            tuple(identity.published for identity in captured.identities),
+            tuple(pin.published for pin in pins),
+        )
         self.assertGreaterEqual(len(checkpoints), 2)
         for query in queries:
             for values in re.findall(r"\bIN \(([^)]*)\)", query["sql"]):

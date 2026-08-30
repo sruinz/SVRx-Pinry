@@ -246,6 +246,9 @@ class ExportAPITests(ExportStorageMixin, TransactionTestCase):
         })
         job = ExportJob.objects.get(pk=response.json()["id"])
         self.assertEqual(list(job.targets.values_list("pin_id", flat=True)), [self.pin.pk])
+        target = job.targets.get()
+        self.assertEqual(target.pin_owner_id_snapshot, self.pin.submitter_id)
+        self.assertEqual(target.pin_published_at_snapshot, self.pin.published)
         self.assertEqual(ExportSlot.objects.get(owner=self.owner).current_job_id, job.pk)
 
     def test_create_worker_failure_is_exact_503_without_rows(self):

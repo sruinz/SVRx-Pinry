@@ -225,10 +225,29 @@ class ExportTarget(models.Model):
     job = models.ForeignKey(ExportJob, related_name="targets", on_delete=models.CASCADE)
     position = models.PositiveIntegerField()
     pin_id = models.PositiveIntegerField()
+    pin_owner_id_snapshot = models.PositiveIntegerField(null=True, blank=True)
+    pin_published_at_snapshot = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         unique_together = (("job", "position"), ("job", "pin_id"))
         ordering = ("position",)
+        constraints = (
+            models.CheckConstraint(
+                check=_all_or_none((
+                    "pin_owner_id_snapshot",
+                    "pin_published_at_snapshot",
+                )),
+                name="export_target_identity_full",
+            ),
+        )
+
+    def clean(self):
+        super(ExportTarget, self).clean()
+        _validate_all_or_none(
+            self,
+            ("pin_owner_id_snapshot", "pin_published_at_snapshot"),
+            "pin_identity_snapshot",
+        )
 
 
 class ExportBlob(models.Model):

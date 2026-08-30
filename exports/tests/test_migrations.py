@@ -1,8 +1,10 @@
+import re
 import uuid
 
 from django.db import IntegrityError, connection, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 
 
 class ExportInitialMigrationTests(TransactionTestCase):
@@ -250,3 +252,105 @@ class ExportInitialMigrationTests(TransactionTestCase):
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 file_model.objects.create(attempt=attempt, kind="quarantine", state="closed", receipt_level="full", relative_path="attempts/0/quarantine.zip", intent_relative_path="ready/dest.zip", receipt_dev=1, receipt_ino=2, receipt_uid=3, receipt_gid=4, receipt_mode=384, receipt_nlink=1, receipt_size=10, receipt_mtime_ns=5, receipt_ctime_ns=6)
+
+
+class ExportTargetIdentityMigrationTests(TransactionTestCase):
+    migrate_from = [
+        ("django_images", "0007_startup_validation_state"),
+        ("core", "0016_board_display_order"),
+        ("exports", "0001_initial"),
+    ]
+    migrate_to = [
+        ("django_images", "0007_startup_validation_state"),
+        ("core", "0016_board_display_order"),
+        ("exports", "0002_exporttarget_identity_snapshot"),
+    ]
+
+    def setUp(self):
+        super(ExportTargetIdentityMigrationTests, self).setUp()
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.migrate_from)
+        old_apps = self.executor.loader.project_state(self.migrate_from).apps
+        user_model = old_apps.get_model("auth", "User")
+        image_model = old_apps.get_model("django_images", "Image")
+        pin_model = old_apps.get_model("core", "Pin")
+        job_model = old_apps.get_model("exports", "ExportJob")
+        target_model = old_apps.get_model("exports", "ExportTarget")
+
+        owner = user_model.objects.create(username="migration-target-owner")
+        image = image_model.objects.create(
+            image="image/original/migration.png",
+            original_filename="migration.png",
+            width=1,
+            height=1,
+        )
+        pin_model.objects.bulk_create([
+            pin_model(submitter_id=owner.pk, image_id=image.pk)
+            for _index in range(401)
+        ], batch_size=400)
+        self.live_pin_ids = tuple(
+            pin_model.objects.order_by("pk").values_list("pk", flat=True)
+        )
+        self.live_published = {
+            pin.pk: pin.published for pin in pin_model.objects.filter(
+                pk__in=self.live_pin_ids
+            )
+        }
+        job = job_model.objects.create(
+            owner_id=owner.pk,
+            scope="pins",
+            requested_total=402,
+            target_total=402,
+            included_total=402,
+        )
+        target_model.objects.bulk_create([
+            target_model(job_id=job.pk, position=position, pin_id=pin_id)
+            for position, pin_id in enumerate(self.live_pin_ids)
+        ] + [
+            target_model(
+                job_id=job.pk,
+                position=401,
+                pin_id=max(self.live_pin_ids) + 1000,
+            )
+        ], batch_size=400)
+        self.job_id = job.pk
+        self.owner_id = owner.pk
+
+    def tearDown(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.executor.loader.graph.leaf_nodes())
+        super(ExportTargetIdentityMigrationTests, self).tearDown()
+
+    @staticmethod
+    def _pin_in_sizes(queries):
+        sizes = []
+        for query in queries:
+            sql = query["sql"]
+            if "core_pin" not in sql or " IN " not in sql:
+                continue
+            for values in re.findall(r"\bIN \(([^)]*)\)", sql):
+                sizes.append(values.count(",") + 1)
+        return sizes
+
+    def test_live_targets_are_chunk_backfilled_and_deleted_target_stays_null(self):
+        with CaptureQueriesContext(connection) as queries:
+            self.executor = MigrationExecutor(connection)
+            self.executor.migrate(self.migrate_to)
+        apps = self.executor.loader.project_state(self.migrate_to).apps
+        target_model = apps.get_model("exports", "ExportTarget")
+        targets = list(
+            target_model.objects.filter(job_id=self.job_id).order_by("position")
+        )
+
+        self.assertEqual(len(targets), 402)
+        for target in targets[:401]:
+            self.assertEqual(target.pin_owner_id_snapshot, self.owner_id)
+            self.assertEqual(
+                target.pin_published_at_snapshot,
+                self.live_published[target.pin_id],
+            )
+        self.assertIsNone(targets[-1].pin_owner_id_snapshot)
+        self.assertIsNone(targets[-1].pin_published_at_snapshot)
+        in_sizes = self._pin_in_sizes(queries.captured_queries)
+        self.assertTrue(in_sizes)
+        self.assertLessEqual(max(in_sizes), 400)
