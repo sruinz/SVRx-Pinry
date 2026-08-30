@@ -818,6 +818,46 @@ class ArchiveService(object):
                 current_attempt.state = "cleaned"
                 current_attempt.save(update_fields=("state",))
 
+    def _cleanup_excluded_blobs(self, lease, heartbeat):
+        job = ExportJob.objects.using(self.using).get(pk=lease.job_id)
+        blob_ids = list(job.blobs.filter(
+            cleanup_state="pending",
+        ).exclude(
+            items__inclusion_state="included",
+        ).order_by("pk").values_list("pk", flat=True))
+        if not blob_ids:
+            return
+        root = open_export_root(
+            settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
+        )
+        staging = snapshot = None
+        try:
+            staging = open_staging_directory(root)
+            snapshot = open_receipted_directory(
+                staging, job.snapshot_relative_path,
+                snapshot_directory_receipt(job),
+            )
+            for blob_ids_chunk in self._chunks(blob_ids):
+                for blob in job.blobs.filter(pk__in=blob_ids_chunk):
+                    remove_if_receipt_matches(
+                        snapshot, snapshot_blob_name(blob.pk),
+                        self._blob_receipt(blob),
+                    )
+                heartbeat()
+                with heartbeat.foreground_write_guard():
+                    with transaction.atomic(using=self.using):
+                        lock_current_lease(lease, using=self.using)
+                        ExportBlob.objects.using(self.using).filter(
+                            pk__in=blob_ids_chunk,
+                            cleanup_state="pending",
+                        ).exclude(
+                            items__inclusion_state="included",
+                        ).update(cleanup_state="cleaned")
+        finally:
+            for directory in (snapshot, staging, root):
+                if directory is not None:
+                    directory.close()
+
     def _handoff(self, attempt, candidate, heartbeat):
         with heartbeat.foreground_write_guard():
             with transaction.atomic(using=self.using):
@@ -869,6 +909,7 @@ class ArchiveService(object):
                     self._cleanup_retiring(
                         attempt, attempt_file, rotated, heartbeat,
                     )
+                    self._cleanup_excluded_blobs(rotated, heartbeat)
                     current_lease = rotated
                     continue
                 candidate = self._prepare_ready_candidate(
@@ -883,6 +924,7 @@ class ArchiveService(object):
                     self._cleanup_retiring(
                         attempt, candidate, rotated, heartbeat,
                     )
+                    self._cleanup_excluded_blobs(rotated, heartbeat)
                     current_lease = rotated
                     continue
                 self._handoff(attempt, candidate, heartbeat)
@@ -903,6 +945,10 @@ class ArchiveService(object):
                 current, attempt, candidate, lease,
                 heartbeat, stop_requested,
             )
+        elif candidate.state == "publishing":
+            candidate = self._recover_publishing(
+                current, attempt, candidate, lease, heartbeat,
+            )
         rotated = self._final_fence(
             attempt, candidate, attempt.exported_at, lease,
             heartbeat, stop_requested,
@@ -911,6 +957,94 @@ class ArchiveService(object):
             ExportJob.objects.using(self.using).get(pk=lease.job_id),
             rotated or lease,
         )
+
+    def _recover_publishing(self, job, attempt, candidate, lease, heartbeat):
+        source_receipt = OpenFileReceipt(
+            candidate.receipt_dev, candidate.receipt_ino,
+            candidate.receipt_uid, candidate.receipt_gid,
+            candidate.receipt_mode, candidate.receipt_nlink,
+        )
+        root = open_export_root(
+            settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
+        )
+        staging = source = ready = None
+        descriptor = None
+        try:
+            staging = open_staging_directory(root)
+            source = open_receipted_directory(
+                staging, attempt.relative_path,
+                self._attempt_directory_receipt(attempt),
+            )
+            ready = self._open_ready_directory(root)
+            source_stat = ready_stat = None
+            try:
+                source_stat = os.stat(
+                    ARCHIVE_PART_NAME, dir_fd=source.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            try:
+                ready_stat = os.stat(
+                    "{}.zip".format(job.pk), dir_fd=ready.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            source_matches = (
+                source_stat is not None
+                and source_receipt.matches_stat(source_stat)
+            )
+            ready_matches = (
+                ready_stat is not None
+                and source_receipt.matches_stat(ready_stat)
+            )
+            if source_matches == ready_matches:
+                raise ExportError("export_storage_unsafe", lease)
+            if source_matches:
+                rename_noreplace(
+                    source, ARCHIVE_PART_NAME, ready,
+                    "{}.zip".format(job.pk),
+                )
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            descriptor = os.open(
+                "{}.zip".format(job.pk), flags, dir_fd=ready.descriptor,
+            )
+            opened = OpenFileReceipt.from_fd(
+                descriptor, ready.uid, ready.gid,
+            )
+            if (
+                opened.dev != source_receipt.dev
+                or opened.ino != source_receipt.ino
+            ):
+                raise ExportError("export_storage_unsafe", lease)
+            moved = ClosedFileReceipt.from_open_fd(
+                descriptor, opened, candidate.receipt_sha256,
+            )
+            if moved.size != candidate.receipt_size:
+                raise ExportError("export_storage_unsafe", lease)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            for directory in (ready, source, staging, root):
+                if directory is not None:
+                    directory.close()
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                lock_current_lease(lease, using=self.using)
+                current = ExportAttemptFile.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=candidate.pk)
+                if current.state != "publishing":
+                    raise LeaseLost()
+                current.state = "ready_candidate"
+                current.relative_path = current.intent_relative_path
+                current.intent_relative_path = None
+                self._set_receipt(current, moved)
+                current.save()
+                return current
 
     def recover_retiring(self, lease, heartbeat, stop_requested):
         self._stop(stop_requested, lease)

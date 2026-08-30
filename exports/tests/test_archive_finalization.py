@@ -11,7 +11,7 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 import mock
 
-from exports.contracts import ExportError, LeaseToken
+from exports.contracts import ExportError, LeaseToken, StopRequested
 from exports.models import ExportJob, ExportTarget, ExportWorkerLease
 from exports.services.archive import ArchiveService
 from exports.services.snapshot import SnapshotService
@@ -174,6 +174,11 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
         revoked.save(update_fields=("description",))
         job, lease, heartbeat = self._snapshot((safe, revoked))
         revoked_item = job.items.get(pin_id=revoked.pk)
+        revoked_blob = revoked_item.blob
+        revoked_blob_path = Path(
+            self._export_directory.name, ".staging",
+            revoked_blob.snapshot_relative_path,
+        )
         fired = []
 
         def revoke(point, context):
@@ -192,6 +197,12 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(completed.excluded_permission_revoked_total, 1)
         self.assertEqual(completed.attempt_generation, 1)
         self.assertEqual(completed.archive_done, completed.archive_total)
+        revoked_blob.refresh_from_db()
+        self.assertEqual(revoked_blob.cleanup_state, "cleaned")
+        self.assertEqual(revoked_blob.file_state, "closed")
+        self.assertIsNotNone(revoked_blob.snapshot_relative_path)
+        self.assertIsNotNone(revoked_blob.receipt_ino)
+        self.assertFalse(revoked_blob_path.exists())
         with zipfile.ZipFile(self._archive_path(completed)) as archive:
             self.assertNotIn(revoked_item.archive_image_path, archive.namelist())
             payload = b"".join(archive.read(name) for name in archive.namelist())
@@ -212,3 +223,32 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
 
         self.assertEqual(raised.exception.code, "all_items_revoked")
         self.assertEqual(job.attempts.count(), 0)
+
+    def test_recover_verifying_resumes_publishing_on_either_side_of_rename(self):
+        for fault_point in ("after_publishing_intent", "after_candidate_rename"):
+            with self.subTest(fault_point=fault_point):
+                pin = create_export_pin(
+                    self.owner, filename="recover-{}.png".format(fault_point),
+                )
+                job, lease, heartbeat = self._snapshot((pin,))
+
+                def stop(point, context):
+                    del context
+                    if point == fault_point:
+                        raise StopRequested(lease)
+
+                with self.assertRaises(StopRequested):
+                    ArchiveService(fault_injector=stop).build_and_publish(
+                        job, lease, heartbeat, lambda: False,
+                    )
+                attempt = job.attempts.get()
+                provenance = attempt.lease_uuid
+
+                outcome = ArchiveService().recover_verifying(
+                    lease, heartbeat, lambda: False,
+                )
+
+                attempt.refresh_from_db()
+                self.assertEqual(outcome.job.state, "complete")
+                self.assertEqual(attempt.lease_uuid, provenance)
+                self.assertTrue(self._archive_path(outcome.job).is_file())
