@@ -168,6 +168,38 @@ class ExportModelConstraintTests(TestCase):
         with self.assertRaises(ValidationError):
             file.full_clean()
 
+    def test_closed_archive_with_open_receipt_is_rejected_independently(self):
+        job = ExportJob.objects.create(owner=self.user, scope="pins")
+        file = ExportAttemptFile(
+            attempt=ExportAttempt.objects.create(
+                job=job, attempt_generation=2, lease_uuid=uuid.uuid4(),
+                state="writing", relative_path="attempts/2",
+            ),
+            kind="archive", state="closed", receipt_level="open",
+            relative_path="attempts/2/archive.zip", receipt_dev=1, receipt_ino=2,
+            receipt_uid=3, receipt_gid=4, receipt_mode=0o600, receipt_nlink=1,
+        )
+
+        with self.assertRaises(ValidationError):
+            file.full_clean()
+
+    def test_closed_quarantine_with_intent_is_rejected_independently(self):
+        job = ExportJob.objects.create(owner=self.user, scope="pins")
+        file = ExportAttemptFile(
+            attempt=ExportAttempt.objects.create(
+                job=job, attempt_generation=3, lease_uuid=uuid.uuid4(),
+                state="writing", relative_path="attempts/3",
+            ),
+            kind="quarantine", state="closed", receipt_level="full",
+            relative_path="attempts/3/quarantine.zip", intent_relative_path="ready/dest.zip",
+            receipt_dev=1, receipt_ino=2, receipt_uid=3, receipt_gid=4,
+            receipt_mode=0o600, receipt_nlink=1, receipt_size=10,
+            receipt_mtime_ns=5, receipt_ctime_ns=6,
+        )
+
+        with self.assertRaises(ValidationError):
+            file.full_clean()
+
     def test_sha_validator_rejects_non_strict_values_and_allows_null(self):
         job = ExportJob.objects.create(owner=self.user, scope="pins")
         for value in ("a" * 64 + "\n", "a" * 63, "a" * 65, "A" * 64, "g" * 64, "a" * 62 + "\r\n"):

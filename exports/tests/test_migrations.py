@@ -236,3 +236,17 @@ class ExportInitialMigrationTests(TransactionTestCase):
                 with self.assertRaises(IntegrityError):
                     with transaction.atomic():
                         file_model.objects.create(relative_path="attempts/0/{}".format(index), receipt_sha256=value, **full)
+
+    def test_database_rejects_closed_receipt_and_quarantine_intent_independently(self):
+        user = self.apps.get_model("auth", "User").objects.create(username="independent-owner")
+        job_model = self.apps.get_model("exports", "ExportJob")
+        attempt_model = self.apps.get_model("exports", "ExportAttempt")
+        file_model = self.apps.get_model("exports", "ExportAttemptFile")
+        job = job_model.objects.create(owner=user, scope="pins")
+        attempt = attempt_model.objects.create(job=job, attempt_generation=0, lease_uuid=uuid.uuid4(), state="writing", relative_path="attempts/0")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                file_model.objects.create(attempt=attempt, kind="archive", state="closed", receipt_level="open", relative_path="attempts/0/archive.zip", receipt_dev=1, receipt_ino=2, receipt_uid=3, receipt_gid=4, receipt_mode=384, receipt_nlink=1)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                file_model.objects.create(attempt=attempt, kind="quarantine", state="closed", receipt_level="full", relative_path="attempts/0/quarantine.zip", intent_relative_path="ready/dest.zip", receipt_dev=1, receipt_ino=2, receipt_uid=3, receipt_gid=4, receipt_mode=384, receipt_nlink=1, receipt_size=10, receipt_mtime_ns=5, receipt_ctime_ns=6)
