@@ -1378,6 +1378,32 @@ class RuntimeConfigTests(unittest.TestCase):
         ):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
+    def test_bootstrap_accepts_synology_executable_template_on_empty_data(self):
+        script, root, data, secret, environment = self._bootstrap_fixture()
+        template = root / "pinry/settings/local_settings.example.py"
+        template.chmod(0o755)
+
+        completed = subprocess.run(
+            ["/bin/bash", str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        rendered = completed.stdout + completed.stderr
+        self.assertEqual(completed.returncode, 0, rendered.decode("utf-8"))
+        self.assertNotIn(secret.encode("ascii"), rendered)
+        self.assertNotIn(
+            b"secret_key_place_holder",
+            (data / "local_settings.py").read_bytes(),
+        )
+        for path in (
+            data / "production_secret_key.txt",
+            data / "local_settings.py",
+            root / "pinry/settings/local_settings.py",
+        ):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
     def test_bootstrap_preserves_existing_malformed_local_settings_bytes(self):
         existing = (
             b"SECRET_KEY='sentinel-existing-secret'\n"

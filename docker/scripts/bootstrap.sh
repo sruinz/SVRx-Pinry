@@ -59,6 +59,7 @@ stat_value() {
 
 validate_regular_file() {
     local path="$1"
+    local allow_executable="${2:-0}"
     local link_count
     local mode
     local mode_value
@@ -73,7 +74,9 @@ validate_regular_file() {
     esac
     mode_value=$((8#${mode}))
     [ $((mode_value & 0022)) -eq 0 ] || return 1
-    [ $((mode_value & 0111)) -eq 0 ] || return 1
+    if [ "${allow_executable}" != "1" ]; then
+        [ $((mode_value & 0111)) -eq 0 ] || return 1
+    fi
     [ $((mode_value & 0400)) -ne 0 ] || return 1
     [ "$(LC_ALL=C wc -c < "${path}")" -gt 0 ] || return 1
     [ "$(LC_ALL=C wc -c < "${path}")" -le 1048576 ] || return 1
@@ -151,7 +154,7 @@ if [ -e "${data_settings}" ] || [ -L "${data_settings}" ]; then
 else
     /bin/bash "${gen_key_script}" >/dev/null 2>/dev/null
     secret_key="$(read_key "${key_file}")"
-    validate_regular_file "${settings_template}" || abort_current_stage
+    validate_regular_file "${settings_template}" 1 || abort_current_stage
     placeholder_count="$(
         grep -o 'secret_key_place_holder' "${settings_template}" | wc -l
     )"
