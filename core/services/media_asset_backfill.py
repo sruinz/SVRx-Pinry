@@ -12,14 +12,17 @@ from django.conf import settings
 from django.core.management.base import CommandError
 from django.db import (
     IntegrityError,
-    OperationalError,
-    connection,
     transaction,
 )
 from django.db.models import Q
 from PIL import Image as PILImage
 
 from core.models import MediaAsset, Pin
+from core.services.database_fence import (
+    DatabaseFenceBusy,
+    DatabaseFenceError,
+    database_write_fence,
+)
 from core.services.media_storage import MediaStorage, MediaStorageError
 from core.services.safe_url_fetch import FetchedImage
 from django_images.file_ops import (
@@ -76,8 +79,6 @@ _RESULT_EVENTS = {
     "already_registered",
     "recovered_registered",
 }
-_SQLITE_BUSY_WORD = re.compile(r"\b(?:busy|locked)\b")
-_POSTGRESQL_BUSY_SQLSTATES = frozenset(("40001", "40P01", "55P03"))
 
 
 def _command_error(code, cause=None, retryable=None):
@@ -88,6 +89,20 @@ def _command_error(code, cause=None, retryable=None):
         error.retryable = retryable
     error.__suppress_context__ = True
     return error
+
+
+@contextmanager
+def _backfill_database_write_fence():
+    try:
+        with database_write_fence(
+            using="default",
+            models=(MediaAsset, Pin, Image, Thumbnail),
+        ):
+            yield
+    except DatabaseFenceBusy:
+        raise _command_error("database_busy", retryable=True) from None
+    except DatabaseFenceError:
+        raise _command_error("registry_plan_identity_changed") from None
 
 
 def _identity(file_stat):
@@ -113,169 +128,6 @@ def _tupleize(value):
     if isinstance(value, list):
         return tuple(_tupleize(entry) for entry in value)
     return value
-
-
-def _database_error_is_busy(error, vendor):
-    if (
-        vendor == "sqlite"
-        and isinstance(error, OperationalError)
-        and _SQLITE_BUSY_WORD.search(str(error).lower())
-    ):
-        return True
-    if vendor != "postgresql":
-        return False
-    candidates = (
-        error,
-        getattr(error, "__cause__", None),
-        getattr(error, "__context__", None),
-    )
-    for candidate in candidates:
-        sqlstate = (
-            getattr(candidate, "pgcode", None)
-            or getattr(candidate, "sqlstate", None)
-        )
-        if sqlstate in _POSTGRESQL_BUSY_SQLSTATES:
-            return True
-    return False
-
-
-def _restore_sqlite_busy_timeout(database_connection, busy_timeout):
-    with database_connection.cursor() as cursor:
-        cursor.execute(
-            "PRAGMA busy_timeout = {}".format(busy_timeout)
-        )
-
-
-def _close_database_connection_safely(database_connection):
-    try:
-        database_connection.close()
-    except BaseException:
-        pass
-
-
-@contextmanager
-def _database_write_fence_window(database_connection):
-    if database_connection.vendor != "sqlite":
-        try:
-            yield
-        except CommandError:
-            raise
-        except Exception as error:
-            if _database_error_is_busy(
-                error,
-                database_connection.vendor,
-            ):
-                raise _command_error(
-                    "database_busy",
-                    error,
-                    retryable=True,
-                )
-            raise
-        return
-
-    try:
-        with database_connection.cursor() as cursor:
-            cursor.execute("PRAGMA busy_timeout")
-            row = cursor.fetchone()
-        if (
-            not isinstance(row, (tuple, list))
-            or len(row) != 1
-            or type(row[0]) is not int
-            or row[0] < 0
-        ):
-            raise ValueError("invalid_sqlite_busy_timeout")
-        busy_timeout = row[0]
-        with database_connection.cursor() as cursor:
-            cursor.execute("PRAGMA busy_timeout = 0")
-    except BaseException as error:
-        _close_database_connection_safely(database_connection)
-        if isinstance(error, Exception):
-            raise _command_error(
-                "registry_plan_identity_changed",
-                error,
-            )
-        raise
-
-    try:
-        yield
-    except BaseException as error:
-        try:
-            _restore_sqlite_busy_timeout(
-                database_connection,
-                busy_timeout,
-            )
-        except BaseException:
-            _close_database_connection_safely(database_connection)
-        if (
-            not isinstance(error, CommandError)
-            and isinstance(error, Exception)
-            and _database_error_is_busy(error, "sqlite")
-        ):
-            raise _command_error(
-                "database_busy",
-                error,
-                retryable=True,
-            )
-        raise
-    else:
-        try:
-            _restore_sqlite_busy_timeout(
-                database_connection,
-                busy_timeout,
-            )
-        except BaseException as error:
-            _close_database_connection_safely(database_connection)
-            if isinstance(error, Exception):
-                raise _command_error(
-                    "registry_plan_identity_changed",
-                    error,
-                )
-            raise
-
-
-def _acquire_database_write_fence(database_connection):
-    table_models = (MediaAsset, Pin, Image, Thumbnail)
-    try:
-        with database_connection.cursor() as cursor:
-            if database_connection.vendor == "sqlite":
-                table_name = database_connection.ops.quote_name(
-                    MediaAsset._meta.db_table
-                )
-                primary_key = database_connection.ops.quote_name(
-                    MediaAsset._meta.pk.column
-                )
-                cursor.execute(
-                    "UPDATE {table} SET {pk} = {pk} WHERE 0 = 1".format(
-                        table=table_name,
-                        pk=primary_key,
-                    )
-                )
-                return
-            if database_connection.vendor == "postgresql":
-                for model in table_models:
-                    table_name = database_connection.ops.quote_name(
-                        model._meta.db_table
-                    )
-                    cursor.execute(
-                        "LOCK TABLE {} IN EXCLUSIVE MODE NOWAIT".format(
-                            table_name
-                        )
-                    )
-                return
-    except CommandError:
-        raise
-    except Exception as error:
-        if _database_error_is_busy(error, database_connection.vendor):
-            raise _command_error(
-                "database_busy",
-                error,
-                retryable=True,
-            )
-        raise _command_error(
-            "registry_plan_identity_changed",
-            error,
-        )
-    raise _command_error("unsupported_media_asset_backfill_database")
 
 
 @dataclass(frozen=True)
@@ -2831,78 +2683,71 @@ class MediaAssetBackfiller(object):
 
             with media_global_writer_gate(root_directory):
                 registry_events = {}
-                with _database_write_fence_window(connection):
-                    with transaction.atomic():
-                        _acquire_database_write_fence(connection)
-                        self._verify_current_plans(
-                            manifest,
-                            plans,
-                            decisions,
-                            root_directory,
-                        )
-                        for plan in plans:
-                            if decisions[plan.image_id] != "register":
-                                continue
-                            registry_events[plan.image_id] = (
-                                "recovered_registered"
-                                if self._execute_candidate(
-                                    plan,
-                                    root_directory,
-                                )
-                                else "registered"
+                with _backfill_database_write_fence():
+                    self._verify_current_plans(
+                        manifest,
+                        plans,
+                        decisions,
+                        root_directory,
+                    )
+                    for plan in plans:
+                        if decisions[plan.image_id] != "register":
+                            continue
+                        registry_events[plan.image_id] = (
+                            "recovered_registered"
+                            if self._execute_candidate(
+                                plan,
+                                root_directory,
                             )
-                            root_directory.verify_current()
-                        self._verify_current_plans(
-                            manifest,
-                            plans,
-                            decisions,
-                            root_directory,
+                            else "registered"
                         )
+                        root_directory.verify_current()
+                    self._verify_current_plans(
+                        manifest,
+                        plans,
+                        decisions,
+                        root_directory,
+                    )
 
                 self._fault("after_registry_commit")
 
-                with _database_write_fence_window(connection):
-                    with transaction.atomic():
-                        _acquire_database_write_fence(connection)
-                        self._verify_current_plans(
-                            manifest,
-                            plans,
-                            decisions,
-                            root_directory,
-                        )
-                        for plan in plans:
-                            if (
-                                plan.image_id
-                                in manifest.state.latest_by_image
-                            ):
-                                continue
-                            decision = decisions[plan.image_id]
-                            if decision == "already_registered":
-                                manifest.record_result(
-                                    "already_registered",
-                                    plan.image_id,
-                                )
-                            elif decision != "register":
-                                manifest.record_result(
-                                    "skipped",
-                                    plan.image_id,
-                                    reason_code=decision,
-                                )
-                            else:
-                                self._record_registry_event(
-                                    manifest,
-                                    plan,
-                                    plans,
-                                    root_directory,
-                                    registry_events[plan.image_id],
-                                )
-                            root_directory.verify_current()
-                        self._verify_current_plans(
-                            manifest,
-                            plans,
-                            decisions,
-                            root_directory,
-                        )
+                with _backfill_database_write_fence():
+                    self._verify_current_plans(
+                        manifest,
+                        plans,
+                        decisions,
+                        root_directory,
+                    )
+                    for plan in plans:
+                        if plan.image_id in manifest.state.latest_by_image:
+                            continue
+                        decision = decisions[plan.image_id]
+                        if decision == "already_registered":
+                            manifest.record_result(
+                                "already_registered",
+                                plan.image_id,
+                            )
+                        elif decision != "register":
+                            manifest.record_result(
+                                "skipped",
+                                plan.image_id,
+                                reason_code=decision,
+                            )
+                        else:
+                            self._record_registry_event(
+                                manifest,
+                                plan,
+                                plans,
+                                root_directory,
+                                registry_events[plan.image_id],
+                            )
+                        root_directory.verify_current()
+                    self._verify_current_plans(
+                        manifest,
+                        plans,
+                        decisions,
+                        root_directory,
+                    )
         except CommandError:
             raise
         except (MediaPathError, OSError) as error:
