@@ -203,6 +203,54 @@ class LegacyEvidenceTests(SimpleTestCase):
             copied.close()
             source.close()
 
+    def test_media_migration_policy_is_fail_closed(self):
+        values = {
+            "database_exists": True,
+            "database_bytes": 100,
+            "distinct_legacy_bytes": 0,
+            "has_md5_paths": False,
+            "has_fixed_slot_paths": False,
+            "has_named_canonical_paths": True,
+            "has_media_image_directory": False,
+            "has_media_rows": True,
+            "database_identity": {"device": 1, "inode": 2},
+            "media_root_identity": {"device": 3, "inode": 4},
+        }
+        cases = (
+            (
+                (("users", "0002_admin_bootstrap"),),
+                False,
+                False,
+            ),
+            (
+                (
+                    ("users", "0002_admin_bootstrap"),
+                    ("core", "0017_unknown"),
+                ),
+                False,
+                True,
+            ),
+            (
+                (("users", "0002_admin_bootstrap"),),
+                True,
+                True,
+            ),
+        )
+
+        for pending, has_legacy, expected in cases:
+            with self.subTest(pending=pending, has_legacy=has_legacy):
+                evidence = startup_preflight.LegacyEvidence(
+                    **dict(
+                        values,
+                        pending_migrations=pending,
+                        has_md5_paths=has_legacy,
+                    )
+                )
+                self.assertEqual(
+                    evidence.requires_media_migration,
+                    expected,
+                )
+
     def test_missing_database_never_connects_or_marks_schema_pending(self):
         graph = _DiskGraph(("django_images", "0001_initial"))
 

@@ -247,7 +247,7 @@ class LegacyStartupCoordinator(object):
                 or not evidence.has_named_canonical_paths
             )
         )
-        needs_run = evidence.has_legacy_evidence or evidence.pending_schema
+        needs_run = evidence.requires_media_migration
         if not needs_run and not read_only.requires_migration_flag:
             return None
 
@@ -402,6 +402,8 @@ class LegacyStartupCoordinator(object):
 
     def schema_required(self, run):
         if run is None:
+            return True
+        if self._evidence is not None and self._evidence.pending_schema:
             return True
         return migration_state.read_run_status(run).phase in (
             "initialized",

@@ -520,6 +520,39 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             0o700,
         )
 
+    def test_admin_bootstrap_schema_without_history_uses_standard_migrate(self):
+        evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                    pending=(("users", "0002_admin_bootstrap"),),
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.available_space_bytes",
+            return_value=10 ** 9,
+        ) as available, mock.patch(
+            "django_images.services.legacy_startup.snapshot_sqlite",
+        ) as snapshot:
+            run = coordinator.prepare_before_schema()
+
+        self.assertIsNone(run)
+        self.assertTrue(coordinator.schema_required(run))
+        self.assertFalse(self.backup_root.exists())
+        available.assert_not_called()
+        snapshot.assert_not_called()
+
     def test_adjust_ownership_excludes_backup_root_and_payload(self):
         self.database_path.write_bytes(b"database")
         self.backup_root.mkdir()
@@ -1456,7 +1489,7 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
                 self.evidence(
                     present=False,
                     database_exists=True,
-                    pending=("core.0017",),
+                    pending=(("core", "0017"),),
                 ).__dict__,
                 has_named_canonical_paths=True,
                 has_media_rows=True,
@@ -1484,6 +1517,163 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
             "snapshot_complete",
         )
         self.assertEqual(summary_path.read_bytes(), original_summary)
+
+    def test_completed_history_skips_media_run_for_admin_bootstrap_schema(self):
+        completed_run, summary_path = self._completed_run_with_summary()
+        original_summary = summary_path.read_bytes()
+        coordinator = self.coordinator()
+        pending_evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                    pending=(("users", "0002_admin_bootstrap"),),
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=pending_evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.available_space_bytes",
+            return_value=10 ** 9,
+        ) as available, mock.patch(
+            "django_images.services.legacy_startup.snapshot_sqlite",
+        ) as snapshot:
+            upgrade_run = coordinator.prepare_before_schema()
+
+        self.assertIsNone(upgrade_run)
+        self.assertTrue(coordinator.schema_required(upgrade_run))
+        self.assertEqual(
+            migration_state.scan_run_inventory(str(self.backup_root)).completed,
+            (completed_run,),
+        )
+        self.assertEqual(summary_path.read_bytes(), original_summary)
+        available.assert_not_called()
+        snapshot.assert_not_called()
+
+    def test_admin_bootstrap_schema_does_not_bypass_incomplete_media_run(self):
+        incomplete = self._summary_run()
+        coordinator = self.coordinator()
+        pending_evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                    pending=(("users", "0002_admin_bootstrap"),),
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=pending_evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.available_space_bytes",
+            return_value=10 ** 9,
+        ) as available, mock.patch(
+            "django_images.services.legacy_startup.snapshot_sqlite",
+            return_value=object(),
+        ) as snapshot:
+            resumed = coordinator.prepare_before_schema()
+
+        self.assertEqual(resumed.run_id, incomplete.run_id)
+        self.assertEqual(
+            migration_state.read_run_status(resumed).phase,
+            "snapshot_complete",
+        )
+        available.assert_called_once()
+        snapshot.assert_called_once()
+
+    def test_admin_bootstrap_schema_runs_when_resuming_after_schema_phase(self):
+        incomplete = self._summary_run()
+        migration_state.transition_state(
+            incomplete,
+            "initialized",
+            "schema_complete",
+        )
+        coordinator = self.coordinator()
+        pending_evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                    pending=(("users", "0002_admin_bootstrap"),),
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=pending_evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.available_space_bytes",
+        ) as available, mock.patch(
+            "django_images.services.legacy_startup.snapshot_sqlite",
+        ) as snapshot:
+            resumed = coordinator.prepare_before_schema()
+
+        self.assertEqual(resumed.run_id, incomplete.run_id)
+        self.assertTrue(coordinator.schema_required(resumed))
+        available.assert_not_called()
+        snapshot.assert_not_called()
+
+    def test_admin_bootstrap_schema_runs_when_resuming_media_copy(self):
+        incomplete = self._summary_run()
+        migration_state.transition_state(
+            incomplete,
+            "initialized",
+            "schema_complete",
+        )
+        migration_state.transition_state(
+            incomplete,
+            "schema_complete",
+            "copying",
+            plan_sha256="1" * 64,
+            manifest_sha256="2" * 64,
+        )
+        coordinator = self.coordinator()
+        pending_evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                    pending=(("users", "0002_admin_bootstrap"),),
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=pending_evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.available_space_bytes",
+        ) as available, mock.patch(
+            "django_images.services.legacy_startup.snapshot_sqlite",
+        ) as snapshot:
+            resumed = coordinator.prepare_before_schema()
+
+        self.assertEqual(resumed.run_id, incomplete.run_id)
+        self.assertTrue(coordinator.schema_required(resumed))
+        available.assert_not_called()
+        snapshot.assert_not_called()
 
     def test_completed_separate_start_rejects_tampered_summary(self):
         run, summary_path = self._completed_run_with_summary()

@@ -346,7 +346,8 @@ root archive가 없고 파일 identity를 검증할 수 있는 fixed-slot-only �
 안전하게 재개한다. 현재 산출물은 필요한 정보를 archive 전에 기록하므로 새
 이관에서는 같은 불완전 상태를 만들지 않는다.
 
-기존 데이터 또는 pending schema가 발견되면 다음 순서로 진행한다.
+기존 미디어 증거 또는 안전한 빠른 경로로 분류되지 않은
+pending schema가 발견되면 다음 순서로 진행한다.
 
 1. 컨테이너 수명 전체의 startup lock과 저장소 설정을 검증한다.
 2. 기존 DB·미디어 증거를 읽고 run을 만들거나 중단된 같은 run을 재개한다.
@@ -358,6 +359,12 @@ root archive가 없고 파일 identity를 검증할 수 있는 fixed-slot-only �
    이동한다.
 8. service 계정의 실제 읽기·쓰기 검사를 통과한 뒤 nginx와 Gunicorn을
    시작한다.
+
+미디어와 무관하다고 명시적으로 검증된 schema migration은 이 절차의
+전체 미디어 검증을 시작하지 않고 표준 Django migration으로
+처리한다. 현재 빠른 경로는 `users.0002_admin_bootstrap`에만
+허용된다. 완료되지 않은 기존 run이 있거나 다른 migration이 함께
+남아 있으면 기존 안전 절차를 그대로 재개한다.
 
 어느 단계든 실패하면 app 서버는 시작되지 않는다. 로그에는 비밀값이나
 원본 파일명 대신 `legacy_migration_space_insufficient`,

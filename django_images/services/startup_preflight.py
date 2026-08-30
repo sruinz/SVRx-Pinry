@@ -63,6 +63,11 @@ _LEGACY_EVIDENCE_STAGE_CODES = {
     "media_rows": "legacy_media_rows_invalid",
     "migration_graph": "legacy_migration_graph_invalid",
 }
+# 전체 미디어 검증 없이 표준 Django migrate로 처리해도 되는
+# 정확한 스키마 변경만 등록한다. 알 수 없는 변경은 안전 경로를 유지한다.
+_SCHEMA_ONLY_MIGRATIONS = frozenset((
+    ("users", "0002_admin_bootstrap"),
+))
 
 
 class StartupPreflightError(Exception):
@@ -108,6 +113,13 @@ class LegacyEvidence(object):
             or self.has_media_image_directory
             or self.has_pinry_direct_md5_directory
             or bool(self.missing_unreferenced_images)
+        )
+
+    @property
+    def requires_media_migration(self):
+        return self.has_legacy_evidence or any(
+            migration not in _SCHEMA_ONLY_MIGRATIONS
+            for migration in self.pending_migrations
         )
 
 
