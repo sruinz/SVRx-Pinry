@@ -11,13 +11,14 @@ import mock
 
 from exports.models import ExportJob
 from exports.services.file_ops import ClosedFileReceipt, ExportStorageError
+from exports.services.jobs import ExportRequestError, JobService
 from exports.services.worker import (
     LeaseHeartbeat,
     acquire_worker_lease,
     cleanup_expired_and_stale,
 )
 
-from .helpers import ExportStorageMixin, create_export_user
+from .helpers import ExportStorageMixin, create_export_pin, create_export_user
 
 
 class RetentionTests(ExportStorageMixin, TransactionTestCase):
@@ -25,6 +26,7 @@ class RetentionTests(ExportStorageMixin, TransactionTestCase):
         super(RetentionTests, self).setUp()
         self.now = timezone.now()
         self.owner = create_export_user("retention-owner")
+        self.pin = create_export_pin(self.owner, private=True)
         self.ready = Path(settings.PINRY_EXPORT_ROOT, "ready")
         self.ready.mkdir(mode=0o700)
         os.chmod(str(self.ready), 0o700)
@@ -194,6 +196,38 @@ class RetentionTests(ExportStorageMixin, TransactionTestCase):
         self.assertFalse(path.exists())
         self.assertEqual(active.state, "queued")
         self.assertTrue(outcome.did_work)
+
+    def test_create_allows_three_row_window_then_blocked_row_fails_closed(self):
+        expired, unused_path = self._complete(self.owner, self.now)
+        del unused_path
+        expired.state = "expired"
+        expired.ready_cleanup_state = "pending"
+        expired.save(update_fields=("state", "ready_cleanup_state"))
+        success, unused_success_path = self._complete(
+            self.owner,
+            self.now + timedelta(hours=1),
+        )
+        del success, unused_success_path
+        acquire_worker_lease(self.now)
+        service = JobService(available_space_observer=lambda: 10 ** 12)
+
+        created = service.create(
+            self.owner,
+            {"scope": "pins", "pin_ids": [self.pin.pk]},
+            self.now,
+        )
+
+        self.assertEqual(created.state, "queued")
+        self.assertEqual(ExportJob.objects.filter(owner=self.owner).count(), 3)
+        expired.ready_cleanup_state = "blocked"
+        expired.save(update_fields=("ready_cleanup_state",))
+        with self.assertRaises(ExportRequestError) as raised:
+            service.create(
+                self.owner,
+                {"scope": "pins", "pin_ids": [self.pin.pk]},
+                self.now,
+            )
+        self.assertEqual(raised.exception.code, "export_storage_unsafe")
 
     def test_owner_bound_cleaned_failure_is_preserved_but_orphan_is_deleted(self):
         kept = ExportJob.objects.create(

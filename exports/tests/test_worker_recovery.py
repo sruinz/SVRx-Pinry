@@ -15,6 +15,8 @@ from exports.contracts import ERROR_CONTRACTS, LeaseToken, StopRequested
 from exports.models import (
     ExportAttempt,
     ExportAttemptFile,
+    ExportBlob,
+    ExportItem,
     ExportJob,
     ExportSlot,
     ExportWorkerLease,
@@ -33,6 +35,10 @@ from exports.services.worker import (
     cleanup_expired_and_stale,
     handoff_after_normal_stop,
     requeue_expired_nonverifying_jobs,
+)
+from exports.services.snapshot import (
+    snapshot_blob_name,
+    snapshot_directory_name,
 )
 
 from .helpers import ExportStorageMixin, create_export_user
@@ -238,6 +244,99 @@ class WorkerRecoveryTests(TransactionTestCase):
         self.assertFalse(outcome.terminalized)
         self.assertEqual(job.state, "queued")
         self.assertEqual(job.attempt_generation, 5)
+        self.assertEqual(job.resume_count, 1)
+        self.assertEqual((job.archive_done, job.bytes_done), (0, 0))
+        self.assertEqual(
+            (
+                job.verifying_attempt_generation,
+                job.verifying_size,
+                job.verifying_sha256,
+                job.verifying_completed_at,
+            ),
+            (None, None, None, None),
+        )
+
+        repeated = requeue_expired_nonverifying_jobs(worker, self.now)
+        job.refresh_from_db()
+        self.assertEqual(repeated.requeued_count, 0)
+        self.assertEqual(job.attempt_generation, 5)
+
+    def test_fifty_thousand_item_totals_use_bounded_autocommit_reads(self):
+        old_worker_uuid = uuid.uuid4()
+        old_job_uuid = uuid.uuid4()
+        ExportWorkerLease.objects.create(
+            pk=1, generation=5, lease_uuid=old_worker_uuid,
+        )
+        job = self._active_job(
+            worker_generation=5,
+            lease_uuid=old_job_uuid,
+            attempt_generation=4,
+            requested_total=50000,
+            target_total=50000,
+            included_total=50000,
+        )
+        ExportAttempt.objects.create(
+            job=job,
+            attempt_generation=4,
+            lease_uuid=old_job_uuid,
+            state="cleaned",
+            relative_path="attempt-{}-4".format(job.pk),
+            dir_dev=1,
+            dir_ino=2,
+            dir_uid=3,
+            dir_gid=4,
+            dir_mode=0o700,
+        )
+        generation = uuid.uuid4()
+        blob = ExportBlob.objects.create(
+            job=job,
+            snapshot_generation=generation,
+            source_media_asset_id=1,
+            source_image_id=1,
+            source_relative_path="source",
+            file_state="closed",
+            snapshot_relative_path="snapshot/blob",
+            size=7,
+            receipt_dev=1,
+            receipt_ino=2,
+            receipt_uid=3,
+            receipt_gid=4,
+            receipt_mode=0o600,
+            receipt_nlink=1,
+            receipt_mtime_ns=5,
+            receipt_ctime_ns=6,
+            receipt_sha256="a" * 64,
+        )
+        for start in range(0, 50000, 400):
+            ExportItem.objects.bulk_create([
+                ExportItem(
+                    job=job,
+                    target_position=index,
+                    snapshot_generation=generation,
+                    blob=blob,
+                    pin_id=index + 1,
+                    pin_owner_id=self.owner.pk,
+                    owner_username=self.owner.username,
+                    is_public=True,
+                    published_at=self.now,
+                    original_filename="{}.png".format(index),
+                )
+                for index in range(start, min(start + 400, 50000))
+            ], batch_size=400)
+        worker = acquire_worker_lease(self.now)
+        checkpoints = []
+
+        outcome = requeue_expired_nonverifying_jobs(
+            worker,
+            self.now,
+            checkpoint=lambda: checkpoints.append(connection.in_atomic_block),
+        )
+
+        job.refresh_from_db()
+        self.assertEqual(outcome.requeued_count, 1)
+        self.assertEqual((job.archive_total, job.bytes_total), (50000, 350000))
+        self.assertGreaterEqual(len(checkpoints), 125)
+        self.assertFalse(any(checkpoints))
         self.assertEqual(job.resume_count, 1)
         self.assertEqual((job.archive_done, job.bytes_done), (0, 0))
         self.assertEqual(
@@ -592,6 +691,49 @@ class WorkerRecoveryTests(TransactionTestCase):
         self.assertEqual(queued.state, "queued")
         worker.claim_next_job.assert_not_called()
 
+    def test_owner_deleted_queued_terminalizes_before_another_claim(self):
+        deleted_owner = create_export_user("worker-deleted-queued-owner")
+        deleted_owner_id = deleted_owner.pk
+        orphan = ExportJob.objects.create(
+            owner=deleted_owner,
+            scope="pins",
+            state="queued",
+            requested_total=1,
+            target_total=1,
+            included_total=1,
+        )
+        ExportSlot.objects.create(owner=deleted_owner, current_job=orphan)
+        queued = ExportJob.objects.create(
+            owner=self.owner,
+            scope="pins",
+            state="queued",
+            requested_total=1,
+            target_total=1,
+            included_total=1,
+        )
+        deleted_owner.delete()
+        worker = ExportWorker(clock=lambda: self.now)
+        worker.worker_token = acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+        )
+        worker.claim_next_job = mock.Mock(return_value=None)
+
+        self.assertTrue(worker.run_once(lambda: False))
+
+        orphan.refresh_from_db()
+        queued.refresh_from_db()
+        self.assertEqual(orphan.state, "failed")
+        self.assertEqual(orphan.error_code, "permission_changed")
+        self.assertEqual(orphan.staging_cleanup_state, "pending")
+        self.assertEqual(queued.state, "queued")
+        self.assertFalse(ExportSlot.objects.filter(
+            owner_id=deleted_owner_id,
+        ).exists())
+        self.assertIsNone(worker.heartbeat.current_job_token)
+        worker.claim_next_job.assert_not_called()
+
     def test_stop_during_complete_maintenance_releases_terminal_lease(self):
         old_worker_uuid = uuid.uuid4()
         old_job_uuid = uuid.uuid4()
@@ -723,6 +865,75 @@ class TerminalCleanupTests(ExportStorageMixin, TransactionTestCase):
         token = acquire_worker_lease(self.now)
         return token, LeaseHeartbeat(token, clock=lambda: self.now)
 
+    def _snapshot_fixture(self, count=2):
+        generation = uuid.uuid4()
+        job = ExportJob.objects.create(
+            owner=self.owner,
+            scope="pins",
+            state="failed",
+            error_code="archive_failed",
+            error_class="retryable",
+            error_retryable=True,
+            staging_cleanup_state="pending",
+        )
+        name = snapshot_directory_name(job.pk, generation)
+        directory = self.staging / name
+        directory.mkdir(mode=0o700)
+        os.chmod(str(directory), 0o700)
+        directory_stat = directory.stat()
+        job.snapshot_relative_path = name
+        job.snapshot_generation = generation
+        job.snapshot_dir_dev = directory_stat.st_dev
+        job.snapshot_dir_ino = directory_stat.st_ino
+        job.snapshot_dir_uid = directory_stat.st_uid
+        job.snapshot_dir_gid = directory_stat.st_gid
+        job.snapshot_dir_mode = 0o700
+        job.save()
+        blobs = []
+        paths = []
+        for index in range(count):
+            blob = ExportBlob.objects.create(
+                job=job,
+                snapshot_generation=generation,
+                source_media_asset_id=index + 1,
+                source_image_id=index + 1,
+                source_relative_path="source-{}".format(index),
+            )
+            path = directory / snapshot_blob_name(blob.pk)
+            content = "snapshot-{}".format(index).encode("ascii")
+            path.write_bytes(content)
+            os.chmod(str(path), 0o600)
+            descriptor = os.open(str(path), os.O_RDONLY)
+            try:
+                opened = OpenFileReceipt.from_fd(
+                    descriptor,
+                    os.getuid(),
+                    os.getgid(),
+                )
+                receipt = ClosedFileReceipt.from_open_fd(
+                    descriptor,
+                    opened,
+                    hashlib.sha256(content).hexdigest(),
+                )
+            finally:
+                os.close(descriptor)
+            blob.file_state = "closed"
+            blob.snapshot_relative_path = "{}/{}".format(name, path.name)
+            blob.size = receipt.size
+            blob.receipt_dev = receipt.dev
+            blob.receipt_ino = receipt.ino
+            blob.receipt_uid = receipt.uid
+            blob.receipt_gid = receipt.gid
+            blob.receipt_mode = receipt.mode
+            blob.receipt_nlink = receipt.nlink
+            blob.receipt_mtime_ns = receipt.mtime_ns
+            blob.receipt_ctime_ns = receipt.ctime_ns
+            blob.receipt_sha256 = receipt.sha256
+            blob.save()
+            blobs.append(blob)
+            paths.append(path)
+        return job, blobs, paths, directory
+
     def _cleanup(self, token, heartbeat):
         return cleanup_expired_and_stale(
             token,
@@ -730,6 +941,40 @@ class TerminalCleanupTests(ExportStorageMixin, TransactionTestCase):
             lambda: False,
             now=self.now,
         )
+
+    def _ready_directory(self):
+        ready = Path(settings.PINRY_EXPORT_ROOT, "ready")
+        ready.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(str(ready), 0o700)
+        return ready
+
+    @staticmethod
+    def _refresh_full_receipt(attempt_file, path):
+        descriptor = os.open(str(path), os.O_RDONLY)
+        try:
+            opened = OpenFileReceipt.from_fd(
+                descriptor,
+                os.getuid(),
+                os.getgid(),
+            )
+            receipt = ClosedFileReceipt.from_open_fd(
+                descriptor,
+                opened,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+        finally:
+            os.close(descriptor)
+        for field in (
+            "dev", "ino", "uid", "gid", "mode", "nlink",
+            "size", "mtime_ns", "ctime_ns", "sha256",
+        ):
+            setattr(
+                attempt_file,
+                "receipt_{}".format(field),
+                getattr(receipt, field),
+            )
+        attempt_file.receipt_level = "full"
+        attempt_file.save()
 
     def test_terminal_cleanup_unlinks_then_cas_and_finishes_in_batches(self):
         job, attempt, attempt_file, path, directory = self._fixture()
@@ -775,6 +1020,22 @@ class TerminalCleanupTests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(job.staging_cleanup_state, "cleaned")
         self.assertTrue(final.claim_allowed)
 
+    def test_terminal_snapshot_cleanup_persists_one_blob_per_step(self):
+        job, blobs, paths, directory = self._snapshot_fixture()
+        token, heartbeat = self._worker()
+
+        outcome = self._cleanup(token, heartbeat)
+
+        job.refresh_from_db()
+        states = list(job.blobs.order_by("pk").values_list(
+            "cleanup_state", flat=True,
+        ))
+        self.assertEqual(states.count("cleaned"), 1)
+        self.assertEqual(sum(path.exists() for path in paths), 1)
+        self.assertTrue(directory.exists())
+        self.assertIsNotNone(job.snapshot_generation)
+        self.assertFalse(outcome.claim_allowed)
+
     def test_terminal_cleanup_transient_unlink_failure_stays_pending(self):
         job, attempt, attempt_file, path, unused_directory = self._fixture()
         del attempt, unused_directory
@@ -808,3 +1069,98 @@ class TerminalCleanupTests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(path.read_bytes(), b"foreign")
         self.assertEqual(job.staging_cleanup_state, "blocked")
         self.assertFalse(outcome.claim_allowed)
+
+    def test_publishing_source_match_and_foreign_intent_preserves_both(self):
+        job, attempt, attempt_file, source, unused_directory = self._fixture()
+        del unused_directory
+        ready = self._ready_directory()
+        intent = ready / "{}.zip".format(job.pk)
+        intent.write_bytes(b"foreign intent")
+        os.chmod(str(intent), 0o600)
+        attempt_file.state = "retiring"
+        attempt_file.intent_relative_path = "ready/{}.zip".format(job.pk)
+        attempt_file.save(update_fields=("state", "intent_relative_path"))
+        token, heartbeat = self._worker()
+
+        outcome = self._cleanup(token, heartbeat)
+
+        job.refresh_from_db()
+        attempt_file.refresh_from_db()
+        self.assertTrue(source.exists())
+        self.assertTrue(intent.exists())
+        self.assertEqual(job.staging_cleanup_state, "blocked")
+        self.assertEqual(attempt_file.state, "retiring")
+        self.assertEqual(
+            attempt_file.intent_relative_path,
+            "ready/{}.zip".format(job.pk),
+        )
+        self.assertFalse(outcome.claim_allowed)
+
+    def test_publishing_intent_match_and_foreign_source_preserves_both(self):
+        job, attempt, attempt_file, source, unused_directory = self._fixture()
+        del unused_directory
+        ready = self._ready_directory()
+        intent = ready / "{}.zip".format(job.pk)
+        os.replace(str(source), str(intent))
+        source.write_bytes(b"foreign source")
+        os.chmod(str(source), 0o600)
+        attempt_file.state = "retiring"
+        attempt_file.intent_relative_path = "ready/{}.zip".format(job.pk)
+        self._refresh_full_receipt(attempt_file, intent)
+        token, heartbeat = self._worker()
+
+        outcome = self._cleanup(token, heartbeat)
+
+        job.refresh_from_db()
+        attempt_file.refresh_from_db()
+        self.assertTrue(source.exists())
+        self.assertTrue(intent.exists())
+        self.assertEqual(job.staging_cleanup_state, "blocked")
+        self.assertEqual(attempt_file.state, "retiring")
+        self.assertIsNotNone(attempt_file.intent_relative_path)
+        self.assertFalse(outcome.claim_allowed)
+
+    def test_quarantine_open_receipt_is_closed_before_terminal_unlink(self):
+        job, attempt, attempt_file, source, unused_directory = self._fixture()
+        del unused_directory
+        ready = self._ready_directory()
+        ready_path = ready / "{}.zip".format(job.pk)
+        os.replace(str(source), str(ready_path))
+        descriptor = os.open(str(ready_path), os.O_RDONLY)
+        try:
+            opened = OpenFileReceipt.from_fd(
+                descriptor,
+                os.getuid(),
+                os.getgid(),
+            )
+        finally:
+            os.close(descriptor)
+        attempt_file.kind = "quarantine"
+        attempt_file.state = "writing"
+        attempt_file.receipt_level = "open"
+        attempt_file.relative_path = "ready/{}.zip".format(job.pk)
+        attempt_file.intent_relative_path = (
+            "{}/quarantine-ready-0.zip".format(attempt.relative_path)
+        )
+        attempt_file.receipt_dev = opened.dev
+        attempt_file.receipt_ino = opened.ino
+        attempt_file.receipt_uid = opened.uid
+        attempt_file.receipt_gid = opened.gid
+        attempt_file.receipt_mode = opened.mode
+        attempt_file.receipt_nlink = opened.nlink
+        attempt_file.receipt_size = None
+        attempt_file.receipt_mtime_ns = None
+        attempt_file.receipt_ctime_ns = None
+        attempt_file.receipt_sha256 = None
+        attempt_file.save()
+        token, heartbeat = self._worker()
+
+        first = self._cleanup(token, heartbeat)
+
+        attempt_file.refresh_from_db()
+        self.assertTrue(ready_path.exists())
+        self.assertEqual(attempt_file.state, "closed")
+        self.assertEqual(attempt_file.receipt_level, "full")
+        self.assertIsNotNone(attempt_file.receipt_size)
+        self.assertIsNotNone(attempt_file.receipt_ctime_ns)
+        self.assertFalse(first.claim_allowed)
