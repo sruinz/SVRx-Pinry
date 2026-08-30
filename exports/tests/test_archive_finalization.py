@@ -488,6 +488,60 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(quarantine.state, "closed")
         return job, attempt, archive, quarantine, lease, heartbeat
 
+    def _complete_cleanup_fixture(self, label, pin_count=2):
+        pins = tuple(
+            create_export_pin(
+                self.owner,
+                filename="complete-{}-{}.png".format(label, position),
+            )
+            for position in range(pin_count)
+        )
+        job, lease, heartbeat = self._snapshot(pins)
+        ready = Path(self._export_directory.name, "ready")
+        ready.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(str(ready), 0o700)
+        collision = ready / "{}.zip".format(job.pk)
+        collision.write_bytes(b"preexisting-safe-collision")
+        os.chmod(str(collision), 0o600)
+        fired = []
+
+        def stop_after_complete(point, context):
+            del context
+            if point == "after_complete_commit" and not fired:
+                fired.append(True)
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(
+                fault_injector=stop_after_complete,
+            ).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+        self.assertEqual(fired, [True])
+        job.refresh_from_db()
+        attempt = job.attempts.get(attempt_generation=0)
+        archive = attempt.files.get(kind="archive")
+        quarantine = attempt.files.get(kind="quarantine")
+        return {
+            "job": job,
+            "lease": lease,
+            "heartbeat": heartbeat,
+            "attempt": attempt,
+            "archive": archive,
+            "quarantine": quarantine,
+            "ready_path": Path(
+                self._export_directory.name, job.ready_relative_path,
+            ),
+            "snapshot_path": Path(
+                self._export_directory.name, ".staging",
+                job.snapshot_relative_path,
+            ),
+            "attempt_path": Path(
+                self._export_directory.name, ".staging",
+                attempt.relative_path,
+            ),
+        }
+
     def test_build_preserves_original_and_writes_pin_specific_xmp_manifest(self):
         first = create_export_pin(self.owner, filename="shared.PNG")
         second = first.__class__.objects.create(
@@ -670,11 +724,9 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
 
                 self.assertEqual(outcome.job.state, "complete")
                 self.assertEqual(attempt.lease_uuid, lease.job_lease_uuid)
-                self.assertEqual(quarantine.state, "closed")
-                self.assertEqual(
-                    quarantine_path.read_bytes(),
-                    b"preexisting-safe-collision",
-                )
+                quarantine.refresh_from_db()
+                self.assertEqual(quarantine.state, "cleaned")
+                self.assertFalse(quarantine_path.exists())
                 self.assertNotEqual(
                     self._archive_path(outcome.job).read_bytes(),
                     b"preexisting-safe-collision",
@@ -729,9 +781,10 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
         original_rmdir = os.rmdir
 
         def remove_after_intent(directory, name, receipt):
-            retired.refresh_from_db()
-            retired_file.refresh_from_db()
-            removal_states.append((retired.state, retired_file.state))
+            if name == archive_services.ARCHIVE_PART_NAME:
+                retired.refresh_from_db()
+                retired_file.refresh_from_db()
+                removal_states.append((retired.state, retired_file.state))
             return original_remove(directory, name, receipt)
 
         def rmdir_after_children(name, *args, **kwargs):
@@ -1418,3 +1471,450 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
             ("archive", "cleaned"),
             ("quarantine", "cleaned"),
         ]])
+
+    def test_complete_commit_fault_recovers_db_only_ready_handoff_and_staging_cleanup(self):
+        fixture = self._complete_cleanup_fixture("commit-fault")
+        job = fixture["job"]
+        attempt = fixture["attempt"]
+        archive = fixture["archive"]
+        quarantine = fixture["quarantine"]
+
+        self.assertEqual(job.state, "complete")
+        self.assertEqual(job.ready_cleanup_state, "retained")
+        self.assertEqual(job.staging_cleanup_state, "pending")
+        self.assertEqual(attempt.state, "published")
+        self.assertEqual(archive.state, "published")
+        self.assertEqual(quarantine.state, "closed")
+        self.assertTrue(fixture["ready_path"].is_file())
+
+        outcome = ArchiveService().recover_complete(
+            fixture["lease"], fixture["heartbeat"], lambda: False,
+        )
+
+        job.refresh_from_db()
+        attempt.refresh_from_db()
+        archive.refresh_from_db()
+        quarantine.refresh_from_db()
+        self.assertEqual(outcome.job.state, "complete")
+        self.assertEqual(job.staging_cleanup_state, "cleaned")
+        self.assertEqual(job.ready_cleanup_state, "retained")
+        self.assertEqual(attempt.state, "cleaned")
+        self.assertEqual(archive.state, "cleaned")
+        self.assertEqual(quarantine.state, "cleaned")
+        self.assertFalse(job.blobs.exclude(cleanup_state="cleaned").exists())
+        self.assertFalse(fixture["snapshot_path"].exists())
+        self.assertFalse(fixture["attempt_path"].exists())
+        self.assertTrue(fixture["ready_path"].is_file())
+
+    def test_complete_handoff_requires_full_job_and_attempt_file_receipt_match(self):
+        fixture = self._complete_cleanup_fixture("receipt-match", pin_count=1)
+        job = fixture["job"]
+        archive = fixture["archive"]
+        fields = (
+            ("ready_relative_path", "relative_path"),
+            ("ready_dev", "receipt_dev"),
+            ("ready_ino", "receipt_ino"),
+            ("ready_uid", "receipt_uid"),
+            ("ready_gid", "receipt_gid"),
+            ("ready_mode", "receipt_mode"),
+            ("ready_nlink", "receipt_nlink"),
+            ("ready_size", "receipt_size"),
+            ("ready_mtime_ns", "receipt_mtime_ns"),
+            ("ready_ctime_ns", "receipt_ctime_ns"),
+            ("ready_sha256", "receipt_sha256"),
+        )
+
+        for job_field, file_field in fields:
+            with self.subTest(job_field=job_field):
+                original = getattr(job, job_field)
+                if job_field == "ready_relative_path":
+                    changed = "ready/not-the-job.zip"
+                elif job_field == "ready_sha256":
+                    changed = "f" * 64
+                else:
+                    changed = original + 1
+                setattr(job, job_field, changed)
+                job.staging_cleanup_state = "pending"
+                job.save(update_fields=(
+                    job_field, "staging_cleanup_state",
+                ))
+
+                with self.assertRaises(ExportError) as raised:
+                    ArchiveService().recover_complete(
+                        fixture["lease"], fixture["heartbeat"],
+                        lambda: False,
+                    )
+
+                self.assertEqual(
+                    raised.exception.code, "export_storage_unsafe",
+                )
+                job.refresh_from_db()
+                archive.refresh_from_db()
+                self.assertEqual(job.staging_cleanup_state, "blocked")
+                self.assertEqual(archive.state, "published")
+                self.assertNotEqual(
+                    getattr(job, job_field), getattr(archive, file_field),
+                )
+                self.assertTrue(fixture["ready_path"].is_file())
+                setattr(job, job_field, original)
+                job.staging_cleanup_state = "pending"
+                job.save(update_fields=(
+                    job_field, "staging_cleanup_state",
+                ))
+
+        outcome = ArchiveService().recover_complete(
+            fixture["lease"], fixture["heartbeat"], lambda: False,
+        )
+        archive.refresh_from_db()
+        self.assertEqual(outcome.job.staging_cleanup_state, "cleaned")
+        self.assertEqual(archive.state, "cleaned")
+
+    def test_complete_cleanup_removes_quarantine_and_snapshot_but_never_ready_archive(self):
+        fixture = self._complete_cleanup_fixture("all-staging")
+        job = fixture["job"]
+        attempt = fixture["attempt"]
+        archive = fixture["archive"]
+        quarantine = fixture["quarantine"]
+        excluded = job.items.order_by("target_position").last()
+        excluded.inclusion_state = "excluded"
+        excluded.exclusion_reason = "permission_revoked"
+        excluded.save(update_fields=(
+            "inclusion_state", "exclusion_reason",
+        ))
+        job.included_total = 1
+        job.excluded_total = 1
+        job.excluded_permission_revoked_total = 1
+        job.save(update_fields=(
+            "included_total", "excluded_total",
+            "excluded_permission_revoked_total",
+        ))
+        blob_tombstones = {
+            blob.pk: (
+                blob.file_state,
+                blob.snapshot_relative_path,
+                blob.receipt_dev,
+                blob.receipt_ino,
+                blob.receipt_uid,
+                blob.receipt_gid,
+                blob.receipt_mode,
+                blob.receipt_nlink,
+                blob.size,
+                blob.receipt_mtime_ns,
+                blob.receipt_ctime_ns,
+                blob.receipt_sha256,
+            )
+            for blob in job.blobs.order_by("pk")
+        }
+        ready_bytes = fixture["ready_path"].read_bytes()
+        ready_stat = os.stat(str(fixture["ready_path"]))
+        with zipfile.ZipFile(str(fixture["ready_path"])) as ready_zip:
+            expected_names = ready_zip.namelist()
+            self.assertIsNone(ready_zip.testzip())
+        removed_names = []
+        original_remove = remove_if_receipt_matches
+
+        def observe_remove(directory, name, receipt):
+            self.assertNotEqual(name, "{}.zip".format(job.pk))
+            removed_names.append(name)
+            return original_remove(directory, name, receipt)
+
+        with mock.patch(
+            "exports.services.archive.remove_if_receipt_matches",
+            side_effect=observe_remove,
+        ):
+            outcome = ArchiveService().recover_complete(
+                fixture["lease"], fixture["heartbeat"], lambda: False,
+            )
+
+        job.refresh_from_db()
+        attempt.refresh_from_db()
+        archive.refresh_from_db()
+        quarantine.refresh_from_db()
+        self.assertEqual(outcome.job.state, "complete")
+        self.assertEqual(job.ready_cleanup_state, "retained")
+        self.assertEqual(job.staging_cleanup_state, "cleaned")
+        self.assertNotIn("{}.zip".format(job.pk), removed_names)
+        self.assertEqual(archive.state, "cleaned")
+        self.assertEqual(quarantine.state, "cleaned")
+        self.assertEqual(attempt.state, "cleaned")
+        self.assertFalse(fixture["snapshot_path"].exists())
+        self.assertFalse(fixture["attempt_path"].exists())
+        self.assertTrue(all(
+            getattr(job, field) is None
+            for field in (
+                "snapshot_generation", "snapshot_relative_path",
+                "snapshot_dir_dev", "snapshot_dir_ino",
+                "snapshot_dir_uid", "snapshot_dir_gid",
+                "snapshot_dir_mode",
+            )
+        ))
+        for blob in job.blobs.order_by("pk"):
+            self.assertEqual(blob.cleanup_state, "cleaned")
+            self.assertEqual(blob_tombstones[blob.pk], (
+                blob.file_state,
+                blob.snapshot_relative_path,
+                blob.receipt_dev,
+                blob.receipt_ino,
+                blob.receipt_uid,
+                blob.receipt_gid,
+                blob.receipt_mode,
+                blob.receipt_nlink,
+                blob.size,
+                blob.receipt_mtime_ns,
+                blob.receipt_ctime_ns,
+                blob.receipt_sha256,
+            ))
+        self.assertEqual(fixture["ready_path"].read_bytes(), ready_bytes)
+        after_stat = os.stat(str(fixture["ready_path"]))
+        self.assertEqual(
+            (
+                after_stat.st_dev, after_stat.st_ino, after_stat.st_uid,
+                after_stat.st_gid, after_stat.st_mode & 0o777,
+                after_stat.st_nlink, after_stat.st_size,
+                after_stat.st_mtime_ns, after_stat.st_ctime_ns,
+            ),
+            (
+                ready_stat.st_dev, ready_stat.st_ino, ready_stat.st_uid,
+                ready_stat.st_gid, ready_stat.st_mode & 0o777,
+                ready_stat.st_nlink, ready_stat.st_size,
+                ready_stat.st_mtime_ns, ready_stat.st_ctime_ns,
+            ),
+        )
+        descriptor = os.open(str(fixture["ready_path"]), os.O_RDONLY)
+        try:
+            size, digest = archive_services.validate_archive(
+                descriptor, expected_names, None, None,
+            )
+        finally:
+            os.close(descriptor)
+        self.assertEqual(size, job.ready_size)
+        self.assertEqual(digest, job.ready_sha256)
+        self.assertEqual(digest, hashlib.sha256(ready_bytes).hexdigest())
+
+    def test_recover_complete_is_idempotent_after_each_cleanup_fault(self):
+        points = (
+            "after_complete_handoff",
+            "after_complete_quarantine_unlink",
+            "after_complete_quarantine_cas",
+            "after_complete_blob_unlink",
+            "after_complete_blob_cas",
+            "after_complete_snapshot_rmdir",
+            "after_complete_snapshot_cas",
+            "after_complete_attempt_rmdir",
+            "after_complete_attempt_cas",
+        )
+        for position, point in enumerate(points):
+            with self.subTest(point=point):
+                fixture = self._complete_cleanup_fixture(
+                    "fault-{}".format(position), pin_count=1,
+                )
+                ready_bytes = fixture["ready_path"].read_bytes()
+                fired = []
+                unlinks = []
+                rmdirs = []
+                original_unlink = os.unlink
+                original_rmdir = os.rmdir
+
+                def interrupt(fault_point, context):
+                    del context
+                    if fault_point == point and not fired:
+                        fired.append(True)
+                        raise StopRequested(fixture["lease"])
+
+                def observe_unlink(name, *args, **kwargs):
+                    unlinks.append(name)
+                    return original_unlink(name, *args, **kwargs)
+
+                def observe_rmdir(name, *args, **kwargs):
+                    rmdirs.append(name)
+                    return original_rmdir(name, *args, **kwargs)
+
+                with mock.patch(
+                    "exports.services.archive.os.unlink",
+                    side_effect=observe_unlink,
+                ), mock.patch(
+                    "exports.services.archive.os.rmdir",
+                    side_effect=observe_rmdir,
+                ):
+                    with self.assertRaises(StopRequested):
+                        ArchiveService(
+                            fault_injector=interrupt,
+                        ).recover_complete(
+                            fixture["lease"], fixture["heartbeat"],
+                            lambda: False,
+                        )
+                    outcome = ArchiveService().recover_complete(
+                        fixture["lease"], fixture["heartbeat"],
+                        lambda: False,
+                    )
+
+                self.assertEqual(fired, [True])
+                self.assertEqual(outcome.job.state, "complete")
+                self.assertEqual(
+                    outcome.job.staging_cleanup_state, "cleaned",
+                )
+                self.assertTrue(all(
+                    unlinks.count(name) == 1 for name in set(unlinks)
+                ))
+                self.assertTrue(all(
+                    rmdirs.count(name) == 1 for name in set(rmdirs)
+                ))
+                self.assertNotIn(
+                    "{}.zip".format(fixture["job"].pk), unlinks,
+                )
+                self.assertEqual(
+                    fixture["ready_path"].read_bytes(), ready_bytes,
+                )
+                with mock.patch(
+                    "exports.services.archive.open_export_root",
+                    side_effect=AssertionError(
+                        "completed cleanup must not touch filesystem",
+                    ),
+                ):
+                    repeated = ArchiveService().recover_complete(
+                        fixture["lease"], fixture["heartbeat"],
+                        lambda: False,
+                    )
+                self.assertEqual(
+                    repeated.job.staging_cleanup_state, "cleaned",
+                )
+
+        fixture = self._complete_cleanup_fixture(
+            "unsafe-parent", pin_count=1,
+        )
+        original_attempt_path = fixture["attempt_path"].with_name(
+            "{}.original".format(fixture["attempt_path"].name),
+        )
+        os.rename(str(fixture["attempt_path"]), str(original_attempt_path))
+        fixture["attempt_path"].mkdir(mode=0o700)
+        os.chmod(str(fixture["attempt_path"]), 0o700)
+        marker = fixture["attempt_path"] / "do-not-remove"
+        marker.write_bytes(b"different inode")
+        os.chmod(str(marker), 0o600)
+
+        with self.assertRaises(ExportError) as raised:
+            ArchiveService().recover_complete(
+                fixture["lease"], fixture["heartbeat"], lambda: False,
+            )
+
+        fixture["job"].refresh_from_db()
+        self.assertEqual(raised.exception.code, "export_storage_unsafe")
+        self.assertEqual(
+            fixture["job"].staging_cleanup_state, "blocked",
+        )
+        self.assertEqual(marker.read_bytes(), b"different inode")
+        self.assertTrue(fixture["ready_path"].is_file())
+        self.assertTrue(original_attempt_path.is_dir())
+
+        fixture = self._complete_cleanup_fixture(
+            "attempt-cas", pin_count=1,
+        )
+        changed = []
+
+        def change_receipt_after_rmdir(point, context):
+            del context
+            if point == "after_complete_attempt_rmdir" and not changed:
+                changed.append(True)
+                ExportAttempt.objects.filter(
+                    pk=fixture["attempt"].pk,
+                ).update(dir_ino=fixture["attempt"].dir_ino + 1)
+
+        with self.assertRaises(ExportError) as raised:
+            ArchiveService(
+                fault_injector=change_receipt_after_rmdir,
+            ).recover_complete(
+                fixture["lease"], fixture["heartbeat"], lambda: False,
+            )
+
+        fixture["job"].refresh_from_db()
+        fixture["attempt"].refresh_from_db()
+        self.assertEqual(changed, [True])
+        self.assertEqual(raised.exception.code, "export_storage_unsafe")
+        self.assertEqual(
+            fixture["job"].staging_cleanup_state, "blocked",
+        )
+        self.assertEqual(fixture["attempt"].state, "published")
+        self.assertTrue(fixture["ready_path"].is_file())
+
+    def test_final_fence_contains_no_filesystem_syscalls(self):
+        fixture = self._bulk_finalization_fixture(1)
+        item = fixture["job"].items.get()
+        pin = Pin.objects.get(pk=item.pin_id)
+        pin.private = False
+        pin.save(update_fields=("private",))
+        item.published_at = pin.published
+        item.save(update_fields=("published_at",))
+        fence_depth = {"value": 0}
+        observations = []
+        original_fence = archive_services.database_write_fence
+
+        @contextmanager
+        def tracking_fence(*args, **kwargs):
+            fence_depth["value"] += 1
+            try:
+                with original_fence(*args, **kwargs) as current:
+                    yield current
+            finally:
+                fence_depth["value"] -= 1
+
+        def reject_filesystem(name):
+            def reject(*args, **kwargs):
+                del args, kwargs
+                observations.append((name, fence_depth["value"]))
+                raise AssertionError(
+                    "{} called inside final fence".format(name),
+                )
+            return reject
+
+        patches = (
+            mock.patch("builtins.open", side_effect=reject_filesystem("open")),
+            mock.patch(
+                "exports.services.archive.os.open",
+                side_effect=reject_filesystem("os.open"),
+            ),
+            mock.patch(
+                "exports.services.archive.os.stat",
+                side_effect=reject_filesystem("stat"),
+            ),
+            mock.patch(
+                "exports.services.archive.os.fstat",
+                side_effect=reject_filesystem("fstat"),
+            ),
+            mock.patch(
+                "exports.services.archive.os.rename",
+                side_effect=reject_filesystem("rename"),
+            ),
+            mock.patch(
+                "exports.services.archive.os.unlink",
+                side_effect=reject_filesystem("unlink"),
+            ),
+            mock.patch(
+                "exports.services.archive.os.fsync",
+                side_effect=reject_filesystem("fsync"),
+            ),
+            mock.patch(
+                "exports.services.archive.rename_noreplace",
+                side_effect=reject_filesystem("rename_noreplace"),
+            ),
+            mock.patch(
+                "exports.services.archive.remove_if_receipt_matches",
+                side_effect=reject_filesystem("remove"),
+            ),
+        )
+        with mock.patch(
+            "exports.services.archive.database_write_fence",
+            tracking_fence,
+        ):
+            with patches[0], patches[1], patches[2], patches[3], \
+                    patches[4], patches[5], patches[6], patches[7], \
+                    patches[8]:
+                rotated = ArchiveService()._final_fence(
+                    fixture["attempt"], fixture["candidate"],
+                    fixture["exported_at"], fixture["lease"],
+                    fixture["heartbeat"], lambda: False,
+                )
+
+        self.assertIsNone(rotated)
+        self.assertEqual(observations, [])
+        fixture["job"].refresh_from_db()
+        self.assertEqual(fixture["job"].state, "complete")

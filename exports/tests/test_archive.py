@@ -9,7 +9,11 @@ import zipfile
 from django.test import SimpleTestCase
 from django.utils import timezone
 
-from exports.services.archive import build_manifest, validate_archive
+from exports.services.archive import (
+    ArchiveValidationStopped,
+    build_manifest,
+    validate_archive,
+)
 from exports.services.file_ops import ExportStorageError
 
 
@@ -189,3 +193,42 @@ class ArchiveValidationTests(SimpleTestCase):
                             lambda: None, lambda: False,
                         )
                 self.assertEqual(raised.exception.code, "archive_failed")
+
+    def test_virtual_forty_five_second_validation_pulses_and_checks_stop_at_megabyte_boundaries(self):
+        content = b"x" * (12 * 1024 * 1024 + 17)
+        clock = [0.0]
+        heartbeat_times = []
+        stop_times = []
+        stop_state = {"requested": False}
+
+        def heartbeat():
+            heartbeat_times.append(clock[0])
+            clock[0] += 2.5
+            if clock[0] >= 45.0:
+                stop_state["requested"] = True
+
+        def stop_requested():
+            stop_times.append(clock[0])
+            return stop_state["requested"]
+
+        entries = (("originals/large.bin", zipfile.ZIP_STORED, content),)
+        with self._zip_file(entries) as file_obj:
+            archive_chunks = (
+                os.fstat(file_obj.fileno()).st_size + 1024 * 1024 - 1
+            ) // (1024 * 1024)
+            with self.assertRaises(ArchiveValidationStopped):
+                validate_archive(
+                    file_obj.fileno(), ["originals/large.bin"],
+                    heartbeat, stop_requested,
+                )
+
+        self.assertGreaterEqual(clock[0], 45.0)
+        self.assertGreater(len(heartbeat_times), archive_chunks)
+        self.assertEqual(len(stop_times), len(heartbeat_times) + 1)
+        gaps = [
+            later - earlier
+            for earlier, later in zip(
+                heartbeat_times, heartbeat_times[1:] + [clock[0]],
+            )
+        ]
+        self.assertLessEqual(max(gaps), 5.0)

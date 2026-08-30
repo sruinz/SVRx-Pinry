@@ -61,6 +61,7 @@ from exports.services.permissions import revoked_item_ids
 from exports.services.snapshot import (
     open_staging_directory,
     snapshot_blob_name,
+    snapshot_directory_name,
     snapshot_directory_receipt,
 )
 
@@ -965,6 +966,13 @@ class ArchiveService(object):
                         rotation.clear()
                     else:
                         rotation.replace(rotated)
+                if rotated is None:
+                    self._fault(
+                        "after_complete_commit",
+                        lease=lease,
+                        attempt=attempt,
+                        attempt_file=candidate,
+                    )
                 return rotated
             except DatabaseFenceBusy:
                 self._stop(stop_requested, lease)
@@ -1027,6 +1035,34 @@ class ArchiveService(object):
             blob.receipt_mtime_ns,
             blob.receipt_ctime_ns,
             blob.receipt_sha256,
+        )
+
+    @staticmethod
+    def _snapshot_cleanup_snapshot(job):
+        return (
+            job.snapshot_generation,
+            job.snapshot_relative_path,
+            job.snapshot_dir_dev,
+            job.snapshot_dir_ino,
+            job.snapshot_dir_uid,
+            job.snapshot_dir_gid,
+            job.snapshot_dir_mode,
+        )
+
+    @staticmethod
+    def _attempt_cleanup_snapshot(attempt):
+        return (
+            attempt.job_id,
+            attempt.attempt_generation,
+            attempt.lease_uuid,
+            attempt.state,
+            attempt.relative_path,
+            attempt.dir_dev,
+            attempt.dir_ino,
+            attempt.dir_uid,
+            attempt.dir_gid,
+            attempt.dir_mode,
+            attempt.exported_at,
         )
 
     def _retiring_cleanup_state(self, attempt, lease, heartbeat):
@@ -1125,7 +1161,9 @@ class ArchiveService(object):
                 if current is not None:
                     current.close()
 
-    def _remove_retiring_directory_fs(self, attempt, checkpoint):
+    def _remove_retiring_directory_fs(
+        self, attempt, checkpoint, completion_fault=False,
+    ):
         expected_name = "attempt-{}-{}".format(
             attempt.job_id, attempt.attempt_generation,
         )
@@ -1180,6 +1218,11 @@ class ArchiveService(object):
                 "after_cleanup_parent_fsync", checkpoint,
                 attempt=attempt, attempt_file=None,
             )
+            if completion_fault:
+                self._cleanup_fault(
+                    "after_complete_attempt_rmdir", checkpoint,
+                    attempt=attempt, attempt_file=None,
+                )
             return True
         except ExportStorageError:
             raise
@@ -1192,6 +1235,7 @@ class ArchiveService(object):
 
     def _mark_attempt_file_cleaned(
         self, attempt, attempt_file, lease, heartbeat,
+        attempt_state="retiring",
     ):
         expected = self._attempt_file_cleanup_snapshot(attempt_file)
         with heartbeat.foreground_write_guard():
@@ -1204,7 +1248,7 @@ class ArchiveService(object):
                     self.using,
                 ).select_for_update().get(pk=attempt_file.pk)
                 if (
-                    current_attempt.state != "retiring"
+                    current_attempt.state != attempt_state
                     or current_file.attempt_id != current_attempt.pk
                     or self._attempt_file_cleanup_snapshot(current_file)
                     != expected
@@ -1281,7 +1325,7 @@ class ArchiveService(object):
                 return list(blobs[:QUERY_CHUNK_SIZE])
 
     def _mark_blob_cleanup_batch(
-        self, lease, heartbeat, blobs,
+        self, lease, heartbeat, blobs, excluded_only=True,
     ):
         blob_ids = [blob.pk for blob in blobs]
         expected = {
@@ -1291,15 +1335,18 @@ class ArchiveService(object):
         with heartbeat.foreground_write_guard():
             with transaction.atomic(using=self.using):
                 current = lock_current_lease(lease, using=self.using)
-                locked = list(ExportBlob.objects.using(
+                locked_query = ExportBlob.objects.using(
                     self.using,
                 ).select_for_update().filter(
                     job=current,
                     pk__in=blob_ids,
                     cleanup_state="pending",
-                ).exclude(
-                    items__inclusion_state="included",
-                ).order_by("pk"))
+                )
+                if excluded_only:
+                    locked_query = locked_query.exclude(
+                        items__inclusion_state="included",
+                    )
+                locked = list(locked_query.order_by("pk"))
                 if (
                     len(locked) != len(blobs)
                     or any(
@@ -1309,13 +1356,16 @@ class ArchiveService(object):
                     )
                 ):
                     raise ExportStorageError("export_storage_unsafe")
-                updated = ExportBlob.objects.using(self.using).filter(
+                update_query = ExportBlob.objects.using(self.using).filter(
                     job=current,
                     pk__in=blob_ids,
                     cleanup_state="pending",
-                ).exclude(
-                    items__inclusion_state="included",
-                ).update(cleanup_state="cleaned")
+                )
+                if excluded_only:
+                    update_query = update_query.exclude(
+                        items__inclusion_state="included",
+                    )
+                updated = update_query.update(cleanup_state="cleaned")
                 if updated != len(blob_ids):
                     raise ExportStorageError("export_storage_unsafe")
 
@@ -1381,34 +1431,524 @@ class ArchiveService(object):
                 if directory is not None:
                     directory.close()
 
-    def _handoff(self, attempt, candidate, heartbeat):
+    def _complete_cleanup_context(self, lease, heartbeat):
         with heartbeat.foreground_write_guard():
             with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                if (
+                    current.state != "complete"
+                    or current.ready_cleanup_state != "retained"
+                    or current.staging_cleanup_state
+                    not in ("pending", "blocked", "cleaned")
+                ):
+                    raise LeaseLost()
+                if current.staging_cleanup_state == "cleaned":
+                    return current, None, None, None
+                attempts = list(ExportAttempt.objects.using(
+                    self.using,
+                ).select_for_update().filter(
+                    job=current,
+                    attempt_generation=lease.attempt_generation,
+                )[:2])
+                if len(attempts) != 1:
+                    raise ExportStorageError("export_storage_unsafe")
+                attempt = attempts[0]
+                files = list(ExportAttemptFile.objects.using(
+                    self.using,
+                ).select_for_update().filter(
+                    attempt=attempt,
+                ).order_by("kind", "pk")[:3])
+                archives = [item for item in files if item.kind == "archive"]
+                quarantines = [
+                    item for item in files if item.kind == "quarantine"
+                ]
+                if (
+                    len(files) != len(archives) + len(quarantines)
+                    or len(archives) != 1
+                    or len(quarantines) > 1
+                    or attempt.state not in ("published", "cleaned")
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                archive = archives[0]
+                quarantine = quarantines[0] if quarantines else None
+                if attempt.state == "cleaned" and any(
+                    item.state != "cleaned" for item in files
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                return current, attempt, archive, quarantine
+
+    def _complete_quarantine_state(self, attempt, lease, heartbeat):
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                current_attempt = ExportAttempt.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=attempt.pk)
+                if (
+                    current.state != "complete"
+                    or current.ready_cleanup_state != "retained"
+                    or current.staging_cleanup_state == "cleaned"
+                    or current_attempt.job_id != current.pk
+                    or current_attempt.state != "published"
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                archives = list(current_attempt.files.using(
+                    self.using,
+                ).select_for_update().filter(kind="archive")[:2])
+                quarantines = list(current_attempt.files.using(
+                    self.using,
+                ).select_for_update().filter(kind="quarantine")[:2])
+                if (
+                    len(archives) != 1
+                    or archives[0].state != "cleaned"
+                    or len(quarantines) > 1
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                if not quarantines or quarantines[0].state == "cleaned":
+                    return current_attempt, None
+                if quarantines[0].state != "closed":
+                    raise ExportStorageError("export_storage_unsafe")
+                return current_attempt, quarantines[0]
+
+    def _cleanup_complete_quarantine(
+        self, attempt, lease, heartbeat, checkpoint,
+    ):
+        checkpoint()
+        current_attempt, quarantine = self._complete_quarantine_state(
+            attempt, lease, heartbeat,
+        )
+        checkpoint()
+        if quarantine is None:
+            return
+        self._remove_retiring_file_fs(
+            current_attempt, quarantine, checkpoint,
+        )
+        self._cleanup_fault(
+            "after_complete_quarantine_unlink", checkpoint,
+            attempt=current_attempt, attempt_file=quarantine,
+        )
+        self._mark_attempt_file_cleaned(
+            current_attempt, quarantine, lease, heartbeat,
+            attempt_state="published",
+        )
+        self._cleanup_fault(
+            "after_complete_quarantine_cas", checkpoint,
+            attempt=current_attempt, attempt_file=quarantine,
+        )
+
+    def _complete_blob_cleanup_batch(
+        self, lease, heartbeat, last_pk,
+    ):
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                if (
+                    current.state != "complete"
+                    or current.ready_cleanup_state != "retained"
+                    or current.staging_cleanup_state == "cleaned"
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                blobs = current.blobs.using(
+                    self.using,
+                ).select_for_update().filter(
+                    cleanup_state="pending",
+                ).order_by("pk")
+                if last_pk is not None:
+                    blobs = blobs.filter(pk__gt=last_pk)
+                return current, list(blobs[:QUERY_CHUNK_SIZE])
+
+    def _cleanup_complete_blobs(
+        self, lease, heartbeat, checkpoint,
+    ):
+        last_pk = None
+        root = None
+        staging = snapshot = None
+        try:
+            while True:
+                checkpoint()
+                current, blobs = self._complete_blob_cleanup_batch(
+                    lease, heartbeat, last_pk,
+                )
+                checkpoint()
+                if not blobs:
+                    return
+                if (
+                    current.snapshot_relative_path is None
+                    or snapshot_directory_receipt(current) is None
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                if root is None:
+                    root = open_export_root(
+                        settings.PINRY_EXPORT_ROOT,
+                        os.getuid(),
+                        os.getgid(),
+                    )
+                    staging = open_staging_directory(root)
+                    snapshot = open_receipted_directory(
+                        staging, current.snapshot_relative_path,
+                        snapshot_directory_receipt(current),
+                    )
+                    checkpoint()
+                for blob in blobs:
+                    expected_path = "{}/{}".format(
+                        current.snapshot_relative_path,
+                        snapshot_blob_name(blob.pk),
+                    )
+                    if (
+                        blob.cleanup_state != "pending"
+                        or blob.file_state != "closed"
+                        or not blob.confirmed
+                        or blob.snapshot_generation
+                        != current.snapshot_generation
+                        or blob.snapshot_relative_path != expected_path
+                    ):
+                        raise ExportStorageError("export_storage_unsafe")
+                    remove_if_receipt_matches(
+                        snapshot, snapshot_blob_name(blob.pk),
+                        self._blob_receipt(blob),
+                    )
+                    self._cleanup_fault(
+                        "after_complete_blob_unlink", checkpoint,
+                        blob=blob, lease=lease,
+                    )
+                self._mark_blob_cleanup_batch(
+                    lease, heartbeat, blobs, excluded_only=False,
+                )
+                self._cleanup_fault(
+                    "after_complete_blob_cas", checkpoint,
+                    blobs=blobs, lease=lease,
+                )
+                last_pk = blobs[-1].pk
+        finally:
+            for directory in (snapshot, staging, root):
+                if directory is not None:
+                    directory.close()
+
+    def _complete_snapshot_state(self, lease, heartbeat):
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                if (
+                    current.state != "complete"
+                    or current.ready_cleanup_state != "retained"
+                    or current.staging_cleanup_state == "cleaned"
+                    or current.blobs.exclude(
+                        cleanup_state="cleaned",
+                    ).exists()
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                snapshot = self._snapshot_cleanup_snapshot(current)
+                if all(value is None for value in snapshot):
+                    return current, False
+                if any(value is None for value in snapshot):
+                    raise ExportStorageError("export_storage_unsafe")
+                if current.snapshot_relative_path != snapshot_directory_name(
+                    current.pk, current.snapshot_generation,
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                return current, True
+
+    def _remove_complete_snapshot_directory_fs(
+        self, job, checkpoint,
+    ):
+        expected_name = snapshot_directory_name(
+            job.pk, job.snapshot_generation,
+        )
+        if job.snapshot_relative_path != expected_name:
+            raise ExportStorageError("export_storage_unsafe")
+        receipt = snapshot_directory_receipt(job)
+        if receipt is None:
+            raise ExportStorageError("export_storage_unsafe")
+        root = None
+        staging = snapshot = None
+        try:
+            checkpoint()
+            root = open_export_root(
+                settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
+            )
+            checkpoint()
+            staging = open_staging_directory(root)
+            checkpoint()
+            try:
+                named = os.stat(
+                    expected_name,
+                    dir_fd=staging.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                staging.verify_identity()
+                checkpoint()
+                return False
+            if not receipt.matches_stat(named):
+                raise ExportStorageError("export_storage_unsafe")
+            snapshot = open_receipted_directory(
+                staging, expected_name, receipt,
+            )
+            if os.listdir(snapshot.descriptor):
+                raise ExportStorageError("export_storage_unsafe")
+            snapshot.verify_identity()
+            if os.listdir(snapshot.descriptor):
+                raise ExportStorageError("export_storage_unsafe")
+            os.rmdir(expected_name, dir_fd=staging.descriptor)
+            checkpoint()
+            os.fsync(staging.descriptor)
+            self._cleanup_fault(
+                "after_complete_snapshot_rmdir", checkpoint,
+                job=job,
+            )
+            return True
+        except ExportStorageError:
+            raise
+        except OSError:
+            raise ExportStorageError("export_storage_unsafe") from None
+        finally:
+            for directory in (snapshot, staging, root):
+                if directory is not None:
+                    directory.close()
+
+    def _mark_complete_snapshot_cleaned(
+        self, job, lease, heartbeat,
+    ):
+        expected = self._snapshot_cleanup_snapshot(job)
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                if (
+                    current.state != "complete"
+                    or current.ready_cleanup_state != "retained"
+                    or current.staging_cleanup_state == "cleaned"
+                    or self._snapshot_cleanup_snapshot(current) != expected
+                    or current.blobs.exclude(
+                        cleanup_state="cleaned",
+                    ).exists()
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                current.snapshot_generation = None
+                current.snapshot_relative_path = None
+                current.snapshot_dir_dev = None
+                current.snapshot_dir_ino = None
+                current.snapshot_dir_uid = None
+                current.snapshot_dir_gid = None
+                current.snapshot_dir_mode = None
+                current.save(update_fields=(
+                    "snapshot_generation", "snapshot_relative_path",
+                    "snapshot_dir_dev", "snapshot_dir_ino",
+                    "snapshot_dir_uid", "snapshot_dir_gid",
+                    "snapshot_dir_mode",
+                ))
+
+    def _cleanup_complete_snapshot(
+        self, lease, heartbeat, checkpoint,
+    ):
+        checkpoint()
+        current, needs_cleanup = self._complete_snapshot_state(
+            lease, heartbeat,
+        )
+        checkpoint()
+        if not needs_cleanup:
+            return
+        self._remove_complete_snapshot_directory_fs(current, checkpoint)
+        self._mark_complete_snapshot_cleaned(
+            current, lease, heartbeat,
+        )
+        self._cleanup_fault(
+            "after_complete_snapshot_cas", checkpoint,
+            job=current,
+        )
+
+    def _complete_attempt_state(self, attempt, lease, heartbeat):
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                current_attempt = ExportAttempt.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=attempt.pk)
+                if (
+                    current.state != "complete"
+                    or current.ready_cleanup_state != "retained"
+                    or current.staging_cleanup_state == "cleaned"
+                    or current_attempt.job_id != current.pk
+                    or current_attempt.state not in ("published", "cleaned")
+                    or current.blobs.exclude(
+                        cleanup_state="cleaned",
+                    ).exists()
+                    or any(
+                        value is not None
+                        for value in self._snapshot_cleanup_snapshot(current)
+                    )
+                    or current_attempt.files.exclude(
+                        state="cleaned",
+                    ).exists()
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                return current_attempt
+
+    def _mark_complete_attempt_cleaned(
+        self, attempt, lease, heartbeat,
+    ):
+        expected = self._attempt_cleanup_snapshot(attempt)
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                current_attempt = ExportAttempt.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=attempt.pk)
+                if (
+                    current.state != "complete"
+                    or current.ready_cleanup_state != "retained"
+                    or current.staging_cleanup_state == "cleaned"
+                    or current_attempt.job_id != current.pk
+                    or current_attempt.state != "published"
+                    or self._attempt_cleanup_snapshot(current_attempt)
+                    != expected
+                    or current_attempt.files.exclude(
+                        state="cleaned",
+                    ).exists()
+                    or current.blobs.exclude(
+                        cleanup_state="cleaned",
+                    ).exists()
+                    or any(
+                        value is not None
+                        for value in self._snapshot_cleanup_snapshot(current)
+                    )
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                current_attempt.state = "cleaned"
+                current_attempt.save(update_fields=("state",))
+
+    def _cleanup_complete_attempt(
+        self, attempt, lease, heartbeat, checkpoint,
+    ):
+        checkpoint()
+        current_attempt = self._complete_attempt_state(
+            attempt, lease, heartbeat,
+        )
+        checkpoint()
+        if current_attempt.state == "cleaned":
+            return
+        self._remove_retiring_directory_fs(
+            current_attempt, checkpoint, completion_fault=True,
+        )
+        self._mark_complete_attempt_cleaned(
+            current_attempt, lease, heartbeat,
+        )
+        self._cleanup_fault(
+            "after_complete_attempt_cas", checkpoint,
+            attempt=current_attempt,
+        )
+
+    def _mark_complete_staging_cleaned(
+        self, attempt, lease, heartbeat,
+    ):
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                current_attempt = ExportAttempt.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=attempt.pk)
+                if (
+                    current.state != "complete"
+                    or current.ready_cleanup_state != "retained"
+                    or current_attempt.job_id != current.pk
+                    or current_attempt.state != "cleaned"
+                    or current_attempt.files.exclude(
+                        state="cleaned",
+                    ).exists()
+                    or current.blobs.exclude(
+                        cleanup_state="cleaned",
+                    ).exists()
+                    or any(
+                        value is not None
+                        for value in self._snapshot_cleanup_snapshot(current)
+                    )
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                if current.staging_cleanup_state != "cleaned":
+                    current.staging_cleanup_state = "cleaned"
+                    current.save(update_fields=("staging_cleanup_state",))
+                return current
+
+    def _mark_complete_cleanup_blocked(self, lease, heartbeat):
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                if (
+                    current.state != "complete"
+                    or current.ready_cleanup_state != "retained"
+                ):
+                    raise LeaseLost()
+                if current.staging_cleanup_state != "cleaned":
+                    current.staging_cleanup_state = "blocked"
+                    current.save(update_fields=("staging_cleanup_state",))
+
+    @staticmethod
+    def _ready_handoff_matches(job, attempt_file):
+        return (
+            job.ready_relative_path == "ready/{}.zip".format(job.pk)
+            and attempt_file.kind == "archive"
+            and attempt_file.receipt_level == "full"
+            and attempt_file.relative_path == job.ready_relative_path
+            and (
+                attempt_file.receipt_dev,
+                attempt_file.receipt_ino,
+                attempt_file.receipt_uid,
+                attempt_file.receipt_gid,
+                attempt_file.receipt_mode,
+                attempt_file.receipt_nlink,
+                attempt_file.receipt_size,
+                attempt_file.receipt_mtime_ns,
+                attempt_file.receipt_ctime_ns,
+                attempt_file.receipt_sha256,
+            ) == (
+                job.ready_dev,
+                job.ready_ino,
+                job.ready_uid,
+                job.ready_gid,
+                job.ready_mode,
+                job.ready_nlink,
+                job.ready_size,
+                job.ready_mtime_ns,
+                job.ready_ctime_ns,
+                job.ready_sha256,
+            )
+        )
+
+    def _handoff(self, attempt, candidate, lease, heartbeat, checkpoint):
+        changed = False
+        checkpoint()
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                job = lock_current_lease(lease, using=self.using)
                 current_attempt = ExportAttempt.objects.using(
                     self.using,
                 ).select_for_update().get(pk=attempt.pk)
                 current_file = ExportAttemptFile.objects.using(
                     self.using,
                 ).select_for_update().get(pk=candidate.pk)
-                job = ExportJob.objects.using(self.using).select_for_update().get(
-                    pk=current_attempt.job_id,
-                )
                 if (
                     job.state != "complete"
                     or job.ready_cleanup_state != "retained"
-                    or current_file.state != "published"
-                    or current_file.relative_path != job.ready_relative_path
-                    or current_file.receipt_dev != job.ready_dev
-                    or current_file.receipt_ino != job.ready_ino
+                    or job.staging_cleanup_state == "cleaned"
+                    or current_attempt.job_id != job.pk
+                    or current_attempt.state != "published"
+                    or current_file.attempt_id != current_attempt.pk
+                    or current_file.state not in ("published", "cleaned")
+                    or not self._ready_handoff_matches(job, current_file)
                 ):
-                    return
-                current_file.state = "cleaned"
-                current_file.intent_relative_path = None
-                current_file.save(update_fields=(
-                    "state", "intent_relative_path",
-                ))
-                current_attempt.state = "cleaned"
-                current_attempt.save(update_fields=("state",))
+                    raise ExportStorageError("export_storage_unsafe")
+                if current_file.state == "published":
+                    current_file.state = "cleaned"
+                    current_file.intent_relative_path = None
+                    current_file.save(update_fields=(
+                        "state", "intent_relative_path",
+                    ))
+                    changed = True
+        checkpoint()
+        if changed:
+            self._cleanup_fault(
+                "after_complete_handoff", checkpoint,
+                attempt=attempt, attempt_file=candidate,
+            )
 
     def _mark_current_attempt_retiring(self, lease, heartbeat):
         with heartbeat.foreground_write_guard():
@@ -1543,13 +2083,52 @@ class ArchiveService(object):
                     )
                     current_lease = rotated
                     continue
-                self._handoff(attempt, candidate, heartbeat)
-                return ExportJob.objects.using(self.using).get(pk=job.pk)
+                return self.recover_complete(
+                    current_lease, heartbeat, stop_requested,
+                ).job
         except ExportStorageError as error:
             raise ExportError(error.code, current_lease) from None
         except ExportError:
             self._mark_current_attempt_retiring(current_lease, heartbeat)
             raise
+
+    def recover_complete(self, lease, heartbeat, stop_requested):
+        self._stop(stop_requested, lease)
+        checkpoint = self._cleanup_checkpointer(
+            lease, heartbeat, stop_requested,
+        )
+        try:
+            checkpoint()
+            current, attempt, archive, quarantine = (
+                self._complete_cleanup_context(lease, heartbeat)
+            )
+            del quarantine
+            checkpoint()
+            if current.staging_cleanup_state == "cleaned":
+                return RecoveryOutcome(current, lease)
+            if attempt.state == "published":
+                self._handoff(
+                    attempt, archive, lease, heartbeat, checkpoint,
+                )
+                self._cleanup_complete_quarantine(
+                    attempt, lease, heartbeat, checkpoint,
+                )
+            self._cleanup_complete_blobs(
+                lease, heartbeat, checkpoint,
+            )
+            self._cleanup_complete_snapshot(
+                lease, heartbeat, checkpoint,
+            )
+            self._cleanup_complete_attempt(
+                attempt, lease, heartbeat, checkpoint,
+            )
+            completed = self._mark_complete_staging_cleaned(
+                attempt, lease, heartbeat,
+            )
+            return RecoveryOutcome(completed, lease)
+        except ExportStorageError as error:
+            self._mark_complete_cleanup_blocked(lease, heartbeat)
+            raise ExportError(error.code, lease) from None
 
     def recover_archiving(self, lease, heartbeat, stop_requested):
         self._stop(stop_requested, lease)
@@ -1649,9 +2228,13 @@ class ArchiveService(object):
             attempt, candidate, attempt.exported_at, lease,
             heartbeat, stop_requested,
         )
+        if rotated is None:
+            return self.recover_complete(
+                lease, heartbeat, stop_requested,
+            )
         return RecoveryOutcome(
             ExportJob.objects.using(self.using).get(pk=lease.job_id),
-            rotated or lease,
+            rotated,
         )
 
     def _recover_publishing(self, job, attempt, candidate, lease, heartbeat):
