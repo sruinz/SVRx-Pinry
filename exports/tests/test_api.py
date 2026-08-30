@@ -291,6 +291,56 @@ class ExportAPITests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(raised.exception.code, "export_worker_unavailable")
         self.assertEqual(ExportJob.objects.count(), 0)
 
+    def test_create_start_health_uses_current_clock_not_job_timestamp(self):
+        ExportWorkerLease.objects.create(
+            pk=1,
+            health_state="ready",
+            heartbeat_at=self.now,
+        )
+        service = JobService(
+            available_space_observer=lambda: 10 ** 12,
+            health_clock=lambda: self.now + timedelta(seconds=16),
+        )
+
+        with self.assertRaises(ExportRequestError) as raised:
+            service.create(
+                self.owner,
+                {"scope": "pins", "pin_ids": [self.pin.pk]},
+                self.now,
+            )
+
+        self.assertEqual(raised.exception.code, "export_worker_unavailable")
+        self.assertEqual(ExportJob.objects.count(), 0)
+        self.assertEqual(ExportTarget.objects.count(), 0)
+        self.assertEqual(ExportSlot.objects.count(), 0)
+
+    def test_worker_becoming_stale_during_observation_creates_no_rows(self):
+        ExportWorkerLease.objects.create(
+            pk=1,
+            health_state="ready",
+            heartbeat_at=self.now,
+        )
+        health_times = iter((
+            self.now,
+            self.now + timedelta(seconds=16),
+        ))
+        service = JobService(
+            available_space_observer=lambda: 10 ** 12,
+            health_clock=lambda: next(health_times),
+        )
+
+        with self.assertRaises(ExportRequestError) as raised:
+            service.create(
+                self.owner,
+                {"scope": "pins", "pin_ids": [self.pin.pk]},
+                self.now,
+            )
+
+        self.assertEqual(raised.exception.code, "export_worker_unavailable")
+        self.assertEqual(ExportJob.objects.count(), 0)
+        self.assertEqual(ExportTarget.objects.count(), 0)
+        self.assertEqual(ExportSlot.objects.count(), 0)
+
     def test_insufficient_space_rolls_back_job_target_and_slot(self):
         self._ready_worker()
         service = JobService(
@@ -454,6 +504,69 @@ class ExportAPITests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(ExportJob.objects.count(), 0)
         self.assertEqual(ExportTarget.objects.count(), 0)
         self.assertEqual(ExportSlot.objects.count(), 0)
+
+    def test_slow_observation_does_not_consume_database_busy_deadline(self):
+        self._ready_worker()
+        clock = [0.0]
+
+        def observe_space():
+            clock[0] = 6.0
+            return 10 ** 12
+
+        service = JobService(
+            available_space_observer=observe_space,
+            monotonic=lambda: clock[0],
+        )
+
+        try:
+            job = service.create(
+                self.owner,
+                {"scope": "pins", "pin_ids": [self.pin.pk]},
+                self.now,
+            )
+        except ExportRequestError as error:
+            self.fail("관측 시간이 DB deadline을 소모함: {}".format(error.code))
+
+        self.assertEqual(ExportJob.objects.filter(pk=job.pk).count(), 1)
+        self.assertEqual(ExportTarget.objects.filter(job=job).count(), 1)
+
+    def test_each_identity_retry_starts_a_fresh_database_deadline(self):
+        self._ready_worker()
+        clock = [0.0]
+        observations = []
+        original_name = self.pin.image.image.name
+
+        def change_identity_once(identity):
+            observations.append(identity.storage_name)
+            clock[0] += 4.0
+            if len(observations) == 1:
+                image = self.pin.image
+                image.image.name = "image/original/deadline-retry.png"
+                image.save(update_fields=("image",))
+            return 1
+
+        from exports.services.targeting import TargetingService
+        service = JobService(
+            targeting=TargetingService(size_observer=change_identity_once),
+            available_space_observer=lambda: 10 ** 12,
+            monotonic=lambda: clock[0],
+        )
+
+        try:
+            job = service.create(
+                self.owner,
+                {"scope": "pins", "pin_ids": [self.pin.pk]},
+                self.now,
+            )
+        except ExportRequestError as error:
+            self.fail("identity 재시도 deadline이 재사용됨: {}".format(error.code))
+
+        self.assertEqual(observations, [
+            original_name,
+            "image/original/deadline-retry.png",
+        ])
+        self.assertEqual(ExportJob.objects.filter(pk=job.pk).count(), 1)
+        self.assertEqual(ExportTarget.objects.filter(job=job).count(), 1)
 
     def test_database_fence_failure_is_secret_free_temporary_503(self):
         self._login()

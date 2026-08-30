@@ -7,6 +7,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, IntegrityError
 from django.db.models import Q
+from django.utils import timezone
 from taggit.models import Tag, TaggedItem
 
 from core.models import Board, MediaAsset, Pin
@@ -113,6 +114,7 @@ class JobService(object):
         available_space_observer=None,
         monotonic=None,
         sleeper=None,
+        health_clock=None,
     ):
         self.targeting = targeting or TargetingService()
         self.available_space_observer = (
@@ -122,6 +124,9 @@ class JobService(object):
         )
         self.monotonic = time.monotonic if monotonic is None else monotonic
         self.sleeper = time.sleep if sleeper is None else sleeper
+        self.health_clock = (
+            timezone.now if health_clock is None else health_clock
+        )
 
     def _delete_retired_rows_if_cleanup_complete(self, user, checkpoint):
         candidates = (
@@ -171,7 +176,7 @@ class JobService(object):
         available_bytes,
         checkpoint,
     ):
-        WorkerHealthService.require_available(now)
+        WorkerHealthService.require_available(self.health_clock())
         if not User.objects.filter(pk=user.pk).exists():
             raise ExportRequestError("invalid_target", 404)
         self._delete_retired_rows_if_cleanup_complete(user, checkpoint)
@@ -216,8 +221,7 @@ class JobService(object):
             return None
 
     def create(self, user, request_data, now):
-        WorkerHealthService.require_available(now)
-        deadline = DatabaseFenceDeadline(self.monotonic)
+        WorkerHealthService.require_available(self.health_clock())
         for _attempt in range(self.IDENTITY_RETRY_LIMIT):
             snapshot = self.targeting.snapshot_for_observation(
                 user,
@@ -230,6 +234,7 @@ class JobService(object):
                 raise ExportRequestError(error.code, 503) from None
             if type(available_bytes) is not int or available_bytes < 0:
                 raise ExportRequestError("export_storage_unsafe", 503)
+            deadline = DatabaseFenceDeadline(self.monotonic)
             while True:
                 try:
                     with database_write_fence(

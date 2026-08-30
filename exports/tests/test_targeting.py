@@ -2,8 +2,9 @@ import re
 from datetime import timedelta
 
 import mock
+from core.models import Board, Image, MediaAsset, Pin
 from django.db import connection, transaction
-from django.test import TransactionTestCase
+from django.test import TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
@@ -32,6 +33,79 @@ class ChunkingTests(TransactionTestCase):
         self.assertTrue(all(len(chunk) == 400 for chunk in chunks))
         self.assertEqual(chunks[0][0], 0)
         self.assertEqual(chunks[-1][-1], 49999)
+
+
+class TargetingLargeORMTests(TestCase):
+    PIN_COUNT = 50000
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.owner = create_export_user("target-large-owner")
+        image = Image.objects.create(
+            image="image/original/shared.png",
+            original_filename="shared.png",
+            width=1,
+            height=1,
+        )
+        MediaAsset.objects.create(
+            submitter=cls.owner,
+            image=image,
+            content_sha256="0" * 64,
+        )
+        Pin.objects.bulk_create([
+            Pin(submitter=cls.owner, image=image)
+            for _index in range(cls.PIN_COUNT)
+        ], batch_size=400)
+        cls.pin_ids = tuple(
+            Pin.objects.order_by("pk").values_list("pk", flat=True)
+        )
+        cls.board = Board.objects.create(
+            submitter=cls.owner,
+            name="large-board",
+        )
+        Board.pins.through.objects.bulk_create([
+            Board.pins.through(board_id=cls.board.pk, pin_id=pin_id)
+            for pin_id in cls.pin_ids
+        ], batch_size=400)
+
+    @staticmethod
+    def _in_list_sizes(captured_queries):
+        sizes = []
+        for query in captured_queries:
+            for values in re.findall(r"\bIN \(([^)]*)\)", query["sql"]):
+                sizes.append(values.count(",") + 1)
+        return sizes
+
+    def test_selected_and_board_fifty_thousand_use_bounded_real_orm_queries(self):
+        service = TargetingService(size_observer=lambda identity: 1)
+        selected_ids = tuple(reversed(self.pin_ids))
+
+        with CaptureQueriesContext(connection) as selected_queries:
+            selected = service.preview(
+                self.owner,
+                {"scope": "pins", "pin_ids": selected_ids},
+                timezone.now(),
+            )
+        selected_in_sizes = self._in_list_sizes(selected_queries)
+
+        with CaptureQueriesContext(connection) as board_queries:
+            board = service.preview(
+                self.owner,
+                {"scope": "board", "board_id": self.board.pk},
+                timezone.now(),
+            )
+        board_in_sizes = self._in_list_sizes(board_queries)
+
+        self.assertEqual(selected.requested_total, self.PIN_COUNT)
+        self.assertEqual(selected.eligible_total, self.PIN_COUNT)
+        self.assertEqual(selected.pin_ids, selected_ids)
+        self.assertEqual(board.requested_total, self.PIN_COUNT)
+        self.assertEqual(board.eligible_total, self.PIN_COUNT)
+        self.assertEqual(board.pin_ids, self.pin_ids)
+        self.assertEqual(max(selected_in_sizes), 400)
+        self.assertEqual(max(board_in_sizes), 400)
+        self.assertTrue(all(size <= 400 for size in selected_in_sizes))
+        self.assertTrue(all(size <= 400 for size in board_in_sizes))
 
 
 class TargetingServiceTests(ExportStorageMixin, TransactionTestCase):
