@@ -1,9 +1,11 @@
 import json
 from contextlib import contextmanager
 from datetime import timedelta
+from types import SimpleNamespace
 
 import mock
 from django.db import connection, transaction
+from django.db.models.query import QuerySet
 from django.test import TransactionTestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -22,6 +24,8 @@ from exports.services.jobs import (
     JobService,
     WorkerHealthService,
 )
+from exports.services.file_ops import SpaceBudget
+from exports.services.targeting import CapturedTargets, TargetIdentity
 
 from .helpers import (
     ExportStorageMixin,
@@ -119,6 +123,53 @@ class ExportAPITests(ExportStorageMixin, TransactionTestCase):
                 "error_code": None,
             },
         )
+
+    def _captured_targets(self, count):
+        identities = tuple(
+            TargetIdentity(
+                pin_id=index + 1,
+                image_id=index + 1,
+                media_asset_id=index + 1,
+                storage_name="image/original/{}.png".format(index),
+                content_sha256=None,
+                owner_id=self.owner.pk,
+                private=True,
+                published=self.now,
+            )
+            for index in range(count)
+        )
+        return CapturedTargets(
+            pin_ids=tuple(identity.pin_id for identity in identities),
+            identities=identities,
+            job_fields={
+                "scope": "pins",
+                "requested_total": count,
+                "target_total": count,
+                "included_total": count,
+                "excluded_total": 0,
+                "excluded_not_visible_total": 0,
+                "bytes_total": 0,
+            },
+            space_budget=SpaceBudget.for_export(0, 0, 0),
+        )
+
+    def _commit_captured_targets(self, captured, checkpoint):
+        targeting = mock.Mock()
+        targeting.capture_locked.return_value = captured
+        service = JobService(
+            targeting=targeting,
+            available_space_observer=lambda: 10 ** 12,
+        )
+        observed = SimpleNamespace(sizes={}, snapshot=None)
+        with transaction.atomic():
+            return service._commit_locked(
+                self.owner,
+                {"scope": "pins", "pin_ids": captured.pin_ids},
+                self.now,
+                observed,
+                10 ** 12,
+                checkpoint,
+            )
 
     def test_anonymous_requests_are_401(self):
         for path in ("/api/v2/exports/preview/", "/api/v2/exports/"):
@@ -250,6 +301,97 @@ class ExportAPITests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(target.pin_owner_id_snapshot, self.pin.submitter_id)
         self.assertEqual(target.pin_published_at_snapshot, self.pin.published)
         self.assertEqual(ExportSlot.objects.get(owner=self.owner).current_job_id, job.pk)
+
+    def test_target_insert_uses_real_bounded_batches_and_preserves_order(self):
+        self._ready_worker()
+        captured = self._captured_targets(801)
+        calls = []
+        checkpoints = []
+        original_bulk_create = QuerySet.bulk_create
+
+        def record_bulk_create(queryset, objects, batch_size=None,
+                               ignore_conflicts=False):
+            objects = tuple(objects)
+            if queryset.model is ExportTarget:
+                calls.append((
+                    len(objects),
+                    batch_size,
+                    objects[0].position,
+                    objects[-1].position,
+                ))
+            return original_bulk_create(
+                queryset,
+                objects,
+                batch_size=batch_size,
+                ignore_conflicts=ignore_conflicts,
+            )
+
+        with mock.patch.object(
+            QuerySet,
+            "bulk_create",
+            autospec=True,
+            side_effect=record_bulk_create,
+        ):
+            job = self._commit_captured_targets(
+                captured,
+                lambda: checkpoints.append("checkpoint"),
+            )
+
+        self.assertEqual(calls, [
+            (400, 400, 0, 399),
+            (400, 400, 400, 799),
+            (1, 400, 800, 800),
+        ])
+        self.assertEqual(len(checkpoints), 3)
+        self.assertEqual(
+            list(job.targets.order_by("position").values_list(
+                "position",
+                "pin_id",
+            )),
+            [(index, index + 1) for index in range(801)],
+        )
+
+    def test_fifty_thousand_target_insert_batches_and_checkpoints(self):
+        self._ready_worker()
+        captured = self._captured_targets(50000)
+        events = []
+
+        def record_bulk_create(queryset, objects, batch_size=None,
+                               ignore_conflicts=False):
+            del ignore_conflicts
+            objects = tuple(objects)
+            self.assertIs(queryset.model, ExportTarget)
+            events.append((
+                "bulk",
+                len(objects),
+                batch_size,
+                objects[0].position,
+                objects[-1].position,
+            ))
+            return list(objects)
+
+        with mock.patch.object(
+            QuerySet,
+            "bulk_create",
+            autospec=True,
+            side_effect=record_bulk_create,
+        ):
+            self._commit_captured_targets(
+                captured,
+                lambda: events.append(("checkpoint",)),
+            )
+
+        bulk_events = [event for event in events if event[0] == "bulk"]
+        self.assertEqual(len(bulk_events), 125)
+        self.assertTrue(all(
+            event[1:3] == (400, 400) for event in bulk_events
+        ))
+        self.assertEqual(bulk_events[0][3:], (0, 399))
+        self.assertEqual(bulk_events[-1][3:], (49600, 49999))
+        self.assertEqual(events.count(("checkpoint",)), 125)
+        for index, event in enumerate(events):
+            if event[0] == "bulk":
+                self.assertEqual(events[index + 1], ("checkpoint",))
 
     def test_create_worker_failure_is_exact_503_without_rows(self):
         self._login()

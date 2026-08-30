@@ -38,7 +38,11 @@ from exports.models import (
     ExportTarget,
     ExportWorkerLease,
 )
-from exports.services.file_ops import ExportStorageError, SpaceBudget
+from exports.services.file_ops import (
+    DirectoryReceipt,
+    ExportStorageError,
+    SpaceBudget,
+)
 from exports.services.snapshot import SnapshotService, detect_image_mime
 
 from .helpers import ExportStorageMixin, create_export_pin, create_export_user
@@ -1036,6 +1040,49 @@ class SnapshotServiceTests(ExportStorageMixin, TransactionTestCase):
         self.assertIsNotNone(generation)
         self.assertTrue(raised[0])
 
+    def test_open_receipted_truncated_final_is_preserved_and_fails_closed(self):
+        pin = create_export_pin(self.owner, filename="truncated-final.png")
+        job, lease = self._job((pin,))
+        generations = [uuid.uuid4(), uuid.uuid4()]
+        planned = []
+        truncated = [None]
+
+        def truncate_final_then_busy(point, context):
+            if point == "after_candidate_planned":
+                planned.append(context["generation"])
+                return
+            if point != "before_blob_closed_receipt" or truncated[0]:
+                return
+            blob = context["blob"]
+            self.assertGreater(blob.source_size, 0)
+            os.ftruncate(context["destination_fd"], blob.source_size - 1)
+            os.fsync(context["destination_fd"])
+            current = ExportJob.objects.get(pk=job.pk)
+            truncated[0] = self._candidate_path(
+                current.candidate_snapshot_relative_path,
+            ) / str(blob.pk)
+            raise DatabaseFenceBusy()
+
+        with self.assertRaises(ExportError) as raised:
+            self._capture(
+                job,
+                lease,
+                fault_injector=truncate_final_then_busy,
+                generation_factory=lambda: generations.pop(0),
+                sleeper=lambda seconds: None,
+            )
+
+        job.refresh_from_db()
+        self.assertEqual(raised.exception.code, "export_storage_unsafe")
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(job.candidate_snapshot_generation, planned[0])
+        self.assertIsNone(job.snapshot_generation)
+        self.assertTrue(truncated[0].is_file())
+        self.assertEqual(
+            truncated[0].stat().st_size,
+            os.path.getsize(pin.image.image.path) - 1,
+        )
+
     def test_cleanup_intent_then_lease_loss_preserves_candidate(self):
         pin = create_export_pin(self.owner, filename="cleanup-lease.png")
         job, lease = self._job((pin,))
@@ -1444,6 +1491,193 @@ class SnapshotServiceTests(ExportStorageMixin, TransactionTestCase):
             items[-1].archive_xmp_path,
             "originals/49999.png.xmp",
         )
+
+    def _candidate_metadata_rows(self, job, generation, count):
+        published_at = timezone.now()
+        blobs = [
+            ExportBlob(
+                job=job,
+                snapshot_generation=generation,
+                source_media_asset_id=index + 1,
+                source_image_id=index + 1,
+                source_relative_path="bulk/{}.png".format(index),
+            )
+            for index in range(count)
+        ]
+        items = [
+            ExportItem(
+                job=job,
+                target_position=index,
+                snapshot_generation=generation,
+                blob=blob,
+                pin_id=index + 1,
+                pin_owner_id=self.owner.pk,
+                owner_username=self.owner.username,
+                is_public=True,
+                published_at=published_at,
+                original_filename="{}.png".format(index),
+            )
+            for index, blob in enumerate(blobs)
+        ]
+        return items, blobs
+
+    def _record_candidate_metadata(self, service, job, lease, generation,
+                                   items, blobs):
+        receipt = DirectoryReceipt(1, 2, os.getuid(), os.getgid(), 0o700)
+        job.candidate_snapshot_generation = generation
+        job.candidate_snapshot_relative_path = "snapshot-{}-{}".format(
+            job.pk,
+            generation,
+        )
+        job.candidate_snapshot_dir_dev = receipt.dev
+        job.candidate_snapshot_dir_ino = receipt.ino
+        job.candidate_snapshot_dir_uid = receipt.uid
+        job.candidate_snapshot_dir_gid = receipt.gid
+        job.candidate_snapshot_dir_mode = receipt.mode
+
+        @contextmanager
+        def metadata_fence(heartbeat, current_lease):
+            del heartbeat, current_lease
+            yield job
+
+        service._metadata_fence = metadata_fence
+        service._build_metadata = mock.Mock(
+            return_value=(items, blobs, 0),
+        )
+        return service._record_metadata(
+            lease,
+            generation,
+            SimpleNamespace(receipt=receipt),
+            FakeHeartbeat(),
+        )
+
+    def test_candidate_insert_uses_real_bounded_batches(self):
+        job, lease = self._job(())
+        generation = uuid.uuid4()
+        items, blobs = self._candidate_metadata_rows(job, generation, 801)
+        service = SnapshotService()
+        calls = []
+        events = []
+        original_bulk_create = QuerySet.bulk_create
+
+        class Deadline(object):
+            def __init__(self, monotonic):
+                del monotonic
+
+            def checkpoint(self):
+                events.append(("checkpoint",))
+
+        def record_bulk_create(queryset, objects, batch_size=None,
+                               ignore_conflicts=False):
+            objects = tuple(objects)
+            if queryset.model in (ExportBlob, ExportItem):
+                calls.append((queryset.model, len(objects), batch_size))
+                events.append(("bulk", queryset.model, len(objects)))
+            return original_bulk_create(
+                queryset,
+                objects,
+                batch_size=batch_size,
+                ignore_conflicts=ignore_conflicts,
+            )
+
+        with mock.patch(
+            "exports.services.snapshot.DatabaseFenceDeadline",
+            Deadline,
+        ), mock.patch.object(
+            QuerySet,
+            "bulk_create",
+            autospec=True,
+            side_effect=record_bulk_create,
+        ):
+            self._record_candidate_metadata(
+                service,
+                job,
+                lease,
+                generation,
+                items,
+                blobs,
+            )
+
+        expected = [
+            (ExportBlob, 400, 400),
+            (ExportBlob, 400, 400),
+            (ExportBlob, 1, 400),
+            (ExportItem, 400, 400),
+            (ExportItem, 400, 400),
+            (ExportItem, 1, 400),
+        ]
+        self.assertEqual(calls, expected)
+        self.assertEqual(job.blobs.count(), 801)
+        self.assertEqual(job.items.count(), 801)
+        for index, event in enumerate(events):
+            if event[0] == "bulk":
+                self.assertEqual(events[index + 1], ("checkpoint",))
+
+    def test_fifty_thousand_candidate_batches_and_checkpoints(self):
+        job, lease = self._job(())
+        generation = uuid.uuid4()
+        items, blobs = self._candidate_metadata_rows(
+            job,
+            generation,
+            50000,
+        )
+        service = SnapshotService()
+        events = []
+
+        class Deadline(object):
+            def __init__(self, monotonic):
+                del monotonic
+
+            def checkpoint(self):
+                events.append(("checkpoint",))
+
+        def record_bulk_create(queryset, objects, batch_size=None,
+                               ignore_conflicts=False):
+            del ignore_conflicts
+            objects = tuple(objects)
+            self.assertIn(queryset.model, (ExportBlob, ExportItem))
+            events.append((
+                "bulk",
+                queryset.model,
+                len(objects),
+                batch_size,
+            ))
+            return list(objects)
+
+        with mock.patch(
+            "exports.services.snapshot.DatabaseFenceDeadline",
+            Deadline,
+        ), mock.patch.object(
+            QuerySet,
+            "bulk_create",
+            autospec=True,
+            side_effect=record_bulk_create,
+        ):
+            self._record_candidate_metadata(
+                service,
+                job,
+                lease,
+                generation,
+                items,
+                blobs,
+            )
+
+        bulk_events = [event for event in events if event[0] == "bulk"]
+        self.assertEqual(len(bulk_events), 250)
+        self.assertEqual(
+            [event[1] for event in bulk_events[:125]],
+            [ExportBlob] * 125,
+        )
+        self.assertEqual(
+            [event[1] for event in bulk_events[125:]],
+            [ExportItem] * 125,
+        )
+        self.assertTrue(all(
+            event[2:] == (400, 400) for event in bulk_events
+        ))
+        for index, event in enumerate(events):
+            if event[0] == "bulk":
+                self.assertEqual(events[index + 1], ("checkpoint",))
 
     def test_large_candidate_db_work_is_chunked_without_n_plus_one(self):
         job, _lease = self._job(())

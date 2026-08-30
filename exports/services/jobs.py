@@ -33,9 +33,11 @@ from exports.services.file_ops import (
     open_export_root,
 )
 from exports.services.targeting import (
+    QUERY_CHUNK_SIZE,
     ExportRequestError,
     TargetIdentityChanged,
     TargetingService,
+    iter_chunks,
 )
 
 
@@ -204,17 +206,20 @@ class JobService(object):
         ).update(current_job=job, updated_at=now)
         if claimed != 1:
             raise ExportRequestError("active_export_exists", 409)
-        ExportTarget.objects.bulk_create(tuple(
-            ExportTarget(
-                job=job,
-                position=position,
-                pin_id=identity.pin_id,
-                pin_owner_id_snapshot=identity.owner_id,
-                pin_published_at_snapshot=identity.published,
-            )
-            for position, identity in enumerate(captured.identities)
-        ))
-        checkpoint()
+        position = 0
+        for identity_chunk in iter_chunks(captured.identities):
+            ExportTarget.objects.bulk_create(tuple(
+                ExportTarget(
+                    job=job,
+                    position=position + offset,
+                    pin_id=identity.pin_id,
+                    pin_owner_id_snapshot=identity.owner_id,
+                    pin_published_at_snapshot=identity.published,
+                )
+                for offset, identity in enumerate(identity_chunk)
+            ), batch_size=QUERY_CHUNK_SIZE)
+            position += len(identity_chunk)
+            checkpoint()
         return job
 
     def _occupied_slot(self, user):

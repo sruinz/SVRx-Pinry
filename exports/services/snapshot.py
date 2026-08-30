@@ -602,8 +602,18 @@ class SnapshotService(object):
                 deadline.checkpoint,
             )
             deadline.checkpoint()
-            ExportBlob.objects.using(self.using).bulk_create(blobs)
-            ExportItem.objects.using(self.using).bulk_create(items)
+            for blob_chunk in self._chunks(blobs):
+                ExportBlob.objects.using(self.using).bulk_create(
+                    blob_chunk,
+                    batch_size=QUERY_CHUNK_SIZE,
+                )
+                deadline.checkpoint()
+            for item_chunk in self._chunks(items):
+                ExportItem.objects.using(self.using).bulk_create(
+                    item_chunk,
+                    batch_size=QUERY_CHUNK_SIZE,
+                )
+                deadline.checkpoint()
             deadline.checkpoint()
         return snapshot_at, len(items), excluded
 
@@ -1228,7 +1238,14 @@ class SnapshotService(object):
                         if (
                             blob.source_size is None
                             or current.st_size < 0
-                            or current.st_size > blob.source_size
+                            or (
+                                name == part_name
+                                and current.st_size > blob.source_size
+                            )
+                            or (
+                                name == final_name
+                                and current.st_size != blob.source_size
+                            )
                         ):
                             raise ExportStorageError("export_storage_unsafe")
                         remove_if_receipt_matches(
