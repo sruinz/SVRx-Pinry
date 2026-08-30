@@ -6,6 +6,7 @@ from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.db.models import F, Q
+from django.db.models.functions import Length
 
 from .contracts import (
     ACTIVE_STATES, ATTEMPT_FILE_KINDS, ATTEMPT_FILE_STATES, ATTEMPT_STATES,
@@ -13,6 +14,9 @@ from .contracts import (
     INCLUSION_STATES, JOB_ERROR_CODES, JOB_STATES, READY_CLEANUP_STATES,
     READY_FORBIDDEN_STATES, RECEIPT_LEVELS, SCOPE_VALUES, WORKER_HEALTH_STATES,
 )
+
+
+models.CharField.register_lookup(Length)
 
 
 def _choices(values):
@@ -33,12 +37,13 @@ def _all_or_none(fields):
 
 
 def _is_lower_sha(value):
-    return value is None or bool(re.match(r"^[0-9a-f]{64}$", value))
+    return value is None or re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
 def _nullable_sha_check(field):
-    return Q(**{"{}__isnull".format(field): True}) | Q(
-        **{"{}__regex".format(field): r"^[0-9a-f]{64}$"}
+    return Q(**{"{}__isnull".format(field): True}) | (
+        Q(**{"{}__length".format(field): 64}) &
+        Q(**{"{}__regex".format(field): r"^[0-9a-f]{64}$"})
     )
 
 

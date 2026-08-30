@@ -180,3 +180,59 @@ class ExportInitialMigrationTests(TransactionTestCase):
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 blob_model.objects.create(job=job, snapshot_generation=uuid.uuid4(), source_media_asset_id=1, source_image_id=1, source_relative_path="blob", receipt_sha256="UPPER")
+
+    def test_database_accepts_terminal_ready_and_tombstone_matrix(self):
+        user = self.apps.get_model("auth", "User").objects.create(username="matrix-owner")
+        job_model = self.apps.get_model("exports", "ExportJob")
+        attempt_model = self.apps.get_model("exports", "ExportAttempt")
+        file_model = self.apps.get_model("exports", "ExportAttemptFile")
+        errors = (
+            ("source_missing", "fatal", False), ("source_changed", "retryable", True),
+            ("source_unsafe", "operator_action_required", False), ("snapshot_failed", "retryable", True),
+            ("insufficient_space", "operator_action_required", True), ("archive_failed", "retryable", True),
+            ("permission_changed", "fatal", False), ("all_items_revoked", "fatal", False),
+            ("worker_repeated_failure", "operator_action_required", True), ("export_storage_unsafe", "operator_action_required", False),
+        )
+        for code, error_class, retryable in errors:
+            with self.subTest(code=code):
+                job_model.objects.create(owner=user, scope="pins", state="failed", error_code=code, error_class=error_class, error_retryable=retryable)
+        for code in ("invalid_target", "active_export_exists", "export_not_ready", "export_worker_unavailable", "export_temporarily_unavailable", "export_expired"):
+            with self.subTest(http_code=code):
+                with self.assertRaises(IntegrityError):
+                    with transaction.atomic():
+                        job_model.objects.create(owner=user, scope="pins", state="failed", error_code=code, error_class="retryable", error_retryable=True)
+        ready = {"ready_relative_path": "ready/matrix.zip", "ready_display_name": "matrix.zip", "ready_size": 10, "ready_sha256": "a" * 64, "ready_dev": 1, "ready_ino": 2, "ready_uid": 3, "ready_gid": 4, "ready_mode": 384, "ready_nlink": 1, "ready_mtime_ns": 5, "ready_ctime_ns": 6}
+        job_model.objects.create(owner=user, scope="pins", state="expired", ready_cleanup_state="pending", **ready)
+        job_model.objects.create(owner=user, scope="pins", state="expired", ready_cleanup_state="blocked", **dict(ready, ready_relative_path="ready/blocked.zip"))
+        job = job_model.objects.create(owner=user, scope="pins", state="expired", ready_cleanup_state="cleaned")
+        attempt = attempt_model.objects.create(job=job, attempt_generation=0, lease_uuid=uuid.uuid4(), state="cleaned", relative_path="attempts/0", dir_dev=1, dir_ino=2, dir_uid=3, dir_gid=4, dir_mode=448)
+        full = {"receipt_level": "full", "receipt_dev": 1, "receipt_ino": 2, "receipt_uid": 3, "receipt_gid": 4, "receipt_mode": 384, "receipt_nlink": 1, "receipt_size": 10, "receipt_mtime_ns": 5, "receipt_ctime_ns": 6}
+        file_model.objects.create(attempt=attempt, kind="archive", state="closed", relative_path="attempts/0/closed", **full)
+        file_model.objects.create(attempt=attempt, kind="quarantine", state="closed", relative_path="attempts/0/quarantine", **full)
+        file_model.objects.create(attempt=attempt, kind="archive", state="cleaned", receipt_level="open", relative_path="attempts/0/open", receipt_dev=1, receipt_ino=2, receipt_uid=3, receipt_gid=4, receipt_mode=384, receipt_nlink=1)
+        file_model.objects.create(attempt=attempt, kind="archive", state="cleaned", relative_path="attempts/0/full", **dict(full, receipt_sha256=None))
+        file_model.objects.create(attempt=attempt, kind="archive", state="cleaned", relative_path="attempts/0/verified", **dict(full, receipt_sha256="b" * 64))
+
+    def test_database_rejects_non_strict_sha_values_but_allows_null(self):
+        user = self.apps.get_model("auth", "User").objects.create(username="sha-owner")
+        job_model = self.apps.get_model("exports", "ExportJob")
+        blob_model = self.apps.get_model("exports", "ExportBlob")
+        attempt_model = self.apps.get_model("exports", "ExportAttempt")
+        file_model = self.apps.get_model("exports", "ExportAttemptFile")
+        ready = {"completed_at": "2026-08-30T12:00:00Z", "expires_at": "2026-08-31T12:00:00Z", "ready_relative_path": "ready/sha.zip", "ready_display_name": "sha.zip", "ready_size": 10, "ready_dev": 1, "ready_ino": 2, "ready_uid": 3, "ready_gid": 4, "ready_mode": 384, "ready_nlink": 1, "ready_mtime_ns": 5, "ready_ctime_ns": 6}
+        invalid = ("a" * 64 + "\n", "a" * 63, "a" * 65, "A" * 64, "g" * 64, "a" * 62 + "\r\n")
+        for value in invalid:
+            with self.subTest(job_sha=repr(value)):
+                with self.assertRaises(IntegrityError):
+                    with transaction.atomic():
+                        job_model.objects.create(owner=user, scope="pins", state="complete", ready_cleanup_state="retained", **dict(ready, ready_sha256=value))
+        job = job_model.objects.create(owner=user, scope="pins")
+        blob_model.objects.create(job=job, snapshot_generation=uuid.uuid4(), source_media_asset_id=1, source_image_id=1, source_relative_path="blob", receipt_sha256=None)
+        attempt = attempt_model.objects.create(job=job, attempt_generation=0, lease_uuid=uuid.uuid4(), state="writing", relative_path="attempts/0")
+        full = {"attempt": attempt, "kind": "archive", "state": "closed", "receipt_level": "full", "receipt_dev": 1, "receipt_ino": 2, "receipt_uid": 3, "receipt_gid": 4, "receipt_mode": 384, "receipt_nlink": 1, "receipt_size": 10, "receipt_mtime_ns": 5, "receipt_ctime_ns": 6}
+        file_model.objects.create(relative_path="attempts/0/null", receipt_sha256=None, **full)
+        for index, value in enumerate(invalid):
+            with self.subTest(file_sha=repr(value)):
+                with self.assertRaises(IntegrityError):
+                    with transaction.atomic():
+                        file_model.objects.create(relative_path="attempts/0/{}".format(index), receipt_sha256=value, **full)

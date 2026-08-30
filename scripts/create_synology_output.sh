@@ -45,6 +45,7 @@ package_source_paths=(
     requirements.txt
     manage.py
     core
+    exports
     django_images
     pinry
     pinry_plugins
@@ -603,6 +604,7 @@ git archive --format=tar "${source_commit}" -- \
     requirements.txt \
     manage.py \
     core \
+    exports \
     django_images \
     pinry \
     pinry_plugins \
@@ -612,6 +614,7 @@ git archive --format=tar "${source_commit}" -- \
     docker/scripts \
     docker/migration \
     ':(exclude)core/tests' \
+    ':(exclude)exports/tests' \
     ':(exclude)django_images/test_*.py' \
     ':(exclude)django_images/tests.py' \
     ':(exclude)pinry/settings/test_sqlite_file.py' \

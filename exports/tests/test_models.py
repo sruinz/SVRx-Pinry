@@ -167,3 +167,12 @@ class ExportModelConstraintTests(TestCase):
         )
         with self.assertRaises(ValidationError):
             file.full_clean()
+
+    def test_sha_validator_rejects_non_strict_values_and_allows_null(self):
+        job = ExportJob.objects.create(owner=self.user, scope="pins")
+        for value in ("a" * 64 + "\n", "a" * 63, "a" * 65, "A" * 64, "g" * 64, "a" * 62 + "\r\n"):
+            with self.subTest(value=repr(value)):
+                blob = ExportBlob(job=job, snapshot_generation=uuid.uuid4(), source_media_asset_id=1, source_image_id=1, source_relative_path="blob", receipt_sha256=value)
+                with self.assertRaises(ValidationError):
+                    blob.full_clean()
+        ExportBlob(job=job, snapshot_generation=uuid.uuid4(), source_media_asset_id=2, source_image_id=2, source_relative_path="null", receipt_sha256=None).full_clean()
