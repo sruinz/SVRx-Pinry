@@ -90,6 +90,33 @@ class UrlMetadataTests(SimpleTestCase):
 
         self.assertFalse(any(secret in message for message in capture.messages))
 
+    def test_redact_url_rejects_hostname_characters_outside_reg_name_or_ip_literal(self):
+        for value in (
+                "https://exa<mple.test/a?keep=1",
+                "https://exa|mple.test/a?keep=1",
+                "https://exa\\mple.test/a?keep=1"):
+            self.assertEqual(redact_url(value), (None, True))
+
+    def test_redact_url_rejects_unencodable_or_control_path_characters(self):
+        self.assertEqual(
+            redact_url("https://example.test/a\ud800?token=hidden"),
+            (None, True),
+        )
+        self.assertEqual(
+            redact_url("https://example.test/a\x01?token=hidden"),
+            (None, True),
+        )
+
+    def test_redact_url_preserves_valid_percent_encoding_while_removing_credentials(self):
+        self.assertEqual(
+            redact_url("https://example.test/a%20b?keep=%E2%9C%93&blank=&keep=%2525"),
+            ("https://example.test/a%20b?keep=%E2%9C%93&blank=&keep=%2525", False),
+        )
+        self.assertEqual(
+            redact_url("https://user:p%40ss@example.test/a?keep=%2F&%54oken=secret"),
+            ("https://example.test/a?keep=%2F", True),
+        )
+
 
 class TimeMetadataTests(SimpleTestCase):
     def test_format_utc_converts_timezone_and_keeps_microseconds(self):

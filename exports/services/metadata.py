@@ -1,3 +1,4 @@
+import ipaddress
 import os
 import unicodedata
 from datetime import datetime, timezone
@@ -31,6 +32,10 @@ _EXIF_NAMESPACE = "http://ns.adobe.com/exif/1.0/"
 _PHOTOSHOP_NAMESPACE = "http://ns.adobe.com/photoshop/1.0/"
 _DC_NAMESPACE = "http://purl.org/dc/elements/1.1/"
 _DIGIKAM_NAMESPACE = "http://www.digikam.org/ns/1.0/"
+_REG_NAME_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    "-._~!$&'()*+,;="
+)
 
 
 def _has_malformed_percent_escape(value):
@@ -44,12 +49,26 @@ def _has_malformed_percent_escape(value):
     return False
 
 
-def _valid_hostname(hostname):
-    return hostname and not any(
-        character.isspace()
-        or unicodedata.category(character) in ("Cc", "Cs")
-        or character == "%"
-        for character in hostname
+def _valid_hostname(hostname, is_ip_literal):
+    if not hostname:
+        return False
+    if is_ip_literal:
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            return False
+        return True
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    return all(character in _REG_NAME_CHARACTERS for character in ascii_hostname)
+
+
+def _valid_path(path):
+    return not any(
+        unicodedata.category(character) in ("Cc", "Cs")
+        for character in path
     )
 
 
@@ -65,7 +84,9 @@ def redact_url(value):
         hostname = parsed.hostname
         port = parsed.port
         authority = parsed.netloc.rsplit("@", 1)[-1]
-        if authority.endswith(":") or not _valid_hostname(hostname):
+        if (authority.endswith(":")
+                or not _valid_hostname(hostname, authority.startswith("["))
+                or not _valid_path(parsed.path)):
             return None, True
 
         host = hostname
@@ -82,9 +103,11 @@ def redact_url(value):
             else:
                 retained_pairs.append((key, item))
         query = urlencode(retained_pairs, doseq=True)
-        return urlunsplit(
+        sanitized = urlunsplit(
             (parsed.scheme.casefold(), host, parsed.path, query, ""),
-        ), redacted
+        )
+        sanitized.encode("utf-8")
+        return sanitized, redacted
     except (UnicodeError, ValueError):
         return None, True
 
