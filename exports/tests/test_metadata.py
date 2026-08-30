@@ -117,6 +117,56 @@ class UrlMetadataTests(SimpleTestCase):
             ("https://example.test/a?keep=%2F", True),
         )
 
+    def test_redact_url_rejects_raw_c0_and_surrogate_before_urlsplit(self):
+        templates = (
+            "https://exa{}mple.test/a?keep=1",
+            "https://example.test/a{}b?keep=1",
+            "https://example.test/a?keep=a{}b",
+        )
+
+        capture = _LogCapture()
+        logger = logging.getLogger()
+        logger.addHandler(capture)
+        try:
+            for character in ("\t", "\n", "\r", "\x00", "\ud800"):
+                for template in templates:
+                    self.assertEqual(
+                        redact_url(template.format(character)),
+                        (None, True),
+                    )
+        finally:
+            logger.removeHandler(capture)
+
+        self.assertEqual(capture.messages, [])
+
+    def test_redact_url_preserves_percent_encoded_controls_as_url_data(self):
+        self.assertEqual(
+            redact_url("https://example.test/a%09b?tab=%09&lf=%0A&cr=%0D"),
+            ("https://example.test/a%09b?tab=%09&lf=%0A&cr=%0D", False),
+        )
+
+    def test_redact_url_allows_rfc_reg_name_and_ip_literal_variants(self):
+        fixtures = (
+            "https://%65xample.test/a",
+            "https://b%C3%BCcher.example/a",
+            "https://bücher.example/a",
+            "https://127.0.0.1/a",
+            "https://[2001:db8::1]/a",
+            "https://[fe80::1%25eth0]/a",
+            "https://[v1.fe]/a",
+        )
+
+        for value in fixtures:
+            self.assertEqual(redact_url(value), (value, False))
+
+    def test_redact_url_rejects_malformed_ip_literal_variants(self):
+        for value in (
+                "https://[v1.]/a",
+                "https://[vG.fe]/a",
+                "https://[fe80::1%eth0]/a",
+                "https://[2001:db8:::1]/a"):
+            self.assertEqual(redact_url(value), (None, True))
+
 
 class TimeMetadataTests(SimpleTestCase):
     def test_format_utc_converts_timezone_and_keeps_microseconds(self):

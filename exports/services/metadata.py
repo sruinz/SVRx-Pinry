@@ -32,37 +32,93 @@ _EXIF_NAMESPACE = "http://ns.adobe.com/exif/1.0/"
 _PHOTOSHOP_NAMESPACE = "http://ns.adobe.com/photoshop/1.0/"
 _DC_NAMESPACE = "http://purl.org/dc/elements/1.1/"
 _DIGIKAM_NAMESPACE = "http://www.digikam.org/ns/1.0/"
-_REG_NAME_CHARACTERS = frozenset(
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_UNRESERVED_CHARACTERS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    "-._~!$&'()*+,;="
+    "-._~"
 )
+_SUB_DELIMITER_CHARACTERS = frozenset("!$&'()*+,;=")
+_REG_NAME_CHARACTERS = _UNRESERVED_CHARACTERS | _SUB_DELIMITER_CHARACTERS
+_IPVFUTURE_CHARACTERS = _REG_NAME_CHARACTERS | frozenset(":")
 
 
 def _has_malformed_percent_escape(value):
-    hex_digits = frozenset("0123456789abcdefABCDEF")
     for index, character in enumerate(value):
         if character == "%" and (
                 index + 2 >= len(value)
-                or value[index + 1] not in hex_digits
-                or value[index + 2] not in hex_digits):
+                or value[index + 1] not in _HEX_DIGITS
+                or value[index + 2] not in _HEX_DIGITS):
             return True
     return False
+
+
+def _has_raw_c0_or_surrogate(value):
+    return any(
+        ord(character) < 0x20 or unicodedata.category(character) == "Cs"
+        for character in value
+    )
+
+
+def _valid_uri_tokens(value, allowed_characters):
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "%":
+            if (index + 2 >= len(value)
+                    or value[index + 1] not in _HEX_DIGITS
+                    or value[index + 2] not in _HEX_DIGITS):
+                return False
+            index += 3
+        elif character in allowed_characters:
+            index += 1
+        else:
+            return False
+    return True
+
+
+def _valid_ipvfuture(hostname):
+    if len(hostname) < 4 or hostname[0].casefold() != "v":
+        return False
+    version, separator, address = hostname[1:].partition(".")
+    return (
+        bool(version)
+        and bool(separator)
+        and bool(address)
+        and all(character in _HEX_DIGITS for character in version)
+        and _valid_uri_tokens(address, _IPVFUTURE_CHARACTERS)
+    )
+
+
+def _valid_ip_literal(hostname):
+    if "%" in hostname:
+        address, encoded_zone = hostname.split("%", 1)
+        if not encoded_zone.startswith("25"):
+            return False
+        try:
+            ipaddress.IPv6Address(address)
+        except ValueError:
+            return False
+        return (
+            bool(encoded_zone[2:])
+            and _valid_uri_tokens(encoded_zone[2:], _UNRESERVED_CHARACTERS)
+        )
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        return _valid_ipvfuture(hostname)
+    return True
 
 
 def _valid_hostname(hostname, is_ip_literal):
     if not hostname:
         return False
     if is_ip_literal:
-        try:
-            ipaddress.ip_address(hostname)
-        except ValueError:
-            return False
-        return True
+        return _valid_ip_literal(hostname)
     try:
         ascii_hostname = hostname.encode("idna").decode("ascii")
     except UnicodeError:
         return False
-    return all(character in _REG_NAME_CHARACTERS for character in ascii_hostname)
+    return _valid_uri_tokens(ascii_hostname, _REG_NAME_CHARACTERS)
 
 
 def _valid_path(path):
@@ -76,7 +132,7 @@ def redact_url(value):
     if not isinstance(value, str):
         return None, True
     try:
-        if _has_malformed_percent_escape(value):
+        if _has_raw_c0_or_surrogate(value) or _has_malformed_percent_escape(value):
             return None, True
         parsed = urlsplit(value)
         if parsed.scheme.casefold() not in ("http", "https"):
@@ -89,9 +145,7 @@ def redact_url(value):
                 or not _valid_path(parsed.path)):
             return None, True
 
-        host = hostname
-        if ":" in host and not host.startswith("["):
-            host = "[{}]".format(host)
+        host = "[{}]".format(hostname) if authority.startswith("[") else hostname
         if port is not None:
             host = "{}:{}".format(host, port)
 
