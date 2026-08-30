@@ -101,7 +101,11 @@ def _backfill_database_write_fence():
             yield
     except DatabaseFenceBusy:
         raise _command_error("database_busy", retryable=True) from None
-    except DatabaseFenceError:
+    except DatabaseFenceError as error:
+        if error.code == "unsupported_database_fence_backend":
+            raise _command_error(
+                "unsupported_media_asset_backfill_database"
+            ) from None
         raise _command_error("registry_plan_identity_changed") from None
 
 

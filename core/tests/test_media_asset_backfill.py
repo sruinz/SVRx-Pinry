@@ -3262,6 +3262,47 @@ class DatabaseWriteFenceTests(SimpleTestCase):
     def test_deadline_is_a_busy_fence_error(self):
         self.assertTrue(issubclass(DatabaseFenceDeadline, DatabaseFenceBusy))
 
+    def test_backfill_adapter_preserves_legacy_error_branches(self):
+        cases = (
+            (
+                DatabaseFenceBusy(),
+                "database_busy",
+                True,
+            ),
+            (
+                DatabaseFenceError(
+                    "unsupported_database_fence_backend"
+                ),
+                "unsupported_media_asset_backfill_database",
+                None,
+            ),
+            (
+                DatabaseFenceError(),
+                "registry_plan_identity_changed",
+                None,
+            ),
+        )
+        for fence_error, expected_code, retryable in cases:
+            @contextmanager
+            def fail_fence(using, models):
+                del using, models
+                raise fence_error
+                yield
+
+            with self.subTest(expected_code=expected_code), mock.patch.object(
+                media_asset_backfill,
+                "database_write_fence",
+                side_effect=fail_fence,
+            ), self.assertRaisesRegex(
+                CommandError,
+                "^{}$".format(expected_code),
+            ) as caught:
+                with media_asset_backfill._backfill_database_write_fence():
+                    pass
+
+            if retryable is not None:
+                self.assertEqual(caught.exception.retryable, retryable)
+
     def test_deadline_uses_five_second_monotonic_budget(self):
         values = iter((10.0, 14.999, 15.0))
         deadline = DatabaseFenceDeadline(lambda: next(values))

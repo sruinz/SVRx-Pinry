@@ -488,6 +488,8 @@ def open_receipted_directory(parent, name, receipt):
     if not isinstance(receipt, DirectoryReceipt):
         raise TypeError("receipt must be a DirectoryReceipt")
     parent.verify_identity()
+    descriptor = None
+    directory = None
     try:
         descriptor = _open_named_directory(parent, name, receipt)
         directory = ExportDirectory(
@@ -497,10 +499,23 @@ def open_receipted_directory(parent, name, receipt):
             name=name,
         )
         directory.verify_identity()
+        descriptor = None
         return directory
-    except ExportStorageError:
-        raise
-    except Exception:
+    except BaseException as error:
+        if directory is not None:
+            try:
+                directory.close()
+            except BaseException:
+                pass
+        elif descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+        if isinstance(error, ExportStorageError):
+            raise
+        if not isinstance(error, Exception):
+            raise
         raise _storage_error("export_storage_unsafe") from None
 
 
@@ -825,13 +840,34 @@ class _DarwinMetadataAdapter(object):
     def _normalize_acl(cls, libc, descriptor):
         if not cls._acl_has_entry(libc, descriptor):
             return
-        acl_delete_fd_np = getattr(libc, "acl_delete_fd_np", None)
-        if acl_delete_fd_np is None:
+        acl_init = getattr(libc, "acl_init", None)
+        acl_set_fd_np = getattr(libc, "acl_set_fd_np", None)
+        acl_free = getattr(libc, "acl_free", None)
+        if None in (acl_init, acl_set_fd_np, acl_free):
             raise _storage_error("export_storage_unsafe")
-        acl_delete_fd_np.argtypes = (ctypes.c_int, ctypes.c_uint)
-        acl_delete_fd_np.restype = ctypes.c_int
-        if acl_delete_fd_np(descriptor, cls._ACL_TYPE_EXTENDED) != 0:
+        acl_init.argtypes = (ctypes.c_int,)
+        acl_init.restype = ctypes.c_void_p
+        acl_set_fd_np.argtypes = (
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+        )
+        acl_set_fd_np.restype = ctypes.c_int
+        acl_free.argtypes = (ctypes.c_void_p,)
+        acl_free.restype = ctypes.c_int
+        empty_acl = acl_init(0)
+        if not empty_acl:
             raise _storage_error("export_storage_unsafe")
+        try:
+            if acl_set_fd_np(
+                descriptor,
+                empty_acl,
+                cls._ACL_TYPE_EXTENDED,
+            ) != 0:
+                raise _storage_error("export_storage_unsafe")
+        finally:
+            if acl_free(empty_acl) != 0:
+                raise _storage_error("export_storage_unsafe")
         if cls._acl_has_entry(libc, descriptor):
             raise _storage_error("export_storage_unsafe")
 
@@ -891,6 +927,8 @@ def _copy_and_hash(
                 written += count
             offset += len(chunk)
             heartbeat()
+            if stop_requested():
+                raise _storage_error("snapshot_failed")
         os.ftruncate(destination_fd, size)
     except ExportStorageError:
         raise
@@ -960,10 +998,14 @@ def clone_or_copy(
         destination_fd,
     )
     try:
+        if stop_requested():
+            raise _storage_error("snapshot_failed")
         if sys.platform.startswith("linux"):
             try:
                 fcntl.ioctl(destination_fd, _FICLONE, source_fd)
                 method, digest = "reflink", None
+                if stop_requested():
+                    raise _storage_error("snapshot_failed")
             except OSError as error:
                 if error.errno == errno.ENOSPC:
                     raise _storage_error("insufficient_space") from None

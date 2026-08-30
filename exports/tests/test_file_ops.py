@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import unittest
 
 from django.test import SimpleTestCase, override_settings
 import mock
@@ -243,6 +244,44 @@ class ExportFileOpsTests(SimpleTestCase):
                 receipt,
             )
 
+    def test_reopen_final_verify_base_exception_closes_descriptor(self):
+        directory = create_private_directory(
+            self.root,
+            "snapshot-reopen-failure",
+            self.uid,
+            self.gid,
+        )
+        receipt = directory.receipt
+        directory.close()
+        opened = {}
+        interruption = KeyboardInterrupt("final verify interrupted")
+        original_verify = file_ops.ExportDirectory.verify_identity
+
+        def fail_child_verify(candidate):
+            if candidate.name == "snapshot-reopen-failure":
+                opened["descriptor"] = candidate.descriptor
+                raise interruption
+            return original_verify(candidate)
+
+        with mock.patch.object(
+            file_ops.ExportDirectory,
+            "verify_identity",
+            autospec=True,
+            side_effect=fail_child_verify,
+        ), self.assertRaises(KeyboardInterrupt) as caught:
+            open_receipted_directory(
+                self.root,
+                "snapshot-reopen-failure",
+                receipt,
+            )
+
+        descriptor = opened["descriptor"]
+        self.addCleanup(self._close_if_open, descriptor)
+        self.assertIs(caught.exception, interruption)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(descriptor)
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+
     def test_create_private_file_fsync_failure_removes_created_name(self):
         real_fsync = file_ops.os.fsync
 
@@ -423,6 +462,99 @@ class ExportFileOpsTests(SimpleTestCase):
         self.assertEqual(ioctl.call_count, 1)
         self.assertEqual(os.pread(destination_fd, len(content), 0), content)
 
+    def test_initial_stop_prevents_copy_or_reflink_side_effects(self):
+        _path, source_fd, source_receipt = self._source(b"initial stop")
+        destination_fd, _receipt = self._private_file()
+
+        with mock.patch(
+            "exports.services.file_ops.sys.platform", "linux"
+        ), mock.patch(
+            "exports.services.file_ops.fcntl.ioctl",
+            side_effect=lambda *_args: self.fail("reflink attempted"),
+        ), mock.patch.object(
+            file_ops._LinuxMetadataAdapter,
+            "normalize",
+            side_effect=lambda *_args: self.fail("metadata normalized"),
+        ), mock.patch(
+            "exports.services.file_ops.os.fsync",
+            side_effect=lambda *_args: self.fail("destination synced"),
+        ), self.assertRaisesRegex(
+            ExportStorageError, "^snapshot_failed$"
+        ):
+            clone_or_copy(
+                source_fd,
+                destination_fd,
+                source_receipt,
+                heartbeat=lambda: None,
+                stop_requested=lambda: True,
+                before_copy=lambda _size: self.fail("copy prepared"),
+            )
+
+    def test_final_copy_heartbeat_stop_prevents_metadata_and_fsync(self):
+        _path, source_fd, source_receipt = self._source(b"final stop")
+        destination_fd, _receipt = self._private_file()
+        stopped = {"value": False}
+
+        def heartbeat():
+            stopped["value"] = True
+
+        with mock.patch(
+            "exports.services.file_ops.sys.platform", "darwin"
+        ), mock.patch.object(
+            file_ops._DarwinMetadataAdapter,
+            "normalize",
+            side_effect=lambda *_args: self.fail("metadata normalized"),
+        ), mock.patch(
+            "exports.services.file_ops.os.fsync",
+            side_effect=lambda *_args: self.fail("destination synced"),
+        ), self.assertRaisesRegex(
+            ExportStorageError, "^snapshot_failed$"
+        ):
+            clone_or_copy(
+                source_fd,
+                destination_fd,
+                source_receipt,
+                heartbeat=heartbeat,
+                stop_requested=lambda: stopped["value"],
+                before_copy=lambda _size: None,
+            )
+
+    def test_reflink_stop_prevents_metadata_and_fsync(self):
+        content = b"reflink stop"
+        _path, source_fd, source_receipt = self._source(content)
+        destination_fd, _receipt = self._private_file()
+        stopped = {"value": False}
+
+        def emulate_reflink(destination, _operation, source):
+            os.ftruncate(destination, 0)
+            os.pwrite(destination, os.pread(source, len(content), 0), 0)
+            stopped["value"] = True
+            return 0
+
+        with mock.patch(
+            "exports.services.file_ops.sys.platform", "linux"
+        ), mock.patch(
+            "exports.services.file_ops.fcntl.ioctl",
+            side_effect=emulate_reflink,
+        ), mock.patch.object(
+            file_ops._LinuxMetadataAdapter,
+            "normalize",
+            side_effect=lambda *_args: self.fail("metadata normalized"),
+        ), mock.patch(
+            "exports.services.file_ops.os.fsync",
+            side_effect=lambda *_args: self.fail("destination synced"),
+        ), self.assertRaisesRegex(
+            ExportStorageError, "^snapshot_failed$"
+        ):
+            clone_or_copy(
+                source_fd,
+                destination_fd,
+                source_receipt,
+                heartbeat=lambda: None,
+                stop_requested=lambda: stopped["value"],
+                before_copy=lambda _size: self.fail("copy prepared"),
+            )
+
     def test_linux_unsupported_reflink_errors_fall_back_to_copy(self):
         for error_number in (errno.ENOTTY, errno.EOPNOTSUPP):
             with self.subTest(error_number=error_number):
@@ -558,12 +690,47 @@ class ExportFileOpsTests(SimpleTestCase):
             file_ops._LinuxMetadataAdapter.normalize(17)
 
     def test_darwin_metadata_adapter_uses_fd_acl_and_xattr_apis(self):
+        acl_state = {"present": True}
+        freed_acls = []
         names = [b"com.apple.pinry"]
         raw_names = b"com.apple.pinry\x00"
 
-        def acl_get_fd_np(_descriptor, _acl_type):
+        def acl_get_fd_np(descriptor, acl_type):
+            if descriptor != 17 or acl_type != 0x00000100:
+                ctypes.set_errno(errno.EINVAL)
+                return None
+            if acl_state["present"]:
+                ctypes.set_errno(0)
+                return 101
             ctypes.set_errno(errno.ENOENT)
             return None
+
+        def acl_get_entry(acl, entry_id, _entry):
+            if acl != 101 or entry_id != 0:
+                ctypes.set_errno(errno.EINVAL)
+                return -1
+            return 0
+
+        def acl_init(count):
+            if count != 0:
+                ctypes.set_errno(errno.EINVAL)
+                return None
+            return 202
+
+        def acl_set_fd_np(descriptor, acl, acl_type):
+            if (
+                descriptor != 17
+                or acl != 202
+                or acl_type != 0x00000100
+            ):
+                ctypes.set_errno(errno.EINVAL)
+                return -1
+            acl_state["present"] = False
+            return 0
+
+        def acl_free(acl):
+            freed_acls.append(acl)
+            return 0
 
         def flistxattr(_descriptor, buffer, _size, _options):
             if not names:
@@ -579,9 +746,10 @@ class ExportFileOpsTests(SimpleTestCase):
 
         libc = mock.Mock()
         libc.acl_get_fd_np = mock.Mock(side_effect=acl_get_fd_np)
-        libc.acl_get_entry = mock.Mock()
-        libc.acl_free = mock.Mock()
-        libc.acl_delete_fd_np = mock.Mock()
+        libc.acl_get_entry = mock.Mock(side_effect=acl_get_entry)
+        libc.acl_init = mock.Mock(side_effect=acl_init)
+        libc.acl_set_fd_np = mock.Mock(side_effect=acl_set_fd_np)
+        libc.acl_free = mock.Mock(side_effect=acl_free)
         libc.flistxattr = mock.Mock(side_effect=flistxattr)
         libc.fremovexattr = mock.Mock(side_effect=fremovexattr)
 
@@ -596,23 +764,17 @@ class ExportFileOpsTests(SimpleTestCase):
         ):
             file_ops._normalize_metadata(17)
 
-        libc.acl_get_fd_np.assert_called_once_with(
-            17,
-            file_ops._DarwinMetadataAdapter._ACL_TYPE_EXTENDED,
-        )
-        libc.fremovexattr.assert_called_once_with(
-            17,
-            b"com.apple.pinry",
-            0,
-        )
+        self.assertFalse(acl_state["present"])
+        self.assertEqual(freed_acls, [101, 202])
         self.assertEqual(names, [])
 
     def test_darwin_metadata_adapter_rejects_unknown_acl_result(self):
         libc = mock.Mock()
         libc.acl_get_fd_np = mock.Mock(return_value=1)
         libc.acl_get_entry = mock.Mock(return_value=1)
+        libc.acl_init = mock.Mock(return_value=2)
+        libc.acl_set_fd_np = mock.Mock(return_value=0)
         libc.acl_free = mock.Mock(return_value=0)
-        libc.acl_delete_fd_np = mock.Mock(return_value=0)
         libc.flistxattr = mock.Mock(return_value=0)
         libc.fremovexattr = mock.Mock(return_value=0)
 
@@ -624,6 +786,43 @@ class ExportFileOpsTests(SimpleTestCase):
             ExportStorageError, "^export_storage_unsafe$"
         ):
             file_ops._DarwinMetadataAdapter.normalize(17)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin ACL integration")
+    def test_darwin_metadata_adapter_removes_actual_extended_acl(self):
+        path = Path(self.temporary.name, "darwin-acl.part")
+        path.write_bytes(b"acl")
+        os.chmod(str(path), 0o600)
+        descriptor = os.open(str(path), os.O_RDWR)
+        self.addCleanup(self._close_if_open, descriptor)
+
+        subprocess.run(
+            ["chmod", "+a", "everyone deny write", str(path)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(
+            subprocess.run,
+            ["chmod", "-N", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        libc = file_ops._DarwinMetadataAdapter._libc()
+        self.assertTrue(
+            file_ops._DarwinMetadataAdapter._acl_has_entry(
+                libc,
+                descriptor,
+            )
+        )
+
+        file_ops._DarwinMetadataAdapter._normalize_acl(libc, descriptor)
+
+        self.assertFalse(
+            file_ops._DarwinMetadataAdapter._acl_has_entry(
+                libc,
+                descriptor,
+            )
+        )
 
     def test_remove_refuses_replaced_inode(self):
         descriptor, receipt = self._private_file()
