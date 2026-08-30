@@ -6,8 +6,6 @@ from functools import wraps
 from django.conf import settings
 from django.db import transaction
 from django.shortcuts import get_object_or_404
-from django.utils.decorators import method_decorator
-from django.views.decorators.cache import cache_page
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets, mixins, routers, status
 from rest_framework.decorators import action
@@ -576,14 +574,6 @@ class TagAutoCompleteViewSet(mixins.ListModelMixin, viewsets.GenericViewSet):
     queryset = Tag.objects.all()
     serializer_class = api.TagAutoCompleteSerializer
     pagination_class = None
-
-    @method_decorator(cache_page(60 * 5))
-    def list(self, request, *args, **kwargs):
-        return super(TagAutoCompleteViewSet, self).list(
-            request,
-            *args,
-            **kwargs
-        )
 
 
 drf_router = routers.DefaultRouter()
