@@ -93,7 +93,20 @@ def detect_image_mime(source_fd):
     raise ExportStorageError("source_unsafe")
 
 
-def _directory_receipt_from_job(job):
+def snapshot_directory_receipt(job):
+    values = (
+        job.snapshot_dir_dev,
+        job.snapshot_dir_ino,
+        job.snapshot_dir_uid,
+        job.snapshot_dir_gid,
+        job.snapshot_dir_mode,
+    )
+    if any(value is None for value in values):
+        return None
+    return DirectoryReceipt(*values)
+
+
+def _candidate_directory_receipt(job):
     values = (
         job.candidate_snapshot_dir_dev,
         job.candidate_snapshot_dir_ino,
@@ -106,7 +119,7 @@ def _directory_receipt_from_job(job):
     return DirectoryReceipt(*values)
 
 
-def _candidate_name(job_id, generation):
+def snapshot_directory_name(job_id, generation):
     return "snapshot-{}-{}".format(job_id, generation)
 
 
@@ -114,11 +127,11 @@ def _blob_part_name(blob_id):
     return "{}.part".format(blob_id)
 
 
-def _blob_final_name(blob_id):
+def snapshot_blob_name(blob_id):
     return str(blob_id)
 
 
-def _open_staging_directory(export_root):
+def open_staging_directory(export_root):
     try:
         named = os.stat(
             ".staging",
@@ -239,20 +252,20 @@ class SnapshotService(object):
     ):
         if current.candidate_snapshot_generation != generation:
             raise LeaseLost()
-        if current.candidate_snapshot_relative_path != _candidate_name(
+        if current.candidate_snapshot_relative_path != snapshot_directory_name(
             lease.job_id,
             generation,
         ):
             raise ExportError("export_storage_unsafe", lease)
         if (
             directory is not None
-            and _directory_receipt_from_job(current) != directory.receipt
+            and _candidate_directory_receipt(current) != directory.receipt
         ):
             raise ExportError("export_storage_unsafe", lease)
 
     def _plan_candidate(self, lease, heartbeat):
         generation = self.generation_factory()
-        relative_path = _candidate_name(lease.job_id, generation)
+        relative_path = snapshot_directory_name(lease.job_id, generation)
         with self._lease_cas(heartbeat, lease) as current:
             if current.snapshot_generation is not None:
                 return current.snapshot_generation, None
@@ -277,7 +290,7 @@ class SnapshotService(object):
         return generation, generation
 
     def _prepare_directory(self, staging, generation, job_id):
-        name = _candidate_name(job_id, generation)
+        name = snapshot_directory_name(job_id, generation)
         directory = create_private_directory(
             staging,
             name,
@@ -299,7 +312,7 @@ class SnapshotService(object):
         receipt = directory.receipt
         with self._lease_cas(heartbeat, lease) as current:
             self._require_candidate(current, generation, lease)
-            recorded_receipt = _directory_receipt_from_job(current)
+            recorded_receipt = _candidate_directory_receipt(current)
             if recorded_receipt not in (None, receipt):
                 raise ExportError("export_storage_unsafe", lease)
             current.candidate_snapshot_dir_dev = receipt.dev
@@ -592,7 +605,7 @@ class SnapshotService(object):
             )
             if current.owner_id is None:
                 raise ExportError("permission_changed", lease)
-            if _directory_receipt_from_job(current) is None:
+            if _candidate_directory_receipt(current) is None:
                 raise ExportError("export_storage_unsafe", lease)
             snapshot_at = timezone.now()
             items, blobs, excluded = self._build_metadata(
@@ -653,12 +666,12 @@ class SnapshotService(object):
             "source_ctime_ns": source_receipt.ctime_ns,
             "mime_type": mime_type,
             "part_relative_path": "{}/{}".format(
-                _candidate_name(lease.job_id, generation),
+                snapshot_directory_name(lease.job_id, generation),
                 _blob_part_name(blob.pk),
             ),
             "snapshot_relative_path": "{}/{}".format(
-                _candidate_name(lease.job_id, generation),
-                _blob_final_name(blob.pk),
+                snapshot_directory_name(lease.job_id, generation),
+                snapshot_blob_name(blob.pk),
             ),
             "file_state": "writing",
         })
@@ -794,7 +807,7 @@ class SnapshotService(object):
                 ) * reference_counts.get(blob.pk, 0)
                 mime_type = detect_image_mime(source.descriptor)
                 part_name = _blob_part_name(blob.pk)
-                final_name = _blob_final_name(blob.pk)
+                final_name = snapshot_blob_name(blob.pk)
                 destination_fd, open_receipt = create_private_file_fs(
                     directory,
                     part_name,
@@ -1140,12 +1153,12 @@ class SnapshotService(object):
         stop_requested,
         lease,
     ):
-        if job.candidate_snapshot_relative_path != _candidate_name(
+        if job.candidate_snapshot_relative_path != snapshot_directory_name(
             job.pk,
             job.candidate_snapshot_generation,
         ):
             raise ExportStorageError("export_storage_unsafe")
-        receipt = _directory_receipt_from_job(job)
+        receipt = _candidate_directory_receipt(job)
         if receipt is None:
             if has_blobs:
                 raise ExportStorageError("export_storage_unsafe")
@@ -1196,7 +1209,7 @@ class SnapshotService(object):
                 )
                 for blob in blob_chunk:
                     part_name = _blob_part_name(blob.pk)
-                    final_name = _blob_final_name(blob.pk)
+                    final_name = snapshot_blob_name(blob.pk)
                     existing = []
                     for name in (part_name, final_name):
                         try:
@@ -1431,7 +1444,7 @@ class SnapshotService(object):
             generation = pending
             current = ExportJob.objects.using(self.using).get(pk=lease.job_id)
             self._require_candidate(current, generation, lease)
-            receipt = _directory_receipt_from_job(current)
+            receipt = _candidate_directory_receipt(current)
             if (
                 receipt is None
                 or current.items.filter(snapshot_generation=generation).exists()
@@ -1515,7 +1528,7 @@ class SnapshotService(object):
         media_root = None
         try:
             media_root = open_verified_media_root(settings.MEDIA_ROOT)
-            staging = _open_staging_directory(export_root)
+            staging = open_staging_directory(export_root)
             current_for_space = ExportJob.objects.using(self.using).get(
                 pk=lease.job_id,
             )
@@ -1606,4 +1619,11 @@ class SnapshotService(object):
             export_root.close()
 
 
-__all__ = ("SnapshotService", "detect_image_mime")
+__all__ = (
+    "SnapshotService",
+    "detect_image_mime",
+    "open_staging_directory",
+    "snapshot_blob_name",
+    "snapshot_directory_name",
+    "snapshot_directory_receipt",
+)

@@ -43,7 +43,13 @@ from exports.services.file_ops import (
     ExportStorageError,
     SpaceBudget,
 )
-from exports.services.snapshot import SnapshotService, detect_image_mime
+from exports.services.snapshot import (
+    SnapshotService,
+    detect_image_mime,
+    snapshot_blob_name,
+    snapshot_directory_name,
+    snapshot_directory_receipt,
+)
 
 from .helpers import ExportStorageMixin, create_export_pin, create_export_user
 
@@ -84,6 +90,49 @@ class ImageMimeTests(SimpleTestCase):
                     with self.assertRaises(ExportStorageError) as raised:
                         detect_image_mime(file_obj.fileno())
                 self.assertEqual(raised.exception.code, "source_unsafe")
+
+
+class SnapshotPublicHelperTests(SimpleTestCase):
+    def test_names_are_deterministic_leaf_names(self):
+        job_id = uuid.UUID("12345678-1234-5678-1234-567812345678")
+        generation = uuid.UUID("87654321-4321-8765-4321-876543218765")
+        blob_id = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+        self.assertEqual(
+            snapshot_directory_name(job_id, generation),
+            "snapshot-{}-{}".format(job_id, generation),
+        )
+        self.assertEqual(snapshot_blob_name(blob_id), str(blob_id))
+
+    def test_confirmed_directory_receipt_uses_confirmed_fields_only(self):
+        job = SimpleNamespace(
+            snapshot_dir_dev=11,
+            snapshot_dir_ino=12,
+            snapshot_dir_uid=13,
+            snapshot_dir_gid=14,
+            snapshot_dir_mode=0o700,
+            candidate_snapshot_dir_dev=91,
+            candidate_snapshot_dir_ino=92,
+            candidate_snapshot_dir_uid=93,
+            candidate_snapshot_dir_gid=94,
+            candidate_snapshot_dir_mode=0o700,
+        )
+
+        self.assertEqual(
+            snapshot_directory_receipt(job),
+            DirectoryReceipt(11, 12, 13, 14, 0o700),
+        )
+
+    def test_incomplete_confirmed_directory_receipt_is_rejected(self):
+        job = SimpleNamespace(
+            snapshot_dir_dev=11,
+            snapshot_dir_ino=None,
+            snapshot_dir_uid=13,
+            snapshot_dir_gid=14,
+            snapshot_dir_mode=0o700,
+        )
+
+        self.assertIsNone(snapshot_directory_receipt(job))
 
 
 class FakeHeartbeat(object):
