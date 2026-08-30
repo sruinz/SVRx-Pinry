@@ -1,5 +1,6 @@
 import errno
 import os
+import stat
 
 from django.conf import settings
 from django.db import transaction
@@ -67,6 +68,23 @@ def closed_file_receipt(attempt_file):
     )
 
 
+def attempt_file_cleanup_receipt(attempt_file):
+    if attempt_file.receipt_level == "open":
+        if any(getattr(attempt_file, field) is not None for field in (
+            "receipt_size",
+            "receipt_mtime_ns",
+            "receipt_ctime_ns",
+            "receipt_sha256",
+        )):
+            raise ExportStorageError("export_storage_unsafe")
+        return _open_receipt(attempt_file)
+    if attempt_file.receipt_level == "full":
+        receipt = closed_file_receipt(attempt_file)
+        if receipt is not None:
+            return receipt
+    raise ExportStorageError("export_storage_unsafe")
+
+
 class AttemptService(object):
     def __init__(self, using="default"):
         self.using = using
@@ -80,6 +98,55 @@ class AttemptService(object):
             staging.uid,
             staging.gid,
         )
+
+    def remove_unreceipted_directory_fs(self, staging, job, lease):
+        if (
+            job.pk != lease.job_id
+            or job.state != "archiving"
+            or job.attempt_generation != lease.attempt_generation
+        ):
+            raise LeaseLost()
+        name = _attempt_name(job.pk, lease.attempt_generation)
+        staging.verify_identity()
+        try:
+            named = os.stat(
+                name,
+                dir_fd=staging.descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            staging.verify_identity()
+            return False
+        if (
+            not stat.S_ISDIR(named.st_mode)
+            or named.st_uid != staging.uid
+            or named.st_gid != staging.gid
+            or stat.S_IMODE(named.st_mode) != 0o700
+        ):
+            raise ExportStorageError("export_storage_unsafe")
+        receipt = DirectoryReceipt(
+            named.st_dev,
+            named.st_ino,
+            named.st_uid,
+            named.st_gid,
+            stat.S_IMODE(named.st_mode),
+        )
+        directory = open_receipted_directory(staging, name, receipt)
+        try:
+            if os.listdir(directory.descriptor):
+                raise ExportStorageError("export_storage_unsafe")
+            directory.verify_identity()
+            if os.listdir(directory.descriptor):
+                raise ExportStorageError("export_storage_unsafe")
+            os.rmdir(name, dir_fd=staging.descriptor)
+            os.fsync(staging.descriptor)
+            return True
+        except ExportStorageError:
+            raise
+        except OSError:
+            raise ExportStorageError("export_storage_unsafe") from None
+        finally:
+            directory.close()
 
     def record_directory_receipt_db_only(
         self, job, lease, directory, heartbeat,
@@ -316,5 +383,6 @@ class AttemptService(object):
 __all__ = (
     "ARCHIVE_PART_NAME",
     "AttemptService",
+    "attempt_file_cleanup_receipt",
     "closed_file_receipt",
 )

@@ -38,7 +38,7 @@ from exports.models import (
 from exports.services.attempts import (
     ARCHIVE_PART_NAME,
     AttemptService,
-    closed_file_receipt,
+    attempt_file_cleanup_receipt,
 )
 from exports.services.file_ops import (
     ClosedFileReceipt,
@@ -258,6 +258,20 @@ class ArchiveService(object):
         if stop_requested is not None and stop_requested():
             raise StopRequested(lease)
 
+    def _retry_recovery_db(
+        self, operation, lease, heartbeat, stop_requested,
+    ):
+        deadline = DatabaseFenceDeadline(self.monotonic)
+        while True:
+            try:
+                return operation()
+            except DatabaseFenceBusy:
+                deadline.checkpoint()
+                self._stop(stop_requested, lease)
+                heartbeat()
+                self.sleeper(0.01)
+                self._stop(stop_requested, lease)
+
     @staticmethod
     def _chunks(values):
         values = list(values)
@@ -374,6 +388,7 @@ class ArchiveService(object):
             flags |= os.O_CLOEXEC
         descriptor = None
         digest = hashlib.sha256()
+        bytes_written = 0
         try:
             descriptor = os.open(
                 snapshot_blob_name(blob.pk), flags,
@@ -386,6 +401,14 @@ class ArchiveService(object):
                     break
                 destination.write(chunk)
                 digest.update(chunk)
+                bytes_written += len(chunk)
+                self._fault(
+                    "after_archive_chunk",
+                    blob=blob,
+                    lease=lease,
+                    chunk_size=len(chunk),
+                    bytes_written=bytes_written,
+                )
                 self._stop(stop_requested, lease)
                 heartbeat()
             receipt.verify_identity(descriptor)
@@ -424,6 +447,12 @@ class ArchiveService(object):
             )
             attempt_directory = self.attempt_service.create_directory_fs(
                 staging, job, lease,
+            )
+            self._fault(
+                "after_attempt_directory_create",
+                directory=attempt_directory,
+                job=job,
+                lease=lease,
             )
             attempt = self.attempt_service.record_directory_receipt_db_only(
                 job, lease, attempt_directory, heartbeat,
@@ -485,6 +514,12 @@ class ArchiveService(object):
             descriptor = None
             attempt_file = self.attempt_service.record_closed_file_receipt_db_only(
                 attempt, attempt_file, closed, lease, heartbeat,
+            )
+            self._fault(
+                "after_archive_closed_receipt",
+                attempt=attempt,
+                attempt_file=attempt_file,
+                lease=lease,
             )
             return attempt, attempt_file, tuple(expected_names), exported_at
         finally:
@@ -896,19 +931,45 @@ class ArchiveService(object):
                 heartbeat()
                 self.sleeper(0.01)
 
-    def _cleanup_retiring(self, attempt, attempt_file, lease, heartbeat):
+    def _retiring_cleanup_state(
+        self, attempt, attempt_file, lease, heartbeat,
+    ):
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                lock_current_lease(lease, using=self.using)
+                current_attempt = ExportAttempt.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=attempt.pk)
+                current_file = None
+                if attempt_file is not None:
+                    current_file = ExportAttemptFile.objects.using(
+                        self.using,
+                    ).select_for_update().get(pk=attempt_file.pk)
+                    if current_file.attempt_id != current_attempt.pk:
+                        raise LeaseLost()
+                    if current_file.state not in ("retiring", "cleaned"):
+                        raise LeaseLost()
+                if current_attempt.state not in ("retiring", "cleaned"):
+                    raise LeaseLost()
+                return current_attempt, current_file
+
+    def _remove_retiring_file_fs(self, attempt, attempt_file):
         root = open_export_root(
             settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
         )
         staging = directory = ready = None
         try:
-            receipt = closed_file_receipt(attempt_file)
-            if attempt_file.relative_path.startswith("ready/"):
+            receipt = attempt_file_cleanup_receipt(attempt_file)
+            ready_path = "ready/{}.zip".format(attempt.job_id)
+            staging_path = "{}/{}".format(
+                attempt.relative_path, ARCHIVE_PART_NAME,
+            )
+            if attempt_file.relative_path == ready_path:
                 ready = self._open_ready_directory(root)
                 remove_if_receipt_matches(
                     ready, os.path.basename(attempt_file.relative_path), receipt,
                 )
-            else:
+            elif attempt_file.relative_path == staging_path:
                 staging = open_staging_directory(root)
                 directory = open_receipted_directory(
                     staging, attempt.relative_path,
@@ -917,26 +978,104 @@ class ArchiveService(object):
                 remove_if_receipt_matches(
                     directory, ARCHIVE_PART_NAME, receipt,
                 )
+            else:
+                raise ExportStorageError("export_storage_unsafe")
         finally:
             for current in (ready, directory, staging, root):
                 if current is not None:
                     current.close()
+
+    def _remove_retiring_directory_fs(self, attempt):
+        expected_name = "attempt-{}-{}".format(
+            attempt.job_id, attempt.attempt_generation,
+        )
+        if attempt.relative_path != expected_name:
+            raise ExportStorageError("export_storage_unsafe")
+        root = open_export_root(
+            settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
+        )
+        staging = directory = None
+        try:
+            staging = open_staging_directory(root)
+            try:
+                named = os.stat(
+                    expected_name,
+                    dir_fd=staging.descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                staging.verify_identity()
+                return False
+            receipt = self._attempt_directory_receipt(attempt)
+            if not receipt.matches_stat(named):
+                raise ExportStorageError("export_storage_unsafe")
+            directory = open_receipted_directory(
+                staging, expected_name, receipt,
+            )
+            if os.listdir(directory.descriptor):
+                raise ExportStorageError("export_storage_unsafe")
+            directory.verify_identity()
+            if os.listdir(directory.descriptor):
+                raise ExportStorageError("export_storage_unsafe")
+            os.rmdir(expected_name, dir_fd=staging.descriptor)
+            os.fsync(staging.descriptor)
+            return True
+        except ExportStorageError:
+            raise
+        except OSError:
+            raise ExportStorageError("export_storage_unsafe") from None
+        finally:
+            for current in (directory, staging, root):
+                if current is not None:
+                    current.close()
+
+    def _cleanup_retiring(self, attempt, attempt_file, lease, heartbeat):
+        current_attempt, current_file = self._retiring_cleanup_state(
+            attempt, attempt_file, lease, heartbeat,
+        )
+        if current_attempt.state == "cleaned":
+            return
+        if current_file is not None and current_file.state == "retiring":
+            self._remove_retiring_file_fs(current_attempt, current_file)
         with heartbeat.foreground_write_guard():
             with transaction.atomic(using=self.using):
                 lock_current_lease(lease, using=self.using)
-                current_file = ExportAttemptFile.objects.using(
-                    self.using,
-                ).select_for_update().get(pk=attempt_file.pk)
                 current_attempt = ExportAttempt.objects.using(
                     self.using,
                 ).select_for_update().get(pk=attempt.pk)
-                if current_file.state != "retiring":
+                if current_attempt.state != "retiring":
                     raise LeaseLost()
-                current_file.state = "cleaned"
-                current_file.intent_relative_path = None
-                current_file.save(update_fields=(
-                    "state", "intent_relative_path",
-                ))
+                if attempt_file is not None:
+                    current_file = ExportAttemptFile.objects.using(
+                        self.using,
+                    ).select_for_update().get(pk=attempt_file.pk)
+                    if current_file.state == "retiring":
+                        current_file.state = "cleaned"
+                        current_file.intent_relative_path = None
+                        current_file.save(update_fields=(
+                            "state", "intent_relative_path",
+                        ))
+                    elif current_file.state != "cleaned":
+                        raise LeaseLost()
+                if current_attempt.files.exclude(state="cleaned").exists():
+                    return
+        current_attempt, current_file = self._retiring_cleanup_state(
+            attempt, attempt_file, lease, heartbeat,
+        )
+        if current_attempt.state == "cleaned":
+            return
+        self._remove_retiring_directory_fs(current_attempt)
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                lock_current_lease(lease, using=self.using)
+                current_attempt = ExportAttempt.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=attempt.pk)
+                if (
+                    current_attempt.state != "retiring"
+                    or current_attempt.files.exclude(state="cleaned").exists()
+                ):
+                    raise LeaseLost()
                 current_attempt.state = "cleaned"
                 current_attempt.save(update_fields=("state",))
 
@@ -1034,6 +1173,68 @@ class ArchiveService(object):
                     attempt.state = "retiring"
                     attempt.save(update_fields=("state",))
 
+    def _archiving_recovery_state(self, lease, heartbeat):
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                if current.state != "archiving":
+                    return current, None, None
+                attempt = ExportAttempt.objects.using(
+                    self.using,
+                ).select_for_update().filter(
+                    job=current,
+                    attempt_generation=lease.attempt_generation,
+                ).first()
+                if attempt is None:
+                    return current, None, None
+                expected_path = "attempt-{}-{}".format(
+                    current.pk, lease.attempt_generation,
+                )
+                if attempt.relative_path != expected_path:
+                    raise ExportError("export_storage_unsafe", lease)
+                files = list(ExportAttemptFile.objects.using(
+                    self.using,
+                ).select_for_update().filter(
+                    attempt=attempt,
+                    kind="archive",
+                )[:2])
+                if len(files) > 1:
+                    raise ExportError("export_storage_unsafe", lease)
+                return current, attempt, files[0] if files else None
+
+    def _rotate_recovered_attempt(
+        self, attempt, lease, heartbeat,
+    ):
+        with heartbeat.job_token_transition(lease) as rotation:
+            with heartbeat.foreground_write_guard():
+                with transaction.atomic(using=self.using):
+                    current = lock_current_lease(lease, using=self.using)
+                    locked_attempt = ExportAttempt.objects.using(
+                        self.using,
+                    ).select_for_update().get(pk=attempt.pk)
+                    if (
+                        current.state != "archiving"
+                        or current.attempt_generation
+                        != locked_attempt.attempt_generation
+                        or locked_attempt.state != "cleaned"
+                    ):
+                        raise LeaseLost()
+                    current.attempt_generation += 1
+                    current.archive_done = 0
+                    current.bytes_done = 0
+                    current.save(update_fields=(
+                        "attempt_generation", "archive_done", "bytes_done",
+                    ))
+                    rotated = LeaseToken(
+                        lease.worker_generation,
+                        lease.worker_lease_uuid,
+                        lease.job_id,
+                        lease.job_lease_uuid,
+                        current.attempt_generation,
+                    )
+            rotation.replace(rotated)
+        return rotated
+
     def build_and_publish(self, job, lease, heartbeat, stop_requested):
         current_lease = lease
         try:
@@ -1081,6 +1282,79 @@ class ArchiveService(object):
         except ExportError:
             self._mark_current_attempt_retiring(current_lease, heartbeat)
             raise
+
+    def recover_archiving(self, lease, heartbeat, stop_requested):
+        self._stop(stop_requested, lease)
+        try:
+            current, attempt, attempt_file = self._retry_recovery_db(
+                lambda: self._archiving_recovery_state(lease, heartbeat),
+                lease,
+                heartbeat,
+                stop_requested,
+            )
+            if current.state != "archiving":
+                return RecoveryOutcome(current, lease)
+            if attempt is None:
+                root = open_export_root(
+                    settings.PINRY_EXPORT_ROOT,
+                    os.getuid(),
+                    os.getgid(),
+                )
+                staging = None
+                try:
+                    staging = open_staging_directory(root)
+                    self.attempt_service.remove_unreceipted_directory_fs(
+                        staging, current, lease,
+                    )
+                finally:
+                    if staging is not None:
+                        staging.close()
+                    root.close()
+                completed = self.build_and_publish(
+                    current, lease, heartbeat, stop_requested,
+                )
+                return RecoveryOutcome(completed, lease)
+            if attempt.state in ("writing", "closed"):
+                self._retry_recovery_db(
+                    lambda: self._mark_current_attempt_retiring(
+                        lease, heartbeat,
+                    ),
+                    lease,
+                    heartbeat,
+                    stop_requested,
+                )
+                attempt.refresh_from_db()
+                if attempt_file is not None:
+                    attempt_file.refresh_from_db()
+            elif attempt.state not in ("retiring", "cleaned"):
+                raise ExportError("export_storage_unsafe", lease)
+            if attempt.state == "retiring":
+                self._retry_recovery_db(
+                    lambda: self._cleanup_retiring(
+                        attempt, attempt_file, lease, heartbeat,
+                    ),
+                    lease,
+                    heartbeat,
+                    stop_requested,
+                )
+                attempt.refresh_from_db()
+            if attempt.state != "cleaned":
+                raise ExportError("export_storage_unsafe", lease)
+            rotated = self._retry_recovery_db(
+                lambda: self._rotate_recovered_attempt(
+                    attempt, lease, heartbeat,
+                ),
+                lease,
+                heartbeat,
+                stop_requested,
+            )
+            current = ExportJob.objects.using(self.using).get(pk=lease.job_id)
+            completed = self.build_and_publish(
+                current, rotated, heartbeat, stop_requested,
+            )
+            return RecoveryOutcome(completed, rotated)
+        except ExportStorageError as error:
+            raise ExportError(error.code, lease) from None
 
     def recover_verifying(self, lease, heartbeat, stop_requested):
         current = ExportJob.objects.using(self.using).get(pk=lease.job_id)

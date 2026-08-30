@@ -11,9 +11,17 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 import mock
 
+from core.services.database_fence import DatabaseFenceBusy
 from exports.contracts import ExportError, LeaseToken, StopRequested
-from exports.models import ExportJob, ExportTarget, ExportWorkerLease
+from exports.models import (
+    ExportAttempt,
+    ExportJob,
+    ExportTarget,
+    ExportWorkerLease,
+)
+from exports.services import archive as archive_services
 from exports.services.archive import ArchiveService
+from exports.services.file_ops import remove_if_receipt_matches
 from exports.services.snapshot import SnapshotService
 
 from .helpers import ExportStorageMixin, create_export_pin, create_export_user
@@ -116,6 +124,16 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
 
     def _archive_path(self, job):
         return Path(self._export_directory.name, job.ready_relative_path)
+
+    def _large_pin(self, filename):
+        pin = create_export_pin(self.owner, filename=filename)
+        path = Path(pin.image.image.path)
+        content = path.read_bytes() + b"x" * (1024 * 1024 + 17)
+        path.write_bytes(content)
+        asset = pin.image.media_asset
+        asset.content_sha256 = hashlib.sha256(content).hexdigest()
+        asset.save(update_fields=("content_sha256",))
+        return pin
 
     def test_build_preserves_original_and_writes_pin_specific_xmp_manifest(self):
         first = create_export_pin(self.owner, filename="shared.PNG")
@@ -326,3 +344,232 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
         attempt = job.attempts.get()
         self.assertEqual(attempt.state, "retiring")
         self.assertEqual(attempt.files.get(kind="archive").state, "retiring")
+
+    def test_writing_fault_retires_open_receipt_and_rebuilds_with_next_generation(self):
+        pin = self._large_pin("writing-fault.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+        chunks = []
+
+        def stop(point, context):
+            if point == "after_archive_chunk":
+                chunks.append((
+                    context["chunk_size"],
+                    context["bytes_written"],
+                ))
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(fault_injector=stop).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+
+        retired = job.attempts.get(attempt_generation=0)
+        retired_file = retired.files.get(kind="archive")
+        provenance = retired.lease_uuid
+        self.assertEqual(chunks, [(1024 * 1024, 1024 * 1024)])
+        self.assertEqual(retired.state, "writing")
+        self.assertEqual(retired_file.state, "writing")
+        self.assertEqual(retired_file.receipt_level, "open")
+        removal_states = []
+        rmdir_states = []
+        original_remove = remove_if_receipt_matches
+        original_rmdir = os.rmdir
+
+        def remove_after_intent(directory, name, receipt):
+            retired.refresh_from_db()
+            retired_file.refresh_from_db()
+            removal_states.append((retired.state, retired_file.state))
+            return original_remove(directory, name, receipt)
+
+        def rmdir_after_children(name, *args, **kwargs):
+            if name == os.path.basename(retired.relative_path):
+                retired_file.refresh_from_db()
+                rmdir_states.append(retired_file.state)
+            return original_rmdir(name, *args, **kwargs)
+
+        with mock.patch(
+            "exports.services.archive.remove_if_receipt_matches",
+            side_effect=remove_after_intent,
+        ), mock.patch(
+            "exports.services.archive.os.rmdir",
+            side_effect=rmdir_after_children,
+        ):
+            outcome = ArchiveService().recover_archiving(
+                lease, heartbeat, lambda: False,
+            )
+
+        retired.refresh_from_db()
+        retired_file.refresh_from_db()
+        rebuilt = ExportAttempt.objects.exclude(pk=retired.pk).get(job=job)
+        self.assertEqual(removal_states, [("retiring", "retiring")])
+        self.assertEqual(rmdir_states, ["cleaned"])
+        self.assertEqual(retired.state, "cleaned")
+        self.assertEqual(retired_file.state, "cleaned")
+        self.assertEqual(retired_file.receipt_level, "open")
+        self.assertIsNone(retired_file.receipt_size)
+        self.assertEqual(retired.lease_uuid, provenance)
+        self.assertEqual(outcome.job.state, "complete")
+        self.assertEqual(outcome.job.attempt_generation, 1)
+        self.assertEqual(outcome.lease.attempt_generation, 1)
+        self.assertIsNot(outcome.lease, lease)
+        self.assertEqual(rebuilt.attempt_generation, 1)
+
+    def test_archiving_recovery_retries_database_busy_outside_guard(self):
+        pin = create_export_pin(self.owner, filename="recovery-busy.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+        original_lock = archive_services.lock_current_lease
+        locks = []
+        sleeps = []
+
+        def busy_once(*args, **kwargs):
+            locks.append((args, kwargs))
+            if len(locks) == 1:
+                raise DatabaseFenceBusy()
+            return original_lock(*args, **kwargs)
+
+        def sleep_outside_guard(seconds):
+            self.assertEqual(heartbeat.guard_depth, 0)
+            sleeps.append(seconds)
+
+        with mock.patch(
+            "exports.services.archive.lock_current_lease",
+            side_effect=busy_once,
+        ):
+            outcome = ArchiveService(
+                sleeper=sleep_outside_guard,
+            ).recover_archiving(
+                lease, heartbeat, lambda: False,
+            )
+
+        self.assertEqual(outcome.job.state, "complete")
+        self.assertGreater(len(locks), 1)
+        self.assertEqual(sleeps, [0.01])
+
+    def test_closed_receipt_fault_retires_without_reusing_closed_zip(self):
+        pin = create_export_pin(self.owner, filename="closed-fault.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+
+        def stop(point, context):
+            del context
+            if point == "after_archive_closed_receipt":
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(fault_injector=stop).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+
+        retired = job.attempts.get(attempt_generation=0)
+        retired_file = retired.files.get(kind="archive")
+        old_receipt = (
+            retired_file.receipt_dev,
+            retired_file.receipt_ino,
+            retired_file.receipt_size,
+            retired_file.receipt_mtime_ns,
+            retired_file.receipt_ctime_ns,
+            retired_file.receipt_sha256,
+        )
+        provenance = retired.lease_uuid
+        self.assertEqual(retired.state, "closed")
+        self.assertEqual(retired_file.state, "closed")
+        self.assertEqual(retired_file.receipt_level, "full")
+
+        outcome = ArchiveService().recover_archiving(
+            lease, heartbeat, lambda: False,
+        )
+
+        retired.refresh_from_db()
+        retired_file.refresh_from_db()
+        rebuilt = ExportAttempt.objects.exclude(pk=retired.pk).get(job=job)
+        self.assertEqual(retired.state, "cleaned")
+        self.assertEqual(retired_file.state, "cleaned")
+        self.assertEqual(retired.lease_uuid, provenance)
+        self.assertEqual((
+            retired_file.receipt_dev,
+            retired_file.receipt_ino,
+            retired_file.receipt_size,
+            retired_file.receipt_mtime_ns,
+            retired_file.receipt_ctime_ns,
+            retired_file.receipt_sha256,
+        ), old_receipt)
+        self.assertEqual(outcome.job.state, "complete")
+        self.assertEqual(outcome.job.attempt_generation, 1)
+        self.assertEqual(outcome.lease.attempt_generation, 1)
+        self.assertEqual(rebuilt.attempt_generation, 1)
+
+    def test_verifying_before_publishing_intent_recovers_with_existing_fault_boundary(self):
+        pin = create_export_pin(self.owner, filename="verifying-fault.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+
+        def stop(point, context):
+            del context
+            if point == "before_final_permission_check":
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(fault_injector=stop).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+
+        attempt = job.attempts.get(attempt_generation=0)
+        attempt_file = attempt.files.get(kind="archive")
+        provenance = attempt.lease_uuid
+        exported_at = attempt.exported_at
+        receipt = (
+            attempt_file.receipt_dev,
+            attempt_file.receipt_ino,
+            attempt_file.receipt_uid,
+            attempt_file.receipt_gid,
+            attempt_file.receipt_mode,
+            attempt_file.receipt_nlink,
+            attempt_file.receipt_size,
+            attempt_file.receipt_mtime_ns,
+            attempt_file.receipt_sha256,
+        )
+        self.assertEqual(attempt.state, "verifying")
+        self.assertEqual(attempt_file.state, "verifying")
+
+        outcome = ArchiveService().recover_verifying(
+            lease, heartbeat, lambda: False,
+        )
+
+        attempt.refresh_from_db()
+        attempt_file.refresh_from_db()
+        self.assertEqual(outcome.job.state, "complete")
+        self.assertEqual(outcome.job.completed_at, exported_at)
+        self.assertEqual(outcome.job.attempt_generation, 0)
+        self.assertEqual(attempt.lease_uuid, provenance)
+        self.assertEqual((
+            attempt_file.receipt_dev,
+            attempt_file.receipt_ino,
+            attempt_file.receipt_uid,
+            attempt_file.receipt_gid,
+            attempt_file.receipt_mode,
+            attempt_file.receipt_nlink,
+            attempt_file.receipt_size,
+            attempt_file.receipt_mtime_ns,
+            attempt_file.receipt_sha256,
+        ), receipt)
+        self.assertEqual((
+            outcome.job.ready_dev,
+            outcome.job.ready_ino,
+            outcome.job.ready_uid,
+            outcome.job.ready_gid,
+            outcome.job.ready_mode,
+            outcome.job.ready_nlink,
+            outcome.job.ready_size,
+            outcome.job.ready_mtime_ns,
+            outcome.job.ready_ctime_ns,
+            outcome.job.ready_sha256,
+        ), (
+            attempt_file.receipt_dev,
+            attempt_file.receipt_ino,
+            attempt_file.receipt_uid,
+            attempt_file.receipt_gid,
+            attempt_file.receipt_mode,
+            attempt_file.receipt_nlink,
+            attempt_file.receipt_size,
+            attempt_file.receipt_mtime_ns,
+            attempt_file.receipt_ctime_ns,
+            attempt_file.receipt_sha256,
+        ))
