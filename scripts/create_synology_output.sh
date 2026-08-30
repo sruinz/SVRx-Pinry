@@ -447,7 +447,7 @@ try:
     os.fchdir(source_fd)
     environment = os.environ.copy()
     environment["COPYFILE_DISABLE"] = "1"
-    completed = subprocess.run(
+    tar_process = subprocess.Popen(
         [
             "tar",
             "--no-xattrs",
@@ -455,7 +455,7 @@ try:
             "--exclude=*/.DS_Store",
             "--exclude=._*",
             "--exclude=*/._*",
-            "-czf",
+            "-cf",
             "-",
             "-C",
             ".",
@@ -469,8 +469,20 @@ try:
             f"{package_name}/docker-compose.yml",
         ],
         env=environment,
-        stdout=archive_fd,
+        stdout=subprocess.PIPE,
     )
+    try:
+        completed = subprocess.run(
+            ["gzip", "-n", "-c"],
+            stdin=tar_process.stdout,
+            stdout=archive_fd,
+        )
+    finally:
+        if tar_process.stdout is not None:
+            tar_process.stdout.close()
+    tar_returncode = tar_process.wait()
+    if tar_returncode != 0:
+        sys.exit(tar_returncode)
     if completed.returncode != 0:
         sys.exit(completed.returncode)
 finally:

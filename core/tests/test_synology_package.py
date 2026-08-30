@@ -134,7 +134,7 @@ def _write_tar_race_wrapper(path, real_tar):
         "package_name=\n"
         "previous=\n"
         "for argument in \"$@\"; do\n"
-        "    if [ \"$previous\" = \"-czf\" ]; then\n"
+        "    if [ \"$previous\" = \"-cf\" ]; then\n"
         "        previous=\n"
         "        continue\n"
         "    fi\n"
@@ -148,7 +148,7 @@ def _write_tar_race_wrapper(path, real_tar):
         "        continue\n"
         "    fi\n"
         "    case \"$argument\" in\n"
-        "        -czf)\n"
+        "        -cf)\n"
         "            create=1\n"
         "            previous=$argument\n"
         "            ;;\n"
@@ -194,7 +194,7 @@ def _write_final_tar_failure_wrapper(path):
         "#!/bin/sh\n"
         "set -eu\n"
         "for argument in \"$@\"; do\n"
-        "    if [ \"$argument\" = \"-czf\" ]; then\n"
+        "    if [ \"$argument\" = \"-cf\" ]; then\n"
         "        exit 42\n"
         "    fi\n"
         "done\n"
@@ -420,7 +420,7 @@ def _write_archive_source_swap_tar_wrapper(path):
         "set -eu\n"
         "create=0\n"
         "for argument in \"$@\"; do\n"
-        "    if [ \"$argument\" = -czf ]; then\n"
+        "    if [ \"$argument\" = -cf ]; then\n"
         "        create=1\n"
         "    fi\n"
         "done\n"
@@ -1308,6 +1308,21 @@ class SynologyPackageTests(unittest.TestCase):
                 "sw-transition",
                 "svrx-pinry-{}.tar.gz".format(self.short_sha),
             },
+        )
+
+    def test_packager_writes_gzip_archive_without_trailing_data(self):
+        self._create_package()
+        gzip = shutil.which("gzip")
+        self.assertIsNotNone(gzip)
+
+        completed = subprocess.run(
+            [gzip, "-t", str(self.archive_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertEqual(
+            completed.returncode, 0, completed.stderr.decode("utf-8")
         )
 
     def test_packager_creates_minimal_build_context_from_head(self):
