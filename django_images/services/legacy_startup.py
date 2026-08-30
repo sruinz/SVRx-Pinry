@@ -17,7 +17,10 @@ from core.services.media_asset_backfill import (
 )
 from core.version import normalize_source_commit
 from django_images import file_ops
-from django_images.models import Image, Thumbnail
+from django_images.models import Image, StartupValidationState, Thumbnail
+from django_images.startup_validation import (
+    STARTUP_VALIDATION_CONTRACT_VERSION,
+)
 from django_images.services import migration_state, startup_preflight
 from django_images.services.media_archive import LegacyMediaArchive
 from django_images.services.media_migration_v2 import (
@@ -190,9 +193,14 @@ class LegacyStartupCoordinator(object):
         self._backfill_summary = None
         self._child_progress_error = None
         self._last_committed_batch = None
+        self._validated_fast_start = False
+        self._startup_lock_descriptor = None
+        self._invalidate_validation_before_work = False
 
     def prepare_no_flag_before_schema(self):
         """No-flag startup의 pre-schema evidence를 read-only로 고정한다."""
+        if self._prepare_current_startup_validation():
+            return None
         evidence = startup_preflight.inspect_legacy_evidence(
             self._database_path(),
             None,
@@ -234,6 +242,11 @@ class LegacyStartupCoordinator(object):
                 completed_run,
                 migration_state.read_run_status(completed_run),
             )
+        validation_current = self._prepare_current_startup_validation(
+            allow_fast_start=not read_only.requires_migration_flag,
+        )
+        if validation_current:
+            return None
         evidence = startup_preflight.inspect_legacy_evidence(
             self._database_path(),
             None,
@@ -401,6 +414,8 @@ class LegacyStartupCoordinator(object):
                 run_directory.close()
 
     def schema_required(self, run):
+        if self._validated_fast_start:
+            return False
         if run is None:
             return True
         if self._evidence is not None and self._evidence.pending_schema:
@@ -564,12 +579,19 @@ class LegacyStartupCoordinator(object):
         return payload
 
     def adjust_ownership(self, startup_lock_descriptor):
+        self._startup_lock_descriptor = startup_lock_descriptor
+        recursive_adjustment = not self._validated_fast_start
+        configured_paths = (
+            (self._database_path(),)
+            if self._validated_fast_start
+            else (
+                getattr(settings, "STATIC_ROOT", None),
+                settings.MEDIA_ROOT,
+                self._database_path(),
+            )
+        )
         managed_paths = []
-        for configured in (
-            getattr(settings, "STATIC_ROOT", None),
-            settings.MEDIA_ROOT,
-            self._database_path(),
-        ):
+        for configured in configured_paths:
             if configured is not None and os.path.lexists(os.fspath(configured)):
                 managed_paths.append(os.fspath(configured))
         startup_preflight.adjust_storage_ownership(
@@ -579,6 +601,7 @@ class LegacyStartupCoordinator(object):
             self.service_gid,
             startup_lock_descriptor,
         )
+        return recursive_adjustment
 
     def runtime_check(self, service_uid, service_gid):
         """service identity로 실제 storage write·lock probe를 실행한다."""
@@ -587,9 +610,68 @@ class LegacyStartupCoordinator(object):
             service_uid,
             service_gid,
         )
+        if (
+            not result.ok
+            and self._validated_fast_start
+            and result.reason_code in (
+                "media_root_not_writable",
+                "media_lock_not_usable",
+            )
+            and self._startup_lock_descriptor is not None
+        ):
+            self._validated_fast_start = False
+            self.adjust_ownership(self._startup_lock_descriptor)
+            result = startup_preflight.validate_storage_runtime_preflight(
+                settings.MEDIA_ROOT,
+                service_uid,
+                service_gid,
+            )
         if not result.ok:
             raise LegacyStartupError(result.reason_code)
         return result
+
+    def invalidate_startup_validation(self):
+        if not self._invalidate_validation_before_work:
+            return False
+        try:
+            updated = StartupValidationState.invalidate()
+        except Exception as error:
+            raise LegacyStartupError("legacy_startup_failed") from error
+        if updated != 1:
+            raise LegacyStartupError("legacy_startup_failed")
+        self._invalidate_validation_before_work = False
+        return True
+
+    def record_successful_startup(self):
+        if self._validated_fast_start:
+            return False
+        try:
+            StartupValidationState.mark_current()
+        except Exception as error:
+            raise LegacyStartupError("legacy_startup_failed") from error
+        self._validated_fast_start = True
+        return True
+
+    def _prepare_current_startup_validation(self, allow_fast_start=True):
+        validation = startup_preflight.inspect_startup_validation(
+            self._database_path(),
+            None,
+        )
+        marker_is_current = (
+            validation.marker_version
+            == STARTUP_VALIDATION_CONTRACT_VERSION
+        )
+        self._invalidate_validation_before_work = bool(
+            marker_is_current
+            and (validation.pending_migrations or not allow_fast_start)
+        )
+        self._validated_fast_start = bool(
+            validation.is_current and allow_fast_start
+        )
+        if self._validated_fast_start:
+            self._evidence = None
+            self._allow_missing_media_layout = False
+        return self._validated_fast_start
 
     def _converge_media(self, run):  # noqa: C901
         status = migration_state.read_run_status(run)

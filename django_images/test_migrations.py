@@ -13,7 +13,7 @@ class AssetMetadataMigrationTests(TransactionTestCase):
     migrate_to = ("django_images", "0005_enforce_image_asset_metadata")
     migrate_latest = [
         ("core", "0016_board_display_order"),
-        ("django_images", "0006_pending_media_deletion"),
+        ("django_images", "0007_startup_validation_state"),
     ]
 
     def setUp(self):
@@ -198,3 +198,28 @@ class AssetMetadataMigrationTests(TransactionTestCase):
             [second_thumbnail.id],
         )
         self.assertEqual(self._media_snapshot(), self.legacy_media_snapshot)
+
+
+class StartupValidationMigrationTests(TransactionTestCase):
+    migrate_from = [("django_images", "0006_pending_media_deletion")]
+    migrate_to = [("django_images", "0007_startup_validation_state")]
+
+    def setUp(self):
+        super(StartupValidationMigrationTests, self).setUp()
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.migrate_from)
+
+    def tearDown(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.executor.loader.graph.leaf_nodes())
+        super(StartupValidationMigrationTests, self).tearDown()
+
+    def test_creates_empty_validation_state(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.migrate_to)
+        apps = self.executor.loader.project_state(self.migrate_to).apps
+        State = apps.get_model(
+            "django_images", "StartupValidationState"
+        )
+
+        self.assertEqual(State.objects.count(), 0)

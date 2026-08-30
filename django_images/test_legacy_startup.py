@@ -1335,6 +1335,161 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         load_backfill.assert_not_called()
         seal.assert_not_called()
 
+    def test_current_validation_skips_full_scan_and_recursive_ownership(self):
+        self.database_path.write_bytes(b"database")
+        coordinator = self.coordinator()
+        held_lock = mock.Mock()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_startup_validation",
+            return_value=SimpleNamespace(
+                is_current=True,
+                marker_version=1,
+                pending_migrations=(),
+            ),
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            side_effect=AssertionError("full legacy scan"),
+        ) as inspect_evidence, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.adjust_storage_ownership",
+        ) as adjust, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_configuration_preflight",
+            return_value=PreflightResult(ok=True),
+        ) as configuration, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_runtime_preflight",
+            return_value=PreflightResult(ok=True),
+        ) as runtime, mock.patch(
+            "django_images.services.legacy_startup."
+            "StartupValidationState.objects.update_or_create",
+        ) as record:
+            run = coordinator.prepare_before_schema()
+            result = coordinator.converge_after_schema(run)
+            coordinator.adjust_ownership(held_lock)
+            coordinator.runtime_check(self.uid, self.gid)
+            coordinator.record_successful_startup()
+
+        self.assertIsNone(run)
+        self.assertIsNone(result)
+        self.assertFalse(coordinator.schema_required(run))
+        inspect_evidence.assert_not_called()
+        adjust.assert_called_once()
+        self.assertEqual(
+            adjust.call_args.args[1],
+            (str(self.database_path),),
+        )
+        configuration.assert_called_once()
+        runtime.assert_called_once_with(
+            str(self.media_root), self.uid, self.gid
+        )
+        record.assert_not_called()
+
+    def test_fast_start_repairs_ownership_only_after_runtime_failure(self):
+        self.database_path.write_bytes(b"database")
+        coordinator = self.coordinator()
+        held_lock = mock.Mock()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_startup_validation",
+            return_value=SimpleNamespace(
+                is_current=True,
+                marker_version=1,
+                pending_migrations=(),
+            ),
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            side_effect=AssertionError("full legacy scan"),
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.adjust_storage_ownership",
+        ) as adjust, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_runtime_preflight",
+            side_effect=(
+                PreflightResult(
+                    ok=False,
+                    reason_code="media_root_not_writable",
+                ),
+                PreflightResult(ok=True),
+            ),
+        ) as runtime:
+            coordinator.prepare_before_schema()
+            coordinator.adjust_ownership(held_lock)
+            result = coordinator.runtime_check(self.uid, self.gid)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(adjust.call_count, 2)
+        self.assertEqual(
+            adjust.call_args_list[0].args[1],
+            (str(self.database_path),),
+        )
+        self.assertIn(
+            str(self.media_root),
+            adjust.call_args_list[1].args[1],
+        )
+        runtime.assert_has_calls((
+            mock.call(str(self.media_root), self.uid, self.gid),
+            mock.call(str(self.media_root), self.uid, self.gid),
+        ))
+
+    def test_pending_schema_invalidates_current_marker_before_migrate(self):
+        evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                    pending=(("users", "0002_admin_bootstrap"),),
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_startup_validation",
+            return_value=SimpleNamespace(
+                is_current=False,
+                marker_version=1,
+                pending_migrations=(("users", "0002_admin_bootstrap"),),
+            ),
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "StartupValidationState.invalidate",
+            return_value=1,
+        ) as invalidate:
+            run = coordinator.prepare_before_schema()
+            required = coordinator.schema_required(run)
+            invalidated = coordinator.invalidate_startup_validation()
+
+        self.assertIsNone(run)
+        self.assertTrue(required)
+        self.assertTrue(invalidated)
+        invalidate.assert_called_once_with()
+
+    def test_slow_start_records_current_validation_after_success(self):
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "StartupValidationState.mark_current",
+        ) as mark_current:
+            recorded = coordinator.record_successful_startup()
+
+        self.assertTrue(recorded)
+        mark_current.assert_called_once_with()
+
     def test_completed_previous_summary_contract_is_promoted_on_update(self):
         _run, summary_path = self._completed_run_with_summary()
         original_summary = summary_path.read_bytes()
@@ -1630,6 +1785,60 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         self.assertTrue(coordinator.schema_required(resumed))
         available.assert_not_called()
         snapshot.assert_not_called()
+
+    def test_resumed_run_invalidates_current_marker_before_pending_schema(self):
+        incomplete = self._summary_run()
+        migration_state.transition_state(
+            incomplete,
+            "initialized",
+            "schema_complete",
+        )
+        coordinator = self.coordinator()
+        pending_evidence = LegacyEvidence(
+            **dict(
+                self.evidence(
+                    present=False,
+                    database_exists=True,
+                    pending=(("users", "0002_admin_bootstrap"),),
+                ).__dict__,
+                has_named_canonical_paths=True,
+                has_media_rows=True,
+            )
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_startup_validation",
+            return_value=SimpleNamespace(
+                is_current=False,
+                marker_version=1,
+                pending_migrations=(("users", "0002_admin_bootstrap"),),
+            ),
+        ) as inspect_validation, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=pending_evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "StartupValidationState.invalidate",
+            return_value=1,
+        ) as invalidate, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.available_space_bytes",
+        ), mock.patch(
+            "django_images.services.legacy_startup.snapshot_sqlite",
+        ):
+            resumed = coordinator.prepare_before_schema()
+            invalidated = coordinator.invalidate_startup_validation()
+
+        self.assertEqual(resumed.run_id, incomplete.run_id)
+        self.assertTrue(coordinator.schema_required(resumed))
+        self.assertTrue(invalidated)
+        inspect_validation.assert_called_once_with(
+            str(self.database_path),
+            None,
+        )
+        invalidate.assert_called_once_with()
 
     def test_admin_bootstrap_schema_runs_when_resuming_media_copy(self):
         incomplete = self._summary_run()

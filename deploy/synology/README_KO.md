@@ -362,8 +362,13 @@ pending schema가 발견되면 다음 순서로 진행한다.
 
 미디어와 무관하다고 명시적으로 검증된 schema migration은 이 절차의
 전체 미디어 검증을 시작하지 않고 표준 Django migration으로
-처리한다. 현재 빠른 경로는 `users.0002_admin_bootstrap`에만
-허용된다. 완료되지 않은 기존 run이 있거나 다른 migration이 함께
+처리한다. 현재 빠른 경로는
+`django_images.0007_startup_validation_state`와
+`users.0002_admin_bootstrap`에만 허용된다. 첫 시작에서 전체 검증과
+실행 계정의 저장소 검사를 통과하면 DB에 검증 계약 버전을
+기록한다. 이후 스키마가 같은 재시작은 핀과 미디어 전체를 다시
+순회하지 않고 표식과 실제 쓰기·lock probe만 검사한다. 완료되지
+않은 기존 run이 있거나 다른 migration이 함께
 남아 있으면 기존 안전 절차를 그대로 재개한다.
 
 어느 단계든 실패하면 app 서버는 시작되지 않는다. 로그에는 비밀값이나

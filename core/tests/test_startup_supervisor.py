@@ -357,6 +357,102 @@ class WorkerCliTests(unittest.TestCase):
             ])
 
 
+class WorkerCoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        self.worker = _load_script("migration_worker")
+
+    def test_schema_commands_keep_static_assets_but_skip_current_migrate(self):
+        call_command = mock.Mock()
+
+        self.worker._run_schema_commands(
+            call_command,
+            migrate_required=False,
+        )
+
+        call_command.assert_called_once_with(
+            "collectstatic", interactive=False
+        )
+
+    def test_worker_invalidates_stale_marker_without_schema_migration(self):
+        from django.conf import settings
+
+        coordinator = mock.Mock()
+        coordinator.prepare_before_schema.return_value = object()
+        coordinator.schema_required.return_value = False
+        reporter = mock.Mock()
+        data_root = os.path.abspath(os.fspath(settings.PINRY_DATA_ROOT))
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "LegacyStartupCoordinator",
+            return_value=coordinator,
+        ), mock.patch.object(
+            self.worker,
+            "_service_identity",
+            return_value=(33, 44),
+        ), mock.patch.object(
+            self.worker,
+            "_run_schema_commands",
+        ) as schema_commands, mock.patch.object(
+            self.worker,
+            "_finalize_coordinator",
+        ), mock.patch.dict(
+            self.worker.os.environ,
+            {"PINRY_DATA_ROOT": data_root},
+        ):
+            self.worker._run_coordinator(
+                [self.worker._MIGRATION_FLAG],
+                lock_fd=7,
+                reporter=reporter,
+            )
+
+        coordinator.invalidate_startup_validation.assert_called_once_with()
+        schema_commands.assert_called_once_with(
+            mock.ANY,
+            migrate_required=False,
+        )
+
+    def test_success_is_recorded_only_after_runtime_check(self):
+        events = []
+        coordinator = mock.Mock()
+        coordinator.adjust_ownership.side_effect = (
+            lambda descriptor: events.append(("ownership", descriptor))
+        )
+        coordinator.runtime_check.side_effect = (
+            lambda uid, gid: events.append(("runtime", uid, gid))
+        )
+        coordinator.record_successful_startup.side_effect = (
+            lambda: events.append(("record",))
+        )
+
+        self.worker._finalize_coordinator(
+            coordinator,
+            lock_fd=7,
+            service_uid=33,
+            service_gid=44,
+        )
+
+        self.assertEqual(events, [
+            ("ownership", 7),
+            ("runtime", 33, 44),
+            ("record",),
+        ])
+
+    def test_runtime_failure_never_records_success(self):
+        coordinator = mock.Mock()
+        coordinator.runtime_check.side_effect = RuntimeError("probe failed")
+
+        with self.assertRaisesRegex(RuntimeError, "probe failed"):
+            self.worker._finalize_coordinator(
+                coordinator,
+                lock_fd=7,
+                service_uid=33,
+                service_gid=44,
+            )
+
+        coordinator.record_successful_startup.assert_not_called()
+
+
 class WorkerSubprocessIntegrationTests(unittest.TestCase):
     def test_real_worker_uses_passed_fds_project_cwd_and_terminal_eof(self):
         temporary = Path(tempfile.mkdtemp(dir="/private/tmp"))

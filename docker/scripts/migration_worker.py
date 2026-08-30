@@ -172,9 +172,21 @@ def _setup_django():
         ) from error
 
 
-def _run_schema_commands(call_command):
+def _run_schema_commands(call_command, migrate_required=True):
     call_command("collectstatic", interactive=False)
-    call_command("migrate", interactive=False)
+    if migrate_required:
+        call_command("migrate", interactive=False)
+
+
+def _finalize_coordinator(
+    coordinator,
+    lock_fd,
+    service_uid,
+    service_gid,
+):
+    coordinator.adjust_ownership(lock_fd)
+    coordinator.runtime_check(service_uid, service_gid)
+    coordinator.record_successful_startup()
 
 
 def _run_coordinator(arguments, lock_fd, reporter):
@@ -210,14 +222,21 @@ def _run_coordinator(arguments, lock_fd, reporter):
     if migration_requested:
         run = coordinator.prepare_before_schema()
         coordinator.prepare_migration_locks(run)
-        if coordinator.schema_required(run):
-            _run_schema_commands(call_command)
     else:
         coordinator.prepare_no_flag_before_schema()
-        _run_schema_commands(call_command)
+    migrate_required = coordinator.schema_required(run)
+    coordinator.invalidate_startup_validation()
+    _run_schema_commands(
+        call_command,
+        migrate_required=migrate_required,
+    )
     coordinator.converge_after_schema(run)
-    coordinator.adjust_ownership(lock_fd)
-    coordinator.runtime_check(service_uid, service_gid)
+    _finalize_coordinator(
+        coordinator,
+        lock_fd,
+        service_uid,
+        service_gid,
+    )
 
 
 def main(arguments, progress_fd, lock_fd):

@@ -14,6 +14,9 @@ from django.utils.functional import LazyObject
 from django.utils.text import get_valid_filename
 
 from django_images import file_ops
+from django_images.startup_validation import (
+    STARTUP_VALIDATION_CONTRACT_VERSION,
+)
 from django_images.paths import (
     FORMAT_EXTENSIONS,
     PINRY_DIRECT_MD5_ROOTS,
@@ -66,6 +69,7 @@ _LEGACY_EVIDENCE_STAGE_CODES = {
 # 전체 미디어 검증 없이 표준 Django migrate로 처리해도 되는
 # 정확한 스키마 변경만 등록한다. 알 수 없는 변경은 안전 경로를 유지한다.
 _SCHEMA_ONLY_MIGRATIONS = frozenset((
+    ("django_images", "0007_startup_validation_state"),
     ("users", "0002_admin_bootstrap"),
 ))
 
@@ -135,6 +139,164 @@ class PreflightResult(object):
     ok: bool
     reason_code: str = None
     field_classes: tuple = ()
+
+
+@dataclass(frozen=True)
+class StartupValidation(object):
+    database_exists: bool
+    is_current: bool
+    pending_migrations: tuple
+    marker_version: object = None
+
+
+def inspect_startup_validation(database_path, disk_migration_graph):
+    """DB schema와 singleton 완료 증명만 읽는 빠른 시작 검사다."""
+    stage = "database"
+    database_root = None
+    database_receipt = None
+    database_guard = None
+    connection = None
+    try:
+        normalized_database_path = _configured_path(database_path)
+        if normalized_database_path is None:
+            raise StartupPreflightError("legacy_evidence_invalid")
+        database_root, database_receipt = _open_database(
+            normalized_database_path
+        )
+        if database_receipt is None:
+            return StartupValidation(
+                database_exists=False,
+                is_current=False,
+                pending_migrations=(),
+            )
+
+        database_receipt.verify_current()
+        database_guard = sqlite_snapshot._SourceMutationGuard(
+            database_receipt.descriptor
+        )
+        database_uri = _database_receipt_uri(database_receipt, "ro")
+        connection = sqlite3.connect(database_uri, uri=True)
+        _verify_read_database(database_receipt, database_guard)
+        connection.execute("PRAGMA query_only = ON")
+
+        stage = "database_schema"
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        applied_migrations = set()
+        if "django_migrations" in tables:
+            applied_migrations = {
+                (row[0], row[1])
+                for row in connection.execute(
+                    "SELECT app, name FROM django_migrations"
+                )
+            }
+
+        stage = "migration_graph"
+        if disk_migration_graph is None:
+            disk_migration_graph = MigrationLoader(None).graph
+        disk_nodes = _migration_nodes(disk_migration_graph)
+        pending_migrations = tuple(sorted(
+            disk_nodes - applied_migrations
+        ))
+
+        stage = "database_schema"
+        marker_version = None
+        marker_table = "django_images_startupvalidationstate"
+        if marker_table in tables:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info({})".format(marker_table)
+                )
+            }
+            if not {"id", "contract_version"}.issubset(columns):
+                raise StartupPreflightError(
+                    "legacy_database_schema_invalid"
+                )
+            rows = tuple(connection.execute(
+                "SELECT id, contract_version FROM {} "
+                "ORDER BY id LIMIT 2".format(marker_table)
+            ))
+            if rows:
+                if (
+                    len(rows) != 1
+                    or rows[0][0] != 1
+                    or type(rows[0][1]) is not int
+                    or rows[0][1] < 0
+                ):
+                    raise StartupPreflightError(
+                        "legacy_database_schema_invalid"
+                    )
+                marker_version = rows[0][1]
+                if (
+                    marker_version
+                    > STARTUP_VALIDATION_CONTRACT_VERSION
+                ):
+                    raise StartupPreflightError(
+                        "legacy_database_schema_invalid"
+                    )
+
+        _verify_read_database(database_receipt, database_guard)
+        validation = StartupValidation(
+            database_exists=True,
+            is_current=(
+                marker_version == STARTUP_VALIDATION_CONTRACT_VERSION
+                and not pending_migrations
+            ),
+            pending_migrations=pending_migrations,
+            marker_version=marker_version,
+        )
+        connection.close()
+        connection = None
+        _verify_read_database(database_receipt, database_guard)
+        database_guard.close()
+        database_guard = None
+        return validation
+    except BaseException as error:
+        if isinstance(error, StartupPreflightError):
+            raise
+        if not isinstance(error, Exception):
+            raise
+        code = _LEGACY_EVIDENCE_STAGE_CODES.get(
+            stage, "legacy_evidence_invalid"
+        )
+        raise StartupPreflightError(code) from error
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except BaseException:
+                pass
+            if database_receipt is not None:
+                try:
+                    if database_guard is not None:
+                        _verify_read_database(
+                            database_receipt,
+                            database_guard,
+                        )
+                    else:
+                        database_receipt.verify_current()
+                except BaseException:
+                    pass
+        if database_guard is not None:
+            try:
+                database_guard.close()
+            except BaseException:
+                pass
+        if database_receipt is not None:
+            try:
+                database_receipt.close()
+            except BaseException:
+                pass
+        if database_root is not None:
+            try:
+                database_root.close()
+            except BaseException:
+                pass
 
 
 def inspect_legacy_evidence(

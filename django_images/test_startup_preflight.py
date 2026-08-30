@@ -14,6 +14,9 @@ from django.test import SimpleTestCase
 import mock
 
 from django_images import file_ops
+from django_images.startup_validation import (
+    STARTUP_VALIDATION_CONTRACT_VERSION,
+)
 from django_images.services import startup_lock, startup_preflight
 
 
@@ -82,6 +85,104 @@ class LegacyEvidenceTests(SimpleTestCase):
             connection.commit()
         finally:
             connection.close()
+
+    def _add_startup_validation(self, contract_version=None):
+        if contract_version is None:
+            contract_version = STARTUP_VALIDATION_CONTRACT_VERSION
+        connection = sqlite3.connect(str(self.database_path))
+        try:
+            connection.executescript("""
+                CREATE TABLE django_images_startupvalidationstate (
+                    id INTEGER PRIMARY KEY,
+                    contract_version INTEGER NOT NULL
+                );
+            """)
+            connection.execute(
+                "INSERT INTO django_images_startupvalidationstate "
+                "(id, contract_version) VALUES (1, ?)",
+                (contract_version,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def test_current_startup_validation_does_not_scan_media_rows(self):
+        applied = (("django_images", "0007_startup_validation_state"),)
+        self._create_database(
+            image_paths=("originals/ignored/image.png",),
+            applied=applied,
+        )
+        self._add_startup_validation()
+
+        with mock.patch.object(
+            startup_preflight,
+            "_read_media_rows",
+            side_effect=AssertionError("media rows must not be scanned"),
+        ), mock.patch.object(
+            startup_preflight,
+            "_missing_unreferenced_images",
+            side_effect=AssertionError("references must not be scanned"),
+        ), mock.patch.object(
+            startup_preflight,
+            "_distinct_legacy_bytes",
+            side_effect=AssertionError("media files must not be scanned"),
+        ):
+            validation = startup_preflight.inspect_startup_validation(
+                str(self.database_path),
+                _DiskGraph(*applied),
+            )
+
+        self.assertTrue(validation.database_exists)
+        self.assertTrue(validation.is_current)
+        self.assertEqual(validation.pending_migrations, ())
+
+    def test_startup_validation_rejects_missing_marker(self):
+        applied = (("django_images", "0007_startup_validation_state"),)
+        self._create_database(applied=applied)
+
+        validation = startup_preflight.inspect_startup_validation(
+            str(self.database_path),
+            _DiskGraph(*applied),
+        )
+
+        self.assertFalse(validation.is_current)
+
+    def test_startup_validation_rejects_old_contract_or_pending_schema(self):
+        applied = (("django_images", "0007_startup_validation_state"),)
+        pending = ("core", "0017_future_schema")
+        self._create_database(applied=applied)
+        self._add_startup_validation(
+            STARTUP_VALIDATION_CONTRACT_VERSION - 1
+        )
+
+        old_contract = startup_preflight.inspect_startup_validation(
+            str(self.database_path),
+            _DiskGraph(*applied),
+        )
+        pending_schema = startup_preflight.inspect_startup_validation(
+            str(self.database_path),
+            _DiskGraph(*(applied + (pending,))),
+        )
+
+        self.assertFalse(old_contract.is_current)
+        self.assertFalse(pending_schema.is_current)
+        self.assertEqual(pending_schema.pending_migrations, (pending,))
+
+    def test_startup_validation_rejects_newer_contract(self):
+        applied = (("django_images", "0007_startup_validation_state"),)
+        self._create_database(applied=applied)
+        self._add_startup_validation(
+            STARTUP_VALIDATION_CONTRACT_VERSION + 1
+        )
+
+        with self.assertRaisesRegex(
+            startup_preflight.StartupPreflightError,
+            "^legacy_database_schema_invalid$",
+        ):
+            startup_preflight.inspect_startup_validation(
+                str(self.database_path),
+                _DiskGraph(*applied),
+            )
 
     def _add_asset_metadata_and_derivatives(
         self,

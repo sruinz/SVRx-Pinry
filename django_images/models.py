@@ -12,6 +12,7 @@ from django.urls import reverse
 
 from . import utils
 from .settings import IMAGE_SIZES, IMAGE_PATH, IMAGE_AUTO_DELETE
+from .startup_validation import STARTUP_VALIDATION_CONTRACT_VERSION
 
 
 def hashed_upload_to(instance, filename, **kwargs):
@@ -134,6 +135,23 @@ class PendingMediaDeletion(models.Model):
 
     class Meta:
         unique_together = ("kind", "name")
+
+
+class StartupValidationState(models.Model):
+    contract_version = models.PositiveIntegerField(default=0)
+
+    @classmethod
+    def mark_current(cls):
+        return cls.objects.update_or_create(
+            pk=1,
+            defaults={
+                "contract_version": STARTUP_VALIDATION_CONTRACT_VERSION,
+            },
+        )
+
+    @classmethod
+    def invalidate(cls):
+        return cls.objects.filter(pk=1).update(contract_version=0)
 
 
 @receiver(models.signals.post_save)

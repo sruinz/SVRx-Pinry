@@ -699,13 +699,17 @@ class RuntimeConfigTests(unittest.TestCase):
             "fail('prepare_migration_locks', 'media_lifecycle_lock_failed')\n"
             "    def schema_required(self, run):\n"
             "        del run; return os.environ.get('PINRY_SCHEMA_REQUIRED', '1') == '1'\n"
+            "    def invalidate_startup_validation(self):\n"
+            "        event('invalidate_validation')\n"
             "    def converge_after_schema(self, run):\n"
             "        event('converge:none' if run is None else 'converge:run')\n"
             "        fail('converge', 'migration_state_plan_mismatch')\n"
             "    def adjust_ownership(self, descriptor):\n"
             "        del descriptor; event('ownership'); fail('ownership', 'unsafe_storage_ownership')\n"
             "    def runtime_check(self, uid, gid):\n"
-            "        del uid, gid; event('runtime'); fail('runtime', 'media_root_not_writable')\n",
+            "        del uid, gid; event('runtime'); fail('runtime', 'media_root_not_writable')\n"
+            "    def record_successful_startup(self):\n"
+            "        event('record_validation')\n",
         )
         write_module("pinry/__init__.py", "")
         write_module(
