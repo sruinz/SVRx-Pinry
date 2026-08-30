@@ -787,6 +787,31 @@ class ExportFileOpsTests(SimpleTestCase):
         ):
             file_ops._DarwinMetadataAdapter.normalize(17)
 
+    def test_darwin_acl_set_failure_frees_observed_and_empty_acl(self):
+        freed_acls = []
+
+        def fail_acl_set(_descriptor, _acl, _acl_type):
+            ctypes.set_errno(errno.EPERM)
+            return -1
+
+        def acl_free(acl):
+            freed_acls.append(acl)
+            return 0
+
+        libc = mock.Mock()
+        libc.acl_get_fd_np = mock.Mock(return_value=101)
+        libc.acl_get_entry = mock.Mock(return_value=0)
+        libc.acl_init = mock.Mock(return_value=202)
+        libc.acl_set_fd_np = mock.Mock(side_effect=fail_acl_set)
+        libc.acl_free = mock.Mock(side_effect=acl_free)
+
+        with self.assertRaisesRegex(
+            ExportStorageError, "^export_storage_unsafe$"
+        ):
+            file_ops._DarwinMetadataAdapter._normalize_acl(libc, 17)
+
+        self.assertEqual(freed_acls, [101, 202])
+
     @unittest.skipUnless(sys.platform == "darwin", "Darwin ACL integration")
     def test_darwin_metadata_adapter_removes_actual_extended_acl(self):
         path = Path(self.temporary.name, "darwin-acl.part")
