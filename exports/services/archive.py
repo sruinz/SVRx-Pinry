@@ -67,6 +67,7 @@ from exports.services.snapshot import (
 
 STREAM_CHUNK_SIZE = 1024 * 1024
 QUERY_CHUNK_SIZE = 400
+CLEANUP_HEARTBEAT_INTERVAL = 4.0
 User = get_user_model()
 
 
@@ -970,52 +971,152 @@ class ArchiveService(object):
                 heartbeat()
                 self.sleeper(0.01)
 
-    def _retiring_cleanup_state(
-        self, attempt, attempt_file, lease, heartbeat,
-    ):
+    def _cleanup_checkpointer(self, lease, heartbeat, stop_requested):
+        renewed_at = [self.monotonic()]
+
+        def checkpoint():
+            self._stop(stop_requested, lease)
+            now = self.monotonic()
+            if now - renewed_at[0] >= CLEANUP_HEARTBEAT_INTERVAL:
+                heartbeat.renew_now(lease)
+                renewed_at[0] = self.monotonic()
+
+        return checkpoint
+
+    def _cleanup_fault(self, point, checkpoint, **context):
+        checkpoint()
+        context["checkpoint"] = checkpoint
+        self._fault(point, **context)
+        checkpoint()
+
+    @staticmethod
+    def _attempt_file_cleanup_snapshot(attempt_file):
+        return (
+            attempt_file.kind,
+            attempt_file.state,
+            attempt_file.receipt_level,
+            attempt_file.relative_path,
+            attempt_file.intent_relative_path,
+            attempt_file.receipt_dev,
+            attempt_file.receipt_ino,
+            attempt_file.receipt_uid,
+            attempt_file.receipt_gid,
+            attempt_file.receipt_mode,
+            attempt_file.receipt_nlink,
+            attempt_file.receipt_size,
+            attempt_file.receipt_mtime_ns,
+            attempt_file.receipt_ctime_ns,
+            attempt_file.receipt_sha256,
+        )
+
+    @staticmethod
+    def _blob_cleanup_snapshot(blob):
+        return (
+            blob.cleanup_state,
+            blob.file_state,
+            blob.snapshot_generation,
+            blob.snapshot_relative_path,
+            blob.confirmed,
+            blob.receipt_dev,
+            blob.receipt_ino,
+            blob.receipt_uid,
+            blob.receipt_gid,
+            blob.receipt_mode,
+            blob.receipt_nlink,
+            blob.size,
+            blob.receipt_mtime_ns,
+            blob.receipt_ctime_ns,
+            blob.receipt_sha256,
+        )
+
+    def _retiring_cleanup_state(self, attempt, lease, heartbeat):
         with heartbeat.foreground_write_guard():
             with transaction.atomic(using=self.using):
                 lock_current_lease(lease, using=self.using)
                 current_attempt = ExportAttempt.objects.using(
                     self.using,
                 ).select_for_update().get(pk=attempt.pk)
-                current_file = None
-                if attempt_file is not None:
-                    current_file = ExportAttemptFile.objects.using(
-                        self.using,
-                    ).select_for_update().get(pk=attempt_file.pk)
-                    if current_file.attempt_id != current_attempt.pk:
-                        raise LeaseLost()
-                    if current_file.state not in ("retiring", "cleaned"):
-                        raise LeaseLost()
                 if current_attempt.state not in ("retiring", "cleaned"):
                     raise LeaseLost()
+                current_file = current_attempt.files.using(
+                    self.using,
+                ).select_for_update().exclude(
+                    state="cleaned",
+                ).order_by("kind", "pk").first()
+                if current_file is not None and not (
+                    (
+                        current_file.kind == "archive"
+                        and current_file.state == "retiring"
+                    )
+                    or (
+                        current_file.kind == "quarantine"
+                        and current_file.state == "closed"
+                    )
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
                 return current_attempt, current_file
 
-    def _remove_retiring_file_fs(self, attempt, attempt_file):
-        root = open_export_root(
-            settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
-        )
+    def _remove_retiring_file_fs(
+        self, attempt, attempt_file, checkpoint,
+    ):
+        root = None
         staging = directory = ready = None
         try:
+            checkpoint()
+            root = open_export_root(
+                settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
+            )
+            checkpoint()
             receipt = attempt_file_cleanup_receipt(attempt_file)
             ready_path = "ready/{}.zip".format(attempt.job_id)
             staging_path = "{}/{}".format(
                 attempt.relative_path, ARCHIVE_PART_NAME,
             )
-            if attempt_file.relative_path == ready_path:
+            quarantine_path = "{}/quarantine-ready-{}.zip".format(
+                attempt.relative_path, attempt.attempt_generation,
+            )
+            if (
+                attempt_file.kind == "archive"
+                and attempt_file.relative_path == ready_path
+            ):
                 ready = self._open_ready_directory(root)
+                self._cleanup_fault(
+                    "before_cleanup_unlink", checkpoint,
+                    attempt=attempt, attempt_file=attempt_file,
+                )
                 remove_if_receipt_matches(
                     ready, os.path.basename(attempt_file.relative_path), receipt,
                 )
-            elif attempt_file.relative_path == staging_path:
+                self._cleanup_fault(
+                    "after_cleanup_parent_fsync", checkpoint,
+                    attempt=attempt, attempt_file=attempt_file,
+                )
+            elif (
+                (
+                    attempt_file.kind == "archive"
+                    and attempt_file.relative_path == staging_path
+                )
+                or (
+                    attempt_file.kind == "quarantine"
+                    and attempt_file.relative_path == quarantine_path
+                )
+            ):
                 staging = open_staging_directory(root)
                 directory = open_receipted_directory(
                     staging, attempt.relative_path,
                     self._attempt_directory_receipt(attempt),
                 )
+                leaf = os.path.basename(attempt_file.relative_path)
+                self._cleanup_fault(
+                    "before_cleanup_unlink", checkpoint,
+                    attempt=attempt, attempt_file=attempt_file,
+                )
                 remove_if_receipt_matches(
-                    directory, ARCHIVE_PART_NAME, receipt,
+                    directory, leaf, receipt,
+                )
+                self._cleanup_fault(
+                    "after_cleanup_parent_fsync", checkpoint,
+                    attempt=attempt, attempt_file=attempt_file,
                 )
             else:
                 raise ExportStorageError("export_storage_unsafe")
@@ -1024,18 +1125,22 @@ class ArchiveService(object):
                 if current is not None:
                     current.close()
 
-    def _remove_retiring_directory_fs(self, attempt):
+    def _remove_retiring_directory_fs(self, attempt, checkpoint):
         expected_name = "attempt-{}-{}".format(
             attempt.job_id, attempt.attempt_generation,
         )
         if attempt.relative_path != expected_name:
             raise ExportStorageError("export_storage_unsafe")
-        root = open_export_root(
-            settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
-        )
+        root = None
         staging = directory = None
         try:
+            checkpoint()
+            root = open_export_root(
+                settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
+            )
+            checkpoint()
             staging = open_staging_directory(root)
+            checkpoint()
             try:
                 named = os.stat(
                     expected_name,
@@ -1044,6 +1149,7 @@ class ArchiveService(object):
                 )
             except FileNotFoundError:
                 staging.verify_identity()
+                checkpoint()
                 return False
             receipt = self._attempt_directory_receipt(attempt)
             if not receipt.matches_stat(named):
@@ -1056,8 +1162,24 @@ class ArchiveService(object):
             directory.verify_identity()
             if os.listdir(directory.descriptor):
                 raise ExportStorageError("export_storage_unsafe")
+            self._cleanup_fault(
+                "before_cleanup_unlink", checkpoint,
+                attempt=attempt, attempt_file=None,
+            )
             os.rmdir(expected_name, dir_fd=staging.descriptor)
+            self._cleanup_fault(
+                "after_cleanup_unlink", checkpoint,
+                attempt=attempt, attempt_file=None,
+            )
+            self._cleanup_fault(
+                "before_cleanup_parent_fsync", checkpoint,
+                attempt=attempt, attempt_file=None,
+            )
             os.fsync(staging.descriptor)
+            self._cleanup_fault(
+                "after_cleanup_parent_fsync", checkpoint,
+                attempt=attempt, attempt_file=None,
+            )
             return True
         except ExportStorageError:
             raise
@@ -1068,42 +1190,67 @@ class ArchiveService(object):
                 if current is not None:
                     current.close()
 
-    def _cleanup_retiring(self, attempt, attempt_file, lease, heartbeat):
-        current_attempt, current_file = self._retiring_cleanup_state(
-            attempt, attempt_file, lease, heartbeat,
-        )
-        if current_attempt.state == "cleaned":
-            return
-        if current_file is not None and current_file.state == "retiring":
-            self._remove_retiring_file_fs(current_attempt, current_file)
+    def _mark_attempt_file_cleaned(
+        self, attempt, attempt_file, lease, heartbeat,
+    ):
+        expected = self._attempt_file_cleanup_snapshot(attempt_file)
         with heartbeat.foreground_write_guard():
             with transaction.atomic(using=self.using):
                 lock_current_lease(lease, using=self.using)
                 current_attempt = ExportAttempt.objects.using(
                     self.using,
                 ).select_for_update().get(pk=attempt.pk)
-                if current_attempt.state != "retiring":
+                current_file = ExportAttemptFile.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=attempt_file.pk)
+                if (
+                    current_attempt.state != "retiring"
+                    or current_file.attempt_id != current_attempt.pk
+                    or self._attempt_file_cleanup_snapshot(current_file)
+                    != expected
+                ):
                     raise LeaseLost()
-                if attempt_file is not None:
-                    current_file = ExportAttemptFile.objects.using(
-                        self.using,
-                    ).select_for_update().get(pk=attempt_file.pk)
-                    if current_file.state == "retiring":
-                        current_file.state = "cleaned"
-                        current_file.intent_relative_path = None
-                        current_file.save(update_fields=(
-                            "state", "intent_relative_path",
-                        ))
-                    elif current_file.state != "cleaned":
-                        raise LeaseLost()
-                if current_attempt.files.exclude(state="cleaned").exists():
-                    return
+                current_file.state = "cleaned"
+                current_file.intent_relative_path = None
+                current_file.save(update_fields=(
+                    "state", "intent_relative_path",
+                ))
+
+    def _cleanup_retiring(
+        self, attempt, attempt_file, lease, heartbeat,
+        stop_requested=None,
+    ):
+        del attempt_file
+        checkpoint = self._cleanup_checkpointer(
+            lease, heartbeat, stop_requested,
+        )
+        while True:
+            checkpoint()
+            current_attempt, current_file = self._retiring_cleanup_state(
+                attempt, lease, heartbeat,
+            )
+            checkpoint()
+            if current_attempt.state == "cleaned":
+                return
+            if current_file is None:
+                break
+            self._remove_retiring_file_fs(
+                current_attempt, current_file, checkpoint,
+            )
+            checkpoint()
+            self._mark_attempt_file_cleaned(
+                current_attempt, current_file, lease, heartbeat,
+            )
+            checkpoint()
         current_attempt, current_file = self._retiring_cleanup_state(
-            attempt, attempt_file, lease, heartbeat,
+            attempt, lease, heartbeat,
         )
         if current_attempt.state == "cleaned":
             return
-        self._remove_retiring_directory_fs(current_attempt)
+        if current_file is not None:
+            raise LeaseLost()
+        self._remove_retiring_directory_fs(current_attempt, checkpoint)
+        checkpoint()
         with heartbeat.foreground_write_guard():
             with transaction.atomic(using=self.using):
                 lock_current_lease(lease, using=self.using)
@@ -1118,41 +1265,117 @@ class ArchiveService(object):
                 current_attempt.state = "cleaned"
                 current_attempt.save(update_fields=("state",))
 
-    def _cleanup_excluded_blobs(self, lease, heartbeat):
+    def _excluded_blob_cleanup_batch(
+        self, lease, heartbeat, last_pk,
+    ):
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                blobs = current.blobs.using(self.using).select_for_update().filter(
+                    cleanup_state="pending",
+                ).exclude(
+                    items__inclusion_state="included",
+                ).order_by("pk")
+                if last_pk is not None:
+                    blobs = blobs.filter(pk__gt=last_pk)
+                return list(blobs[:QUERY_CHUNK_SIZE])
+
+    def _mark_blob_cleanup_batch(
+        self, lease, heartbeat, blobs,
+    ):
+        blob_ids = [blob.pk for blob in blobs]
+        expected = {
+            blob.pk: self._blob_cleanup_snapshot(blob)
+            for blob in blobs
+        }
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                current = lock_current_lease(lease, using=self.using)
+                locked = list(ExportBlob.objects.using(
+                    self.using,
+                ).select_for_update().filter(
+                    job=current,
+                    pk__in=blob_ids,
+                    cleanup_state="pending",
+                ).exclude(
+                    items__inclusion_state="included",
+                ).order_by("pk"))
+                if (
+                    len(locked) != len(blobs)
+                    or any(
+                        self._blob_cleanup_snapshot(blob)
+                        != expected.get(blob.pk)
+                        for blob in locked
+                    )
+                ):
+                    raise ExportStorageError("export_storage_unsafe")
+                updated = ExportBlob.objects.using(self.using).filter(
+                    job=current,
+                    pk__in=blob_ids,
+                    cleanup_state="pending",
+                ).exclude(
+                    items__inclusion_state="included",
+                ).update(cleanup_state="cleaned")
+                if updated != len(blob_ids):
+                    raise ExportStorageError("export_storage_unsafe")
+
+    def _cleanup_excluded_blobs(
+        self, lease, heartbeat, stop_requested=None,
+    ):
         job = ExportJob.objects.using(self.using).get(pk=lease.job_id)
-        blob_ids = list(job.blobs.filter(
-            cleanup_state="pending",
-        ).exclude(
-            items__inclusion_state="included",
-        ).order_by("pk").values_list("pk", flat=True))
-        if not blob_ids:
-            return
-        root = open_export_root(
-            settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
+        checkpoint = self._cleanup_checkpointer(
+            lease, heartbeat, stop_requested,
         )
+        last_pk = None
+        root = None
         staging = snapshot = None
         try:
-            staging = open_staging_directory(root)
-            snapshot = open_receipted_directory(
-                staging, job.snapshot_relative_path,
-                snapshot_directory_receipt(job),
-            )
-            for blob_ids_chunk in self._chunks(blob_ids):
-                for blob in job.blobs.filter(pk__in=blob_ids_chunk):
+            while True:
+                checkpoint()
+                blobs = self._excluded_blob_cleanup_batch(
+                    lease, heartbeat, last_pk,
+                )
+                checkpoint()
+                if not blobs:
+                    return
+                if root is None:
+                    root = open_export_root(
+                        settings.PINRY_EXPORT_ROOT,
+                        os.getuid(),
+                        os.getgid(),
+                    )
+                    staging = open_staging_directory(root)
+                    snapshot = open_receipted_directory(
+                        staging, job.snapshot_relative_path,
+                        snapshot_directory_receipt(job),
+                    )
+                    checkpoint()
+                for blob in blobs:
+                    if (
+                        blob.cleanup_state != "pending"
+                        or blob.file_state != "closed"
+                        or not blob.confirmed
+                        or blob.snapshot_relative_path is None
+                    ):
+                        raise ExportStorageError("export_storage_unsafe")
+                    self._cleanup_fault(
+                        "before_cleanup_unlink", checkpoint,
+                        blob=blob, lease=lease,
+                    )
                     remove_if_receipt_matches(
                         snapshot, snapshot_blob_name(blob.pk),
                         self._blob_receipt(blob),
                     )
-                heartbeat()
-                with heartbeat.foreground_write_guard():
-                    with transaction.atomic(using=self.using):
-                        lock_current_lease(lease, using=self.using)
-                        ExportBlob.objects.using(self.using).filter(
-                            pk__in=blob_ids_chunk,
-                            cleanup_state="pending",
-                        ).exclude(
-                            items__inclusion_state="included",
-                        ).update(cleanup_state="cleaned")
+                    self._cleanup_fault(
+                        "after_cleanup_parent_fsync", checkpoint,
+                        blob=blob, lease=lease,
+                    )
+                checkpoint()
+                self._mark_blob_cleanup_batch(
+                    lease, heartbeat, blobs,
+                )
+                checkpoint()
+                last_pk = blobs[-1].pk
         finally:
             for directory in (snapshot, staging, root):
                 if directory is not None:
@@ -1295,8 +1518,11 @@ class ArchiveService(object):
                 if rotated is not None:
                     self._cleanup_retiring(
                         attempt, attempt_file, rotated, heartbeat,
+                        stop_requested,
                     )
-                    self._cleanup_excluded_blobs(rotated, heartbeat)
+                    self._cleanup_excluded_blobs(
+                        rotated, heartbeat, stop_requested,
+                    )
                     current_lease = rotated
                     continue
                 candidate = self._prepare_ready_candidate(
@@ -1310,8 +1536,11 @@ class ArchiveService(object):
                 if rotated is not None:
                     self._cleanup_retiring(
                         attempt, candidate, rotated, heartbeat,
+                        stop_requested,
                     )
-                    self._cleanup_excluded_blobs(rotated, heartbeat)
+                    self._cleanup_excluded_blobs(
+                        rotated, heartbeat, stop_requested,
+                    )
                     current_lease = rotated
                     continue
                 self._handoff(attempt, candidate, heartbeat)
@@ -1371,6 +1600,7 @@ class ArchiveService(object):
                 self._retry_recovery_db(
                     lambda: self._cleanup_retiring(
                         attempt, attempt_file, lease, heartbeat,
+                        stop_requested,
                     ),
                     lease,
                     heartbeat,
@@ -1520,6 +1750,7 @@ class ArchiveService(object):
         if attempt is not None:
             self._cleanup_retiring(
                 attempt, attempt.files.get(kind="archive"), lease, heartbeat,
+                stop_requested,
             )
         return RecoveryOutcome(
             ExportJob.objects.using(self.using).get(pk=lease.job_id), lease,

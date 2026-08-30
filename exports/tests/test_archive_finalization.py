@@ -27,7 +27,10 @@ from exports.models import (
 )
 from exports.services import archive as archive_services
 from exports.services.archive import ArchiveService
-from exports.services.file_ops import remove_if_receipt_matches
+from exports.services.file_ops import (
+    ClosedFileReceipt,
+    remove_if_receipt_matches,
+)
 from exports.services.snapshot import SnapshotService
 
 from .helpers import ExportStorageMixin, create_export_pin, create_export_user
@@ -77,6 +80,17 @@ class ArchiveHeartbeat(object):
 
     def __call__(self):
         self.pulses += 1
+
+
+class FakeMonotonic(object):
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
 
 
 class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
@@ -289,6 +303,190 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
             "item_ids": item_ids,
             "blob_size": blob_size,
         }
+
+    def _bulk_blob_cleanup_fixture(self, count, include_shared=True):
+        generation = uuid.uuid4()
+        digest = "b" * 64
+        snapshot_name = "snapshot-{}".format(generation)
+        snapshot_path = Path(
+            self._export_directory.name, ".staging", snapshot_name,
+        )
+        snapshot_path.mkdir(mode=0o700)
+        os.chmod(str(snapshot_path), 0o700)
+        receipt = os.stat(str(snapshot_path))
+        shared_item_count = 2 if include_shared else 0
+        requested = count + shared_item_count
+        included = 1 if include_shared else 0
+        excluded = requested - included
+        job = ExportJob.objects.create(
+            owner=self.owner,
+            scope="pins",
+            state="archiving",
+            requested_total=requested,
+            target_total=requested,
+            snapshot_done=requested,
+            archive_total=included,
+            included_total=included,
+            excluded_total=excluded,
+            excluded_permission_revoked_total=excluded,
+            bytes_total=included * 7,
+            worker_generation=9,
+            lease_uuid=self.job_uuid,
+            attempt_generation=0,
+            snapshot_generation=generation,
+            snapshot_relative_path=snapshot_name,
+            snapshot_dir_dev=receipt.st_dev,
+            snapshot_dir_ino=receipt.st_ino,
+            snapshot_dir_uid=receipt.st_uid,
+            snapshot_dir_gid=receipt.st_gid,
+            snapshot_dir_mode=receipt.st_mode & 0o777,
+        )
+        blob_ids = []
+        for start in range(0, count, 400):
+            blobs = []
+            for position in range(start, min(start + 400, count)):
+                blob = ExportBlob(
+                    job=job,
+                    snapshot_generation=generation,
+                    source_media_asset_id=position + 1,
+                    source_image_id=position + 1,
+                    source_relative_path="source/{}.png".format(position),
+                    expected_sha256=digest,
+                    file_state="closed",
+                    capture_method="copy",
+                    mime_type="image/png",
+                    size=7,
+                    receipt_dev=101,
+                    receipt_ino=position + 201,
+                    receipt_uid=301,
+                    receipt_gid=401,
+                    receipt_mode=0o600,
+                    receipt_nlink=1,
+                    receipt_mtime_ns=501,
+                    receipt_ctime_ns=601,
+                    receipt_sha256=digest,
+                    confirmed=True,
+                )
+                blob.snapshot_relative_path = str(blob.pk)
+                blobs.append(blob)
+                blob_ids.append(blob.pk)
+            ExportBlob.objects.bulk_create(blobs, batch_size=400)
+            ExportItem.objects.bulk_create([
+                ExportItem(
+                    job=job,
+                    target_position=position,
+                    snapshot_generation=generation,
+                    blob_id=blob_ids[position],
+                    pin_id=position + 1,
+                    pin_owner_id=self.other.pk,
+                    owner_username=self.other.username,
+                    is_public=False,
+                    published_at=timezone.now(),
+                    original_filename="excluded.png",
+                    inclusion_state="excluded",
+                    exclusion_reason="permission_revoked",
+                )
+                for position in range(start, min(start + 400, count))
+            ], batch_size=400)
+        shared_blob = None
+        if include_shared:
+            shared_blob = ExportBlob.objects.create(
+                job=job,
+                snapshot_generation=generation,
+                source_media_asset_id=count + 1,
+                source_image_id=count + 1,
+                source_relative_path="source/shared.png",
+                expected_sha256=digest,
+                file_state="closed",
+                snapshot_relative_path="shared",
+                capture_method="copy",
+                mime_type="image/png",
+                size=7,
+                receipt_dev=101,
+                receipt_ino=count + 201,
+                receipt_uid=301,
+                receipt_gid=401,
+                receipt_mode=0o600,
+                receipt_nlink=1,
+                receipt_mtime_ns=501,
+                receipt_ctime_ns=601,
+                receipt_sha256=digest,
+                confirmed=True,
+            )
+            ExportItem.objects.bulk_create([
+                ExportItem(
+                    job=job,
+                    target_position=count,
+                    snapshot_generation=generation,
+                    blob=shared_blob,
+                    pin_id=count + 1,
+                    pin_owner_id=self.other.pk,
+                    owner_username=self.other.username,
+                    is_public=False,
+                    published_at=timezone.now(),
+                    original_filename="shared-excluded.png",
+                    inclusion_state="excluded",
+                    exclusion_reason="permission_revoked",
+                ),
+                ExportItem(
+                    job=job,
+                    target_position=count + 1,
+                    snapshot_generation=generation,
+                    blob=shared_blob,
+                    pin_id=count + 2,
+                    pin_owner_id=self.owner.pk,
+                    owner_username=self.owner.username,
+                    is_public=True,
+                    published_at=timezone.now(),
+                    original_filename="shared-included.png",
+                ),
+            ], batch_size=400)
+        lease = LeaseToken(
+            9, self.worker_uuid, job.pk, self.job_uuid, 0,
+        )
+        heartbeat = ArchiveHeartbeat()
+        heartbeat.lease = lease
+        return {
+            "job": job,
+            "lease": lease,
+            "heartbeat": heartbeat,
+            "blob_ids": blob_ids,
+            "shared_blob": shared_blob,
+            "snapshot_path": snapshot_path,
+        }
+
+    def _retiring_attempt_with_quarantine(self):
+        pin = create_export_pin(self.owner, filename="cleanup-children.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+        ready = Path(self._export_directory.name, "ready")
+        ready.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(str(ready), 0o700)
+        collision = ready / "{}.zip".format(job.pk)
+        collision.write_bytes(b"cleanup collision")
+        os.chmod(str(collision), 0o600)
+
+        def stop_after_ready(point, context):
+            del context
+            if point == "after_ready_candidate":
+                raise StopRequested(lease)
+
+        with self.assertRaises(StopRequested):
+            ArchiveService(
+                fault_injector=stop_after_ready,
+            ).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+        attempt = job.attempts.get(attempt_generation=0)
+        archive = attempt.files.get(kind="archive")
+        quarantine = attempt.files.get(kind="quarantine")
+        ArchiveService()._mark_current_attempt_retiring(lease, heartbeat)
+        attempt.refresh_from_db()
+        archive.refresh_from_db()
+        quarantine.refresh_from_db()
+        self.assertEqual(attempt.state, "retiring")
+        self.assertEqual(archive.state, "retiring")
+        self.assertEqual(quarantine.state, "closed")
+        return job, attempt, archive, quarantine, lease, heartbeat
 
     def test_build_preserves_original_and_writes_pin_specific_xmp_manifest(self):
         first = create_export_pin(self.owner, filename="shared.PNG")
@@ -936,3 +1134,287 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
             job.items.filter(inclusion_state="included").count(),
             801,
         )
+
+    def test_fifty_thousand_blob_cleanup_uses_keyset_batches_of_at_most_four_hundred(self):
+        fixture = self._bulk_blob_cleanup_fixture(50000)
+        removed = []
+        keyset_selects = []
+        keyset_widths = []
+        cas_selects = []
+        cas_select_widths = []
+        updates = []
+        update_widths = []
+        unbounded_selects = []
+
+        def cooperative_remove(directory, name, receipt):
+            directory.verify_identity()
+            self.assertIsInstance(receipt, ClosedFileReceipt)
+            self.assertEqual(fixture["heartbeat"].guard_depth, 0)
+            self.assertEqual(fixture["heartbeat"].token_depth, 0)
+            self.assertFalse(connection.in_atomic_block)
+            removed.append(name)
+            return True
+
+        def observe(execute, sql, params, many, context):
+            upper = sql.upper()
+            widths = self._in_widths(sql)
+            if (
+                upper.lstrip().startswith("SELECT")
+                and "EXPORTS_EXPORTBLOB" in upper
+            ):
+                if "LIMIT 400" in upper and "ORDER BY" in upper:
+                    keyset_selects.append(sql)
+                    keyset_widths.extend(widths)
+                elif widths:
+                    cas_selects.append(sql)
+                    cas_select_widths.extend(widths)
+                else:
+                    unbounded_selects.append(sql)
+            elif (
+                upper.lstrip().startswith("UPDATE")
+                and "EXPORTS_EXPORTBLOB" in upper
+            ):
+                updates.append(sql)
+                update_widths.extend(widths)
+            return execute(sql, params, many, context)
+
+        with mock.patch(
+            "exports.services.archive.remove_if_receipt_matches",
+            side_effect=cooperative_remove,
+        ), connection.execute_wrapper(observe):
+            ArchiveService()._cleanup_excluded_blobs(
+                fixture["lease"],
+                fixture["heartbeat"],
+                lambda: False,
+            )
+
+        self.assertEqual(len(keyset_selects), 126)
+        self.assertTrue(all("LIMIT 400" in sql.upper() for sql in keyset_selects))
+        self.assertEqual(len(cas_selects), 125)
+        self.assertEqual(len(updates), 125)
+        self.assertLessEqual(max(keyset_widths), 400)
+        self.assertLessEqual(max(cas_select_widths), 400)
+        self.assertLessEqual(max(update_widths), 400)
+        self.assertEqual(unbounded_selects, [])
+        self.assertEqual(len(removed), 50000)
+        self.assertEqual(len(set(removed)), 50000)
+        self.assertNotIn(str(fixture["shared_blob"].pk), removed)
+        candidates = ExportBlob.objects.filter(job=fixture["job"]).exclude(
+            pk=fixture["shared_blob"].pk,
+        )
+        self.assertEqual(candidates.filter(
+            cleanup_state="cleaned",
+            file_state="closed",
+            snapshot_relative_path__isnull=False,
+            receipt_dev__isnull=False,
+            receipt_ino__isnull=False,
+            receipt_uid__isnull=False,
+            receipt_gid__isnull=False,
+            receipt_mode__isnull=False,
+            receipt_nlink__isnull=False,
+            size__isnull=False,
+            receipt_mtime_ns__isnull=False,
+            receipt_ctime_ns__isnull=False,
+            receipt_sha256__isnull=False,
+        ).count(), 50000)
+        fixture["shared_blob"].refresh_from_db()
+        self.assertEqual(fixture["shared_blob"].cleanup_state, "pending")
+        self.assertEqual(fixture["shared_blob"].file_state, "closed")
+        self.assertEqual(fixture["shared_blob"].snapshot_relative_path, "shared")
+
+    def test_virtual_forty_five_second_blob_cleanup_pulses_and_checks_stop_within_five_seconds(self):
+        fixture = self._bulk_blob_cleanup_fixture(
+            30, include_shared=False,
+        )
+        clock = FakeMonotonic()
+        heartbeat_times = [clock()]
+        stop_times = []
+        stop_state = {"requested": False}
+
+        class TimedHeartbeat(ArchiveHeartbeat):
+            def renew_now(self, lease):
+                self.assert_current_lease(lease)
+                heartbeat_times.append(clock())
+                super(TimedHeartbeat, self).renew_now(lease)
+
+            def __call__(self):
+                heartbeat_times.append(clock())
+                super(TimedHeartbeat, self).__call__()
+
+            @staticmethod
+            def assert_current_lease(lease):
+                if lease != fixture["lease"]:
+                    raise AssertionError("cleanup renewed a stale lease")
+
+        heartbeat = TimedHeartbeat()
+        heartbeat.lease = fixture["lease"]
+
+        def stop_requested():
+            stop_times.append(clock())
+            return stop_state["requested"]
+
+        def cooperative_fault(point, context):
+            if point not in (
+                "before_cleanup_unlink",
+                "after_cleanup_parent_fsync",
+            ):
+                return
+            clock.advance(1.0)
+            context["checkpoint"]()
+            if clock() >= 45.0:
+                stop_state["requested"] = True
+
+        def cooperative_remove(directory, name, receipt):
+            del name
+            directory.verify_identity()
+            self.assertIsInstance(receipt, ClosedFileReceipt)
+            return True
+
+        service = ArchiveService(
+            monotonic=clock,
+            sleeper=lambda seconds: self.fail(
+                "cleanup must not use real sleep: {}".format(seconds),
+            ),
+            fault_injector=cooperative_fault,
+        )
+        with mock.patch(
+            "exports.services.archive.remove_if_receipt_matches",
+            side_effect=cooperative_remove,
+        ):
+            with self.assertRaises(StopRequested) as raised:
+                service._cleanup_excluded_blobs(
+                    fixture["lease"], heartbeat, stop_requested,
+                )
+
+        self.assertEqual(raised.exception.lease, fixture["lease"])
+        self.assertGreaterEqual(clock(), 45.0)
+        self.assertGreater(len(stop_times), 45)
+        gaps = [
+            later - earlier
+            for earlier, later in zip(
+                heartbeat_times, heartbeat_times[1:] + [clock()],
+            )
+        ]
+        self.assertLessEqual(max(gaps), 5.0)
+        self.assertEqual(heartbeat.lease, fixture["lease"])
+
+    def test_cleanup_filesystem_calls_run_outside_foreground_token_and_database_fence(self):
+        (
+            job,
+            attempt,
+            archive,
+            quarantine,
+            lease,
+            heartbeat,
+        ) = self._retiring_attempt_with_quarantine()
+        del job, quarantine
+        fence_depth = {"value": 0}
+        observations = []
+        original_fence = archive_services.database_write_fence
+        original_remove = remove_if_receipt_matches
+        original_rmdir = os.rmdir
+
+        def assert_outside(label):
+            observations.append((
+                label,
+                heartbeat.guard_depth,
+                heartbeat.token_depth,
+                fence_depth["value"],
+                connection.in_atomic_block,
+            ))
+
+        @contextmanager
+        def tracking_fence(*args, **kwargs):
+            fence_depth["value"] += 1
+            try:
+                with original_fence(*args, **kwargs) as current:
+                    yield current
+            finally:
+                fence_depth["value"] -= 1
+
+        def observe_fault(point, context):
+            if point in (
+                "before_cleanup_unlink",
+                "after_cleanup_parent_fsync",
+            ):
+                self.assertTrue(callable(context["checkpoint"]))
+                assert_outside(point)
+
+        def observe_remove(directory, name, receipt):
+            assert_outside("remove")
+            return original_remove(directory, name, receipt)
+
+        def observe_rmdir(name, *args, **kwargs):
+            assert_outside("rmdir")
+            return original_rmdir(name, *args, **kwargs)
+
+        service = ArchiveService(fault_injector=observe_fault)
+        with mock.patch(
+            "exports.services.archive.database_write_fence",
+            tracking_fence,
+        ), mock.patch(
+            "exports.services.archive.remove_if_receipt_matches",
+            side_effect=observe_remove,
+        ), mock.patch(
+            "exports.services.archive.os.rmdir",
+            side_effect=observe_rmdir,
+        ):
+            service._cleanup_retiring(
+                attempt, archive, lease, heartbeat, lambda: False,
+            )
+
+        self.assertTrue(observations)
+        self.assertTrue(all(
+            guard == token == fence == 0 and not in_atomic
+            for label, guard, token, fence, in_atomic in observations
+        ))
+
+    def test_retiring_cleanup_marks_attempt_cleaned_only_after_all_children(self):
+        (
+            job,
+            attempt,
+            archive,
+            quarantine,
+            lease,
+            heartbeat,
+        ) = self._retiring_attempt_with_quarantine()
+        del job
+        directory_cleanup_states = []
+        removed = []
+        original_remove = remove_if_receipt_matches
+        original_rmdir = os.rmdir
+
+        def observe_remove(directory, name, receipt):
+            removed.append(name)
+            return original_remove(directory, name, receipt)
+
+        def rmdir_after_children(name, *args, **kwargs):
+            directory_cleanup_states.append(list(
+                attempt.files.order_by("kind").values_list(
+                    "kind", "state",
+                )
+            ))
+            return original_rmdir(name, *args, **kwargs)
+
+        with mock.patch(
+            "exports.services.archive.remove_if_receipt_matches",
+            side_effect=observe_remove,
+        ), mock.patch(
+            "exports.services.archive.os.rmdir",
+            side_effect=rmdir_after_children,
+        ):
+            ArchiveService()._cleanup_retiring(
+                attempt, archive, lease, heartbeat, lambda: False,
+            )
+
+        attempt.refresh_from_db()
+        archive.refresh_from_db()
+        quarantine.refresh_from_db()
+        self.assertEqual(archive.state, "cleaned")
+        self.assertEqual(quarantine.state, "cleaned")
+        self.assertEqual(attempt.state, "cleaned")
+        self.assertEqual(len(removed), 2)
+        self.assertEqual(directory_cleanup_states, [[
+            ("archive", "cleaned"),
+            ("quarantine", "cleaned"),
+        ]])
