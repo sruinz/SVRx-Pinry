@@ -46,6 +46,29 @@ function status(overrides = {}) {
 }
 
 
+function schemaOnlyStatus(overrides = {}) {
+  return status({
+    state: "starting",
+    phase: "preparing",
+    phase_label: "실행 환경 확인",
+    run_id: null,
+    attempt: 0,
+    started_at: null,
+    progress_at: null,
+    last_committed_batch: 0,
+    images_done: 0,
+    images_total: null,
+    files_done: 0,
+    files_total: null,
+    backfill_done: 0,
+    backfill_total: null,
+    phase_percent: null,
+    overall_percent: null,
+    ...overrides,
+  });
+}
+
+
 function response(payload, options = {}) {
   return {
     ok: options.ok ?? true,
@@ -424,6 +447,113 @@ test("실패 안내가 stale 안내보다 우선하고 진행 정체를 별도�
     stalled.notice,
     "큰 파일을 처리 중이거나 저장소 응답을 기다리고 있습니다.",
   );
+});
+
+
+test("스키마 전용 완료 뒤에는 서비스 시작 확인 상태를 표시한다", () => {
+  const documentRef = fakeDocument();
+  const adapter = ui.createDomAdapter(documentRef);
+  const payload = schemaOnlyStatus({
+    state: "migrating",
+    phase: "complete",
+    phase_label: "이전 완료",
+    phase_percent: 100,
+    overall_percent: 100,
+  });
+
+  adapter.renderStatus(payload, Date.parse("2026-08-27T01:05:00Z"));
+
+  assert.equal(
+    documentRef.nodes["page-title"].textContent,
+    "SVRx Pinry 서비스 시작을 확인하고 있습니다.",
+  );
+  assert.equal(
+    documentRef.nodes["state-badge"].textContent,
+    "서비스 시작 확인 중",
+  );
+  assert.equal(
+    documentRef.nodes["notice-title"].textContent,
+    "서비스를 안전하게 시작하고 있습니다.",
+  );
+  assert.equal(
+    documentRef.nodes["notice-text"].textContent,
+    "앱 서버 준비 상태를 확인한 뒤 자동으로 전환합니다.",
+  );
+  assert.equal(documentRef.nodes["images-count"].textContent, "해당 없음");
+  assert.equal(documentRef.nodes["files-count"].textContent, "해당 없음");
+  assert.equal(documentRef.nodes["backfill-count"].textContent, "해당 없음");
+  assert.match(documentRef.nodes["live-status"].textContent, /서비스 시작 확인 중/);
+
+  adapter.renderStatus(status({
+    phase: "complete",
+    phase_label: "이전 완료",
+    images_done: 100,
+    files_done: 300,
+    backfill_done: 100,
+    phase_percent: 100,
+    overall_percent: 100,
+  }), Date.parse("2026-08-27T01:05:00Z"));
+  assert.equal(documentRef.nodes["images-count"].textContent, "100 / 100");
+  assert.equal(documentRef.nodes["files-count"].textContent, "300 / 300");
+  assert.equal(documentRef.nodes["backfill-count"].textContent, "100 / 100");
+});
+
+
+test("시작 준비와 실제 이관과 준비 완료 문구를 구분한다", () => {
+  const now = Date.parse("2026-08-27T01:05:00Z");
+  const cases = [
+    {
+      payload: schemaOnlyStatus(),
+      title: "SVRx Pinry를 준비하고 있습니다.",
+      stateText: "시작 준비 중",
+      noticeTitle: "실행 환경을 확인하고 있습니다.",
+      notice: "설정과 데이터 상태를 확인한 뒤 필요한 작업을 자동으로 진행합니다.",
+    },
+    {
+      payload: status(),
+      title: "기존 Pinry 데이터를 이전하고 있습니다.",
+      stateText: "데이터 이전 중",
+      noticeTitle: "안전하게 이전하는 중입니다.",
+    },
+    {
+      payload: status({
+        state: "starting_service",
+        phase: "finalizing",
+        phase_label: "최종 검증",
+      }),
+      title: "SVRx Pinry 서비스 시작을 확인하고 있습니다.",
+      stateText: "서비스 시작 확인 중",
+      noticeTitle: "서비스를 안전하게 시작하고 있습니다.",
+      notice: "앱 서버 준비 상태를 확인한 뒤 자동으로 전환합니다.",
+    },
+    {
+      payload: schemaOnlyStatus({
+        state: "ready",
+        phase: "complete",
+        phase_label: "이전 완료",
+        phase_percent: 100,
+        overall_percent: 100,
+      }),
+      title: "SVRx Pinry로 이동합니다.",
+      stateText: "준비 완료",
+      noticeTitle: "서비스 준비가 완료되었습니다.",
+      notice: "잠시 후 SVRx Pinry로 자동 이동합니다.",
+      counter: "해당 없음",
+    },
+  ];
+
+  for (const expected of cases) {
+    const view = ui.deriveViewModel(expected.payload, now);
+    assert.equal(view.title, expected.title);
+    assert.equal(view.stateText, expected.stateText);
+    assert.equal(view.noticeTitle, expected.noticeTitle);
+    if (expected.notice) assert.equal(view.notice, expected.notice);
+    if (expected.counter) {
+      assert.equal(view.imagesText, expected.counter);
+      assert.equal(view.filesText, expected.counter);
+      assert.equal(view.backfillText, expected.counter);
+    }
+  }
 });
 
 

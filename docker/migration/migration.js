@@ -270,8 +270,24 @@
     return "DSM Container Manager의 컨테이너 로그를 확인하세요.";
   }
 
+  function isServiceStarting(payload) {
+    return payload.state === "starting_service"
+      || (payload.state === "migrating" && payload.phase === "complete");
+  }
+
   function deriveViewModel(payload, now) {
     var failed = payload.state === "failed";
+    var preparing = payload.state === "starting";
+    var ready = payload.state === "ready";
+    var serviceStarting = isServiceStarting(payload);
+    var noMediaWork = payload.phase === "complete"
+      && payload.run_id === null
+      && payload.images_done === 0
+      && payload.images_total === null
+      && payload.files_done === 0
+      && payload.files_total === null
+      && payload.backfill_done === 0
+      && payload.backfill_total === null;
     var notice = "중지해야 한다면 DSM Container Manager의 정상 중지를 사용하세요. 재시작하면 마지막 확정 배치부터 이어집니다.";
     if (failed) {
       notice = errorNotice(payload.error_class);
@@ -280,6 +296,12 @@
       var progressAge = payload.progress_at === null ? 0 : now - Date.parse(payload.progress_at);
       if (heartbeatAge > 15000) {
         notice = "상태 확인이 지연되고 있습니다.";
+      } else if (serviceStarting) {
+        notice = "앱 서버 준비 상태를 확인한 뒤 자동으로 전환합니다.";
+      } else if (ready) {
+        notice = "잠시 후 SVRx Pinry로 자동 이동합니다.";
+      } else if (preparing) {
+        notice = "설정과 데이터 상태를 확인한 뒤 필요한 작업을 자동으로 진행합니다.";
       } else if (payload.progress_at !== null && progressAge > 60000) {
         notice = "큰 파일을 처리 중이거나 저장소 응답을 기다리고 있습니다.";
       }
@@ -287,18 +309,39 @@
     return {
       title: failed
         ? "데이터 이전을 완료하지 못했습니다."
-        : (payload.state === "ready"
-          ? "SVRx Pinry를 시작합니다."
-          : "기존 Pinry 데이터를 이전하고 있습니다."),
-      stateText: STATE_LABELS[payload.state],
+        : (ready
+          ? "SVRx Pinry로 이동합니다."
+          : (serviceStarting
+            ? "SVRx Pinry 서비스 시작을 확인하고 있습니다."
+            : (preparing
+              ? "SVRx Pinry를 준비하고 있습니다."
+              : "기존 Pinry 데이터를 이전하고 있습니다."))),
+      stateText: serviceStarting
+        ? "서비스 시작 확인 중"
+        : STATE_LABELS[payload.state],
+      noticeTitle: failed
+        ? "데이터를 보존한 상태로 멈춰 있습니다."
+        : (ready
+          ? "서비스 준비가 완료되었습니다."
+          : (serviceStarting
+            ? "서비스를 안전하게 시작하고 있습니다."
+            : (preparing
+              ? "실행 환경을 확인하고 있습니다."
+              : "안전하게 이전하는 중입니다."))),
       notice: notice,
       heartbeatAge: timestampAge(payload.heartbeat_at, now),
       progressAge: timestampAge(payload.progress_at, now),
       overallPercentText: formatPercent(payload.overall_percent),
       phasePercentText: formatPercent(payload.phase_percent),
-      imagesText: formatCounter(payload.images_done, payload.images_total),
-      filesText: formatCounter(payload.files_done, payload.files_total),
-      backfillText: formatCounter(payload.backfill_done, payload.backfill_total),
+      imagesText: noMediaWork
+        ? "해당 없음"
+        : formatCounter(payload.images_done, payload.images_total),
+      filesText: noMediaWork
+        ? "해당 없음"
+        : formatCounter(payload.files_done, payload.files_total),
+      backfillText: noMediaWork
+        ? "해당 없음"
+        : formatCounter(payload.backfill_done, payload.backfill_total),
       errorClassText: ({
         retryable: "재시작 후 자동 재개 가능",
         operator_action_required: "사용자 확인 필요",
@@ -321,7 +364,10 @@
   }
 
   function liveText(payload) {
-    var text = STATE_LABELS[payload.state] + ". " + payload.phase_label
+    var stateText = isServiceStarting(payload)
+      ? "서비스 시작 확인 중"
+      : STATE_LABELS[payload.state];
+    var text = stateText + ". " + payload.phase_label
       + ". 이미지 " + String(payload.images_done)
       + ", 파일 " + String(payload.files_done)
       + ", 미디어 자산 " + String(payload.backfill_done) + ".";
@@ -556,9 +602,7 @@
         elements["progress-age"].textContent = view.progressAge;
         elements["resume-count"].textContent = String(payload.resume_count) + "회";
         elements["last-batch"].textContent = String(payload.last_committed_batch);
-        elements["notice-title"].textContent = payload.state === "failed"
-          ? "데이터를 보존한 상태로 멈춰 있습니다."
-          : "안전하게 이전하는 중입니다.";
+        elements["notice-title"].textContent = view.noticeTitle;
         elements["notice-text"].textContent = view.notice;
         elements["error-panel"].hidden = payload.state !== "failed";
         elements["error-title"].textContent = payload.state === "failed"
