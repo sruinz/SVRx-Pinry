@@ -3,18 +3,24 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import threading
 import uuid
 import zipfile
 
+from django.db import connection
 from django.test import TransactionTestCase
 from django.utils import timezone
 import mock
 
+from core.models import Pin
 from core.services.database_fence import DatabaseFenceBusy
 from exports.contracts import ExportError, LeaseToken, StopRequested
 from exports.models import (
     ExportAttempt,
+    ExportAttemptFile,
+    ExportBlob,
+    ExportItem,
     ExportJob,
     ExportTarget,
     ExportWorkerLease,
@@ -41,6 +47,7 @@ class _Rotation(object):
 class ArchiveHeartbeat(object):
     def __init__(self):
         self.guard_depth = 0
+        self.token_depth = 0
         self.pulses = 0
         self.lease = None
         self._lock = threading.RLock()
@@ -57,8 +64,12 @@ class ArchiveHeartbeat(object):
     @contextmanager
     def job_token_transition(self, lease):
         with self._lock:
-            self.lease = lease
-            yield _Rotation(self)
+            self.token_depth += 1
+            try:
+                self.lease = lease
+                yield _Rotation(self)
+            finally:
+                self.token_depth -= 1
 
     def renew_now(self, lease):
         self.lease = lease
@@ -134,6 +145,150 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
         asset.content_sha256 = hashlib.sha256(content).hexdigest()
         asset.save(update_fields=("content_sha256",))
         return pin
+
+    @staticmethod
+    def _in_widths(sql):
+        widths = []
+        for body in re.findall(r"\bIN\s*\(([^()]*)\)", sql, re.I):
+            widths.append(body.count("%s") + body.count("?"))
+        return [width for width in widths if width]
+
+    def _bulk_finalization_fixture(self, count, initially_excluded=0):
+        blob_size = 7
+        exported_at = timezone.now()
+        generation = uuid.uuid4()
+        digest = "a" * 64
+        seed = create_export_pin(
+            self.other, private=True, filename="bulk-revoked.png",
+        )
+        remaining = count - 1
+        for start in range(0, remaining, 400):
+            batch_size = min(400, remaining - start)
+            Pin.objects.bulk_create([
+                Pin(
+                    submitter=self.other,
+                    image_id=seed.image_id,
+                    private=True,
+                )
+                for unused in range(batch_size)
+            ], batch_size=400)
+        pin_ids = list(Pin.objects.filter(
+            submitter=self.other, image_id=seed.image_id,
+        ).order_by("pk").values_list("pk", flat=True))
+        self.assertEqual(len(pin_ids), count)
+        included = count - initially_excluded
+        job = ExportJob.objects.create(
+            owner=self.owner,
+            scope="pins",
+            state="verifying",
+            requested_total=count,
+            target_total=count,
+            snapshot_done=count,
+            archive_total=included,
+            archive_done=included,
+            included_total=included,
+            excluded_total=initially_excluded,
+            excluded_permission_revoked_total=initially_excluded,
+            bytes_total=included * blob_size,
+            bytes_done=included * blob_size,
+            worker_generation=9,
+            lease_uuid=self.job_uuid,
+            attempt_generation=0,
+            verifying_attempt_generation=0,
+            verifying_size=123,
+            verifying_sha256=digest,
+            verifying_completed_at=exported_at,
+        )
+        blob = ExportBlob.objects.create(
+            job=job,
+            snapshot_generation=generation,
+            source_media_asset_id=seed.image.media_asset.pk,
+            source_image_id=seed.image_id,
+            source_relative_path="bulk/source.png",
+            expected_sha256=digest,
+            file_state="closed",
+            snapshot_relative_path="bulk/snapshot.png",
+            capture_method="copy",
+            mime_type="image/png",
+            size=blob_size,
+            receipt_dev=1,
+            receipt_ino=2,
+            receipt_uid=3,
+            receipt_gid=4,
+            receipt_mode=0o600,
+            receipt_nlink=1,
+            receipt_mtime_ns=5,
+            receipt_ctime_ns=6,
+            receipt_sha256=digest,
+            confirmed=True,
+        )
+        item_ids = []
+        for start in range(0, count, 400):
+            items = []
+            for position, pin_id in enumerate(
+                pin_ids[start:start + 400], start=start,
+            ):
+                item = ExportItem(
+                    job=job,
+                    target_position=position,
+                    snapshot_generation=generation,
+                    blob=blob,
+                    pin_id=pin_id,
+                    pin_owner_id=self.other.pk,
+                    owner_username=self.other.username,
+                    is_public=False,
+                    published_at=exported_at,
+                    original_filename="bulk-revoked.png",
+                )
+                items.append(item)
+                item_ids.append(item.pk)
+            ExportItem.objects.bulk_create(items, batch_size=400)
+        if initially_excluded:
+            stale_ids = item_ids[:initially_excluded]
+            ExportItem.objects.filter(pk__in=stale_ids).update(
+                inclusion_state="excluded",
+                exclusion_reason="permission_revoked",
+            )
+        attempt = ExportAttempt.objects.create(
+            job=job,
+            attempt_generation=0,
+            lease_uuid=self.job_uuid,
+            state="verifying",
+            relative_path="attempts/{}/0".format(job.pk),
+            exported_at=exported_at,
+        )
+        candidate = ExportAttemptFile.objects.create(
+            attempt=attempt,
+            kind="archive",
+            state="ready_candidate",
+            receipt_level="full",
+            relative_path="attempts/{}/0/archive.zip".format(job.pk),
+            receipt_dev=11,
+            receipt_ino=12,
+            receipt_uid=13,
+            receipt_gid=14,
+            receipt_mode=0o600,
+            receipt_nlink=1,
+            receipt_size=123,
+            receipt_mtime_ns=15,
+            receipt_ctime_ns=16,
+            receipt_sha256=digest,
+        )
+        lease = LeaseToken(
+            9, self.worker_uuid, job.pk, self.job_uuid, 0,
+        )
+        heartbeat = ArchiveHeartbeat()
+        heartbeat.lease = lease
+        return {
+            "job": job,
+            "attempt": attempt,
+            "candidate": candidate,
+            "exported_at": exported_at,
+            "lease": lease,
+            "heartbeat": heartbeat,
+            "item_ids": item_ids,
+            "blob_size": blob_size,
+        }
 
     def test_build_preserves_original_and_writes_pin_specific_xmp_manifest(self):
         first = create_export_pin(self.owner, filename="shared.PNG")
@@ -573,3 +728,211 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
             attempt_file.receipt_ctime_ns,
             attempt_file.receipt_sha256,
         ))
+
+    def test_fifty_thousand_final_permission_queries_use_at_most_four_hundred_ids(self):
+        fixture = self._bulk_finalization_fixture(50000)
+        widths = {
+            "live_pin": [],
+            "included_item": [],
+            "item_update": [],
+            "blob_lookup": [],
+        }
+        unbounded_counter_queries = []
+
+        def observe(execute, sql, params, many, context):
+            upper = sql.upper()
+            in_widths = self._in_widths(sql)
+            if "CORE_PIN" in upper and upper.lstrip().startswith("SELECT"):
+                widths["live_pin"].extend(in_widths)
+            if (
+                "EXPORTS_EXPORTITEM" in upper
+                and "EXPORTS_EXPORTBLOB" in upper
+                and upper.lstrip().startswith("SELECT")
+            ):
+                widths["included_item"].extend(in_widths)
+                widths["blob_lookup"].extend(in_widths)
+            if (
+                "EXPORTS_EXPORTITEM" in upper
+                and upper.lstrip().startswith("UPDATE")
+            ):
+                widths["item_update"].extend(in_widths)
+            if (
+                "EXPORTS_EXPORTITEM" in upper
+                and upper.lstrip().startswith("SELECT COUNT")
+            ):
+                unbounded_counter_queries.append(sql)
+            return execute(sql, params, many, context)
+
+        service = ArchiveService()
+        with connection.execute_wrapper(observe):
+            rotated = service._final_fence(
+                fixture["attempt"],
+                fixture["candidate"],
+                fixture["exported_at"],
+                fixture["lease"],
+                fixture["heartbeat"],
+                lambda: False,
+            )
+
+        self.assertIsNotNone(rotated)
+        for name, observed in widths.items():
+            self.assertTrue(observed, name)
+            self.assertLessEqual(max(observed), 400, name)
+        self.assertEqual(len(widths["live_pin"]), 125)
+        self.assertEqual(len(widths["included_item"]), 125)
+        self.assertEqual(len(widths["item_update"]), 125)
+        self.assertEqual(unbounded_counter_queries, [])
+
+    def test_fifty_thousand_final_revocations_checkpoint_each_real_orm_batch(self):
+        fixture = self._bulk_finalization_fixture(
+            50000, initially_excluded=1,
+        )
+        events = []
+
+        class RecordingDeadline(object):
+            def __init__(self, monotonic):
+                del monotonic
+
+            def checkpoint(self):
+                events.append("checkpoint")
+
+        def observe(execute, sql, params, many, context):
+            upper = sql.upper()
+            if (
+                "CORE_PIN" in upper
+                and upper.lstrip().startswith("SELECT")
+                and self._in_widths(sql)
+            ):
+                events.append("live_pin")
+            elif (
+                "EXPORTS_EXPORTITEM" in upper
+                and "EXPORTS_EXPORTBLOB" in upper
+                and upper.lstrip().startswith("SELECT")
+                and self._in_widths(sql)
+            ):
+                events.append("included_item")
+            elif (
+                "EXPORTS_EXPORTITEM" in upper
+                and upper.lstrip().startswith("UPDATE")
+                and self._in_widths(sql)
+            ):
+                events.append("item_update")
+            return execute(sql, params, many, context)
+
+        with mock.patch(
+            "exports.services.archive.DatabaseFenceDeadline",
+            RecordingDeadline,
+        ), connection.execute_wrapper(observe):
+            rotated = ArchiveService()._final_fence(
+                fixture["attempt"],
+                fixture["candidate"],
+                fixture["exported_at"],
+                fixture["lease"],
+                fixture["heartbeat"],
+                lambda: False,
+            )
+
+        expected = []
+        for unused in range(125):
+            expected.extend(("live_pin", "checkpoint"))
+        for unused in range(125):
+            expected.extend((
+                "included_item", "item_update", "checkpoint",
+            ))
+        expected.append("checkpoint")
+        self.assertEqual(events, expected)
+        self.assertEqual(rotated.attempt_generation, 1)
+        job = ExportJob.objects.get(pk=fixture["job"].pk)
+        self.assertEqual(job.included_total, 0)
+        self.assertEqual(job.excluded_total, 50000)
+        self.assertEqual(job.excluded_permission_revoked_total, 50000)
+        self.assertEqual(job.archive_total, 0)
+        self.assertEqual(job.archive_done, 0)
+        self.assertEqual(job.bytes_total, 0)
+        self.assertEqual(job.bytes_done, 0)
+        self.assertEqual(
+            job.items.filter(inclusion_state="excluded").count(),
+            50000,
+        )
+
+    def test_final_revocation_deadline_rolls_back_db_and_keeps_old_tokens(self):
+        fixture = self._bulk_finalization_fixture(801)
+        thresholds = [5, 1]
+        busy_points = []
+        stop_observations = []
+        sleeper_observations = []
+        stop_state = {"armed": False}
+
+        class BusyDeadline(object):
+            def __init__(self, monotonic):
+                del monotonic
+                self.threshold = thresholds.pop(0)
+                self.checkpoints = 0
+
+            def checkpoint(self):
+                self.checkpoints += 1
+                if self.checkpoints == self.threshold:
+                    busy_points.append(self.checkpoints)
+                    raise DatabaseFenceBusy()
+
+        def stop_requested():
+            stop_observations.append((
+                fixture["heartbeat"].guard_depth,
+                fixture["heartbeat"].token_depth,
+            ))
+            return stop_state["armed"]
+
+        def sleep_outside_guards(seconds):
+            sleeper_observations.append((
+                seconds,
+                fixture["heartbeat"].guard_depth,
+                fixture["heartbeat"].token_depth,
+            ))
+            stop_state["armed"] = True
+
+        service = ArchiveService(sleeper=sleep_outside_guards)
+        with mock.patch(
+            "exports.services.archive.DatabaseFenceDeadline",
+            BusyDeadline,
+        ):
+            with self.assertRaises(StopRequested) as raised:
+                service._final_fence(
+                    fixture["attempt"],
+                    fixture["candidate"],
+                    fixture["exported_at"],
+                    fixture["lease"],
+                    fixture["heartbeat"],
+                    stop_requested,
+                )
+
+        self.assertEqual(raised.exception.lease, fixture["lease"])
+        self.assertEqual(busy_points, [5, 1])
+        self.assertEqual(stop_observations, [(0, 0), (0, 0)])
+        self.assertEqual(sleeper_observations, [(0.01, 0, 0)])
+        self.assertEqual(fixture["heartbeat"].pulses, 1)
+        self.assertEqual(fixture["heartbeat"].lease, fixture["lease"])
+        self.assertEqual(fixture["heartbeat"].guard_depth, 0)
+        self.assertEqual(fixture["heartbeat"].token_depth, 0)
+        job = ExportJob.objects.get(pk=fixture["job"].pk)
+        self.assertEqual(job.state, "verifying")
+        self.assertEqual(job.included_total, 801)
+        self.assertEqual(job.excluded_total, 0)
+        self.assertEqual(job.excluded_permission_revoked_total, 0)
+        self.assertEqual(job.archive_total, 801)
+        self.assertEqual(job.archive_done, 801)
+        self.assertEqual(job.bytes_total, 801 * fixture["blob_size"])
+        self.assertEqual(job.bytes_done, 801 * fixture["blob_size"])
+        self.assertEqual(job.attempt_generation, 0)
+        self.assertEqual(job.worker_generation, 9)
+        self.assertEqual(job.lease_uuid, self.job_uuid)
+        worker = ExportWorkerLease.objects.get(pk=1)
+        self.assertEqual(worker.generation, 9)
+        self.assertEqual(worker.lease_uuid, self.worker_uuid)
+        fixture["attempt"].refresh_from_db()
+        fixture["candidate"].refresh_from_db()
+        self.assertEqual(fixture["attempt"].state, "verifying")
+        self.assertEqual(fixture["candidate"].state, "ready_candidate")
+        self.assertEqual(
+            job.items.filter(inclusion_state="included").count(),
+            801,
+        )

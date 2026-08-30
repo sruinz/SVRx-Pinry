@@ -278,21 +278,53 @@ class ArchiveService(object):
         for start in range(0, len(values), QUERY_CHUNK_SIZE):
             yield values[start:start + QUERY_CHUNK_SIZE]
 
-    def _apply_revocations_locked(self, current, revoked):
+    def _apply_revocations_locked(
+        self, current, revoked, checkpoint, lease=None,
+    ):
         changed = 0
+        removed_bytes = 0
         for item_ids in self._chunks(revoked):
-            changed += ExportItem.objects.using(self.using).filter(
+            included = list(ExportItem.objects.using(self.using).filter(
                 job=current, pk__in=item_ids, inclusion_state="included",
+            ).values_list("pk", "blob__size"))
+            if not included:
+                continue
+            included_ids = [item_id for item_id, size in included]
+            sizes = [size for item_id, size in included]
+            if any(size is None or size < 0 for size in sizes):
+                raise ExportError("export_storage_unsafe", lease)
+            updated = ExportItem.objects.using(self.using).filter(
+                job=current, pk__in=included_ids,
+                inclusion_state="included",
             ).update(
                 inclusion_state="excluded",
                 exclusion_reason="permission_revoked",
             )
-        included = current.items.filter(inclusion_state="included")
-        current.included_total = included.count()
-        current.excluded_total = current.requested_total - current.included_total
+            if updated != len(included_ids):
+                raise ExportError("export_storage_unsafe", lease)
+            changed += updated
+            removed_bytes += sum(sizes)
+            checkpoint()
+        if (
+            current.included_total + current.excluded_total
+            != current.requested_total
+            or current.archive_total != current.included_total
+            or current.excluded_permission_revoked_total
+            > current.excluded_total
+            or changed > current.included_total
+            or removed_bytes > current.bytes_total
+        ):
+            raise ExportError("export_storage_unsafe", lease)
+        current.included_total -= changed
+        current.excluded_total += changed
         current.excluded_permission_revoked_total += changed
-        current.archive_total = current.included_total
-        current.bytes_total = sum(included.values_list("blob__size", flat=True))
+        if (
+            current.excluded_permission_revoked_total
+            > current.excluded_total
+        ):
+            raise ExportError("export_storage_unsafe", lease)
+        current.archive_total -= changed
+        current.bytes_total -= removed_bytes
         current.archive_done = 0
         current.bytes_done = 0
         return changed
@@ -308,7 +340,9 @@ class ArchiveService(object):
                     current = lock_current_lease(lease, using=self.using)
                     if current.state != "archiving":
                         raise LeaseLost()
-                    self._apply_revocations_locked(current, revoked)
+                    self._apply_revocations_locked(
+                        current, revoked, lambda: None, lease,
+                    )
                     current.save(update_fields=(
                         "included_total", "excluded_total",
                         "excluded_permission_revoked_total", "archive_total",
@@ -555,8 +589,12 @@ class ArchiveService(object):
         attempt_file.refresh_from_db()
         return attempt, attempt_file, exported_at
 
-    def _rotate_locked(self, current, attempt, attempt_file, revoked, lease):
-        if self._apply_revocations_locked(current, revoked) == 0:
+    def _rotate_locked(
+        self, current, attempt, attempt_file, revoked, lease, checkpoint,
+    ):
+        if self._apply_revocations_locked(
+            current, revoked, checkpoint, lease,
+        ) == 0:
             return None
         attempt.state = "retiring"
         attempt.save(update_fields=("state",))
@@ -606,6 +644,7 @@ class ArchiveService(object):
                     ).select_for_update().get(pk=attempt_file.pk)
                     rotated = self._rotate_locked(
                         current, locked_attempt, locked_file, revoked, lease,
+                        lambda: None,
                     )
             if rotated is not None:
                 rotation.replace(rotated)
@@ -913,7 +952,7 @@ class ArchiveService(object):
                         if revoked:
                             rotated = self._rotate_locked(
                                 current, locked_attempt, locked_file,
-                                revoked, lease,
+                                revoked, lease, deadline.checkpoint,
                             )
                         else:
                             self._complete_locked(
