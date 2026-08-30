@@ -629,6 +629,7 @@ class ArchiveService(object):
                     "state", "intent_relative_path",
                 ))
         self._fault("after_publishing_intent", attempt_file=attempt_file)
+        self._resolve_quarantine(job, attempt, lease, heartbeat)
         root = open_export_root(
             settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
         )
@@ -682,7 +683,128 @@ class ArchiveService(object):
                 current_file.intent_relative_path = None
                 self._set_receipt(current_file, moved)
                 current_file.save()
-                return current_file
+        self._fault("after_ready_candidate", attempt_file=current_file)
+        return current_file
+
+    def _resolve_quarantine(self, job, attempt, lease, heartbeat):
+        quarantine = attempt.files.filter(kind="quarantine").first()
+        if quarantine is None:
+            root = open_export_root(
+                settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
+            )
+            ready = None
+            descriptor = None
+            try:
+                ready = self._open_ready_directory(root)
+                try:
+                    flags = os.O_RDONLY | os.O_NOFOLLOW
+                    descriptor = os.open(
+                        "{}.zip".format(job.pk), flags,
+                        dir_fd=ready.descriptor,
+                    )
+                except FileNotFoundError:
+                    return
+                receipt = OpenFileReceipt.from_fd(
+                    descriptor, ready.uid, ready.gid,
+                )
+                archive = attempt.files.get(kind="archive")
+                if (
+                    receipt.dev == archive.receipt_dev
+                    and receipt.ino == archive.receipt_ino
+                ):
+                    return
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                if ready is not None:
+                    ready.close()
+                root.close()
+            relative = "ready/{}.zip".format(job.pk)
+            intent = "{}/quarantine-ready-{}.zip".format(
+                attempt.relative_path, attempt.attempt_generation,
+            )
+            with heartbeat.foreground_write_guard():
+                with transaction.atomic(using=self.using):
+                    lock_current_lease(lease, using=self.using)
+                    quarantine = ExportAttemptFile.objects.using(
+                        self.using,
+                    ).create(
+                        attempt_id=attempt.pk, kind="quarantine",
+                        state="writing", receipt_level="open",
+                        relative_path=relative,
+                        intent_relative_path=intent,
+                        receipt_dev=receipt.dev, receipt_ino=receipt.ino,
+                        receipt_uid=receipt.uid, receipt_gid=receipt.gid,
+                        receipt_mode=receipt.mode,
+                        receipt_nlink=receipt.nlink,
+                    )
+        if quarantine.state == "closed":
+            self._fault("after_quarantine_closed", quarantine=quarantine)
+            return
+        root = open_export_root(
+            settings.PINRY_EXPORT_ROOT, os.getuid(), os.getgid(),
+        )
+        staging = directory = ready = None
+        descriptor = None
+        try:
+            staging = open_staging_directory(root)
+            directory = open_receipted_directory(
+                staging, attempt.relative_path,
+                self._attempt_directory_receipt(attempt),
+            )
+            ready = self._open_ready_directory(root)
+            leaf = os.path.basename(quarantine.intent_relative_path)
+            source_receipt = OpenFileReceipt(
+                quarantine.receipt_dev, quarantine.receipt_ino,
+                quarantine.receipt_uid, quarantine.receipt_gid,
+                quarantine.receipt_mode, quarantine.receipt_nlink,
+            )
+
+            def matches(parent, name):
+                try:
+                    current = os.stat(
+                        name, dir_fd=parent.descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    return False
+                return source_receipt.matches_stat(current)
+            at_source = matches(ready, "{}.zip".format(job.pk))
+            at_intent = matches(directory, leaf)
+            if at_source == at_intent:
+                raise ExportError("export_storage_unsafe", lease)
+            if at_source:
+                rename_noreplace(
+                    ready, "{}.zip".format(job.pk), directory, leaf,
+                )
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            descriptor = os.open(leaf, flags, dir_fd=directory.descriptor)
+            opened = OpenFileReceipt.from_fd(
+                descriptor, directory.uid, directory.gid,
+            )
+            closed = ClosedFileReceipt.from_open_fd(descriptor, opened)
+            self._fault("after_quarantine_move", quarantine=quarantine)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            for current in (ready, directory, staging, root):
+                if current is not None:
+                    current.close()
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                lock_current_lease(lease, using=self.using)
+                current = ExportAttemptFile.objects.using(
+                    self.using,
+                ).select_for_update().get(pk=quarantine.pk)
+                if current.state != "writing":
+                    raise LeaseLost()
+                current.state = "closed"
+                current.receipt_level = "full"
+                current.relative_path = current.intent_relative_path
+                current.intent_relative_path = None
+                self._set_receipt(current, closed)
+                current.save()
+        self._fault("after_quarantine_closed", quarantine=current)
 
     def _complete_locked(self, current, attempt, candidate, exported_at):
         if (
@@ -887,6 +1009,31 @@ class ArchiveService(object):
                 current_attempt.state = "cleaned"
                 current_attempt.save(update_fields=("state",))
 
+    def _mark_current_attempt_retiring(self, lease, heartbeat):
+        with heartbeat.foreground_write_guard():
+            with transaction.atomic(using=self.using):
+                lock_current_lease(lease, using=self.using)
+                attempt = ExportAttempt.objects.using(
+                    self.using,
+                ).select_for_update().filter(
+                    job_id=lease.job_id,
+                    attempt_generation=lease.attempt_generation,
+                ).first()
+                if attempt is None:
+                    return
+                archive = attempt.files.select_for_update().filter(
+                    kind="archive",
+                ).first()
+                if archive is not None and archive.state in (
+                    "writing", "closed", "verifying", "publishing",
+                    "ready_candidate",
+                ):
+                    archive.state = "retiring"
+                    archive.save(update_fields=("state",))
+                if attempt.state in ("writing", "closed", "verifying"):
+                    attempt.state = "retiring"
+                    attempt.save(update_fields=("state",))
+
     def build_and_publish(self, job, lease, heartbeat, stop_requested):
         current_lease = lease
         try:
@@ -931,6 +1078,9 @@ class ArchiveService(object):
                 return ExportJob.objects.using(self.using).get(pk=job.pk)
         except ExportStorageError as error:
             raise ExportError(error.code, current_lease) from None
+        except ExportError:
+            self._mark_current_attempt_retiring(current_lease, heartbeat)
+            raise
 
     def recover_verifying(self, lease, heartbeat, stop_requested):
         current = ExportJob.objects.using(self.using).get(pk=lease.job_id)
@@ -946,6 +1096,9 @@ class ArchiveService(object):
                 heartbeat, stop_requested,
             )
         elif candidate.state == "publishing":
+            self._resolve_quarantine(
+                current, attempt, lease, heartbeat,
+            )
             candidate = self._recover_publishing(
                 current, attempt, candidate, lease, heartbeat,
             )

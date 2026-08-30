@@ -252,3 +252,77 @@ class ArchiveServiceTests(ExportStorageMixin, TransactionTestCase):
                 self.assertEqual(outcome.job.state, "complete")
                 self.assertEqual(attempt.lease_uuid, provenance)
                 self.assertTrue(self._archive_path(outcome.job).is_file())
+
+    def test_ready_collision_is_quarantined_once_across_publish_faults(self):
+        points = (
+            "after_publishing_intent",
+            "after_quarantine_move",
+            "after_quarantine_closed",
+            "after_candidate_rename",
+            "after_ready_candidate",
+        )
+        for point in points:
+            with self.subTest(point=point):
+                pin = create_export_pin(
+                    self.owner, filename="collision-{}.png".format(point),
+                )
+                job, lease, heartbeat = self._snapshot((pin,))
+                ready = Path(self._export_directory.name, "ready")
+                ready.mkdir(mode=0o700, exist_ok=True)
+                os.chmod(str(ready), 0o700)
+                collision = ready / "{}.zip".format(job.pk)
+                collision.write_bytes(b"preexisting-safe-collision")
+                os.chmod(str(collision), 0o600)
+                fired = []
+
+                def stop(fault_point, context):
+                    del context
+                    if fault_point == point and not fired:
+                        fired.append(True)
+                        raise StopRequested(lease)
+
+                service = ArchiveService(fault_injector=stop)
+                with self.assertRaises(StopRequested):
+                    service.build_and_publish(
+                        job, lease, heartbeat, lambda: False,
+                    )
+
+                outcome = ArchiveService().recover_verifying(
+                    lease, heartbeat, lambda: False,
+                )
+                attempt = job.attempts.get()
+                quarantine = attempt.files.get(kind="quarantine")
+                quarantine_path = Path(
+                    self._export_directory.name, ".staging",
+                    quarantine.relative_path,
+                )
+
+                self.assertEqual(outcome.job.state, "complete")
+                self.assertEqual(attempt.lease_uuid, lease.job_lease_uuid)
+                self.assertEqual(quarantine.state, "closed")
+                self.assertEqual(
+                    quarantine_path.read_bytes(),
+                    b"preexisting-safe-collision",
+                )
+                self.assertNotEqual(
+                    self._archive_path(outcome.job).read_bytes(),
+                    b"preexisting-safe-collision",
+                )
+
+    def test_publishing_export_error_records_retiring_before_cleanup(self):
+        pin = create_export_pin(self.owner, filename="retiring.png")
+        job, lease, heartbeat = self._snapshot((pin,))
+
+        def fail(point, context):
+            del context
+            if point == "after_publishing_intent":
+                raise ExportError("archive_failed", lease)
+
+        with self.assertRaises(ExportError):
+            ArchiveService(fault_injector=fail).build_and_publish(
+                job, lease, heartbeat, lambda: False,
+            )
+
+        attempt = job.attempts.get()
+        self.assertEqual(attempt.state, "retiring")
+        self.assertEqual(attempt.files.get(kind="archive").state, "retiring")
