@@ -1,5 +1,6 @@
 import axios from 'axios';
 import storage from './utils/storage';
+import { validateExportJob, validateLatestExports } from './export/exportContract';
 
 const API_PREFIX = '/api/v2/';
 
@@ -322,6 +323,23 @@ const Version = {
   },
 };
 
+const Export = {
+  preview(payload) {
+    return axios.post(`${API_PREFIX}exports/preview/`, payload);
+  },
+  create(payload) {
+    return axios.post(`${API_PREFIX}exports/`, payload);
+  },
+  fetchLatest() {
+    return axios.get(`${API_PREFIX}exports/latest/`)
+      .then(response => validateLatestExports(response.data));
+  },
+  fetchJob(jobId) {
+    return axios.get(`${API_PREFIX}exports/${jobId}/`)
+      .then(response => validateExportJob(response.data));
+  },
+};
+
 export default {
   Tag,
   Pin,
@@ -331,4 +349,5 @@ export default {
   fetchBoardForUser,
   User,
   Version,
+  Export,
 };
