@@ -76,6 +76,22 @@ class LeaseLost(Exception):
     pass
 
 
+class ExportNotFound(Exception):
+    pass
+
+
+class ExportNotReady(Exception):
+    pass
+
+
+class ExportExpired(Exception):
+    pass
+
+
+class ExportTemporarilyUnavailable(Exception):
+    pass
+
+
 class StopRequested(Exception):
     def __init__(self, lease):
         self.lease = lease

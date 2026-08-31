@@ -1,3 +1,5 @@
+from django.http import Http404, HttpResponse
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework.exceptions import (
     ParseError,
@@ -8,7 +10,15 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from exports.contracts import (
+    ExportExpired,
+    ExportNotFound,
+    ExportNotReady,
+    ExportTemporarilyUnavailable,
+)
 from exports.serializers import ExportJSONParser, ExportRequestSerializer
+from exports.models import ExportJob
+from exports.services.download import authorize_download, content_disposition
 from exports.services.jobs import JobService
 from exports.services.targeting import ExportRequestError, TargetingService
 
@@ -74,3 +84,51 @@ class ExportCreateView(ExportAPIView):
             "excluded_total": job.excluded_total,
             "status_url": "/api/v2/exports/{}/".format(job.pk),
         }, status=202)
+
+
+class ExportLatestView(ExportAPIView):
+    def get(self, request):
+        return Response(
+            JobService.latest_for(request.user, timezone.now()),
+            status=200,
+        )
+
+
+class ExportStatusView(ExportAPIView):
+    def get(self, request, job_uuid):
+        job = get_object_or_404(
+            ExportJob.objects.filter(owner_id=request.user.pk),
+            pk=job_uuid,
+        )
+        return Response(
+            JobService.status_for(job, timezone.now()),
+            status=200,
+        )
+
+
+class ExportDownloadView(ExportAPIView):
+    def get(self, request, job_uuid):
+        try:
+            job = authorize_download(
+                job_uuid,
+                request.user.pk,
+                timezone.now,
+            )
+        except ExportNotFound:
+            raise Http404()
+        except ExportNotReady:
+            return Response({"code": "export_not_ready"}, status=409)
+        except ExportExpired:
+            return Response({"code": "export_expired"}, status=410)
+        except ExportTemporarilyUnavailable:
+            return Response(
+                {"code": "export_temporarily_unavailable"},
+                status=503,
+            )
+        response = HttpResponse(content_type="application/zip")
+        response["X-Accel-Redirect"] = (
+            "/__protected_exports/{}.zip".format(job.pk)
+        )
+        response["Cache-Control"] = "private, no-store"
+        response["Content-Disposition"] = content_disposition(job)
+        return response

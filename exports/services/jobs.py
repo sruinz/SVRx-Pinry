@@ -18,7 +18,7 @@ from core.services.database_fence import (
     database_write_fence,
 )
 from django_images.models import Image
-from exports.contracts import ACTIVE_STATES
+from exports.contracts import ACTIVE_STATES, export_status
 from exports.models import (
     ExportAttempt,
     ExportAttemptFile,
@@ -109,6 +109,46 @@ class JobService(object):
         ExportTarget,
     )
     IDENTITY_RETRY_LIMIT = 3
+
+    @staticmethod
+    def _fresh_worker_heartbeat(now):
+        snapshot = WorkerHealthService.snapshot(now)
+        if (
+            snapshot.health_state == "ready"
+            and snapshot.heartbeat_at is not None
+            and snapshot.heartbeat_at > now - timedelta(seconds=15)
+        ):
+            return snapshot.heartbeat_at
+        return None
+
+    @classmethod
+    def status_for(cls, job, now):
+        return export_status(
+            job,
+            now,
+            cls._fresh_worker_heartbeat(now),
+        )
+
+    @classmethod
+    def latest_for(cls, user, now):
+        worker_heartbeat_at = cls._fresh_worker_heartbeat(now)
+        jobs = ExportJob.objects.filter(owner_id=user.pk)
+        latest_attempt = jobs.order_by("-created_at", "-id").first()
+        downloadable_job = jobs.filter(
+            state="complete",
+            expires_at__gt=now,
+        ).order_by("-completed_at", "-id").first()
+        return {
+            "schema_version": 1,
+            "latest_attempt": (
+                export_status(latest_attempt, now, worker_heartbeat_at)
+                if latest_attempt is not None else None
+            ),
+            "downloadable_job": (
+                export_status(downloadable_job, now, worker_heartbeat_at)
+                if downloadable_job is not None else None
+            ),
+        }
 
     def __init__(
         self,
