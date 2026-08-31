@@ -12,6 +12,7 @@ EXPORT_FIXTURE = (
 POSTGRES_SMOKE = (
     REPOSITORY_ROOT / "docker/tests/export_postgres_concurrency_smoke.sh"
 )
+RUNTIME_SMOKE = REPOSITORY_ROOT / "docker/tests/export_runtime_smoke.sh"
 
 
 class ExportSmokeContractTests(unittest.TestCase):
@@ -61,6 +62,36 @@ class ExportSmokeContractTests(unittest.TestCase):
             source,
         )
         self.assertIn("export_postgres_test_timeout", source)
+
+    def test_runtime_smoke_uses_public_profile_auth_routes(self):
+        source = RUNTIME_SMOKE.read_text("utf-8")
+
+        self.assertIn(
+            "write_auth_body register 'export-smoke-zero-user' "
+            '"${auth_body}"\n'
+            "    auth_code=\"$(http_request POST "
+            "'/api/v2/profile/users/'",
+            source,
+        )
+        self.assertIn(
+            'write_auth_body login "${username}" "${auth_body}"\n'
+            "auth_code=\"$(http_request POST "
+            "'/api/v2/profile/login/'",
+            source,
+        )
+        self.assertEqual(
+            source.count("http_request POST '/api/v2/profile/login/'"),
+            1,
+        )
+        self.assertEqual(
+            source.count("http_request POST '/api/v2/profile/users/'"),
+            1,
+        )
+        self.assertNotIn(
+            "http_request POST '/api/v2/users/login/'",
+            source,
+        )
+        self.assertNotIn("http_request POST '/api/v2/users/'", source)
 
 
 if __name__ == "__main__":

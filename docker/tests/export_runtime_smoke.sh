@@ -1363,7 +1363,7 @@ initialize_csrf
 auth_body="${smoke_root}/auth.json"
 if [ "${pin_count_value}" -eq 0 ]; then
     write_auth_body register 'export-smoke-zero-user' "${auth_body}"
-    auth_code="$(http_request POST '/api/v2/users/' "${response_json}" "${auth_body}")" \
+    auth_code="$(http_request POST '/api/v2/profile/users/' "${response_json}" "${auth_body}")" \
         || fail 'export_smoke_registration_failed'
     [ "${auth_code}" = "201" ] || fail 'export_smoke_registration_failed'
     validate_auth_response "${response_json}" 'export-smoke-zero-user' \
@@ -1428,7 +1428,7 @@ fi
 validate_fixture || fail 'export_smoke_fixture_invalid'
 username="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["username"])' "${fixture_json}")"
 write_auth_body login "${username}" "${auth_body}"
-auth_code="$(http_request POST '/api/v2/users/login/' "${response_json}" "${auth_body}")" \
+auth_code="$(http_request POST '/api/v2/profile/login/' "${response_json}" "${auth_body}")" \
     || fail 'export_smoke_login_failed'
 [ "${auth_code}" = "200" ] || fail 'export_smoke_login_failed'
 validate_auth_response "${response_json}" "${username}" \
