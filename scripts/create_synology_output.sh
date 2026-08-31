@@ -615,9 +615,10 @@ git archive --format=tar "${source_commit}" -- \
     docker/migration \
     ':(exclude)core/tests' \
     ':(exclude)exports/tests' \
+    ':(exclude)exports/tests.py' \
     ':(exclude)django_images/test_*.py' \
     ':(exclude)django_images/tests.py' \
-    ':(exclude)pinry/settings/test_sqlite_file.py' \
+    ':(exclude)pinry/settings/test_*.py' \
     ':(exclude)pinry/settings/development.py' \
     ':(exclude)pinry_plugins/tests.py' \
     ':(exclude)users/test_*.py' \
@@ -641,6 +642,8 @@ git archive --format=tar "${source_commit}" -- \
     ':(exclude,glob)**/._*' \
     | tar -xf - -C "${temporary_transition_directory}"
 required_startup_paths=(
+    exports/apps.py
+    exports/models.py
     docker/scripts/start.sh
     docker/scripts/startup.py
     docker/scripts/bootstrap.sh
@@ -650,6 +653,8 @@ required_startup_paths=(
     docker/scripts/migration_worker.py
     docker/scripts/migration_status.py
     docker/scripts/supervisor.py
+    docker/scripts/export_storage_bootstrap.py
+    docker/scripts/export_worker.py
 )
 for required_path in "${required_startup_paths[@]}"; do
     if ! is_unsymlinked_regular_file \

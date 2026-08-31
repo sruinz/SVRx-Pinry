@@ -26,6 +26,8 @@ _READINESS_SECONDS = 60.0
 _READINESS_INTERVAL_SECONDS = 0.5
 _QUIESCE_SECONDS = 5.0
 _SHUTDOWN_SECONDS = 15.0
+_EXPORT_STABLE_SECONDS = 60.0
+_EXPORT_RESTART_MAX_SECONDS = 30.0
 _READINESS_URL = "http://127.0.0.1:8000/api/v2/version/"
 _SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 
@@ -35,6 +37,12 @@ PROJECT_ROOT = os.path.realpath(
 NGINX_COMMAND = ("/usr/sbin/nginx", "-g", "daemon off;")
 WORKER_PATH = os.path.join(
     PROJECT_ROOT, "docker", "scripts", "migration_worker.py"
+)
+EXPORT_STORAGE_BOOTSTRAP_PATH = os.path.join(
+    PROJECT_ROOT, "docker", "scripts", "export_storage_bootstrap.py"
+)
+EXPORT_WORKER_PATH = os.path.join(
+    PROJECT_ROOT, "docker", "scripts", "export_worker.py"
 )
 GUNICORN_PATH = os.path.join(
     PROJECT_ROOT, "docker", "scripts", "_start_gunicorn.sh"
@@ -281,6 +289,7 @@ class RuntimeSupervisor(object):
         self.status_store = status_store
         self.clock = clock
         self.process_factory = process_factory
+        self.command_runner = subprocess.run
         self.selector_factory = selector_factory
         self.lock_acquirer = lock_acquirer
         self.identity_reader = identity_reader
@@ -296,6 +305,12 @@ class RuntimeSupervisor(object):
         self.children = {}
         self.nginx = None
         self.worker = None
+        self.export_worker = None
+        self.export_started_at = None
+        self.export_restart_at = None
+        self.export_restart_delay = 1.0
+        self._export_stop_deadline = None
+        self._export_spawn_in_progress = False
         self.gunicorn = None
         self.last_worker_error = "legacy_startup_failed"
         self._last_heartbeat = None
@@ -378,6 +393,7 @@ class RuntimeSupervisor(object):
             self._terminate_unregistered(process)
             raise SupervisorError("runtime_supervisor_failed")
         record = _ChildRecord(role, process, identity)
+        self._shutdown_signaled.discard(role)
         self.children[role] = record
         self._log("{0} 프로세스를 시작했습니다.".format(role))
         return record
@@ -649,6 +665,104 @@ class RuntimeSupervisor(object):
         return self._spawn(
             "gunicorn", (GUNICORN_PATH,), cwd=PROJECT_ROOT
         )
+
+    def _run_export_storage_bootstrap(self):
+        command = (
+            sys.executable,
+            EXPORT_STORAGE_BOOTSTRAP_PATH,
+            "--data-root", self.data_root,
+            "--uid", str(self.service_uid),
+            "--gid", str(self.service_gid),
+        )
+        try:
+            completed = self.command_runner(
+                list(command),
+                check=False,
+                close_fds=True,
+                cwd=PROJECT_ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except (IOError, OSError):
+            self._log("내보내기 저장소를 준비하지 못했습니다.")
+            return False
+        if completed.returncode != 0:
+            self._log("내보내기 저장소를 준비하지 못했습니다.")
+            return False
+        return True
+
+    def _spawn_export_worker(self):
+        command = (
+            sys.executable,
+            EXPORT_WORKER_PATH,
+            "--uid", str(self.service_uid),
+            "--gid", str(self.service_gid),
+        )
+        self._export_spawn_in_progress = True
+        try:
+            return self._spawn("export", command, cwd=PROJECT_ROOT)
+        finally:
+            self._export_spawn_in_progress = False
+            if self._shutdown_signal is not None:
+                self._signal_shutdown_children()
+
+    def _schedule_export_restart(self, now):
+        delay = self.export_restart_delay
+        self.export_restart_at = now + delay
+        self.export_restart_delay = min(
+            delay * 2.0, _EXPORT_RESTART_MAX_SECONDS
+        )
+        self.export_started_at = None
+        self._export_stop_deadline = None
+        self.export_worker = None
+
+    def _retire_export_worker(self, now):
+        record = self.export_worker
+        if record is None:
+            return
+        self._reap_record(record, timeout=0)
+        if self._record_is_registered(record):
+            if self._export_stop_deadline is None:
+                self._send_term_record(record)
+                self._export_stop_deadline = now + _POLL_SECONDS
+            elif now >= self._export_stop_deadline:
+                self._kill_record(record)
+            self._refresh_records((record,))
+        if self._record_is_registered(record):
+            return
+        self._schedule_export_restart(now)
+
+    def _maintain_export_worker(self):
+        if self._shutdown_signal is not None:
+            return
+        now = self.clock()
+        if self.export_worker is not None:
+            if self.export_worker.process.poll() is None:
+                if (
+                    self.export_started_at is not None
+                    and now - self.export_started_at
+                    >= _EXPORT_STABLE_SECONDS
+                ):
+                    self.export_restart_delay = 1.0
+                return
+            self._retire_export_worker(now)
+            return
+        if (
+            self.export_restart_at is not None
+            and now < self.export_restart_at
+        ):
+            return
+        self.export_restart_at = None
+        self._run_export_storage_bootstrap()
+        try:
+            self.export_worker = self._spawn_export_worker()
+        except SupervisorError:
+            self._log("내보내기 작업자를 시작하지 못했습니다.")
+            self._schedule_export_restart(now)
+            return
+        self.export_started_at = now
+        if self.export_worker.process.poll() is not None:
+            self._retire_export_worker(now)
 
     def _child_survived_start(self, record):
         if record.process.poll() is not None:
@@ -987,7 +1101,7 @@ class RuntimeSupervisor(object):
                 return 1
             self._terminate_records((self.gunicorn, self.nginx))
             return 1
-        return self._serve_application()
+        return 0
 
     def _project_until_durable(self, method, deadline):
         while self.clock() < deadline:
@@ -1024,17 +1138,24 @@ class RuntimeSupervisor(object):
         if ready != 0:
             self._terminate_record(self.gunicorn)
             return self._hold_failed("gunicorn_start_failed")
-        return self._transition_gate()
+        transitioned = self._transition_gate()
+        if transitioned != 0 or self._shutdown_signal is not None:
+            return transitioned
+        self._maintain_export_worker()
+        return self._serve_application()
 
     def _serve_application(self):
         while self._shutdown_signal is None:
             self._status_tick()
             if self.nginx.process.poll() is not None:
                 self._reap_record(self.nginx)
-                self._terminate_records((self.nginx, self.gunicorn))
+                self._terminate_records(
+                    (self.export_worker, self.gunicorn, self.nginx)
+                )
                 return 1
             if self.gunicorn.process.poll() is not None:
                 self._reap_record(self.gunicorn)
+                self._terminate_record(self.export_worker)
                 self._terminate_record(self.gunicorn)
                 try:
                     self.status_store.create_gate()
@@ -1042,7 +1163,15 @@ class RuntimeSupervisor(object):
                     self._terminate_record(self.nginx)
                     return 1
                 return self._hold_failed("gunicorn_start_failed")
-            self.sleeper(_POLL_SECONDS)
+            self._maintain_export_worker()
+            sleep_seconds = _POLL_SECONDS
+            if self.export_restart_at is not None:
+                sleep_seconds = min(
+                    sleep_seconds,
+                    max(0.0, self.export_restart_at - self.clock()),
+                )
+            if sleep_seconds > 0.0:
+                self.sleeper(sleep_seconds)
         return 0
 
     def _hold_failed(self, code):
@@ -1060,19 +1189,23 @@ class RuntimeSupervisor(object):
             self.sleeper(_POLL_SECONDS)
         return 0
 
+    def _signal_shutdown_children(self):
+        if "migration" in self.children:
+            order = ("migration", "nginx")
+        else:
+            order = ("export", "gunicorn", "nginx")
+        for role in order:
+            record = self.children.get(role)
+            self._send_term_record(record)
+
     def handle_signal(self, signum, frame):
         del frame
         if self._shutdown_signal is not None:
             return
         self._shutdown_signal = signum
         self._shutdown_deadline = self.clock() + _SHUTDOWN_SECONDS
-        if "migration" in self.children:
-            order = ("migration", "nginx")
-        else:
-            order = ("gunicorn", "nginx")
-        for role in order:
-            record = self.children.get(role)
-            self._send_term_record(record)
+        if not self._export_spawn_in_progress:
+            self._signal_shutdown_children()
 
     def _cleanup(self):
         deadline = self._shutdown_deadline
@@ -1081,7 +1214,9 @@ class RuntimeSupervisor(object):
         self._terminate_records(
             [
                 self.children.get(role)
-                for role in ("migration", "gunicorn", "nginx")
+                for role in (
+                    "migration", "export", "gunicorn", "nginx"
+                )
             ],
             deadline=deadline,
         )

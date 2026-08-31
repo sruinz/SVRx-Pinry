@@ -17,11 +17,17 @@ REQUIRED_STARTUP_PATHS = (
     "docker/scripts/gen_key.sh",
     "docker/scripts/normalize_persistent_file.py",
     "docker/scripts/_start_gunicorn.sh",
+    "docker/scripts/export_storage_bootstrap.py",
+    "docker/scripts/export_worker.py",
 )
 REQUIRED_SYNOLOGY_CONTEXT_PATHS = (
+    "exports/apps.py",
+    "exports/models.py",
     "docker/scripts/migration_worker.py",
     "docker/scripts/migration_status.py",
     "docker/scripts/supervisor.py",
+    "docker/scripts/export_storage_bootstrap.py",
+    "docker/scripts/export_worker.py",
     "docker/migration/index.html",
     "docker/migration/migration.css",
     "docker/migration/migration.js",
@@ -39,8 +45,12 @@ ACCEPTANCE_FIXTURE_PATH = (
 PACKAGED_SOURCE_SENTINELS = (
     "Dockerfile.autobuild",
     "core/models.py",
+    "exports/apps.py",
+    "exports/models.py",
     "docker/nginx/sites-enabled/default",
     "docker/scripts/startup.py",
+    "docker/scripts/export_storage_bootstrap.py",
+    "docker/scripts/export_worker.py",
     SERVICE_WORKER_PATH,
 )
 SW_TRANSITION_PATHS = (
@@ -593,8 +603,12 @@ class SynologyPackageTests(unittest.TestCase):
             destination = cls.fixture_repository / relative_path
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPOSITORY_ROOT / relative_path, destination)
+        export_test_module = cls.fixture_repository / "exports/tests.py"
+        export_test_module.write_text("raise AssertionError('not runtime')\n")
         completed = subprocess.run(
-            ["git", "add"] + list(TASK_PRODUCTION_PATHS),
+            ["git", "add"] + list(TASK_PRODUCTION_PATHS) + [
+                "exports/tests.py"
+            ],
             cwd=str(cls.fixture_repository),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1428,6 +1442,16 @@ class SynologyPackageTests(unittest.TestCase):
             },
             {"migration", "nginx", "scripts"},
         )
+        for excluded_path in (
+            "exports/tests",
+            "exports/tests.py",
+            "pinry/settings/test_postgres.py",
+            "pinry/settings/test_sqlite_file.py",
+        ):
+            with self.subTest(excluded_path=excluded_path):
+                self.assertFalse(
+                    (self.context_directory / excluded_path).exists()
+                )
         for path in self.context_directory.rglob("*"):
             relative = path.relative_to(self.context_directory)
             with self.subTest(forbidden=str(relative)):
@@ -2909,6 +2933,28 @@ class SynologyPackageTests(unittest.TestCase):
         self.assertFalse(capture.exists())
         self.assertEqual(_docker_call_count(capture), 0)
 
+    def test_build_rejects_missing_exports_directory_before_docker(self):
+        self._create_package()
+        exports_directory = self.context_directory / "exports"
+        hidden = self.context_directory / "exports.missing"
+        exports_directory.rename(hidden)
+        self.addCleanup(hidden.rename, exports_directory)
+        environment, capture, _working_directory = (
+            self._docker_environment()
+        )
+
+        completed = subprocess.run(
+            ["sh", str(self.package_directory / "build-image.sh")],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(b"missing_build_input=exports", completed.stderr)
+        self.assertFalse(capture.exists())
+        self.assertEqual(_docker_call_count(capture), 0)
+
     def test_build_rejects_each_missing_startup_runtime_before_docker(self):
         self._create_package()
         environment, capture, _working_directory = (
@@ -2955,6 +3001,12 @@ class SynologyPackageTests(unittest.TestCase):
 
         for relative_path in REQUIRED_SYNOLOGY_CONTEXT_PATHS:
             with self.subTest(relative_path=relative_path):
+                for artifact in (
+                    capture,
+                    Path(str(capture) + ".calls"),
+                ):
+                    if artifact.exists():
+                        artifact.unlink()
                 required = self.context_directory / relative_path
                 hidden = required.with_name(required.name + ".missing")
                 required.rename(hidden)
@@ -2972,10 +3024,13 @@ class SynologyPackageTests(unittest.TestCase):
                     hidden.rename(required)
 
                 self.assertNotEqual(completed.returncode, 0)
-                self.assertIn(
-                    b"synology_context_incomplete",
-                    completed.stderr,
-                )
+                if relative_path in REQUIRED_STARTUP_PATHS:
+                    expected_error = "missing_build_input={}".format(
+                        relative_path
+                    ).encode("ascii")
+                else:
+                    expected_error = b"synology_context_incomplete"
+                self.assertIn(expected_error, completed.stderr)
                 self.assertFalse(capture.exists())
                 self.assertEqual(_docker_call_count(capture), 0)
 
@@ -3020,6 +3075,20 @@ class SynologyPackageTests(unittest.TestCase):
             (
                 self.context_directory / "docker/scripts/startup.py",
                 b"missing_build_input=docker/scripts/startup.py",
+            ),
+            (
+                self.context_directory / "exports",
+                b"missing_build_input=exports",
+            ),
+            (
+                self.context_directory
+                / "docker/scripts/export_storage_bootstrap.py",
+                b"missing_build_input=docker/scripts/"
+                b"export_storage_bootstrap.py",
+            ),
+            (
+                self.context_directory / "docker/scripts/export_worker.py",
+                b"missing_build_input=docker/scripts/export_worker.py",
             ),
             (
                 self.context_directory / "docker/migration/migration.js",

@@ -93,6 +93,13 @@ server {
         access_log off;
     }
 
+    location ^~ /__protected_exports/ {
+        internal;
+        alias /data/exports/ready/;
+        disable_symlinks on;
+        default_type application/zip;
+    }
+
     location = /api/v2/pins/batch/ {
         if (-f /run/svrx-pinry/maintenance) { return 419; }
         client_max_body_size 1m;

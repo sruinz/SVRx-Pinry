@@ -47,8 +47,9 @@ runtime_directory="$temporary_root/run"
 spa_directory="$temporary_root/spa"
 migration_directory="$temporary_root/docker/migration"
 data_directory="$temporary_root/data/static"
+ready_directory="$temporary_root/data/exports/ready"
 mkdir -p "$runtime_directory" "$spa_directory" "$migration_directory" \
-    "$data_directory/media" "$temporary_root/logs"
+    "$data_directory/media" "$ready_directory" "$temporary_root/logs"
 
 cp -R "$repository_root/docker/migration/." "$migration_directory/"
 printf '%s\n' '<!doctype html><title>application</title>APP SHELL' \
@@ -57,6 +58,12 @@ printf '%s\n' 'self.addEventListener("fetch", function () {});' \
     > "$spa_directory/service-worker.js"
 printf '%s\n' 'static fixture' > "$data_directory/probe.txt"
 printf '%s\n' 'media fixture' > "$data_directory/media/probe.txt"
+known_zip="$temporary_root/known.zip"
+outside_zip="$temporary_root/outside.zip"
+printf '%s\n' 'PK known protected export bytes' > "$known_zip"
+printf '%s\n' 'PK forbidden symlink target bytes' > "$outside_zip"
+cp "$known_zip" "$ready_directory/test.zip"
+ln -s "$outside_zip" "$ready_directory/symlink.zip"
 printf '%s\n' '{"state":"migrating"}' \
     > "$runtime_directory/migration-status.json"
 : > "$runtime_directory/maintenance"
@@ -75,6 +82,26 @@ class Handler(BaseHTTPRequestHandler):
             self.rfile.read(length)
         with open(sys.argv[2], "a") as capture:
             capture.write("{} {}\n".format(self.command, self.path))
+        protected_exports = {
+            "/api/test-protected-export/": "test.zip",
+            "/api/test-protected-export-symlink/": "symlink.zip",
+        }
+        if self.path in protected_exports:
+            self.send_response(200)
+            self.send_header(
+                "X-Accel-Redirect",
+                "/__protected_exports/{}".format(
+                    protected_exports[self.path]
+                ),
+            )
+            self.send_header(
+                "Content-Disposition",
+                'attachment; filename="pinry-export.zip"',
+            )
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("Content-Type", "application/zip")
+            self.end_headers()
+            return
         body = json.dumps({
             "source_commit": "contract",
             "display_version": "contract",
@@ -111,6 +138,7 @@ sed \
     -e "s#/run/svrx-pinry#${runtime_directory}#g" \
     -e "s#/data/static/media#${data_directory}/media#g" \
     -e "s#/data/static#${data_directory}#g" \
+    -e "s#/data/exports/ready/#${ready_directory}/#g" \
     -e "s#127\.0\.0\.1:8000#127.0.0.1:${upstream_port}#g" \
     "$repository_root/docker/nginx/sites-enabled/default" \
     > "$temporary_root/server.conf"
@@ -326,6 +354,34 @@ request POST /api/v2/pins/batch/ '{"items":[]}'
 assert_status 200
 request GET /readyz
 assert_status 200
+
+request GET /__protected_exports/test.zip
+assert_status 404
+if cmp -s "$body" "$known_zip"; then
+    echo "direct protected export request exposed archive bytes" >&2
+    exit 1
+fi
+
+request GET /api/test-protected-export/
+assert_status 200
+assert_header Content-Disposition 'attachment; filename="pinry-export.zip"'
+assert_header Cache-Control 'private, no-store'
+assert_header Content-Type application/zip
+if ! cmp -s "$body" "$known_zip"; then
+    echo "authorized protected export response did not match archive" >&2
+    exit 1
+fi
+
+request GET /api/test-protected-export-symlink/
+if [[ "$status" != 403 && "$status" != 404 ]]; then
+    echo "protected export symlink returned HTTP $status" >&2
+    cat "$headers" >&2
+    exit 1
+fi
+if cmp -s "$body" "$outside_zip"; then
+    echo "protected export symlink exposed target bytes" >&2
+    exit 1
+fi
 
 if ! grep -Fxq 'POST /api/v2/pins/batch/' \
         "$temporary_root/upstream.requests"; then

@@ -68,15 +68,20 @@ for required_path in \
     requirements.txt \
     manage.py \
     pinry \
+    exports \
     docker/scripts/start.sh \
     docker/scripts/startup.py \
     docker/scripts/bootstrap.sh \
     docker/scripts/gen_key.sh \
     docker/scripts/normalize_persistent_file.py \
-    docker/scripts/_start_gunicorn.sh
+    docker/scripts/_start_gunicorn.sh \
+    docker/scripts/export_storage_bootstrap.py \
+    docker/scripts/export_worker.py
 do
     required_type=regular
-    if [ "${required_path}" = pinry ]; then
+    if [ "${required_path}" = pinry ] \
+        || [ "${required_path}" = exports ];
+    then
         required_type=directory
     fi
     if ! is_unsymlinked_path \
@@ -88,9 +93,13 @@ do
 done
 
 for required_path in \
+    exports/apps.py \
+    exports/models.py \
     docker/scripts/migration_worker.py \
     docker/scripts/migration_status.py \
     docker/scripts/supervisor.py \
+    docker/scripts/export_storage_bootstrap.py \
+    docker/scripts/export_worker.py \
     docker/migration/index.html \
     docker/migration/migration.css \
     docker/migration/migration.js \

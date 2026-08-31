@@ -870,6 +870,8 @@ class _FakeProcesses(object):
         hold_worker_pipe=False,
         delayed_worker_payload=None,
         block_worker_wait=False,
+        export_behaviors=None,
+        clock=time.monotonic,
     ):
         self.events = events
         self.worker_payload = worker_payload
@@ -878,8 +880,13 @@ class _FakeProcesses(object):
         self.hold_worker_pipe = hold_worker_pipe
         self.delayed_worker_payload = delayed_worker_payload
         self.block_worker_wait = block_worker_wait
+        self.export_behaviors = list(export_behaviors or ())
+        self.clock = clock
         self.processes = {}
+        self.export_processes = []
+        self.export_attempt_times = []
         self.spawn_kwargs = {}
+        self.spawn_commands = {}
         self.signal_order = []
         self.progress_descriptor = None
         self.next_pid = 4100
@@ -913,6 +920,17 @@ class _FakeProcesses(object):
             role = "gunicorn"
             running = True
             returncode = 0
+        elif "export_worker.py" in rendered:
+            role = "export"
+            self.export_attempt_times.append(self.clock())
+            behavior = (
+                self.export_behaviors.pop(0)
+                if self.export_behaviors else (True, 0)
+            )
+            if behavior == "spawn_error":
+                self.events.append("export_spawn_failed")
+                raise OSError("export spawn failed")
+            running, returncode = behavior
         else:
             role = "nginx"
             running = True
@@ -928,7 +946,10 @@ class _FakeProcesses(object):
         )
         self.next_pid += 1
         self.processes[role] = process
+        if role == "export":
+            self.export_processes.append(process)
         self.spawn_kwargs[role] = kwargs
+        self.spawn_commands[role] = list(command)
         self.events.append("{}_started".format(role))
         return process
 
@@ -959,6 +980,7 @@ class _FakeProcesses(object):
             item for item in self.processes.values() if item.pid == pgid
         )
         self.signal_order.append((process.role, signum))
+        self.events.append("{}_signal:{}".format(process.role, signum))
         if signum in (signal.SIGTERM, signal.SIGKILL, signal.SIGINT):
             process.running = False
             process.returncode = -signum
@@ -968,6 +990,30 @@ class _FakeProcesses(object):
             ):
                 os.close(self.held_progress_descriptor)
                 self.held_progress_descriptor = None
+
+
+class _FakeCommandRunner(object):
+    def __init__(self, events, results=None, clock=time.monotonic):
+        self.events = events
+        self.results = list(results or ())
+        self.clock = clock
+        self.commands = []
+        self.call_times = []
+        self.kwargs = []
+
+    def __call__(self, command, **kwargs):
+        self.events.append("export_bootstrap")
+        self.call_times.append(self.clock())
+        self.commands.append(list(command))
+        self.kwargs.append(dict(kwargs))
+        result = self.results.pop(0) if self.results else 0
+        if isinstance(result, Exception):
+            raise result
+        return subprocess.CompletedProcess(
+            list(command), result, stderr=(
+                b"" if result == 0 else b"export_storage_unsafe\n"
+            )
+        )
 
 
 class RuntimeSupervisorLifecycleTests(unittest.TestCase):
@@ -992,6 +1038,10 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         hold_worker_pipe=False,
         delayed_worker_payload=None,
         block_worker_wait=False,
+        export_behaviors=None,
+        bootstrap_results=None,
+        clock=time.monotonic,
+        sleeper=None,
     ):
         processes = _FakeProcesses(
             self.events,
@@ -1001,13 +1051,20 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
             hold_worker_pipe=hold_worker_pipe,
             delayed_worker_payload=delayed_worker_payload,
             block_worker_wait=block_worker_wait,
+            export_behaviors=export_behaviors,
+            clock=clock,
         )
+        bootstrap_runner = _FakeCommandRunner(
+            self.events, results=bootstrap_results, clock=clock
+        )
+        processes.bootstrap_runner = bootstrap_runner
         supervisor = self.supervisor_module.RuntimeSupervisor(
             ["--migrate-legacy"],
             "/data",
             33,
             33,
             status or self.status,
+            clock=clock,
             process_factory=processes,
             lock_acquirer=lambda *args: self._acquire_lock(*args),
             identity_reader=processes.identity,
@@ -1015,8 +1072,13 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
             group_signaler=processes.signal,
             readiness_probe=readiness_probe,
             quiescence_probe=quiescence_probe,
-            sleeper=lambda seconds: time.sleep(min(seconds, 0.01)),
+            sleeper=(
+                sleeper
+                if sleeper is not None
+                else lambda seconds: time.sleep(min(seconds, 0.01))
+            ),
         )
+        supervisor.command_runner = bootstrap_runner
         return supervisor, processes
 
     def _acquire_lock(self, *arguments):
@@ -1125,7 +1187,7 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(result, [0])
 
-    def test_ready_shutdown_signals_gunicorn_before_nginx(self):
+    def test_ready_shutdown_signals_export_gunicorn_then_nginx(self):
         supervisor, processes = self._supervisor(
             b'{"phase":"preparing"}\n{"phase":"complete"}\n',
             0,
@@ -1133,7 +1195,7 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         result = []
         thread = threading.Thread(target=lambda: result.append(supervisor.run()))
         thread.start()
-        self._wait_until(lambda: self.status.ready)
+        self._wait_until(lambda: bool(processes.export_processes))
 
         supervisor.handle_signal(signal.SIGTERM, None)
         thread.join(2)
@@ -1141,10 +1203,384 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         self.assertEqual(
             [role for role, signum in processes.signal_order
              if signum == signal.SIGTERM],
-            ["gunicorn", "nginx"],
+            ["export", "gunicorn", "nginx"],
         )
         self.assertTrue(processes.processes["migration"].wait_called)
         self.assertEqual(result, [0])
+
+    def test_export_bootstrap_and_worker_start_after_public_gate_opens(self):
+        supervisor, processes = self._supervisor(
+            b'{"phase":"preparing"}\n{"phase":"complete"}\n',
+            0,
+        )
+        result = []
+        thread = threading.Thread(target=lambda: result.append(supervisor.run()))
+        thread.start()
+        try:
+            self._wait_until(lambda: bool(processes.export_processes))
+
+            ordered_events = (
+                "migration_started",
+                "gunicorn_started",
+                "service_opened",
+                "nginx_signal:{}".format(signal.SIGCONT),
+                "export_bootstrap",
+                "export_started",
+            )
+            positions = [self.events.index(event) for event in ordered_events]
+            self.assertEqual(positions, sorted(positions))
+            self.assertTrue(self.status.ready)
+            self.assertNotIn("gate_created", self.events)
+            self.assertIsNot(supervisor.worker, supervisor.export_worker)
+            self.assertEqual(supervisor.worker.role, "migration")
+            self.assertEqual(supervisor.export_worker.role, "export")
+            self.assertNotIn("migration", supervisor.children)
+            self.assertIs(
+                supervisor.children["export"], supervisor.export_worker
+            )
+            self.assertEqual(
+                processes.bootstrap_runner.commands[0],
+                [
+                    sys.executable,
+                    str(REPOSITORY_ROOT / "docker/scripts/"
+                        "export_storage_bootstrap.py"),
+                    "--data-root", "/data",
+                    "--uid", "33",
+                    "--gid", "33",
+                ],
+            )
+            self.assertEqual(
+                processes.spawn_commands["export"],
+                [
+                    sys.executable,
+                    str(REPOSITORY_ROOT / "docker/scripts/export_worker.py"),
+                    "--uid", "33",
+                    "--gid", "33",
+                ],
+            )
+            self.assertEqual(
+                processes.spawn_kwargs["export"].get("cwd"),
+                str(REPOSITORY_ROOT),
+            )
+        finally:
+            supervisor.handle_signal(signal.SIGTERM, None)
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [0])
+
+    def test_export_bootstrap_failure_is_nonfatal_after_gate_open(self):
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            bootstrap_results=[1],
+        )
+        result = []
+        thread = threading.Thread(target=lambda: result.append(supervisor.run()))
+        thread.start()
+        try:
+            self._wait_until(lambda: bool(processes.export_processes))
+
+            self.assertTrue(self.status.ready)
+            self.assertTrue(processes.processes["nginx"].running)
+            self.assertTrue(processes.processes["gunicorn"].running)
+            self.assertTrue(processes.processes["export"].running)
+            self.assertNotIn("gate_created", self.events)
+            self.assertEqual(self.status.failed_codes, [])
+        finally:
+            supervisor.handle_signal(signal.SIGTERM, None)
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result, [0])
+
+    def test_export_restart_uses_exact_capped_backoff_and_bootstrap_each_time(self):
+        now = [0.0]
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            export_behaviors=["spawn_error"] * 7,
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        self.status.ready = True
+        expected_attempts = [0.0, 1.0, 3.0, 7.0, 15.0, 31.0, 61.0]
+
+        for index, attempt_at in enumerate(expected_attempts):
+            if index:
+                now[0] = attempt_at - 0.01
+                supervisor._maintain_export_worker()
+                self.assertEqual(
+                    len(processes.export_attempt_times), index
+                )
+            now[0] = attempt_at
+            supervisor._maintain_export_worker()
+            self.assertEqual(
+                len(processes.export_attempt_times), index + 1
+            )
+            self.assertIsNone(supervisor.export_worker)
+            self.assertNotIn("export", supervisor.children)
+
+        self.assertEqual(
+            processes.export_attempt_times, expected_attempts
+        )
+        self.assertEqual(
+            processes.bootstrap_runner.call_times, expected_attempts
+        )
+        self.assertEqual(supervisor.export_restart_delay, 30.0)
+        self.assertEqual(supervisor.export_restart_at, 91.0)
+        self.assertTrue(self.status.ready)
+        self.assertNotIn("gate_created", self.events)
+
+    def test_export_master_and_descendant_are_reaped_before_respawn(self):
+        now = [0.0]
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            export_behaviors=[(True, 1), (True, 0)],
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        self.status.ready = True
+
+        supervisor._maintain_export_worker()
+        first = processes.export_processes[0]
+        first.running = False
+        first.returncode = 1
+        descendant_alive = [True]
+        descendant_signals = []
+        original_group = processes.group
+        original_signal = processes.signal
+
+        def read_group(pgid):
+            if pgid == first.pid and descendant_alive[0]:
+                return {first.pid + 100: {
+                    "pid": first.pid + 100,
+                    "pgid": first.pid,
+                    "session": first.pid,
+                    "starttime": "{}1".format(first.pid),
+                    "state": "S",
+                }}
+            return original_group(pgid)
+
+        def signal_group(pgid, signum):
+            if pgid == first.pid:
+                descendant_signals.append(signum)
+                descendant_alive[0] = False
+                return
+            return original_signal(pgid, signum)
+
+        supervisor.group_reader = read_group
+        supervisor.group_signaler = signal_group
+        supervisor._maintain_export_worker()
+
+        self.assertTrue(first.wait_called)
+        self.assertFalse(descendant_alive[0])
+        self.assertIn(signal.SIGTERM, descendant_signals)
+        self.assertEqual(len(processes.export_processes), 1)
+        self.assertNotIn("export", supervisor.children)
+        self.assertEqual(supervisor.export_restart_at, 1.0)
+
+        now[0] = 0.99
+        supervisor._maintain_export_worker()
+        self.assertEqual(len(processes.export_processes), 1)
+        now[0] = 1.0
+        supervisor._maintain_export_worker()
+        self.assertEqual(len(processes.export_processes), 2)
+        self.assertIs(
+            supervisor.children["export"].process,
+            processes.export_processes[1],
+        )
+
+    def test_export_restart_delay_resets_after_sixty_seconds_alive(self):
+        now = [0.0]
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            export_behaviors=[(True, 0)],
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        supervisor.export_restart_delay = 30.0
+        supervisor._maintain_export_worker()
+        worker = processes.export_processes[0]
+
+        now[0] = 59.99
+        supervisor._maintain_export_worker()
+        self.assertEqual(supervisor.export_restart_delay, 30.0)
+        now[0] = 60.0
+        supervisor._maintain_export_worker()
+        self.assertEqual(supervisor.export_restart_delay, 1.0)
+
+        worker.running = False
+        worker.returncode = 1
+        supervisor._maintain_export_worker()
+        self.assertEqual(supervisor.export_restart_at, 61.0)
+        self.assertEqual(supervisor.export_restart_delay, 2.0)
+
+    def test_export_dead_at_sixty_without_alive_observation_keeps_backoff(self):
+        now = [0.0]
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            export_behaviors=[(True, 0)],
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        supervisor.export_restart_delay = 30.0
+        supervisor._maintain_export_worker()
+        worker = processes.export_processes[0]
+        now[0] = 59.99
+        worker.running = False
+        worker.returncode = 1
+
+        now[0] = 60.0
+        supervisor._maintain_export_worker()
+
+        self.assertEqual(supervisor.export_restart_at, 90.0)
+        self.assertEqual(supervisor.export_restart_delay, 30.0)
+
+    def test_export_backoff_keeps_public_children_and_status_ticks_alive(self):
+        now = [0.0]
+        holder = {}
+        observation = {}
+
+        def sleep(seconds):
+            now[0] += seconds
+            processes = holder.get("processes")
+            supervisor = holder.get("supervisor")
+            if (
+                processes is not None
+                and len(processes.export_attempt_times) >= 6
+                and supervisor._shutdown_signal is None
+            ):
+                observation.update({
+                    "nginx_pid": supervisor.nginx.pid,
+                    "gunicorn_pid": supervisor.gunicorn.pid,
+                    "nginx_running": supervisor.nginx.process.running,
+                    "gunicorn_running": supervisor.gunicorn.process.running,
+                    "signals": list(processes.signal_order),
+                    "gate_created": "gate_created" in self.events,
+                    "publish_count": self.status.publish_count,
+                    "heartbeat_count": self.status.heartbeat_count,
+                })
+                supervisor.handle_signal(signal.SIGTERM, None)
+            elif (
+                supervisor is not None
+                and now[0] >= 100.0
+                and supervisor._shutdown_signal is None
+            ):
+                supervisor.handle_signal(signal.SIGTERM, None)
+
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            export_behaviors=["spawn_error"] * 5 + [(True, 0)],
+            clock=lambda: now[0],
+            sleeper=sleep,
+        )
+        holder.update({"supervisor": supervisor, "processes": processes})
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 0)
+        self.assertTrue(self.status.ready)
+        self.assertEqual(len(processes.export_attempt_times), 6)
+        self.assertEqual(
+            processes.bootstrap_runner.call_times,
+            processes.export_attempt_times,
+        )
+        self.assertTrue(observation["nginx_running"])
+        self.assertTrue(observation["gunicorn_running"])
+        self.assertEqual(
+            observation["nginx_pid"], processes.processes["nginx"].pid
+        )
+        self.assertEqual(
+            observation["gunicorn_pid"],
+            processes.processes["gunicorn"].pid,
+        )
+        self.assertEqual(observation["signals"][-2:], [
+            ("nginx", signal.SIGSTOP),
+            ("nginx", signal.SIGCONT),
+        ])
+        self.assertFalse(observation["gate_created"])
+        self.assertGreater(observation["publish_count"], 5)
+        self.assertGreater(observation["heartbeat_count"], 2)
+
+    def test_export_immediate_exit_reaps_then_retries_after_one_second(self):
+        now = [0.0]
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            export_behaviors=[(False, 1), (True, 0)],
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        self.status.ready = True
+        supervisor.nginx = supervisor._spawn_nginx()
+        supervisor.gunicorn = supervisor._spawn_gunicorn()
+        public_children = (supervisor.nginx, supervisor.gunicorn)
+
+        supervisor._maintain_export_worker()
+
+        self.assertTrue(processes.export_processes[0].wait_called)
+        self.assertNotIn("export", supervisor.children)
+        self.assertEqual(supervisor.export_restart_at, 1.0)
+        self.assertEqual(supervisor.export_restart_delay, 2.0)
+        self.assertEqual((supervisor.nginx, supervisor.gunicorn), public_children)
+        self.assertTrue(supervisor.nginx.process.running)
+        self.assertTrue(supervisor.gunicorn.process.running)
+        self.assertTrue(self.status.ready)
+        self.assertNotIn("gate_created", self.events)
+
+        now[0] = 0.99
+        supervisor._maintain_export_worker()
+        self.assertEqual(len(processes.export_attempt_times), 1)
+        now[0] = 1.0
+        supervisor._maintain_export_worker()
+        self.assertEqual(len(processes.export_attempt_times), 2)
+        self.assertEqual(processes.bootstrap_runner.call_times, [0.0, 1.0])
+
+    def test_sigterm_during_export_spawn_defers_application_signal_order(self):
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+        )
+        process_factory = supervisor.process_factory
+
+        def spawn_then_signal(command, **kwargs):
+            process = process_factory(command, **kwargs)
+            if "export_worker.py" in " ".join(command):
+                supervisor.handle_signal(signal.SIGTERM, None)
+            return process
+
+        supervisor.process_factory = spawn_then_signal
+
+        self.assertEqual(supervisor.run(), 0)
+        self.assertEqual(
+            [
+                role for role, signum in processes.signal_order
+                if signum == signal.SIGTERM
+            ],
+            ["export", "gunicorn", "nginx"],
+        )
+        self.assertTrue(processes.processes["export"].wait_called)
+        self.assertEqual(supervisor.children, {})
+        self.assertTrue(self.status.ready)
+        self.assertNotIn("gate_created", self.events)
+
+    def test_export_bootstrap_oserror_still_starts_worker(self):
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            bootstrap_results=[OSError("bootstrap unavailable")],
+        )
+        self.status.ready = True
+
+        supervisor._maintain_export_worker()
+
+        self.assertEqual(len(processes.export_processes), 1)
+        self.assertTrue(processes.export_processes[0].running)
+        self.assertNotIn("gate_created", self.events)
+        self.assertEqual(self.status.failed_codes, [])
 
     def test_worker_exit_waits_for_delayed_pipe_eof(self):
         supervisor, processes = self._supervisor(
@@ -1595,7 +2031,11 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
             group_signaler=signal_group,
             sleeper=sleep,
         )
-        for role, pid in (("gunicorn", 5400), ("nginx", 5500)):
+        for role, pid in (
+            ("export", 5300),
+            ("gunicorn", 5400),
+            ("nginx", 5500),
+        ):
             process = _FakeProcess(
                 role,
                 pid,
@@ -1613,10 +2053,12 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         runtime._cleanup()
 
         self.assertLessEqual(now[0], 15.0)
+        term_pids = [item[0] for item in signals if item[1] == signal.SIGTERM]
         term_times = [item[2] for item in signals if item[1] == signal.SIGTERM]
         kill_times = [item[2] for item in signals if item[1] == signal.SIGKILL]
-        self.assertEqual(term_times, [0.0, 0.0])
-        self.assertEqual(len(kill_times), 2)
+        self.assertEqual(term_pids, [5300, 5400, 5500])
+        self.assertEqual(term_times, [0.0, 0.0, 0.0])
+        self.assertEqual(len(kill_times), 3)
         self.assertTrue(all(value <= 15.0 for value in kill_times))
         self.assertEqual(runtime.children, {})
 

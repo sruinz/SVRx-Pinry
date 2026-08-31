@@ -1,4 +1,7 @@
+import ast
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import re
@@ -94,6 +97,214 @@ def _read_startup_events(path):
         for line in path.read_bytes().splitlines()
         if line
     ]
+
+
+def _run_export_worker_launcher(arguments, **overrides):
+    configuration = {
+        "account_uid": 1000,
+        "account_gid": 1000,
+        "account_missing": False,
+        "fail": None,
+        "samefile": True,
+        "stubborn_euid": False,
+        "stubborn_egid": False,
+        "stubborn_groups": False,
+    }
+    configuration.update(overrides)
+    environment = os.environ.copy()
+    environment["PINRY_EXPORT_WORKER_TEST_CONFIG"] = json.dumps(
+        configuration
+    )
+    launcher = REPOSITORY_ROOT / "docker/scripts/export_worker.py"
+    harness = r'''
+import builtins
+import json
+import os
+import pwd
+import runpy
+import sys
+import types
+
+configuration = json.loads(os.environ["PINRY_EXPORT_WORKER_TEST_CONFIG"])
+events = []
+state = {"euid": 0, "egid": 0, "groups": [0, 2000]}
+django_imported_before_drop = False
+project_imported_before_drop = False
+
+
+def dropped():
+    return (
+        state["euid"] == 1000
+        and state["egid"] == 1000
+        and state["groups"] == []
+    )
+
+
+class ObservedEnvironment(dict):
+    def __setitem__(self, key, value):
+        if key == "DJANGO_SETTINGS_MODULE":
+            events.append("settings:{}".format(
+                "after" if dropped() else "before"
+            ))
+        super(ObservedEnvironment, self).__setitem__(key, value)
+
+
+os.environ = ObservedEnvironment(os.environ)
+
+
+def fail_if_requested(name):
+    if configuration["fail"] == name:
+        raise OSError(name)
+
+
+def fake_getpwnam(name):
+    events.append("passwd:{}".format(name))
+    if configuration["account_missing"]:
+        raise KeyError(name)
+    return types.SimpleNamespace(
+        pw_uid=configuration["account_uid"],
+        pw_gid=configuration["account_gid"],
+    )
+
+
+def fake_umask(value):
+    events.append("umask:{:03o}".format(value))
+    fail_if_requested("umask")
+    return 0o022
+
+
+def fake_setgroups(groups):
+    events.append("setgroups:{}".format(list(groups)))
+    fail_if_requested("setgroups")
+    if not configuration["stubborn_groups"]:
+        state["groups"] = list(groups)
+
+
+def fake_setgid(value):
+    events.append("setgid:{}".format(value))
+    fail_if_requested("setgid")
+    if not configuration["stubborn_egid"]:
+        state["egid"] = value
+
+
+def fake_setuid(value):
+    events.append("setuid:{}".format(value))
+    fail_if_requested("setuid")
+    if not configuration["stubborn_euid"]:
+        state["euid"] = value
+
+
+real_samefile = os.path.samefile
+
+
+def observed_samefile(first, second):
+    events.append("samefile:{}".format("after" if dropped() else "before"))
+    if not configuration["samefile"]:
+        return False
+    return real_samefile(first, second)
+
+
+django = types.ModuleType("django")
+
+
+def setup():
+    events.append("django.setup:{}".format(
+        "after" if dropped() else "before"
+    ))
+
+
+django.setup = setup
+django_core = types.ModuleType("django.core")
+django_management = types.ModuleType("django.core.management")
+
+
+def call_command(*arguments, **keyword_arguments):
+    events.append("call_command:{}".format(
+        "after" if dropped() else "before"
+    ))
+    state["command"] = [list(arguments), keyword_arguments]
+    state["command_identity"] = {
+        "euid": state["euid"],
+        "egid": state["egid"],
+        "groups": list(state["groups"]),
+    }
+
+
+django_management.call_command = call_command
+sys.modules["django"] = django
+sys.modules["django.core"] = django_core
+sys.modules["django.core.management"] = django_management
+
+real_import = builtins.__import__
+
+
+def observed_import(name, globals=None, locals=None, fromlist=(), level=0):
+    global django_imported_before_drop, project_imported_before_drop
+    prefixes = (
+        "core", "django", "django_images", "exports", "pinry",
+        "pinry_plugins", "users",
+    )
+    if any(name == prefix or name.startswith(prefix + ".")
+           for prefix in prefixes):
+        moment = "after" if dropped() else "before"
+        events.append("import:{}:{}".format(name, moment))
+        if moment == "before":
+            project_imported_before_drop = True
+            if name == "django" or name.startswith("django."):
+                django_imported_before_drop = True
+    return real_import(name, globals, locals, fromlist, level)
+
+
+pwd.getpwnam = fake_getpwnam
+os.umask = fake_umask
+os.setgroups = fake_setgroups
+os.setgid = fake_setgid
+os.setuid = fake_setuid
+os.geteuid = lambda: state["euid"]
+os.getegid = lambda: state["egid"]
+os.getgroups = lambda: list(state["groups"])
+os.path.samefile = observed_samefile
+builtins.__import__ = observed_import
+
+result_code = None
+harness_error = None
+try:
+    sys.argv = [sys.argv[1]] + sys.argv[2:]
+    try:
+        runpy.run_path(sys.argv[0], run_name="__main__")
+    except SystemExit as error:
+        result_code = error.code
+    except BaseException as error:
+        result_code = 99
+        harness_error = type(error).__name__
+finally:
+    builtins.__import__ = real_import
+    os.path.samefile = real_samefile
+
+if result_code is None:
+    result_code = 0
+print(json.dumps({
+    "code": result_code,
+    "events": events,
+    "identity": state.get("command_identity"),
+    "command": state.get("command"),
+    "django_imported_before_drop": django_imported_before_drop,
+    "project_imported_before_drop": project_imported_before_drop,
+    "harness_error": harness_error,
+}, sort_keys=True))
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", harness, str(launcher)] + list(arguments),
+        cwd=str(REPOSITORY_ROOT),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stderr.decode("utf-8"))
+    payload = json.loads(completed.stdout.decode("utf-8"))
+    payload["stderr"] = completed.stderr.decode("utf-8")
+    return payload
 
 
 def _line_indent(line):
@@ -226,6 +437,26 @@ def _assert_nginx_contract(source):
     ]
     if len(exact) != 1 or len(prefix) != 1:
         raise AssertionError("expected one exact batch and one /api location")
+    protected_exports = [
+        children
+        for arguments, children in locations
+        if arguments == ["^~", "/__protected_exports/"]
+    ]
+    if len(protected_exports) != 1:
+        raise AssertionError("expected one protected export location")
+    protected_export = protected_exports[0]
+    if _direct_values(protected_export, "internal") != [[]]:
+        raise AssertionError("protected exports must be internal")
+    if _direct_values(protected_export, "alias") != [
+        ["/data/exports/ready/"]
+    ]:
+        raise AssertionError("protected export alias must retain trailing slash")
+    if _direct_values(protected_export, "disable_symlinks") != [["on"]]:
+        raise AssertionError("protected export symlinks must be disabled")
+    if _direct_values(protected_export, "default_type") != [
+        ["application/zip"]
+    ]:
+        raise AssertionError("protected exports must use ZIP content type")
     batch = exact[0]
     if _direct_values(batch, "client_max_body_size") != [["1m"]]:
         raise AssertionError("batch body limit must be exactly 1m")
@@ -371,6 +602,329 @@ def _assert_nginx_maintenance_contract(source):
         raise AssertionError("maintenance internal transitions are missing")
     if "/data/nginx-" in source:
         raise AssertionError("nginx must not write bootstrap logs below /data")
+
+
+class ExportWorkerLauncherTests(unittest.TestCase):
+    def test_worker_top_level_imports_only_required_standard_library(self):
+        script = REPOSITORY_ROOT / "docker/scripts/export_worker.py"
+        if not script.is_file():
+            self.fail("export worker launcher is missing")
+        tree = ast.parse(script.read_text("utf-8"))
+        imported = set()
+        for statement in tree.body:
+            if isinstance(statement, ast.Import):
+                imported.update(alias.name for alias in statement.names)
+            elif isinstance(statement, ast.ImportFrom):
+                imported.add(statement.module)
+
+        self.assertEqual(imported, {"argparse", "os", "pwd", "sys"})
+
+    def test_worker_drops_privileges_before_project_or_django_access(self):
+        capture = _run_export_worker_launcher([
+            "--uid", "1000", "--gid", "1000",
+        ])
+
+        self.assertEqual(capture["code"], 0, capture)
+        system_calls = [
+            event for event in capture["events"]
+            if event.startswith(("umask:", "setgroups:", "setgid:",
+                                 "setuid:"))
+        ]
+        self.assertEqual(system_calls, [
+            "umask:077",
+            "setgroups:[]",
+            "setgid:1000",
+            "setuid:1000",
+        ])
+        self.assertEqual(capture["identity"], {
+            "euid": 1000,
+            "egid": 1000,
+            "groups": [],
+        })
+        self.assertEqual(capture["command"], [["run_export_worker"], {}])
+        self.assertIn("samefile:after", capture["events"])
+        self.assertNotIn("samefile:before", capture["events"])
+        self.assertIn("settings:after", capture["events"])
+        self.assertNotIn("settings:before", capture["events"])
+        self.assertTrue(any(
+            event.startswith("import:django:")
+            for event in capture["events"]
+        ))
+        self.assertFalse(capture["django_imported_before_drop"])
+        self.assertFalse(capture["project_imported_before_drop"])
+        self.assertNotIn("Traceback", capture["stderr"])
+
+    def test_worker_rejects_invalid_or_non_www_data_identity_before_drop(self):
+        cases = (
+            (["--uid", "0", "--gid", "1000"], {}),
+            (["--uid", "1000", "--gid", "-1"], {}),
+            (["--uid", "+1000", "--gid", "1000"], {}),
+            (["--uid", " 1000", "--gid", "1000"], {}),
+            (["--uid", "1000", "--gid", "1000"], {
+                "account_uid": 1001,
+            }),
+            (["--uid", "1000", "--gid", "1000"], {
+                "account_gid": 1001,
+            }),
+            (["--uid", "1000", "--gid", "1000"], {
+                "account_missing": True,
+            }),
+        )
+        for arguments, overrides in cases:
+            with self.subTest(arguments=arguments, overrides=overrides):
+                capture = _run_export_worker_launcher(
+                    arguments, **overrides
+                )
+
+                self.assertNotEqual(capture["code"], 0, capture)
+                self.assertFalse(capture["django_imported_before_drop"])
+                self.assertFalse(capture["project_imported_before_drop"])
+                self.assertFalse(any(
+                    event.startswith("import:")
+                    for event in capture["events"]
+                ))
+                self.assertFalse(any(
+                    event.startswith(("umask:", "settings:"))
+                    for event in capture["events"]
+                ))
+
+    def test_worker_drop_or_identity_recheck_failure_imports_no_django(self):
+        cases = (
+            {"fail": "umask"},
+            {"fail": "setgroups"},
+            {"fail": "setgid"},
+            {"fail": "setuid"},
+            {"stubborn_euid": True},
+            {"stubborn_egid": True},
+            {"stubborn_groups": True},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                capture = _run_export_worker_launcher(
+                    ["--uid", "1000", "--gid", "1000"],
+                    **overrides
+                )
+
+                self.assertNotEqual(capture["code"], 0, capture)
+                self.assertIsNone(capture["identity"])
+                self.assertFalse(capture["django_imported_before_drop"])
+                self.assertFalse(capture["project_imported_before_drop"])
+                self.assertFalse(any(
+                    event.startswith(("import:", "samefile:",
+                                      "settings:"))
+                    for event in capture["events"]
+                ))
+                self.assertNotIn("Traceback", capture["stderr"])
+
+    def test_worker_project_reverification_failure_imports_no_project_code(self):
+        capture = _run_export_worker_launcher(
+            ["--uid", "1000", "--gid", "1000"],
+            samefile=False,
+        )
+
+        self.assertNotEqual(capture["code"], 0, capture)
+        self.assertIn("samefile:after", capture["events"])
+        self.assertFalse(capture["django_imported_before_drop"])
+        self.assertFalse(capture["project_imported_before_drop"])
+        self.assertFalse(any(
+            event.startswith(("import:", "settings:"))
+            for event in capture["events"]
+        ))
+        self.assertIsNone(capture["command"])
+
+
+class ExportStorageBootstrapTests(unittest.TestCase):
+    @staticmethod
+    def _identity():
+        uid = os.getuid() or 65534
+        gid = os.getgid() or 65534
+        return uid, gid
+
+    def _run_bootstrap(self, data_root):
+        uid, gid = self._identity()
+        return subprocess.run(
+            [
+                sys.executable,
+                str(REPOSITORY_ROOT / "docker/scripts/"
+                    "export_storage_bootstrap.py"),
+                "--data-root", str(data_root.resolve()),
+                "--uid", str(uid),
+                "--gid", str(gid),
+            ],
+            cwd=str(REPOSITORY_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def _assert_private_directories(self, data_root):
+        uid, gid = self._identity()
+        for relative_path in ("exports", "exports/.staging",
+                              "exports/ready"):
+            entry = (data_root / relative_path).stat()
+            self.assertTrue(stat.S_ISDIR(entry.st_mode))
+            self.assertEqual(entry.st_uid, uid)
+            self.assertEqual(entry.st_gid, gid)
+            self.assertEqual(stat.S_IMODE(entry.st_mode), 0o700)
+
+    def test_bootstrap_creates_all_fixed_directories_from_fresh_data_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data_root = Path(temporary) / "data"
+            data_root.mkdir()
+
+            completed = self._run_bootstrap(data_root)
+
+            self.assertEqual(
+                completed.returncode, 0, completed.stderr.decode("utf-8")
+            )
+            self._assert_private_directories(data_root)
+
+    def test_bootstrap_normalizes_only_fixed_existing_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data_root = Path(temporary) / "data"
+            exports_root = data_root / "exports"
+            staging_root = exports_root / ".staging"
+            ready_root = exports_root / "ready"
+            data_root.mkdir()
+            exports_root.mkdir(mode=0o755)
+            staging_root.mkdir(mode=0o755)
+            ready_root.mkdir(mode=0o755)
+            sentinel = staging_root / "preserve.bin"
+            sentinel.write_bytes(b"preserve")
+            sentinel.chmod(0o644)
+            sentinel_before = sentinel.stat()
+
+            completed = self._run_bootstrap(data_root)
+
+            self.assertEqual(
+                completed.returncode, 0, completed.stderr.decode("utf-8")
+            )
+            self._assert_private_directories(data_root)
+            sentinel_after = sentinel.stat()
+            self.assertEqual(sentinel.read_bytes(), b"preserve")
+            self.assertEqual(
+                stat.S_IMODE(sentinel_after.st_mode),
+                stat.S_IMODE(sentinel_before.st_mode),
+            )
+            self.assertEqual(sentinel_after.st_uid, sentinel_before.st_uid)
+            self.assertEqual(sentinel_after.st_gid, sentinel_before.st_gid)
+
+    def test_bootstrap_rejects_symlink_and_non_directory_without_touching_target(self):
+        cases = (
+            ("exports", "symlink"),
+            (".staging", "symlink"),
+            ("ready", "symlink"),
+            ("ready", "regular"),
+        )
+        for unsafe_component, kind in cases:
+            with self.subTest(unsafe_component=unsafe_component, kind=kind), \
+                    tempfile.TemporaryDirectory() as temporary:
+                data_root = Path(temporary) / "data"
+                exports_root = data_root / "exports"
+                target = Path(temporary) / "outside"
+                data_root.mkdir()
+                target.mkdir(mode=0o755)
+                marker = target / "marker"
+                marker.write_bytes(b"outside")
+                if unsafe_component == "exports":
+                    exports_root.symlink_to(target, target_is_directory=True)
+                else:
+                    exports_root.mkdir()
+                    path = exports_root / unsafe_component
+                    if kind == "symlink":
+                        path.symlink_to(target, target_is_directory=True)
+                    else:
+                        path.write_bytes(b"not a directory")
+                target_before = target.stat()
+
+                completed = self._run_bootstrap(data_root)
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(
+                    completed.stderr.decode("utf-8").splitlines()[-1],
+                    "export_storage_unsafe",
+                )
+                target_after = target.stat()
+                self.assertEqual(marker.read_bytes(), b"outside")
+                self.assertEqual(
+                    stat.S_IMODE(target_after.st_mode),
+                    stat.S_IMODE(target_before.st_mode),
+                )
+                self.assertEqual(target_after.st_uid, target_before.st_uid)
+                self.assertEqual(target_after.st_gid, target_before.st_gid)
+
+    def test_bootstrap_reverify_rejects_each_directory_entry_swap(self):
+        original_umask = os.umask(0o077)
+        os.umask(original_umask)
+        self.addCleanup(os.umask, original_umask)
+        script = (
+            REPOSITORY_ROOT / "docker/scripts/export_storage_bootstrap.py"
+        )
+        if not script.is_file():
+            self.fail("export storage bootstrap is missing")
+        spec = importlib.util.spec_from_file_location(
+            "test_export_storage_bootstrap_swap", str(script)
+        )
+        bootstrap = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bootstrap)
+        for component, swap_call in (("exports", 1), (".staging", 2),
+                                     ("ready", 3)):
+            with self.subTest(component=component), \
+                    tempfile.TemporaryDirectory() as temporary:
+                data_root = Path(temporary) / "data"
+                exports_root = data_root / "exports"
+                staging_root = exports_root / ".staging"
+                ready_root = exports_root / "ready"
+                target = Path(temporary) / "outside"
+                data_root.mkdir()
+                exports_root.mkdir(mode=0o755)
+                staging_root.mkdir(mode=0o755)
+                ready_root.mkdir(mode=0o755)
+                target.mkdir(mode=0o755)
+                target_before = target.stat()
+                paths = {
+                    "exports": exports_root,
+                    ".staging": staging_root,
+                    "ready": ready_root,
+                }
+                selected = paths[component]
+                original = selected.with_name(selected.name + "-original")
+                real_fchmod = bootstrap.os.fchmod
+                calls = []
+
+                def swap_after_descriptor_open(descriptor, mode):
+                    real_fchmod(descriptor, mode)
+                    calls.append(descriptor)
+                    if len(calls) == swap_call:
+                        selected.rename(original)
+                        selected.symlink_to(
+                            target, target_is_directory=True
+                        )
+
+                uid, gid = self._identity()
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    bootstrap.os,
+                    "fchmod",
+                    side_effect=swap_after_descriptor_open,
+                ), mock.patch.object(bootstrap.sys, "stderr", stderr):
+                    result = bootstrap.main([
+                        "--data-root", str(data_root.resolve()),
+                        "--uid", str(uid),
+                        "--gid", str(gid),
+                    ])
+
+                self.assertNotEqual(result, 0)
+                self.assertEqual(
+                    stderr.getvalue().splitlines()[-1],
+                    "export_storage_unsafe",
+                )
+                target_after = target.stat()
+                self.assertEqual(
+                    stat.S_IMODE(target_after.st_mode),
+                    stat.S_IMODE(target_before.st_mode),
+                )
+                self.assertFalse((target / ".staging").exists())
+                self.assertFalse((target / "ready").exists())
 
 
 class RuntimeConfigTests(unittest.TestCase):
@@ -1880,3 +2434,46 @@ class RuntimeConfigTests(unittest.TestCase):
 
         with self.assertRaises(AssertionError):
             _assert_nginx_contract(mutant)
+
+    def test_nginx_validator_rejects_each_protected_export_mutant(self):
+        source = (
+            REPOSITORY_ROOT / "docker/nginx/sites-enabled/default"
+        ).read_text()
+        block = (
+            "    location ^~ /__protected_exports/ {\n"
+            "        internal;\n"
+            "        alias /data/exports/ready/;\n"
+            "        disable_symlinks on;\n"
+            "        default_type application/zip;\n"
+            "    }\n"
+        )
+        replacements = (
+            (
+                "    location ^~ /__protected_exports/ {",
+                "    location /__protected_exports/ {",
+            ),
+            ("        internal;\n", ""),
+            (
+                "        alias /data/exports/ready/;",
+                "        alias /data/exports/ready;",
+            ),
+            (
+                "        disable_symlinks on;",
+                "        disable_symlinks off;",
+            ),
+            (
+                "        default_type application/zip;",
+                "        default_type application/octet-stream;",
+            ),
+        )
+        self.assertEqual(source.count(block), 1)
+        for original, replacement in replacements:
+            with self.subTest(original=original):
+                self.assertEqual(source.count(original), 1)
+                mutant = source.replace(original, replacement, 1)
+                with self.assertRaises(AssertionError):
+                    _assert_nginx_contract(mutant)
+
+        duplicate = source.replace(block, block + "\n" + block, 1)
+        with self.assertRaises(AssertionError):
+            _assert_nginx_contract(duplicate)
