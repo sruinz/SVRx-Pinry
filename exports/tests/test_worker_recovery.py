@@ -975,6 +975,35 @@ class WorkerRecoveryTests(ExportStorageMixin, TransactionTestCase):
         self.assertIsNone(job.lease_uuid)
         self.assertIsNone(worker.heartbeat.current_job_token)
 
+    def test_cleanup_does_not_nest_database_retry_budgets(self):
+        token, heartbeat = self._worker()
+        from exports.services import worker as worker_services
+        original_retry = worker_services._retry_database
+        depth = [0]
+        maximum_depth = [0]
+
+        def tracked_retry(*args, **kwargs):
+            depth[0] += 1
+            maximum_depth[0] = max(maximum_depth[0], depth[0])
+            try:
+                return original_retry(*args, **kwargs)
+            finally:
+                depth[0] -= 1
+
+        with mock.patch.object(
+                worker_services,
+                "_retry_database",
+                side_effect=tracked_retry,
+        ):
+            cleanup_expired_and_stale(
+                token,
+                heartbeat,
+                lambda: False,
+                now=self.now,
+            )
+
+        self.assertEqual(maximum_depth[0], 1)
+
     def test_stop_during_complete_maintenance_releases_terminal_lease(self):
         old_worker_uuid = uuid.uuid4()
         old_job_uuid = uuid.uuid4()
@@ -1287,6 +1316,47 @@ class TerminalCleanupTests(ExportStorageMixin, TransactionTestCase):
         job.refresh_from_db()
         self.assertEqual(job.staging_cleanup_state, "cleaned")
         self.assertTrue(final.claim_allowed)
+
+    def test_virtual_45_second_fs_success_starts_fresh_cas_budget(self):
+        job, unused_attempt, attempt_file, path, unused_directory = (
+            self._fixture()
+        )
+        del unused_attempt, unused_directory
+        elapsed = [0.0]
+        token = acquire_worker_lease(self.now)
+        heartbeat = LeaseHeartbeat(
+            token,
+            clock=lambda: self.now,
+            monotonic=lambda: elapsed[0],
+            sleeper=lambda seconds: None,
+        )
+        from exports.services import worker as worker_services
+        original_cleanup = worker_services._cleanup_attempt_file_fs
+
+        def slow_cleanup(*args, **kwargs):
+            result = original_cleanup(*args, **kwargs)
+            elapsed[0] = 45.0
+            return result
+
+        with mock.patch.object(
+                worker_services,
+                "_cleanup_attempt_file_fs",
+                side_effect=slow_cleanup,
+        ):
+            outcome = cleanup_expired_and_stale(
+                token,
+                heartbeat,
+                lambda: False,
+                now=self.now,
+                monotonic=lambda: elapsed[0],
+                sleeper=lambda seconds: None,
+            )
+
+        attempt_file.refresh_from_db()
+        self.assertEqual(elapsed[0], 45.0)
+        self.assertFalse(path.exists())
+        self.assertEqual(attempt_file.state, "cleaned")
+        self.assertTrue(outcome.did_work)
 
     def test_virtual_45_second_unlink_allows_heartbeat_writer_and_stop(self):
         job, attempt, attempt_file, path, directory = self._fixture()

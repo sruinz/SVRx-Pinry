@@ -8,14 +8,21 @@ import uuid
 from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import DatabaseError, IntegrityError, connection, transaction
+from django.db import (
+    DatabaseError,
+    IntegrityError,
+    OperationalError,
+    connection,
+    transaction,
+)
+from django.db.models.query import QuerySet
 from django.test import TransactionTestCase
 from django.utils import timezone
 import mock
 
 from core.services.database_fence import DatabaseFenceBusy
 from core.models import Pin
-from exports.contracts import LeaseLost, LeaseToken
+from exports.contracts import ExportError, LeaseLost, LeaseToken, StopRequested
 from exports.models import ExportJob, ExportSlot, ExportTarget, ExportWorkerLease
 from exports.services.archive import ArchiveService
 from exports.services.attempts import AttemptService
@@ -69,6 +76,67 @@ class WorkerLeaseTests(TransactionTestCase):
         job.refresh_from_db()
         return job
 
+    def _terminal_interrupt_fixture(self, exception_type):
+        owner = create_export_user(
+            "worker-terminal-{}".format(exception_type),
+        )
+        job = self._job(owner, self.now)
+        generation = uuid.uuid4()
+        ExportJob.objects.filter(pk=job.pk).update(
+            snapshot_generation=generation,
+            snapshot_relative_path="snapshot-{}".format(job.pk),
+            snapshot_dir_dev=1,
+            snapshot_dir_ino=2,
+            snapshot_dir_uid=3,
+            snapshot_dir_gid=4,
+            snapshot_dir_mode=0o700,
+        )
+
+        class TerminalInterruptArchive(object):
+            def recover_archiving(
+                inner_self,
+                lease,
+                heartbeat,
+                stop_requested,
+            ):
+                del inner_self, stop_requested
+                ExportJob.objects.filter(pk=lease.job_id).update(
+                    state="complete",
+                    completed_at=self.now,
+                    expires_at=self.now + timedelta(hours=24),
+                    staging_cleanup_state="pending",
+                    ready_cleanup_state="retained",
+                    ready_relative_path="ready/{}.zip".format(lease.job_id),
+                    ready_display_name="ready.zip",
+                    ready_size=1,
+                    ready_sha256="f" * 64,
+                    ready_dev=1,
+                    ready_ino=2,
+                    ready_uid=3,
+                    ready_gid=4,
+                    ready_mode=0o600,
+                    ready_nlink=1,
+                    ready_mtime_ns=5,
+                    ready_ctime_ns=6,
+                )
+                with heartbeat.job_token_transition(lease) as transition:
+                    transition.clear()
+                if exception_type == "stop":
+                    raise StopRequested(lease)
+                raise ExportError("archive_failed", lease)
+
+        worker = ExportWorker(
+            clock=lambda: self.now,
+            sleeper=lambda seconds: None,
+            archive_service=TerminalInterruptArchive(),
+        )
+        worker.worker_token = worker.acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+        )
+        return job, worker
+
     def test_new_os_lock_owner_takes_over_without_waiting_for_db_expiry(self):
         old_uuid = uuid.uuid4()
         ExportWorkerLease.objects.create(
@@ -111,6 +179,96 @@ class WorkerLeaseTests(TransactionTestCase):
         self.assertEqual(oldest.lease_uuid, lease.job_lease_uuid)
         self.assertEqual(oldest.attempt_generation, lease.attempt_generation)
         self.assertIsNone(claim_next_job(worker, heartbeat, self.now))
+
+    def test_committed_claim_survives_deadline_after_local_publish(self):
+        owner = create_export_user("worker-claim-post-commit-deadline")
+        job = self._job(owner, self.now)
+        elapsed = [0.0]
+        worker = acquire_worker_lease(self.now)
+        heartbeat = LeaseHeartbeat(
+            worker,
+            clock=lambda: self.now,
+            monotonic=lambda: elapsed[0],
+            sleeper=lambda seconds: None,
+        )
+        from exports.services import worker as worker_services
+        original_publish = worker_services._TokenTransition.publish
+        publishes = [0]
+
+        def expire_after_publish(transition, lease):
+            result = original_publish(transition, lease)
+            publishes[0] += 1
+            elapsed[0] = 15.0
+            return result
+
+        with mock.patch.object(
+                worker_services._TokenTransition,
+                "publish",
+                new=expire_after_publish,
+        ):
+            lease = claim_next_job(
+                worker,
+                heartbeat,
+                self.now,
+                monotonic=lambda: elapsed[0],
+                sleeper=lambda seconds: None,
+            )
+
+        job.refresh_from_db()
+        self.assertEqual(publishes[0], 1)
+        self.assertEqual(job.state, "snapshotting")
+        self.assertEqual(job.lease_uuid, lease.job_lease_uuid)
+        self.assertEqual(heartbeat.current_job_token, lease)
+
+    def test_terminal_release_survives_deadline_after_local_clear(self):
+        owner = create_export_user("worker-release-post-commit-deadline")
+        job = self._job(owner, self.now)
+        elapsed = [0.0]
+        worker = ExportWorker(
+            clock=lambda: self.now,
+            monotonic=lambda: elapsed[0],
+            sleeper=lambda seconds: None,
+        )
+        worker.worker_token = worker.acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+            monotonic=lambda: elapsed[0],
+            sleeper=lambda seconds: None,
+        )
+        lease = worker.claim_next_job(
+            worker.worker_token,
+            worker.heartbeat,
+            self.now,
+        )
+        ExportJob.objects.filter(pk=job.pk).update(
+            state="failed",
+            error_code="archive_failed",
+            error_class="retryable",
+            error_retryable=True,
+            staging_cleanup_state="pending",
+        )
+        from exports.services import worker as worker_services
+        original_clear = worker_services._TokenTransition.clear
+        clears = [0]
+
+        def expire_after_clear(transition):
+            result = original_clear(transition)
+            clears[0] += 1
+            elapsed[0] = 15.0
+            return result
+
+        with mock.patch.object(
+                worker_services._TokenTransition,
+                "clear",
+                new=expire_after_clear,
+        ):
+            worker._release_terminal(lease)
+
+        job.refresh_from_db()
+        self.assertEqual(clears[0], 1)
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(worker.heartbeat.current_job_token)
 
     def test_claim_transition_blocks_tick_until_new_token_is_published(self):
         owner = create_export_user("worker-publish-barrier")
@@ -497,6 +655,450 @@ class WorkerLeaseTests(TransactionTestCase):
         self.assertEqual(failed.state, "failed")
         self.assertIsNone(heartbeat.current_job_token)
 
+    def test_handoff_read_busy_retries_with_the_same_active_token(self):
+        owner = create_export_user("worker-handoff-read-busy")
+        job = self._job(owner, self.now)
+        worker = acquire_worker_lease(self.now)
+        heartbeat = LeaseHeartbeat(worker, clock=lambda: self.now)
+        lease = claim_next_job(worker, heartbeat, self.now)
+        original_get = QuerySet.get
+        busy = [False]
+        sleeps = []
+
+        def busy_first_job_read(queryset, *args, **kwargs):
+            if (
+                queryset.model is ExportJob
+                and kwargs.get("pk") == job.pk
+                and not busy[0]
+            ):
+                busy[0] = True
+                raise DatabaseError("database is locked")
+            return original_get(queryset, *args, **kwargs)
+
+        def retry_sleep(seconds):
+            self.assertFalse(connection.in_atomic_block)
+            self.assertEqual(heartbeat.current_job_token, lease)
+            sleeps.append(seconds)
+
+        with mock.patch.object(QuerySet, "get", new=busy_first_job_read):
+            handoff_after_normal_stop(
+                lease,
+                heartbeat,
+                self.now,
+                sleeper=retry_sleep,
+            )
+
+        job.refresh_from_db()
+        self.assertTrue(busy[0])
+        self.assertEqual(sleeps, [0.01])
+        self.assertEqual(job.state, "queued")
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(heartbeat.current_job_token)
+
+    def test_terminal_release_read_busy_retries_with_the_same_lease(self):
+        owner = create_export_user("worker-terminal-release-read-busy")
+        job = self._job(owner, self.now)
+        worker = ExportWorker(clock=lambda: self.now)
+        worker.worker_token = worker.acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+        )
+        lease = worker.claim_next_job(
+            worker.worker_token,
+            worker.heartbeat,
+            self.now,
+        )
+        ExportJob.objects.filter(pk=job.pk).update(
+            state="failed",
+            error_code="archive_failed",
+            error_class="retryable",
+            error_retryable=True,
+            staging_cleanup_state="pending",
+        )
+        original_get = QuerySet.get
+        busy = [False]
+        sleeps = []
+
+        def busy_first_job_read(queryset, *args, **kwargs):
+            if (
+                queryset.model is ExportJob
+                and kwargs.get("pk") == job.pk
+                and not busy[0]
+            ):
+                busy[0] = True
+                raise DatabaseError("database is locked")
+            return original_get(queryset, *args, **kwargs)
+
+        worker.sleeper = lambda seconds: sleeps.append(seconds)
+        with mock.patch.object(QuerySet, "get", new=busy_first_job_read):
+            worker._release_terminal(lease)
+
+        job.refresh_from_db()
+        self.assertTrue(busy[0])
+        self.assertEqual(sleeps, [0.01])
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(worker.heartbeat.current_job_token)
+
+    def test_handoff_totals_busy_retries_inside_the_same_operation(self):
+        owner = create_export_user("worker-handoff-totals-busy")
+        job = self._job(owner, self.now)
+        worker = acquire_worker_lease(self.now)
+        heartbeat = LeaseHeartbeat(worker, clock=lambda: self.now)
+        lease = claim_next_job(worker, heartbeat, self.now)
+        job.attempts.create(
+            attempt_generation=lease.attempt_generation,
+            lease_uuid=lease.job_lease_uuid,
+            state="cleaned",
+            relative_path="attempt-{}-0".format(job.pk),
+            dir_dev=1,
+            dir_ino=2,
+            dir_uid=3,
+            dir_gid=4,
+            dir_mode=0o700,
+        )
+        from exports.services import worker as worker_services
+        original_totals = worker_services._included_totals
+        calls = [0]
+        sleeps = []
+
+        def busy_first_totals(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise DatabaseError("database is locked")
+            return original_totals(*args, **kwargs)
+
+        with mock.patch.object(
+                worker_services,
+                "_included_totals",
+                side_effect=busy_first_totals,
+        ):
+            handoff_after_normal_stop(
+                lease,
+                heartbeat,
+                self.now,
+                sleeper=lambda seconds: sleeps.append(seconds),
+            )
+
+        job.refresh_from_db()
+        self.assertEqual(calls[0], 2)
+        self.assertEqual(sleeps, [0.01])
+        self.assertEqual(job.state, "queued")
+        self.assertEqual(job.attempt_generation, 1)
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(heartbeat.current_job_token)
+
+    def test_active_retry_and_heartbeat_share_one_hard_budget(self):
+        owner = create_export_user("worker-shared-retry-budget")
+        job = self._job(owner, self.now)
+        elapsed = [0.0]
+        foreground_failed = [False]
+        worker = acquire_worker_lease(self.now)
+        heartbeat = LeaseHeartbeat(
+            worker,
+            clock=lambda: self.now,
+            monotonic=lambda: elapsed[0],
+            sleeper=lambda seconds: None,
+        )
+        lease = claim_next_job(worker, heartbeat, self.now)
+        original_save = ExportJob.save
+        original_get = QuerySet.get
+
+        def busy_job_save(instance, *args, **kwargs):
+            if instance.pk == job.pk:
+                foreground_failed[0] = True
+                elapsed[0] += 5.0
+                raise DatabaseFenceBusy()
+            return original_save(instance, *args, **kwargs)
+
+        def busy_heartbeat_read(queryset, *args, **kwargs):
+            if foreground_failed[0] and queryset.model is ExportWorkerLease:
+                elapsed[0] += 5.0
+                raise OperationalError("database is locked")
+            return original_get(queryset, *args, **kwargs)
+
+        with mock.patch.object(ExportJob, "save", new=busy_job_save):
+            with mock.patch.object(QuerySet, "get", new=busy_heartbeat_read):
+                with self.assertRaises(DatabaseFenceBusy):
+                    fail_job(
+                        lease,
+                        "archive_failed",
+                        heartbeat,
+                        self.now,
+                        monotonic=lambda: elapsed[0],
+                        sleeper=lambda seconds: None,
+                    )
+
+        job.refresh_from_db()
+        self.assertEqual(elapsed[0], 15.0)
+        self.assertEqual(job.state, "snapshotting")
+        self.assertEqual(job.lease_uuid, lease.job_lease_uuid)
+        self.assertEqual(heartbeat.current_job_token, lease)
+
+    def test_stop_is_observed_after_one_busy_retry_heartbeat_attempt(self):
+        owner = create_export_user("worker-stop-during-retry-renew")
+        job = self._job(owner, self.now)
+        elapsed = [0.0]
+        foreground_failed = [False]
+        stopped = threading.Event()
+        worker = ExportWorker(
+            clock=lambda: self.now,
+            monotonic=lambda: elapsed[0],
+            sleeper=lambda seconds: None,
+        )
+        worker.worker_token = worker.acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+            monotonic=lambda: elapsed[0],
+            sleeper=lambda seconds: None,
+        )
+        original_save = ExportJob.save
+        original_get = QuerySet.get
+
+        def busy_claim_save(instance, *args, **kwargs):
+            if instance.pk == job.pk:
+                foreground_failed[0] = True
+                elapsed[0] += 5.0
+                raise DatabaseFenceBusy()
+            return original_save(instance, *args, **kwargs)
+
+        def stop_during_busy_heartbeat(queryset, *args, **kwargs):
+            if foreground_failed[0] and queryset.model is ExportWorkerLease:
+                elapsed[0] += 5.0
+                stopped.set()
+                raise OperationalError("database is locked")
+            return original_get(queryset, *args, **kwargs)
+
+        with mock.patch.object(ExportJob, "save", new=busy_claim_save):
+            with mock.patch.object(
+                    QuerySet,
+                    "get",
+                    new=stop_during_busy_heartbeat,
+            ):
+                self.assertFalse(worker.run_once(stopped.is_set))
+
+        job.refresh_from_db()
+        self.assertEqual(elapsed[0], 10.0)
+        self.assertEqual(job.state, "queued")
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(worker.heartbeat.current_job_token)
+
+    def test_run_once_stop_handoff_read_busy_does_not_escape(self):
+        owner = create_export_user("worker-run-once-stop-read-busy")
+        job = self._job(owner, self.now)
+        stop_raised = [False]
+        busy = [False]
+
+        class StoppingSnapshot(object):
+            def capture(inner_self, current, lease, heartbeat, stop_requested):
+                del inner_self, current, heartbeat, stop_requested
+                stop_raised[0] = True
+                raise StopRequested(lease)
+
+        worker = ExportWorker(
+            clock=lambda: self.now,
+            sleeper=lambda seconds: None,
+            snapshot_service=StoppingSnapshot(),
+        )
+        worker.worker_token = worker.acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+        )
+        original_get = QuerySet.get
+
+        def busy_first_handoff_read(queryset, *args, **kwargs):
+            if (
+                stop_raised[0]
+                and queryset.model is ExportJob
+                and kwargs.get("pk") == job.pk
+                and not busy[0]
+            ):
+                busy[0] = True
+                raise OperationalError("database is locked")
+            return original_get(queryset, *args, **kwargs)
+
+        with mock.patch.object(QuerySet, "get", new=busy_first_handoff_read):
+            self.assertTrue(worker.run_once(lambda: False))
+
+        job.refresh_from_db()
+        self.assertTrue(busy[0])
+        self.assertEqual(job.state, "queued")
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(worker.heartbeat.current_job_token)
+
+    def test_run_once_export_error_read_busy_does_not_escape(self):
+        owner = create_export_user("worker-run-once-failure-read-busy")
+        job = self._job(owner, self.now)
+        error_raised = [False]
+        busy = [False]
+
+        class FailingSnapshot(object):
+            def capture(inner_self, current, lease, heartbeat, stop_requested):
+                del inner_self, current, heartbeat, stop_requested
+                error_raised[0] = True
+                raise ExportError("archive_failed", lease)
+
+        worker = ExportWorker(
+            clock=lambda: self.now,
+            sleeper=lambda seconds: None,
+            snapshot_service=FailingSnapshot(),
+        )
+        worker.worker_token = worker.acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+        )
+        original_get = QuerySet.get
+
+        def busy_first_failure_read(queryset, *args, **kwargs):
+            if (
+                error_raised[0]
+                and queryset.model is ExportJob
+                and kwargs.get("pk") == job.pk
+                and not busy[0]
+            ):
+                busy[0] = True
+                raise OperationalError("database is locked")
+            return original_get(queryset, *args, **kwargs)
+
+        with mock.patch.object(QuerySet, "get", new=busy_first_failure_read):
+            self.assertTrue(worker.run_once(lambda: False))
+
+        job.refresh_from_db()
+        self.assertTrue(busy[0])
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.error_code, "archive_failed")
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(worker.heartbeat.current_job_token)
+
+    def test_terminal_stop_with_cleared_local_token_releases_db_lease(self):
+        job, worker = self._terminal_interrupt_fixture("stop")
+
+        self.assertTrue(worker.run_once(lambda: False))
+
+        job.refresh_from_db()
+        self.assertEqual(job.state, "complete")
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(worker.heartbeat.current_job_token)
+
+    def test_terminal_error_with_cleared_local_token_releases_db_lease(self):
+        job, worker = self._terminal_interrupt_fixture("error")
+
+        self.assertTrue(worker.run_once(lambda: False))
+
+        job.refresh_from_db()
+        self.assertEqual(job.state, "complete")
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(worker.heartbeat.current_job_token)
+
+    def test_retry_heartbeat_at_outer_deadline_rolls_back(self):
+        owner = create_export_user("worker-renew-at-outer-deadline")
+        job = self._job(owner, self.now)
+        renewed_at = self.now + timedelta(seconds=1)
+        elapsed = [0.0]
+        foreground_failed = [False]
+        worker = acquire_worker_lease(self.now)
+        heartbeat = LeaseHeartbeat(
+            worker,
+            clock=lambda: renewed_at,
+            monotonic=lambda: elapsed[0],
+            sleeper=lambda seconds: None,
+        )
+        lease = claim_next_job(worker, heartbeat, self.now)
+        original_save = ExportJob.save
+        original_update = QuerySet.update
+
+        def busy_job_save(instance, *args, **kwargs):
+            if instance.pk == job.pk:
+                foreground_failed[0] = True
+                elapsed[0] = 14.0
+                raise DatabaseFenceBusy()
+            return original_save(instance, *args, **kwargs)
+
+        def expire_during_renew(queryset, *args, **kwargs):
+            result = original_update(queryset, *args, **kwargs)
+            if (
+                foreground_failed[0]
+                and queryset.model is ExportWorkerLease
+                and elapsed[0] < 15.0
+            ):
+                elapsed[0] = 15.0
+            return result
+
+        with mock.patch.object(ExportJob, "save", new=busy_job_save):
+            with mock.patch.object(QuerySet, "update", new=expire_during_renew):
+                with self.assertRaises(DatabaseFenceBusy):
+                    fail_job(
+                        lease,
+                        "archive_failed",
+                        heartbeat,
+                        self.now,
+                        monotonic=lambda: elapsed[0],
+                        sleeper=lambda seconds: None,
+                    )
+
+        worker_row = ExportWorkerLease.objects.get(pk=1)
+        job.refresh_from_db()
+        self.assertEqual(elapsed[0], 15.0)
+        self.assertEqual(worker_row.heartbeat_at, self.now)
+        self.assertEqual(job.heartbeat_at, self.now)
+        self.assertEqual(job.state, "snapshotting")
+        self.assertEqual(job.lease_uuid, lease.job_lease_uuid)
+        self.assertEqual(heartbeat.current_job_token, lease)
+
+    def test_handoff_totals_cannot_overrun_outer_deadline(self):
+        owner = create_export_user("worker-handoff-totals-deadline")
+        job = self._job(owner, self.now)
+        elapsed = [0.0]
+        worker = acquire_worker_lease(self.now)
+        heartbeat = LeaseHeartbeat(
+            worker,
+            clock=lambda: self.now,
+            monotonic=lambda: elapsed[0],
+            sleeper=lambda seconds: None,
+        )
+        lease = claim_next_job(worker, heartbeat, self.now)
+        job.attempts.create(
+            attempt_generation=lease.attempt_generation,
+            lease_uuid=lease.job_lease_uuid,
+            state="cleaned",
+            relative_path="attempt-{}-deadline".format(job.pk),
+            dir_dev=1,
+            dir_ino=2,
+            dir_uid=3,
+            dir_gid=4,
+            dir_mode=0o700,
+        )
+
+        def totals_at_deadline(*args, **kwargs):
+            del args, kwargs
+            elapsed[0] = 15.0
+            return 0, 0
+
+        from exports.services import worker as worker_services
+        with mock.patch.object(
+                worker_services,
+                "_included_totals",
+                side_effect=totals_at_deadline,
+        ):
+            with self.assertRaises(DatabaseFenceBusy):
+                handoff_after_normal_stop(
+                    lease,
+                    heartbeat,
+                    self.now,
+                    monotonic=lambda: elapsed[0],
+                    sleeper=lambda seconds: None,
+                )
+
+        job.refresh_from_db()
+        self.assertEqual(elapsed[0], 15.0)
+        self.assertEqual(job.state, "snapshotting")
+        self.assertEqual(job.attempt_generation, lease.attempt_generation)
+        self.assertEqual(job.lease_uuid, lease.job_lease_uuid)
+        self.assertEqual(heartbeat.current_job_token, lease)
+
     def test_external_sqlite_writer_releases_before_heartbeat_and_retry(self):
         owner = create_export_user("worker-external-writer")
         job = self._job(owner, self.now)
@@ -507,17 +1109,20 @@ class WorkerLeaseTests(TransactionTestCase):
             timeout=0,
         )
         external.execute("BEGIN IMMEDIATE")
-        original_renew = heartbeat.renew_worker_now
+        original_renew = heartbeat.renew_worker_once
         released = []
         sleeps = []
 
-        def release_then_renew(now=None):
+        def release_then_renew(now=None, operation_deadline=None):
             if not released:
                 external.commit()
                 released.append(True)
-            return original_renew(now)
+            return original_renew(
+                now,
+                operation_deadline=operation_deadline,
+            )
 
-        heartbeat.renew_worker_now = release_then_renew
+        heartbeat.renew_worker_once = release_then_renew
         try:
             lease = claim_next_job(
                 worker,
@@ -548,6 +1153,58 @@ class WorkerLeaseTests(TransactionTestCase):
 
 
 class WorkerLockTests(ExportStorageMixin, TransactionTestCase):
+    def _budget_exhaustion_fixture(self, suffix):
+        now = timezone.now()
+        owner = create_export_user("worker-budget-{}".format(suffix))
+        job = ExportJob.objects.create(
+            owner=owner,
+            scope="pins",
+            state="queued",
+            requested_total=1,
+            target_total=1,
+            included_total=1,
+        )
+        elapsed = [0.0]
+        foreground_failed = [False]
+        original_save = ExportJob.save
+        original_get = QuerySet.get
+
+        class FailingSnapshot(object):
+            def capture(inner_self, current, lease, heartbeat, stop_requested):
+                del inner_self, current, heartbeat, stop_requested
+                raise ExportError("archive_failed", lease)
+
+        def busy_terminal_save(instance, *args, **kwargs):
+            if instance.pk == job.pk and instance.state == "failed":
+                foreground_failed[0] = True
+                elapsed[0] += 5.0
+                raise DatabaseFenceBusy()
+            return original_save(instance, *args, **kwargs)
+
+        def busy_after_terminal_failure(queryset, *args, **kwargs):
+            if foreground_failed[0] and queryset.model is ExportWorkerLease:
+                elapsed[0] += 5.0
+                raise OperationalError("database is locked")
+            return original_get(queryset, *args, **kwargs)
+
+        worker = ExportWorker(
+            clock=lambda: now,
+            monotonic=lambda: elapsed[0],
+            sleeper=lambda seconds: None,
+            snapshot_service=FailingSnapshot(),
+        )
+        return (
+            worker,
+            job,
+            elapsed,
+            mock.patch.object(ExportJob, "save", new=busy_terminal_save),
+            mock.patch.object(
+                QuerySet,
+                "get",
+                new=busy_after_terminal_failure,
+            ),
+        )
+
     def test_process_flock_rejects_a_second_worker(self):
         root = open_export_root(
             settings.PINRY_EXPORT_ROOT,
@@ -580,21 +1237,49 @@ class WorkerLockTests(ExportStorageMixin, TransactionTestCase):
         worker.run_once.assert_not_called()
 
     def test_database_retry_budget_exhaustion_is_explicit_worker_failure(self):
-        worker = ExportWorker(sleeper=lambda seconds: None)
-        worker.run_once = mock.Mock(side_effect=DatabaseFenceBusy())
+        worker, job, elapsed, save_patch, get_patch = (
+            self._budget_exhaustion_fixture("run")
+        )
 
-        status = worker.run(lambda: False)
+        with save_patch:
+            with get_patch:
+                status = worker.run(lambda: False)
 
+        job.refresh_from_db()
         self.assertEqual(status, 1)
-        worker.run_once.assert_called_once()
+        self.assertEqual(elapsed[0], 15.0)
+        self.assertEqual(job.state, "snapshotting")
+        self.assertIsNotNone(job.lease_uuid)
+        self.assertEqual(
+            worker.heartbeat.current_job_token.job_lease_uuid,
+            job.lease_uuid,
+        )
 
     def test_management_command_normalizes_worker_busy_failure(self):
-        with mock.patch.object(ExportWorker, "run", return_value=1):
-            with self.assertRaisesRegex(
-                CommandError,
-                "안전하게 시작되지 못했습니다",
-            ):
-                call_command("run_export_worker")
+        worker, job, elapsed, save_patch, get_patch = (
+            self._budget_exhaustion_fixture("command")
+        )
+
+        with save_patch:
+            with get_patch:
+                with mock.patch(
+                    "exports.management.commands.run_export_worker.ExportWorker",
+                    return_value=worker,
+                ):
+                    with self.assertRaisesRegex(
+                        CommandError,
+                        "안전하게 시작되지 못했습니다",
+                    ):
+                        call_command("run_export_worker")
+
+        job.refresh_from_db()
+        self.assertEqual(elapsed[0], 15.0)
+        self.assertEqual(job.state, "snapshotting")
+        self.assertIsNotNone(job.lease_uuid)
+        self.assertEqual(
+            worker.heartbeat.current_job_token.job_lease_uuid,
+            job.lease_uuid,
+        )
 
     def test_fatal_after_retry_heartbeat_prevents_second_transaction(self):
         now = timezone.now()
@@ -612,8 +1297,15 @@ class WorkerLockTests(ExportStorageMixin, TransactionTestCase):
         original_save = ExportJob.save
 
         class FatalAfterRenewHeartbeat(LeaseHeartbeat):
-            def renew_worker_now(inner_self, now=None):
-                super(FatalAfterRenewHeartbeat, inner_self).renew_worker_now(now)
+            def renew_worker_once(
+                inner_self,
+                now=None,
+                operation_deadline=None,
+            ):
+                super(FatalAfterRenewHeartbeat, inner_self).renew_worker_once(
+                    now,
+                    operation_deadline=operation_deadline,
+                )
                 inner_self._fatal = DatabaseError("fatal after retry renew")
 
         def slow_save(instance, *args, **kwargs):

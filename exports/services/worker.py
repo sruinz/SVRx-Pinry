@@ -9,7 +9,6 @@ import uuid
 
 from django.conf import settings
 from django.db import DatabaseError, IntegrityError, close_old_connections
-from django.db import transaction
 from django.db.models import Exists, OuterRef, Q
 from django.utils import timezone
 
@@ -95,15 +94,31 @@ class _DatabaseRetryStopped(Exception):
 
 
 @contextmanager
-def _worker_write_fence(using, monotonic=None):
+def _worker_write_fence(
+    using,
+    monotonic=None,
+    operation_deadline=None,
+):
     clock = time.monotonic if monotonic is None else monotonic
+    if operation_deadline is not None:
+        operation_deadline.checkpoint()
+        budget_seconds = min(
+            DATABASE_FENCE_MAX_SECONDS,
+            operation_deadline.deadline - clock(),
+        )
+        if budget_seconds <= 0:
+            operation_deadline.checkpoint()
+    else:
+        budget_seconds = DATABASE_FENCE_MAX_SECONDS
     with database_write_fence(using=using, models=WORKER_FENCE_MODELS):
         deadline = DatabaseFenceDeadline(
             clock,
-            budget_seconds=DATABASE_FENCE_MAX_SECONDS,
+            budget_seconds=budget_seconds,
         )
         yield deadline
         deadline.checkpoint()
+        if operation_deadline is not None:
+            operation_deadline.checkpoint()
 
 
 @contextmanager
@@ -143,42 +158,98 @@ def _retry_database(
 ):
     monotonic = time.monotonic if monotonic is None else monotonic
     sleeper = time.sleep if sleeper is None else sleeper
-    deadline = monotonic() + DATABASE_RETRY_MAX_SECONDS
+    deadline = DatabaseFenceDeadline(
+        monotonic,
+        budget_seconds=DATABASE_RETRY_MAX_SECONDS,
+    )
     while True:
         try:
-            return operation()
+            return operation(deadline)
         except DatabaseFenceBusy:
             pass
         except DatabaseError as error:
             if not _database_error_is_busy(error):
                 raise
         if retry_checkpoint is not None:
-            retry_checkpoint()
-        if monotonic() >= deadline:
-            raise DatabaseFenceBusy()
+            retry_checkpoint(deadline)
+        deadline.checkpoint()
         sleeper(0.01)
 
 
 def _retry_control(heartbeat, stop_requested=None, lease=None):
-    def checkpoint():
+    def checkpoint(deadline=None):
         if heartbeat.lost is not None:
             raise heartbeat.lost
         if heartbeat.fatal is not None:
             raise _HeartbeatFailed()
         if stop_requested is not None and stop_requested():
             raise _DatabaseRetryStopped()
-        if lease is None:
-            heartbeat.renew_worker_now()
-        else:
-            heartbeat.renew_now(lease)
+        if deadline is not None:
+            deadline.checkpoint()
+        try:
+            if lease is None:
+                heartbeat.renew_worker_once(operation_deadline=deadline)
+            else:
+                heartbeat.renew_once(lease, operation_deadline=deadline)
+        except DatabaseFenceBusy:
+            if deadline is None:
+                raise
         if heartbeat.lost is not None:
             raise heartbeat.lost
         if heartbeat.fatal is not None:
             raise _HeartbeatFailed()
         if stop_requested is not None and stop_requested():
             raise _DatabaseRetryStopped()
+        if deadline is not None:
+            deadline.checkpoint()
 
     return checkpoint
+
+
+def _retry_maintenance_database(
+    operation,
+    heartbeat,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
+    return _retry_database(
+        operation,
+        monotonic=monotonic,
+        sleeper=sleeper,
+        retry_checkpoint=_retry_control(
+            heartbeat,
+            stop_requested=stop_requested,
+        ),
+    )
+
+
+def _retry_maintenance_write(
+    operation,
+    worker_lease,
+    heartbeat,
+    using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
+    def guarded(operation_deadline):
+        with heartbeat.foreground_write_guard():
+            with _worker_write_fence(
+                using,
+                monotonic,
+                operation_deadline=operation_deadline,
+            ) as transaction_deadline:
+                lock_current_worker_lease(worker_lease, using=using)
+                return operation(transaction_deadline)
+
+    return _retry_maintenance_database(
+        guarded,
+        heartbeat,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
 
 
 def _worker_expiry(now):
@@ -190,8 +261,12 @@ def acquire_worker_lease(now, using="default", monotonic=None, sleeper=None):
 
     new_uuid = uuid.uuid4()
 
-    def acquire():
-        with _worker_write_fence(using, monotonic):
+    def acquire(operation_deadline):
+        with _worker_write_fence(
+            using,
+            monotonic,
+            operation_deadline=operation_deadline,
+        ):
             try:
                 current = ExportWorkerLease.objects.using(
                     using,
@@ -309,36 +384,47 @@ class LeaseHeartbeat(object):
             transition = _TokenTransition(self, expected_token)
             yield transition
 
-    def _renew(self, token, now):
-        def renew():
-            with transaction.atomic(using=self.using):
-                lock_current_worker_lease(
-                    self.worker_token,
-                    using=self.using,
-                )
-                updated_worker = ExportWorkerLease.objects.using(
-                    self.using,
-                ).filter(
-                    pk=1,
-                    generation=self.worker_token.worker_generation,
-                    lease_uuid=self.worker_token.worker_lease_uuid,
+    def _renew_once(self, token, now, operation_deadline=None):
+        with _worker_write_fence(
+            self.using,
+            self.monotonic,
+            operation_deadline=operation_deadline,
+        ):
+            lock_current_worker_lease(
+                self.worker_token,
+                using=self.using,
+            )
+            updated_worker = ExportWorkerLease.objects.using(
+                self.using,
+            ).filter(
+                pk=1,
+                generation=self.worker_token.worker_generation,
+                lease_uuid=self.worker_token.worker_lease_uuid,
+            ).update(
+                lease_expires_at=_worker_expiry(now),
+                heartbeat_at=now,
+                health_state="ready",
+                error_code=None,
+            )
+            if updated_worker != 1:
+                raise LeaseLost()
+            if token is not None:
+                updated_job = ExportJob.objects.using(self.using).filter(
+                    **token.job_fence()
                 ).update(
                     lease_expires_at=_worker_expiry(now),
                     heartbeat_at=now,
-                    health_state="ready",
-                    error_code=None,
                 )
-                if updated_worker != 1:
+                if updated_job != 1:
                     raise LeaseLost()
-                if token is not None:
-                    updated_job = ExportJob.objects.using(self.using).filter(
-                        **token.job_fence()
-                    ).update(
-                        lease_expires_at=_worker_expiry(now),
-                        heartbeat_at=now,
-                    )
-                    if updated_job != 1:
-                        raise LeaseLost()
+
+    def _renew(self, token, now):
+        def renew(operation_deadline):
+            return self._renew_once(
+                token,
+                now,
+                operation_deadline=operation_deadline,
+            )
 
         return _retry_database(
             renew,
@@ -366,6 +452,27 @@ class LeaseHeartbeat(object):
         with self._mutex:
             current = self.clock() if now is None else now
             self._renew(None, current)
+
+    def renew_once(self, token, now=None, operation_deadline=None):
+        with self._mutex:
+            if self._job_token is not None and self._job_token != token:
+                raise LeaseLost()
+            current = self.clock() if now is None else now
+            self._renew_once(
+                token,
+                current,
+                operation_deadline=operation_deadline,
+            )
+            return token
+
+    def renew_worker_once(self, now=None, operation_deadline=None):
+        with self._mutex:
+            current = self.clock() if now is None else now
+            self._renew_once(
+                None,
+                current,
+                operation_deadline=operation_deadline,
+            )
 
     def __call__(self):
         return self.tick()
@@ -443,12 +550,13 @@ def claim_next_job(
     if heartbeat.current_job_token is not None:
         return None
 
-    def claim():
+    def claim(operation_deadline):
         with heartbeat.job_token_transition(None) as transition:
             with heartbeat.foreground_write_guard():
                 with _worker_write_fence(
                     using,
                     monotonic=monotonic,
+                    operation_deadline=operation_deadline,
                 ):
                     lock_current_worker_lease(worker_lease, using=using)
                     current_attempt = ExportAttempt.objects.using(
@@ -588,12 +696,13 @@ def _claim_recovery(
     sleeper=None,
     stop_requested=None,
 ):
-    def claim():
+    def claim(operation_deadline):
         with heartbeat.job_token_transition(None) as transition:
             with heartbeat.foreground_write_guard():
                 with _worker_write_fence(
                     using,
                     monotonic=monotonic,
+                    operation_deadline=operation_deadline,
                 ):
                     lock_current_worker_lease(worker_lease, using=using)
                     candidates = ExportJob.objects.using(
@@ -771,7 +880,10 @@ def requeue_expired_nonverifying_jobs(
     write_guard=None,
     retry_checkpoint=None,
 ):
-    checkpoint = (lambda: None) if checkpoint is None else checkpoint
+    if checkpoint is None:
+        def checkpoint(deadline=None):
+            if deadline is not None:
+                deadline.checkpoint()
     write_guard = _passthrough_guard if write_guard is None else write_guard
 
     def candidates():
@@ -795,7 +907,7 @@ def requeue_expired_nonverifying_jobs(
             | ~Q(worker_generation=worker_lease.worker_generation)
         )
 
-    def requeue():
+    def requeue(operation_deadline):
         count = 0
         candidate = candidates().order_by(
             "state", "created_at", "id",
@@ -811,12 +923,26 @@ def requeue_expired_nonverifying_jobs(
         totals = None
         has_items = None
         if candidate.has_current_tombstone:
-            totals = _included_totals(candidate, using, checkpoint)
+            def totals_checkpoint():
+                operation_deadline.checkpoint()
+                if retry_checkpoint is None:
+                    checkpoint()
+                else:
+                    retry_checkpoint(operation_deadline)
+                operation_deadline.checkpoint()
+
+            totals = _included_totals(
+                candidate,
+                using,
+                totals_checkpoint,
+            )
             has_items = candidate.items.exists()
+            operation_deadline.checkpoint()
         with write_guard():
             with _worker_write_fence(
                 using,
                 monotonic=monotonic,
+                operation_deadline=operation_deadline,
             ):
                 lock_current_worker_lease(worker_lease, using=using)
                 current = candidates().select_for_update().filter(
@@ -901,26 +1027,60 @@ def handoff_after_normal_stop(
     sleeper=None,
 ):
     now = timezone.now() if now is None else now
-    job = ExportJob.objects.using(using).get(pk=lease.job_id)
-    tombstone = job.attempts.filter(
-        attempt_generation=job.attempt_generation,
-        state="cleaned",
-    ).exists()
-    totals = None
-    has_items = None
-    if tombstone:
-        totals = _included_totals(
-            job,
-            using,
-            lambda: heartbeat.renew_now(lease),
-        )
-        has_items = job.items.exists()
+    retry_checkpoint = _retry_control(heartbeat, lease=lease)
 
-    def handoff():
+    def handoff(operation_deadline):
+        try:
+            job = ExportJob.objects.using(using).get(pk=lease.job_id)
+        except ExportJob.DoesNotExist:
+            raise LeaseLost() from None
+        if (
+            job.worker_generation != lease.worker_generation
+            or job.attempt_generation != lease.attempt_generation
+            or job.lease_uuid not in (None, lease.job_lease_uuid)
+            or (job.lease_uuid is None and job.state not in TERMINAL_STATES)
+        ):
+            raise LeaseLost()
+        tombstone = job.attempts.filter(
+            attempt_generation=job.attempt_generation,
+            state="cleaned",
+        ).exists()
+        totals = None
+        has_items = None
+        if tombstone:
+            totals = _included_totals(
+                job,
+                using,
+                lambda: retry_checkpoint(operation_deadline),
+            )
+            has_items = job.items.exists()
+            operation_deadline.checkpoint()
         with heartbeat.job_token_transition(lease) as transition:
             with heartbeat.foreground_write_guard():
-                with _worker_write_fence(using, monotonic) as deadline:
-                    current = lock_current_lease(lease, using=using)
+                with _worker_write_fence(
+                    using,
+                    monotonic,
+                    operation_deadline=operation_deadline,
+                ) as deadline:
+                    try:
+                        current = lock_current_lease(lease, using=using)
+                    except LeaseLost:
+                        worker_token = WorkerLeaseToken(
+                            lease.worker_generation,
+                            lease.worker_lease_uuid,
+                        )
+                        lock_current_worker_lease(worker_token, using=using)
+                        current = ExportJob.objects.using(
+                            using,
+                        ).select_for_update().filter(
+                            pk=lease.job_id,
+                            worker_generation=lease.worker_generation,
+                            attempt_generation=lease.attempt_generation,
+                            lease_uuid__isnull=True,
+                            state__in=TERMINAL_STATES,
+                        ).first()
+                        if current is None:
+                            raise LeaseLost() from None
                     if current.state in ("snapshotting", "archiving"):
                         if _job_has_cleanup_work(current):
                             _mark_attempts_retiring_locked(current)
@@ -954,7 +1114,7 @@ def handoff_after_normal_stop(
         handoff,
         monotonic=monotonic,
         sleeper=sleeper,
-        retry_checkpoint=_retry_control(heartbeat, lease=lease),
+        retry_checkpoint=retry_checkpoint,
     )
 
 
@@ -973,19 +1133,47 @@ def fail_job(
         lease.worker_lease_uuid,
     )
 
-    def fail():
+    def fail(operation_deadline):
         with heartbeat.job_token_transition(lease) as transition:
             with heartbeat.foreground_write_guard():
-                with _worker_write_fence(using, monotonic):
+                with _worker_write_fence(
+                    using,
+                    monotonic,
+                    operation_deadline=operation_deadline,
+                ):
                     job = ExportJob.objects.using(using).get(pk=lease.job_id)
-                    failed = _fail_locked(
-                        job,
-                        error_code,
-                        worker_token,
-                        job_token=lease,
-                        now=now,
-                        using=using,
-                    )
+                    if job.state in TERMINAL_STATES:
+                        lock_current_worker_lease(worker_token, using=using)
+                        current = ExportJob.objects.using(
+                            using,
+                        ).select_for_update().get(pk=lease.job_id)
+                        if (
+                            current.worker_generation
+                            != lease.worker_generation
+                            or current.attempt_generation
+                            != lease.attempt_generation
+                            or current.lease_uuid
+                            not in (None, lease.job_lease_uuid)
+                        ):
+                            raise LeaseLost()
+                        if current.lease_uuid is not None:
+                            current.lease_uuid = None
+                            current.lease_expires_at = None
+                            current.heartbeat_at = now
+                            current.save(update_fields=(
+                                "lease_uuid", "lease_expires_at",
+                                "heartbeat_at",
+                            ))
+                        failed = current
+                    else:
+                        failed = _fail_locked(
+                            job,
+                            error_code,
+                            worker_token,
+                            job_token=lease,
+                            now=now,
+                            using=using,
+                        )
             transition.clear()
             return failed
 
@@ -1009,9 +1197,13 @@ def claim_complete_maintenance(
     if heartbeat.current_job_token is not None:
         raise LeaseLost()
 
-    def claim():
+    def claim(operation_deadline):
         with heartbeat.foreground_write_guard():
-            with _worker_write_fence(using, monotonic):
+            with _worker_write_fence(
+                using,
+                monotonic,
+                operation_deadline=operation_deadline,
+            ):
                 lock_current_worker_lease(worker_lease, using=using)
                 candidates = ExportJob.objects.using(
                     using,
@@ -1072,23 +1264,48 @@ def release_job_lease(
     using="default",
     monotonic=None,
     sleeper=None,
+    allow_released=False,
 ):
     now = timezone.now() if now is None else now
     expected = heartbeat.current_job_token
     if expected not in (None, lease):
         raise LeaseLost()
 
-    def release():
+    def release(operation_deadline):
         with heartbeat.job_token_transition(expected) as transition:
             with heartbeat.foreground_write_guard():
-                with _worker_write_fence(using, monotonic):
-                    current = lock_current_lease(lease, using=using)
-                    current.lease_uuid = None
-                    current.lease_expires_at = None
-                    current.heartbeat_at = now
-                    current.save(update_fields=(
-                        "lease_uuid", "lease_expires_at", "heartbeat_at",
-                    ))
+                with _worker_write_fence(
+                    using,
+                    monotonic,
+                    operation_deadline=operation_deadline,
+                ):
+                    try:
+                        current = lock_current_lease(lease, using=using)
+                    except LeaseLost:
+                        if not allow_released:
+                            raise
+                        worker_token = WorkerLeaseToken(
+                            lease.worker_generation,
+                            lease.worker_lease_uuid,
+                        )
+                        lock_current_worker_lease(worker_token, using=using)
+                        current = ExportJob.objects.using(
+                            using,
+                        ).select_for_update().filter(
+                            pk=lease.job_id,
+                            worker_generation=lease.worker_generation,
+                            attempt_generation=lease.attempt_generation,
+                            lease_uuid__isnull=True,
+                        ).first()
+                        if current is None:
+                            raise LeaseLost() from None
+                    else:
+                        current.lease_uuid = None
+                        current.lease_expires_at = None
+                        current.heartbeat_at = now
+                        current.save(update_fields=(
+                            "lease_uuid", "lease_expires_at", "heartbeat_at",
+                        ))
             if expected is not None:
                 transition.clear()
 
@@ -1198,53 +1415,104 @@ def _mark_ready_cleanup(
     state,
     heartbeat,
     using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
 ):
-    with heartbeat.foreground_write_guard():
-        with _worker_write_fence(using):
-            lock_current_worker_lease(worker_lease, using=using)
-            current = ExportJob.objects.using(using).select_for_update().get(
-                pk=job.pk,
-            )
-            if _ready_snapshot(current) != expected:
-                raise LeaseLost()
-            current.ready_cleanup_state = state
-            update_fields = ["ready_cleanup_state"]
-            if state == "cleaned":
-                for field in _READY_FIELDS:
-                    setattr(current, field, None)
-                update_fields.extend(_READY_FIELDS)
-            current.save(update_fields=tuple(update_fields))
+    def mark(unused_deadline):
+        del unused_deadline
+        current = ExportJob.objects.using(
+            using,
+        ).select_for_update().get(pk=job.pk)
+        if _ready_snapshot(current) != expected:
+            raise LeaseLost()
+        current.ready_cleanup_state = state
+        update_fields = ["ready_cleanup_state"]
+        if state == "cleaned":
+            for field in _READY_FIELDS:
+                setattr(current, field, None)
+            update_fields.extend(_READY_FIELDS)
+        current.save(update_fields=tuple(update_fields))
+
+    return _retry_maintenance_write(
+        mark,
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
 
 
-def _expire_complete_jobs(worker_lease, heartbeat, now, using):
-    with heartbeat.foreground_write_guard():
-        with _worker_write_fence(using) as deadline:
-            lock_current_worker_lease(worker_lease, using=using)
-            jobs = list(ExportJob.objects.using(using).select_for_update().filter(
-                state="complete",
-                ready_cleanup_state="retained",
-            ).filter(
-                Q(expires_at__lte=now) | Q(owner_id__isnull=True)
-            ).order_by("created_at", "id")[:MAINTENANCE_BATCH_SIZE])
-            for current in jobs:
-                deadline.checkpoint()
-                current.state = "expired"
-                current.ready_cleanup_state = "pending"
-                current.save(update_fields=("state", "ready_cleanup_state"))
-            return len(jobs)
+def _expire_complete_jobs(
+    worker_lease,
+    heartbeat,
+    now,
+    using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
+    def expire(transaction_deadline):
+        jobs = list(ExportJob.objects.using(
+            using,
+        ).select_for_update().filter(
+            state="complete",
+            ready_cleanup_state="retained",
+        ).filter(
+            Q(expires_at__lte=now) | Q(owner_id__isnull=True)
+        ).order_by("created_at", "id")[:MAINTENANCE_BATCH_SIZE])
+        for current in jobs:
+            transaction_deadline.checkpoint()
+            current.state = "expired"
+            current.ready_cleanup_state = "pending"
+            current.save(update_fields=("state", "ready_cleanup_state"))
+        return len(jobs)
+
+    return _retry_maintenance_write(
+        expire,
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
 
 
-def _cleanup_one_ready(worker_lease, heartbeat, using):
-    with heartbeat.foreground_write_guard():
-        with _worker_write_fence(using):
-            lock_current_worker_lease(worker_lease, using=using)
-            job = ExportJob.objects.using(using).select_for_update().filter(
-                state="expired",
-                ready_cleanup_state="pending",
-            ).order_by("created_at", "id").first()
-            if job is None:
-                return False
-            expected = _ready_snapshot(job)
+def _cleanup_one_ready(
+    worker_lease,
+    heartbeat,
+    using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
+    def select_ready(unused_deadline):
+        del unused_deadline
+        job = ExportJob.objects.using(
+            using,
+        ).select_for_update().filter(
+            state="expired",
+            ready_cleanup_state="pending",
+        ).order_by("created_at", "id").first()
+        if job is None:
+            return None
+        return job, _ready_snapshot(job)
+
+    selected = _retry_maintenance_write(
+        select_ready,
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
+    if selected is None:
+        return False
+    job, expected = selected
     try:
         _remove_ready_file_fs(job)
     except ExportStorageError:
@@ -1258,6 +1526,9 @@ def _cleanup_one_ready(worker_lease, heartbeat, using):
             state,
             heartbeat,
             using,
+            stop_requested=stop_requested,
+            monotonic=monotonic,
+            sleeper=sleeper,
         )
         return True
     _mark_ready_cleanup(
@@ -1267,6 +1538,9 @@ def _cleanup_one_ready(worker_lease, heartbeat, using):
         "cleaned",
         heartbeat,
         using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
     )
     return True
 
@@ -1572,41 +1846,62 @@ def _remove_attempt_directory_fs(attempt):
                 current.close()
 
 
-def _terminal_attempt_cleanup(worker_lease, heartbeat, job, using):
-    with heartbeat.foreground_write_guard():
-        with _worker_write_fence(using):
-            lock_current_worker_lease(worker_lease, using=using)
-            current = ExportJob.objects.using(using).select_for_update().get(
-                pk=job.pk,
+def _terminal_attempt_cleanup(
+    worker_lease,
+    heartbeat,
+    job,
+    using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
+    def select_attempt(unused_deadline):
+        del unused_deadline
+        current = ExportJob.objects.using(
+            using,
+        ).select_for_update().get(pk=job.pk)
+        attempt = current.attempts.select_for_update().exclude(
+            state="cleaned",
+        ).order_by("attempt_generation").first()
+        if attempt is None:
+            return None
+        attempt_file = attempt.files.select_for_update().exclude(
+            state="cleaned",
+        ).order_by("kind", "pk").first()
+        if attempt_file is not None:
+            file_snapshot = (
+                attempt_file.kind,
+                attempt_file.state,
+                attempt_file.relative_path,
+                attempt_file.intent_relative_path,
+                attempt_file.receipt_level,
+                _file_receipt(attempt_file),
             )
-            attempt = current.attempts.select_for_update().exclude(
-                state="cleaned",
-            ).order_by("attempt_generation").first()
-            if attempt is None:
-                return False
-            attempt_file = attempt.files.select_for_update().exclude(
-                state="cleaned",
-            ).order_by("kind", "pk").first()
-            if attempt_file is not None:
-                file_snapshot = (
-                    attempt_file.kind,
-                    attempt_file.state,
-                    attempt_file.relative_path,
-                    attempt_file.intent_relative_path,
-                    attempt_file.receipt_level,
-                    _file_receipt(attempt_file),
+            ready_handoff = (
+                attempt_file.kind == "archive"
+                and attempt_file.state == "published"
+                and attempt_file.relative_path == current.ready_relative_path
+                and current.ready_cleanup_state in (
+                    "retained", "pending", "blocked",
                 )
-                ready_handoff = (
-                    attempt_file.kind == "archive"
-                    and attempt_file.state == "published"
-                    and attempt_file.relative_path == current.ready_relative_path
-                    and current.ready_cleanup_state in (
-                        "retained", "pending", "blocked",
-                    )
-                )
-            else:
-                file_snapshot = None
-                ready_handoff = False
+            )
+        else:
+            file_snapshot = None
+            ready_handoff = False
+        return attempt, attempt_file, file_snapshot, ready_handoff
+
+    selected = _retry_maintenance_write(
+        select_attempt,
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
+    if selected is None:
+        return False
+    attempt, attempt_file, file_snapshot, ready_handoff = selected
     needs_quarantine_close = (
         attempt_file is not None
         and attempt_file.kind == "quarantine"
@@ -1618,64 +1913,93 @@ def _terminal_attempt_cleanup(worker_lease, heartbeat, job, using):
             attempt,
             attempt_file,
         )
-        with heartbeat.foreground_write_guard():
-            with _worker_write_fence(using):
-                lock_current_worker_lease(worker_lease, using=using)
-                current_file = ExportAttemptFile.objects.using(
-                    using,
-                ).select_for_update().get(pk=attempt_file.pk)
-                current_snapshot = (
-                    current_file.kind,
-                    current_file.state,
-                    current_file.relative_path,
-                    current_file.intent_relative_path,
-                    current_file.receipt_level,
-                    _file_receipt(current_file),
-                )
-                if current_snapshot != file_snapshot:
-                    raise LeaseLost()
-                current_file.state = "closed"
-                current_file.relative_path = matched_path
-                current_file.intent_relative_path = None
-                _set_closed_receipt(current_file, closed_receipt)
-                current_file.save()
+
+        def close_quarantine(unused_deadline):
+            del unused_deadline
+            current_file = ExportAttemptFile.objects.using(
+                using,
+            ).select_for_update().get(pk=attempt_file.pk)
+            current_snapshot = (
+                current_file.kind,
+                current_file.state,
+                current_file.relative_path,
+                current_file.intent_relative_path,
+                current_file.receipt_level,
+                _file_receipt(current_file),
+            )
+            if current_snapshot != file_snapshot:
+                raise LeaseLost()
+            current_file.state = "closed"
+            current_file.relative_path = matched_path
+            current_file.intent_relative_path = None
+            _set_closed_receipt(current_file, closed_receipt)
+            current_file.save()
+
+        _retry_maintenance_write(
+            close_quarantine,
+            worker_lease,
+            heartbeat,
+            using,
+            stop_requested=stop_requested,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
         return True
     if attempt_file is not None and not ready_handoff:
         _cleanup_attempt_file_fs(attempt, attempt_file)
     if attempt_file is not None:
-        with heartbeat.foreground_write_guard():
-            with _worker_write_fence(using):
-                lock_current_worker_lease(worker_lease, using=using)
-                current_file = ExportAttemptFile.objects.using(
-                    using,
-                ).select_for_update().get(pk=attempt_file.pk)
-                current_snapshot = (
-                    current_file.kind,
-                    current_file.state,
-                    current_file.relative_path,
-                    current_file.intent_relative_path,
-                    current_file.receipt_level,
-                    _file_receipt(current_file),
-                )
-                if current_snapshot != file_snapshot:
-                    raise LeaseLost()
-                current_file.state = "cleaned"
-                current_file.intent_relative_path = None
-                current_file.save(update_fields=(
-                    "state", "intent_relative_path",
-                ))
+        def clean_file(unused_deadline):
+            del unused_deadline
+            current_file = ExportAttemptFile.objects.using(
+                using,
+            ).select_for_update().get(pk=attempt_file.pk)
+            current_snapshot = (
+                current_file.kind,
+                current_file.state,
+                current_file.relative_path,
+                current_file.intent_relative_path,
+                current_file.receipt_level,
+                _file_receipt(current_file),
+            )
+            if current_snapshot != file_snapshot:
+                raise LeaseLost()
+            current_file.state = "cleaned"
+            current_file.intent_relative_path = None
+            current_file.save(update_fields=(
+                "state", "intent_relative_path",
+            ))
+
+        _retry_maintenance_write(
+            clean_file,
+            worker_lease,
+            heartbeat,
+            using,
+            stop_requested=stop_requested,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
         return True
     _remove_attempt_directory_fs(attempt)
-    with heartbeat.foreground_write_guard():
-        with _worker_write_fence(using):
-            lock_current_worker_lease(worker_lease, using=using)
-            current_attempt = ExportAttempt.objects.using(
-                using,
-            ).select_for_update().get(pk=attempt.pk)
-            if current_attempt.files.exclude(state="cleaned").exists():
-                raise LeaseLost()
-            current_attempt.state = "cleaned"
-            current_attempt.save(update_fields=("state",))
+
+    def clean_attempt(unused_deadline):
+        del unused_deadline
+        current_attempt = ExportAttempt.objects.using(
+            using,
+        ).select_for_update().get(pk=attempt.pk)
+        if current_attempt.files.exclude(state="cleaned").exists():
+            raise LeaseLost()
+        current_attempt.state = "cleaned"
+        current_attempt.save(update_fields=("state",))
+
+    _retry_maintenance_write(
+        clean_attempt,
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
     return True
 
 
@@ -1831,146 +2155,250 @@ def _cleanup_snapshot_tree_fs(job, candidate, blob=None):  # noqa: C901
                 current.close()
 
 
-def _terminal_snapshot_cleanup(worker_lease, heartbeat, job, using):
-    with heartbeat.foreground_write_guard():
-        with _worker_write_fence(using):
-            lock_current_worker_lease(worker_lease, using=using)
-            current = ExportJob.objects.using(using).select_for_update().get(
-                pk=job.pk,
-            )
-            candidate = current.candidate_snapshot_generation is not None
-            if not candidate and current.snapshot_generation is None:
-                return False
-            generation = (
-                current.candidate_snapshot_generation if candidate
-                else current.snapshot_generation
-            )
-            expected = (
-                generation,
-                current.candidate_snapshot_relative_path if candidate
-                else current.snapshot_relative_path,
-            )
-            blob = current.blobs.select_for_update().filter(
-                snapshot_generation=generation,
-            ).exclude(
-                cleanup_state="cleaned",
-            ).order_by("pk").first()
-            blob_snapshot = None if blob is None else (
-                blob.pk,
-                blob.file_state,
-                blob.part_relative_path,
-                blob.snapshot_relative_path,
-                blob.cleanup_state,
-                _blob_receipt(blob),
-            )
+def _terminal_snapshot_cleanup(
+    worker_lease,
+    heartbeat,
+    job,
+    using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
+    def select_snapshot(unused_deadline):
+        del unused_deadline
+        current = ExportJob.objects.using(
+            using,
+        ).select_for_update().get(pk=job.pk)
+        candidate = current.candidate_snapshot_generation is not None
+        if not candidate and current.snapshot_generation is None:
+            return None
+        generation = (
+            current.candidate_snapshot_generation if candidate
+            else current.snapshot_generation
+        )
+        expected = (
+            generation,
+            current.candidate_snapshot_relative_path if candidate
+            else current.snapshot_relative_path,
+        )
+        blob = current.blobs.select_for_update().filter(
+            snapshot_generation=generation,
+        ).exclude(
+            cleanup_state="cleaned",
+        ).order_by("pk").first()
+        blob_snapshot = None if blob is None else (
+            blob.pk,
+            blob.file_state,
+            blob.part_relative_path,
+            blob.snapshot_relative_path,
+            blob.cleanup_state,
+            _blob_receipt(blob),
+        )
+        return current, candidate, expected, blob, blob_snapshot
+
+    selected = _retry_maintenance_write(
+        select_snapshot,
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
+    if selected is None:
+        return False
+    current, candidate, expected, blob, blob_snapshot = selected
     heartbeat.renew_worker_now()
     _cleanup_snapshot_tree_fs(current, candidate, blob=blob)
     heartbeat.renew_worker_now()
-    with heartbeat.foreground_write_guard():
-        with _worker_write_fence(using):
-            lock_current_worker_lease(worker_lease, using=using)
-            current = ExportJob.objects.using(using).select_for_update().get(
-                pk=job.pk,
+
+    def persist_snapshot_cleanup(unused_deadline):
+        del unused_deadline
+        current = ExportJob.objects.using(
+            using,
+        ).select_for_update().get(pk=job.pk)
+        actual = (
+            current.candidate_snapshot_generation if candidate
+            else current.snapshot_generation,
+            current.candidate_snapshot_relative_path if candidate
+            else current.snapshot_relative_path,
+        )
+        if actual != expected:
+            raise LeaseLost()
+        if blob is not None:
+            current_blob = current.blobs.select_for_update().get(pk=blob.pk)
+            actual_blob = (
+                current_blob.pk,
+                current_blob.file_state,
+                current_blob.part_relative_path,
+                current_blob.snapshot_relative_path,
+                current_blob.cleanup_state,
+                _blob_receipt(current_blob),
             )
-            actual = (
-                current.candidate_snapshot_generation if candidate
-                else current.snapshot_generation,
-                current.candidate_snapshot_relative_path if candidate
-                else current.snapshot_relative_path,
-            )
-            if actual != expected:
+            if actual_blob != blob_snapshot:
                 raise LeaseLost()
-            if blob is not None:
-                current_blob = current.blobs.select_for_update().get(
-                    pk=blob.pk,
-                )
-                actual_blob = (
-                    current_blob.pk,
-                    current_blob.file_state,
-                    current_blob.part_relative_path,
-                    current_blob.snapshot_relative_path,
-                    current_blob.cleanup_state,
-                    _blob_receipt(current_blob),
-                )
-                if actual_blob != blob_snapshot:
-                    raise LeaseLost()
-                current_blob.cleanup_state = "cleaned"
-                current_blob.save(update_fields=("cleanup_state",))
-                return True
-            if candidate:
-                fields = (
-                    "candidate_snapshot_generation",
-                    "candidate_snapshot_relative_path",
-                    "candidate_snapshot_dir_dev",
-                    "candidate_snapshot_dir_ino",
-                    "candidate_snapshot_dir_uid",
-                    "candidate_snapshot_dir_gid",
-                    "candidate_snapshot_dir_mode",
-                )
-            else:
-                fields = (
-                    "snapshot_generation", "snapshot_relative_path",
-                    "snapshot_dir_dev", "snapshot_dir_ino",
-                    "snapshot_dir_uid", "snapshot_dir_gid",
-                    "snapshot_dir_mode",
-                )
-            for field in fields:
-                setattr(current, field, None)
-            current.save(update_fields=fields)
-    return True
+            current_blob.cleanup_state = "cleaned"
+            current_blob.save(update_fields=("cleanup_state",))
+            return True
+        if candidate:
+            fields = (
+                "candidate_snapshot_generation",
+                "candidate_snapshot_relative_path",
+                "candidate_snapshot_dir_dev",
+                "candidate_snapshot_dir_ino",
+                "candidate_snapshot_dir_uid",
+                "candidate_snapshot_dir_gid",
+                "candidate_snapshot_dir_mode",
+            )
+        else:
+            fields = (
+                "snapshot_generation", "snapshot_relative_path",
+                "snapshot_dir_dev", "snapshot_dir_ino",
+                "snapshot_dir_uid", "snapshot_dir_gid",
+                "snapshot_dir_mode",
+            )
+        for field in fields:
+            setattr(current, field, None)
+        current.save(update_fields=fields)
+        return True
+
+    return _retry_maintenance_write(
+        persist_snapshot_cleanup,
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
 
 
-def _terminal_staging_cleanup(worker_lease, heartbeat, job, using):
+def _terminal_staging_cleanup(
+    worker_lease,
+    heartbeat,
+    job,
+    using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
     try:
-        if _terminal_attempt_cleanup(worker_lease, heartbeat, job, using):
+        if _terminal_attempt_cleanup(
+            worker_lease,
+            heartbeat,
+            job,
+            using,
+            stop_requested=stop_requested,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        ):
             return True
-        job.refresh_from_db()
-        if _terminal_snapshot_cleanup(worker_lease, heartbeat, job, using):
+        if _terminal_snapshot_cleanup(
+            worker_lease,
+            heartbeat,
+            job,
+            using,
+            stop_requested=stop_requested,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        ):
             return True
-        with heartbeat.foreground_write_guard():
-            with _worker_write_fence(using):
-                lock_current_worker_lease(worker_lease, using=using)
-                current = ExportJob.objects.using(
-                    using,
-                ).select_for_update().get(pk=job.pk)
-                if (
-                    current.attempts.exclude(state="cleaned").exists()
-                    or current.blobs.exclude(cleanup_state="cleaned").exists()
-                    or current.candidate_snapshot_generation is not None
-                    or current.snapshot_generation is not None
-                ):
-                    raise _CleanupBlocked()
-                current.staging_cleanup_state = "cleaned"
-                current.save(update_fields=("staging_cleanup_state",))
+
+        def mark_staging_cleaned(unused_deadline):
+            del unused_deadline
+            current = ExportJob.objects.using(
+                using,
+            ).select_for_update().get(pk=job.pk)
+            if (
+                current.attempts.exclude(state="cleaned").exists()
+                or current.blobs.exclude(cleanup_state="cleaned").exists()
+                or current.candidate_snapshot_generation is not None
+                or current.snapshot_generation is not None
+            ):
+                raise _CleanupBlocked()
+            current.staging_cleanup_state = "cleaned"
+            current.save(update_fields=("staging_cleanup_state",))
+
+        _retry_maintenance_write(
+            mark_staging_cleaned,
+            worker_lease,
+            heartbeat,
+            using,
+            stop_requested=stop_requested,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
         return True
     except _CleanupBlocked:
-        with heartbeat.foreground_write_guard():
-            with _worker_write_fence(using):
-                lock_current_worker_lease(worker_lease, using=using)
-                current = ExportJob.objects.using(
-                    using,
-                ).select_for_update().get(pk=job.pk)
-                current.staging_cleanup_state = "blocked"
-                current.save(update_fields=("staging_cleanup_state",))
+        def mark_staging_blocked(unused_deadline):
+            del unused_deadline
+            current = ExportJob.objects.using(
+                using,
+            ).select_for_update().get(pk=job.pk)
+            current.staging_cleanup_state = "blocked"
+            current.save(update_fields=("staging_cleanup_state",))
+
+        _retry_maintenance_write(
+            mark_staging_blocked,
+            worker_lease,
+            heartbeat,
+            using,
+            stop_requested=stop_requested,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
         return True
     except (ExportStorageError, OSError):
         return True
 
 
-def _cleanup_one_terminal_staging(worker_lease, heartbeat, using):
-    with heartbeat.foreground_write_guard():
-        with _worker_write_fence(using):
-            lock_current_worker_lease(worker_lease, using=using)
-            job = ExportJob.objects.using(using).select_for_update().filter(
-                state__in=("failed", "expired"),
-                staging_cleanup_state="pending",
-            ).order_by("created_at", "id").first()
+def _cleanup_one_terminal_staging(
+    worker_lease,
+    heartbeat,
+    using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
+    def select_terminal(unused_deadline):
+        del unused_deadline
+        return ExportJob.objects.using(
+            using,
+        ).select_for_update().filter(
+            state__in=("failed", "expired"),
+            staging_cleanup_state="pending",
+        ).order_by("created_at", "id").first()
+
+    job = _retry_maintenance_write(
+        select_terminal,
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
     if job is None:
         return False
-    return _terminal_staging_cleanup(worker_lease, heartbeat, job, using)
+    return _terminal_staging_cleanup(
+        worker_lease,
+        heartbeat,
+        job,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
 
 
-def _delete_clean_orphans(worker_lease, heartbeat, using):
+def _delete_clean_orphans(
+    worker_lease,
+    heartbeat,
+    using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
     unclean_blobs = ExportBlob.objects.using(using).filter(
         job_id=OuterRef("pk"),
     ).exclude(cleanup_state="cleaned")
@@ -1980,59 +2408,106 @@ def _delete_clean_orphans(worker_lease, heartbeat, using):
     unclean_files = ExportAttemptFile.objects.using(using).filter(
         attempt__job_id=OuterRef("pk"),
     ).exclude(state="cleaned")
-    with heartbeat.foreground_write_guard():
-        with _worker_write_fence(using):
-            lock_current_worker_lease(worker_lease, using=using)
-            current = ExportJob.objects.using(using).select_for_update().filter(
-                owner_id__isnull=True,
-                state__in=("failed", "expired"),
-                staging_cleanup_state="cleaned",
-                ready_cleanup_state__in=("absent", "cleaned"),
-                snapshot_relative_path__isnull=True,
-                candidate_snapshot_relative_path__isnull=True,
-                ready_relative_path__isnull=True,
-            ).annotate(
-                has_unclean_blob=Exists(unclean_blobs),
-                has_unclean_attempt=Exists(unclean_attempts),
-                has_unclean_file=Exists(unclean_files),
-            ).filter(
-                has_unclean_blob=False,
-                has_unclean_attempt=False,
-                has_unclean_file=False,
-            ).order_by("created_at", "id").first()
-            if current is None:
-                return 0
-            current.delete()
-            return 1
+
+    def delete_orphan(unused_deadline):
+        del unused_deadline
+        current = ExportJob.objects.using(
+            using,
+        ).select_for_update().filter(
+            owner_id__isnull=True,
+            state__in=("failed", "expired"),
+            staging_cleanup_state="cleaned",
+            ready_cleanup_state__in=("absent", "cleaned"),
+            snapshot_relative_path__isnull=True,
+            candidate_snapshot_relative_path__isnull=True,
+            ready_relative_path__isnull=True,
+        ).annotate(
+            has_unclean_blob=Exists(unclean_blobs),
+            has_unclean_attempt=Exists(unclean_attempts),
+            has_unclean_file=Exists(unclean_files),
+        ).filter(
+            has_unclean_blob=False,
+            has_unclean_attempt=False,
+            has_unclean_file=False,
+        ).order_by("created_at", "id").first()
+        if current is None:
+            return 0
+        current.delete()
+        return 1
+
+    return _retry_maintenance_write(
+        delete_orphan,
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
 
 
-def _maintenance_claim_allowed(using):
-    return not ExportJob.objects.using(using).filter(
-        Q(staging_cleanup_state__in=("pending", "blocked"))
-        & Q(state__in=("failed", "expired"))
-        | Q(staging_cleanup_state="blocked", state="complete")
-        | Q(ready_cleanup_state__in=("pending", "blocked"))
-    ).exists()
+def _maintenance_claim_allowed(
+    heartbeat,
+    using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
+    def check_allowed(operation_deadline):
+        operation_deadline.checkpoint()
+        return not ExportJob.objects.using(using).filter(
+            Q(staging_cleanup_state__in=("pending", "blocked"))
+            & Q(state__in=("failed", "expired"))
+            | Q(staging_cleanup_state="blocked", state="complete")
+            | Q(ready_cleanup_state__in=("pending", "blocked"))
+        ).exists()
+
+    return _retry_maintenance_database(
+        check_allowed,
+        heartbeat,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
 
 
-def _terminalize_ownerless_active(worker_lease, heartbeat, now, using):
-    with heartbeat.foreground_write_guard():
-        with _worker_write_fence(using):
-            lock_current_worker_lease(worker_lease, using=using)
-            current = ExportJob.objects.using(using).select_for_update().filter(
-                owner_id__isnull=True,
-                state__in=ACTIVE_STATES,
-            ).order_by("state", "created_at", "id").first()
-            if current is None:
-                return False
-            _fail_locked(
-                current,
-                "permission_changed",
-                worker_lease,
-                now=now,
-                using=using,
-            )
-            return True
+def _terminalize_ownerless_active(
+    worker_lease,
+    heartbeat,
+    now,
+    using,
+    stop_requested=None,
+    monotonic=None,
+    sleeper=None,
+):
+    def terminalize(unused_deadline):
+        del unused_deadline
+        current = ExportJob.objects.using(
+            using,
+        ).select_for_update().filter(
+            owner_id__isnull=True,
+            state__in=ACTIVE_STATES,
+        ).order_by("state", "created_at", "id").first()
+        if current is None:
+            return False
+        _fail_locked(
+            current,
+            "permission_changed",
+            worker_lease,
+            now=now,
+            using=using,
+        )
+        return True
+
+    return _retry_maintenance_write(
+        terminalize,
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    )
 
 
 def _cleanup_expired_and_stale_once(
@@ -2056,6 +2531,9 @@ def _cleanup_expired_and_stale_once(
         heartbeat,
         now,
         using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
     ):
         return MaintenanceOutcome(True, False)
 
@@ -2083,11 +2561,19 @@ def _cleanup_expired_and_stale_once(
                 heartbeat,
                 now=now,
                 using=using,
+                monotonic=monotonic,
+                sleeper=sleeper,
             )
         did_work = True
         return MaintenanceOutcome(
             did_work,
-            _maintenance_claim_allowed(using),
+            _maintenance_claim_allowed(
+                heartbeat,
+                using,
+                stop_requested=stop_requested,
+                monotonic=monotonic,
+                sleeper=sleeper,
+            ),
         )
 
     expired_count = _expire_complete_jobs(
@@ -2095,23 +2581,53 @@ def _cleanup_expired_and_stale_once(
         heartbeat,
         now,
         using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
     )
     did_work = expired_count > 0
     if stop_requested is not None and stop_requested():
         return MaintenanceOutcome(did_work, False)
-    if _cleanup_one_ready(worker_lease, heartbeat, using):
+    if _cleanup_one_ready(
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    ):
         did_work = True
     if stop_requested is not None and stop_requested():
         return MaintenanceOutcome(did_work, False)
-    if _cleanup_one_terminal_staging(worker_lease, heartbeat, using):
+    if _cleanup_one_terminal_staging(
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    ):
         did_work = True
     if stop_requested is not None and stop_requested():
         return MaintenanceOutcome(did_work, False)
-    if _delete_clean_orphans(worker_lease, heartbeat, using):
+    if _delete_clean_orphans(
+        worker_lease,
+        heartbeat,
+        using,
+        stop_requested=stop_requested,
+        monotonic=monotonic,
+        sleeper=sleeper,
+    ):
         did_work = True
     return MaintenanceOutcome(
         did_work,
-        _maintenance_claim_allowed(using),
+        _maintenance_claim_allowed(
+            heartbeat,
+            using,
+            stop_requested=stop_requested,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        ),
     )
 
 
@@ -2125,7 +2641,7 @@ def cleanup_expired_and_stale(
     monotonic=None,
     sleeper=None,
 ):
-    def maintain():
+    try:
         return _cleanup_expired_and_stale_once(
             worker_lease,
             heartbeat,
@@ -2135,17 +2651,6 @@ def cleanup_expired_and_stale(
             archive_service=archive_service,
             monotonic=monotonic,
             sleeper=sleeper,
-        )
-
-    try:
-        return _retry_database(
-            maintain,
-            monotonic=monotonic,
-            sleeper=sleeper,
-            retry_checkpoint=_retry_control(
-                heartbeat,
-                stop_requested=stop_requested,
-            ),
         )
     except _DatabaseRetryStopped:
         return MaintenanceOutcome(False, False)
@@ -2160,8 +2665,12 @@ def release_worker_lease(
 ):
     now = timezone.now() if now is None else now
 
-    def release():
-        with _worker_write_fence(using, monotonic):
+    def release(operation_deadline):
+        with _worker_write_fence(
+            using,
+            monotonic,
+            operation_deadline=operation_deadline,
+        ):
             updated = ExportWorkerLease.objects.using(using).filter(
                 pk=1,
                 generation=worker_lease.worker_generation,
@@ -2324,9 +2833,6 @@ class ExportWorker(object):
         )
 
     def _release_terminal(self, lease):
-        job = ExportJob.objects.using(self.using).get(pk=lease.job_id)
-        if job.lease_uuid is None:
-            return
         release_job_lease(
             lease,
             self.heartbeat,
@@ -2334,6 +2840,7 @@ class ExportWorker(object):
             using=self.using,
             monotonic=self.monotonic,
             sleeper=self.sleeper,
+            allow_released=True,
         )
 
     def _raise_heartbeat_failure(self):
@@ -2341,6 +2848,18 @@ class ExportWorker(object):
             raise self.heartbeat.lost
         if self.heartbeat.fatal is not None:
             raise _HeartbeatFailed()
+
+    def _handle_stop(self, stopped):
+        if self.heartbeat.current_job_token is None:
+            self._release_terminal(stopped.lease)
+        else:
+            self.handoff_after_normal_stop(stopped.lease)
+
+    def _handle_export_error(self, error):
+        if self.heartbeat.current_job_token is None:
+            self._release_terminal(error.lease)
+        else:
+            self.fail_job(error.lease, error.code)
 
     def _dispatch_claim(self, lease, stop_requested, mode):
         if mode == "verifying":
@@ -2419,26 +2938,12 @@ class ExportWorker(object):
         except _DatabaseRetryStopped:
             return False
         except StopRequested as stopped:
-            current = ExportJob.objects.using(self.using).get(
-                pk=stopped.lease.job_id,
-            )
-            if current.state in TERMINAL_STATES:
-                if current.lease_uuid is not None:
-                    self._release_terminal(stopped.lease)
-            else:
-                self.handoff_after_normal_stop(stopped.lease)
+            self._handle_stop(stopped)
             return True
         except LeaseLost:
             raise
         except ExportError as error:
-            current = ExportJob.objects.using(self.using).get(
-                pk=error.lease.job_id,
-            )
-            if current.state in TERMINAL_STATES:
-                if current.lease_uuid is not None:
-                    self._release_terminal(error.lease)
-            else:
-                self.fail_job(error.lease, error.code)
+            self._handle_export_error(error)
             return True
 
     def _run_once_active(self, stop_requested):  # noqa: C901
@@ -2509,26 +3014,12 @@ class ExportWorker(object):
             self._dispatch_claim(lease, stop_requested, mode)
             return True
         except StopRequested as stopped:
-            current = ExportJob.objects.using(self.using).get(
-                pk=stopped.lease.job_id,
-            )
-            if current.state in TERMINAL_STATES:
-                if current.lease_uuid is not None:
-                    self._release_terminal(stopped.lease)
-            else:
-                self.handoff_after_normal_stop(stopped.lease)
+            self._handle_stop(stopped)
             return True
         except LeaseLost:
             raise
         except ExportError as error:
-            current = ExportJob.objects.using(self.using).get(
-                pk=error.lease.job_id,
-            )
-            if current.state in TERMINAL_STATES:
-                if current.lease_uuid is not None:
-                    self._release_terminal(error.lease)
-            else:
-                self.fail_job(error.lease, error.code)
+            self._handle_export_error(error)
             return True
 
     def run(self, stop_requested):
@@ -2615,8 +3106,12 @@ class ExportWorker(object):
             return
         now = self.clock()
 
-        def record():
-            with _worker_write_fence(self.using, self.monotonic):
+        def record(operation_deadline):
+            with _worker_write_fence(
+                self.using,
+                self.monotonic,
+                operation_deadline=operation_deadline,
+            ):
                 values = {
                     "health_state": "failed",
                     "error_code": "export_storage_unsafe",
