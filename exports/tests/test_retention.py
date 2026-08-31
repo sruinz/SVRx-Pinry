@@ -9,10 +9,12 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 import mock
 
+from core.services.database_fence import DatabaseFenceBusy
 from exports.models import ExportJob
 from exports.services.file_ops import ClosedFileReceipt, ExportStorageError
 from exports.services.jobs import ExportRequestError, JobService
 from exports.services.worker import (
+    ExportWorker,
     LeaseHeartbeat,
     acquire_worker_lease,
     cleanup_expired_and_stale,
@@ -172,6 +174,43 @@ class RetentionTests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(job.ready_cleanup_state, "pending")
         self.assertFalse(outcome.claim_allowed)
 
+    def test_ready_cleanup_busy_retries_after_receipted_unlink(self):
+        job, path = self._complete(self.owner, self.now)
+        job.state = "expired"
+        job.ready_cleanup_state = "pending"
+        job.save(update_fields=("state", "ready_cleanup_state"))
+        worker = acquire_worker_lease(self.now)
+        heartbeat = LeaseHeartbeat(worker, clock=lambda: self.now)
+        original_save = ExportJob.save
+        busy = [False]
+        sleeps = []
+
+        def busy_once(instance, *args, **kwargs):
+            if (
+                instance.pk == job.pk
+                and instance.ready_cleanup_state == "cleaned"
+                and not busy[0]
+            ):
+                busy[0] = True
+                raise DatabaseFenceBusy()
+            return original_save(instance, *args, **kwargs)
+
+        with mock.patch.object(ExportJob, "save", new=busy_once):
+            outcome = cleanup_expired_and_stale(
+                worker,
+                heartbeat,
+                lambda: False,
+                now=self.now,
+                sleeper=lambda seconds: sleeps.append(seconds),
+            )
+
+        job.refresh_from_db()
+        self.assertTrue(busy[0])
+        self.assertEqual(sleeps, [0.01])
+        self.assertTrue(outcome.did_work)
+        self.assertFalse(path.exists())
+        self.assertEqual(job.ready_cleanup_state, "cleaned")
+
     def test_pending_cleanup_runs_before_active_claim_and_preserves_three_rows(self):
         expired, path = self._complete(self.owner, self.now)
         expired.state = "expired"
@@ -228,6 +267,43 @@ class RetentionTests(ExportStorageMixin, TransactionTestCase):
                 self.now,
             )
         self.assertEqual(raised.exception.code, "export_storage_unsafe")
+
+    def test_actual_second_success_allows_c_then_three_rows_reject_d(self):
+        staging = Path(settings.PINRY_EXPORT_ROOT, ".staging")
+        staging.mkdir(mode=0o700)
+        os.chmod(str(staging), 0o700)
+        service = JobService(available_space_observer=lambda: 10 ** 12)
+        worker = ExportWorker(clock=lambda: self.now)
+        worker.worker_token = worker.acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+        )
+        request = {"scope": "pins", "pin_ids": [self.pin.pk]}
+        first = service.create(self.owner, request, self.now)
+        with mock.patch("exports.services.file_ops._normalize_metadata"):
+            self.assertTrue(worker.run_once(lambda: False))
+        first.refresh_from_db()
+        self.assertEqual(first.state, "complete")
+
+        second = service.create(self.owner, request, self.now)
+        with mock.patch("exports.services.file_ops._normalize_metadata"):
+            self.assertTrue(worker.run_once(lambda: False))
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.state, "expired")
+        self.assertEqual(first.ready_cleanup_state, "pending")
+        self.assertEqual(second.state, "complete")
+        third = service.create(self.owner, request, self.now)
+        self.assertEqual(third.state, "queued")
+        with self.assertRaises(ExportRequestError) as raised:
+            service.create(self.owner, request, self.now)
+
+        self.assertEqual(raised.exception.code, "export_storage_unsafe")
+        self.assertEqual(ExportJob.objects.filter(owner=self.owner).count(), 3)
+        first.refresh_from_db()
+        self.assertEqual(first.ready_cleanup_state, "pending")
 
     def test_owner_bound_cleaned_failure_is_preserved_but_orphan_is_deleted(self):
         kept = ExportJob.objects.create(

@@ -3,6 +3,7 @@ from datetime import timedelta
 import hashlib
 import os
 from pathlib import Path
+import threading
 import uuid
 
 from django.conf import settings
@@ -11,6 +12,7 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 import mock
 
+from core.services.database_fence import DatabaseFenceBusy
 from exports.contracts import ERROR_CONTRACTS, LeaseToken, StopRequested
 from exports.models import (
     ExportAttempt,
@@ -41,11 +43,12 @@ from exports.services.snapshot import (
     snapshot_directory_name,
 )
 
-from .helpers import ExportStorageMixin, create_export_user
+from .helpers import ExportStorageMixin, create_export_pin, create_export_user
 
 
-class WorkerRecoveryTests(TransactionTestCase):
+class WorkerRecoveryTests(ExportStorageMixin, TransactionTestCase):
     def setUp(self):
+        super(WorkerRecoveryTests, self).setUp()
         self.now = timezone.now()
         self.owner = create_export_user("worker-recovery-owner")
 
@@ -72,6 +75,176 @@ class WorkerRecoveryTests(TransactionTestCase):
             defaults={"current_job": job},
         )
         return job
+
+    def _assert_fourth_takeover_preserves_file_receipt(
+        self,
+        kind,
+        state,
+        force_invalid=False,
+    ):
+        old_worker_uuid = uuid.uuid4()
+        old_job_uuid = uuid.uuid4()
+        ExportWorkerLease.objects.create(
+            pk=1,
+            generation=8,
+            lease_uuid=old_worker_uuid,
+        )
+        job = self._active_job(
+            worker_generation=8,
+            lease_uuid=old_job_uuid,
+            resume_count=3,
+        )
+        staging = Path(settings.PINRY_EXPORT_ROOT, ".staging")
+        staging.mkdir(mode=0o700)
+        os.chmod(str(staging), 0o700)
+        relative = "attempt-{}-0".format(job.pk)
+        directory = staging / relative
+        directory.mkdir(mode=0o700)
+        os.chmod(str(directory), 0o700)
+        directory_stat = directory.stat()
+        path = directory / "archive.zip.part"
+        content = "{}-{}".format(kind, state).encode("ascii")
+        path.write_bytes(content)
+        os.chmod(str(path), 0o600)
+        descriptor = os.open(str(path), os.O_RDONLY)
+        try:
+            opened = OpenFileReceipt.from_fd(
+                descriptor,
+                os.getuid(),
+                os.getgid(),
+            )
+            receipt = ClosedFileReceipt.from_open_fd(
+                descriptor,
+                opened,
+                hashlib.sha256(content).hexdigest(),
+            )
+        finally:
+            os.close(descriptor)
+        attempt = ExportAttempt.objects.create(
+            job=job,
+            attempt_generation=0,
+            lease_uuid=old_job_uuid,
+            state="writing",
+            relative_path=relative,
+            dir_dev=directory_stat.st_dev,
+            dir_ino=directory_stat.st_ino,
+            dir_uid=directory_stat.st_uid,
+            dir_gid=directory_stat.st_gid,
+            dir_mode=0o700,
+        )
+        intent = None
+        if state == "publishing":
+            intent = "ready/{}.zip".format(job.pk)
+        elif kind == "quarantine" and state == "writing":
+            intent = "{}/quarantine.zip".format(relative)
+        values = {
+            "attempt": attempt,
+            "kind": kind,
+            "state": state,
+            "receipt_level": "full",
+            "relative_path": "{}/{}".format(relative, path.name),
+            "intent_relative_path": intent,
+            "receipt_dev": receipt.dev,
+            "receipt_ino": receipt.ino,
+            "receipt_uid": receipt.uid,
+            "receipt_gid": receipt.gid,
+            "receipt_mode": receipt.mode,
+            "receipt_nlink": receipt.nlink,
+            "receipt_size": receipt.size,
+            "receipt_mtime_ns": receipt.mtime_ns,
+            "receipt_ctime_ns": receipt.ctime_ns,
+            "receipt_sha256": receipt.sha256,
+        }
+        if force_invalid:
+            with connection.cursor() as cursor:
+                cursor.execute("PRAGMA ignore_check_constraints = ON")
+            try:
+                attempt_file = ExportAttemptFile.objects.create(**values)
+            finally:
+                with connection.cursor() as cursor:
+                    cursor.execute("PRAGMA ignore_check_constraints = OFF")
+        else:
+            attempt_file = ExportAttemptFile.objects.create(**values)
+        expected = (
+            attempt_file.relative_path,
+            attempt_file.intent_relative_path,
+            attempt_file.receipt_dev,
+            attempt_file.receipt_ino,
+            attempt_file.receipt_level,
+            attempt_file.receipt_sha256,
+        )
+        worker = ExportWorker(clock=lambda: self.now)
+        worker.worker_token = acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+        )
+
+        self.assertTrue(worker.run_once(lambda: False))
+
+        job.refresh_from_db()
+        attempt_file.refresh_from_db()
+        actual = (
+            attempt_file.relative_path,
+            attempt_file.intent_relative_path,
+            attempt_file.receipt_dev,
+            attempt_file.receipt_ino,
+            attempt_file.receipt_level,
+            attempt_file.receipt_sha256,
+        )
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.error_code, "worker_repeated_failure")
+        self.assertEqual(job.staging_cleanup_state, "pending")
+        self.assertEqual(
+            attempt_file.state,
+            state if kind == "quarantine" else "retiring",
+        )
+        self.assertEqual(actual, expected)
+        self.assertTrue(path.exists())
+        self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(path.stat().st_dev, receipt.dev)
+        self.assertEqual(path.stat().st_ino, receipt.ino)
+        self.assertIsNone(worker.heartbeat.current_job_token)
+
+    def test_fourth_archive_writing_takeover_preserves_receipt(self):
+        self._assert_fourth_takeover_preserves_file_receipt(
+            "archive", "writing",
+        )
+
+    def test_fourth_archive_closed_takeover_preserves_receipt(self):
+        self._assert_fourth_takeover_preserves_file_receipt(
+            "archive", "closed",
+        )
+
+    def test_fourth_archive_publishing_takeover_preserves_receipt(self):
+        self._assert_fourth_takeover_preserves_file_receipt(
+            "archive", "publishing",
+        )
+
+    def test_fourth_archive_ready_candidate_takeover_preserves_receipt(self):
+        self._assert_fourth_takeover_preserves_file_receipt(
+            "archive", "ready_candidate",
+        )
+
+    def test_fourth_quarantine_writing_takeover_preserves_receipt(self):
+        self._assert_fourth_takeover_preserves_file_receipt(
+            "quarantine", "writing",
+        )
+
+    def test_fourth_quarantine_closed_takeover_preserves_receipt(self):
+        self._assert_fourth_takeover_preserves_file_receipt(
+            "quarantine", "closed",
+        )
+
+    def test_invalid_quarantine_publishing_takeover_fails_closed(self):
+        self._assert_fourth_takeover_preserves_file_receipt(
+            "quarantine", "publishing", force_invalid=True,
+        )
+
+    def test_invalid_quarantine_ready_candidate_takeover_fails_closed(self):
+        self._assert_fourth_takeover_preserves_file_receipt(
+            "quarantine", "ready_candidate", force_invalid=True,
+        )
 
     def test_old_generation_future_expiry_is_abnormal_retiring_takeover(self):
         old_worker_uuid = uuid.uuid4()
@@ -734,6 +907,74 @@ class WorkerRecoveryTests(TransactionTestCase):
         self.assertIsNone(worker.heartbeat.current_job_token)
         worker.claim_next_job.assert_not_called()
 
+    def test_owner_null_active_states_terminalize_one_per_worker_loop(self):
+        jobs = []
+        for state in ("queued", "snapshotting", "archiving", "verifying"):
+            owner = create_export_user("worker-owner-null-{}".format(state))
+            job = ExportJob.objects.create(
+                owner=owner,
+                scope="pins",
+                state=state,
+                requested_total=1,
+                target_total=1,
+                included_total=1,
+                archive_total=1,
+                bytes_total=7,
+            )
+            owner.delete()
+            jobs.append(job)
+        worker = ExportWorker(clock=lambda: self.now)
+        worker.worker_token = acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+        )
+
+        for expected_count in range(1, 5):
+            self.assertTrue(worker.run_once(lambda: False))
+            self.assertEqual(
+                ExportJob.objects.filter(
+                    pk__in=[job.pk for job in jobs],
+                    state="failed",
+                    error_code="permission_changed",
+                ).count(),
+                expected_count,
+            )
+
+        self.assertIsNone(worker.heartbeat.current_job_token)
+
+    def test_owner_delete_after_clean_handoff_terminalizes_on_next_loop(self):
+        owner = create_export_user("worker-owner-after-handoff")
+        job = ExportJob.objects.create(
+            owner=owner,
+            scope="pins",
+            state="queued",
+            requested_total=1,
+            target_total=1,
+            included_total=1,
+        )
+        worker = ExportWorker(clock=lambda: self.now)
+        worker.worker_token = acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: self.now,
+        )
+        lease = worker.claim_next_job(
+            worker.worker_token,
+            worker.heartbeat,
+            self.now,
+        )
+
+        handoff_after_normal_stop(lease, worker.heartbeat, self.now)
+        owner.delete()
+        self.assertTrue(worker.run_once(lambda: False))
+
+        job.refresh_from_db()
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.error_code, "permission_changed")
+        self.assertIsNone(job.lease_uuid)
+        self.assertIsNone(worker.heartbeat.current_job_token)
+
     def test_stop_during_complete_maintenance_releases_terminal_lease(self):
         old_worker_uuid = uuid.uuid4()
         old_job_uuid = uuid.uuid4()
@@ -976,6 +1217,33 @@ class TerminalCleanupTests(ExportStorageMixin, TransactionTestCase):
         attempt_file.receipt_level = "full"
         attempt_file.save()
 
+    @staticmethod
+    def _set_quarantine_open_receipt(attempt_file, source, intent_relative):
+        descriptor = os.open(str(source), os.O_RDONLY)
+        try:
+            receipt = OpenFileReceipt.from_fd(
+                descriptor,
+                os.getuid(),
+                os.getgid(),
+            )
+        finally:
+            os.close(descriptor)
+        attempt_file.kind = "quarantine"
+        attempt_file.state = "writing"
+        attempt_file.receipt_level = "open"
+        attempt_file.intent_relative_path = intent_relative
+        attempt_file.receipt_dev = receipt.dev
+        attempt_file.receipt_ino = receipt.ino
+        attempt_file.receipt_uid = receipt.uid
+        attempt_file.receipt_gid = receipt.gid
+        attempt_file.receipt_mode = receipt.mode
+        attempt_file.receipt_nlink = receipt.nlink
+        attempt_file.receipt_size = None
+        attempt_file.receipt_mtime_ns = None
+        attempt_file.receipt_ctime_ns = None
+        attempt_file.receipt_sha256 = None
+        attempt_file.save()
+
     def test_terminal_cleanup_unlinks_then_cas_and_finishes_in_batches(self):
         job, attempt, attempt_file, path, directory = self._fixture()
         token, heartbeat = self._worker()
@@ -1020,6 +1288,112 @@ class TerminalCleanupTests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(job.staging_cleanup_state, "cleaned")
         self.assertTrue(final.claim_allowed)
 
+    def test_virtual_45_second_unlink_allows_heartbeat_writer_and_stop(self):
+        job, attempt, attempt_file, path, directory = self._fixture()
+        queued = ExportJob.objects.create(
+            owner=self.owner,
+            scope="pins",
+            state="queued",
+            requested_total=1,
+            target_total=1,
+            included_total=1,
+        )
+        wall = [self.now]
+        stop = threading.Event()
+        stop_observed = threading.Event()
+        entered = threading.Event()
+        release = threading.Event()
+        renewed = threading.Event()
+        errors = []
+        results = []
+        worker = ExportWorker(clock=lambda: wall[0])
+        worker.worker_token = acquire_worker_lease(self.now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: wall[0],
+            interval=0.01,
+        )
+        original_renew = worker.heartbeat._renew
+
+        def tracked_renew(token, now):
+            result = original_renew(token, now)
+            if now >= self.now + timedelta(seconds=45):
+                renewed.set()
+            return result
+
+        worker.heartbeat._renew = tracked_renew
+        from exports.services import worker as worker_services
+        original_remove = worker_services.remove_if_receipt_matches
+
+        def blocked_remove(*args, **kwargs):
+            entered.set()
+            self.assertTrue(
+                release.wait(5),
+                "가상 NAS 장벽 해제 신호를 받지 못했습니다.",
+            )
+            return original_remove(*args, **kwargs)
+
+        def run_once():
+            try:
+                def stop_requested():
+                    requested = stop.is_set()
+                    if requested:
+                        stop_observed.set()
+                    return requested
+
+                results.append(worker.run_once(stop_requested))
+            except Exception as error:  # pragma: no cover - assertion aid
+                errors.append(error)
+
+        worker.heartbeat.start()
+        thread = threading.Thread(target=run_once)
+        try:
+            with mock.patch(
+                "exports.services.worker.remove_if_receipt_matches",
+                side_effect=blocked_remove,
+            ):
+                thread.start()
+                self.assertTrue(
+                    entered.wait(5),
+                    "가상 NAS syscall 장벽에 진입하지 못했습니다.",
+                )
+                wall[0] = self.now + timedelta(seconds=45)
+                pin = create_export_pin(
+                    self.owner,
+                    filename="writer-during-unlink.png",
+                )
+                self.assertTrue(
+                    renewed.wait(5),
+                    "가상 45초 뒤 heartbeat가 진행되지 않았습니다.",
+                )
+                stop.set()
+                release.set()
+                thread.join(5)
+        finally:
+            release.set()
+            worker.heartbeat.close()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive(), "worker thread가 종료되지 않았습니다.")
+
+        job.refresh_from_db()
+        attempt.refresh_from_db()
+        attempt_file.refresh_from_db()
+        queued.refresh_from_db()
+        pin.refresh_from_db()
+        worker_row = ExportWorkerLease.objects.get(pk=1)
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [True])
+        self.assertTrue(stop_observed.is_set())
+        self.assertFalse(path.exists())
+        self.assertTrue(directory.exists())
+        self.assertEqual(attempt_file.state, "cleaned")
+        self.assertEqual(attempt.state, "retiring")
+        self.assertEqual(job.staging_cleanup_state, "pending")
+        self.assertEqual(queued.state, "queued")
+        self.assertGreaterEqual(worker_row.heartbeat_at, wall[0])
+        self.assertTrue(pin.pk)
+
     def test_terminal_snapshot_cleanup_persists_one_blob_per_step(self):
         job, blobs, paths, directory = self._snapshot_fixture()
         token, heartbeat = self._worker()
@@ -1035,6 +1409,122 @@ class TerminalCleanupTests(ExportStorageMixin, TransactionTestCase):
         self.assertTrue(directory.exists())
         self.assertIsNotNone(job.snapshot_generation)
         self.assertFalse(outcome.claim_allowed)
+
+    def test_attempt_cleanup_busy_retries_after_releasing_guard(self):
+        job, unused_attempt, attempt_file, path, unused_directory = self._fixture()
+        del unused_attempt, unused_directory
+        token, heartbeat = self._worker()
+        original_save = ExportAttemptFile.save
+        busy = [False]
+        sleeps = []
+
+        def busy_once(instance, *args, **kwargs):
+            if instance.pk == attempt_file.pk and not busy[0]:
+                busy[0] = True
+                raise DatabaseFenceBusy()
+            return original_save(instance, *args, **kwargs)
+
+        def retry_sleep(seconds):
+            sleeps.append(seconds)
+            self.assertFalse(connection.in_atomic_block)
+            finished = threading.Event()
+            errors = []
+
+            def tick():
+                try:
+                    heartbeat.tick()
+                except Exception as error:  # pragma: no cover - assertion aid
+                    errors.append(error)
+                finally:
+                    finished.set()
+
+            thread = threading.Thread(target=tick)
+            thread.start()
+            self.assertTrue(finished.wait(1))
+            thread.join(1)
+            self.assertEqual(errors, [])
+
+        with mock.patch.object(ExportAttemptFile, "save", new=busy_once):
+            outcome = cleanup_expired_and_stale(
+                token,
+                heartbeat,
+                lambda: False,
+                now=self.now,
+                sleeper=retry_sleep,
+            )
+
+        job.refresh_from_db()
+        attempt_file.refresh_from_db()
+        self.assertTrue(busy[0])
+        self.assertEqual(sleeps, [0.01])
+        self.assertFalse(path.exists())
+        self.assertEqual(attempt_file.state, "cleaned")
+        self.assertFalse(outcome.claim_allowed)
+
+    def test_snapshot_cleanup_busy_retries_after_receipted_unlink(self):
+        job, blobs, paths, unused_directory = self._snapshot_fixture(count=1)
+        del unused_directory
+        token, heartbeat = self._worker()
+        original_save = ExportBlob.save
+        busy = [False]
+        sleeps = []
+
+        def busy_once(instance, *args, **kwargs):
+            if instance.pk == blobs[0].pk and not busy[0]:
+                busy[0] = True
+                raise DatabaseFenceBusy()
+            return original_save(instance, *args, **kwargs)
+
+        with mock.patch.object(ExportBlob, "save", new=busy_once):
+            cleanup_expired_and_stale(
+                token,
+                heartbeat,
+                lambda: False,
+                now=self.now,
+                sleeper=lambda seconds: sleeps.append(seconds),
+            )
+
+        blobs[0].refresh_from_db()
+        self.assertTrue(busy[0])
+        self.assertEqual(sleeps, [0.01])
+        self.assertFalse(paths[0].exists())
+        self.assertEqual(blobs[0].cleanup_state, "cleaned")
+
+    def test_orphan_delete_busy_retries_without_leaking_from_worker(self):
+        orphan = ExportJob.objects.create(
+            owner=None,
+            scope="pins",
+            state="failed",
+            error_code="archive_failed",
+            error_class="retryable",
+            error_retryable=True,
+            staging_cleanup_state="cleaned",
+            ready_cleanup_state="absent",
+        )
+        token, heartbeat = self._worker()
+        original_delete = ExportJob.delete
+        busy = [False]
+        sleeps = []
+
+        def busy_once(instance, *args, **kwargs):
+            if instance.pk == orphan.pk and not busy[0]:
+                busy[0] = True
+                raise DatabaseFenceBusy()
+            return original_delete(instance, *args, **kwargs)
+
+        with mock.patch.object(ExportJob, "delete", new=busy_once):
+            outcome = cleanup_expired_and_stale(
+                token,
+                heartbeat,
+                lambda: False,
+                now=self.now,
+                sleeper=lambda seconds: sleeps.append(seconds),
+            )
+
+        self.assertTrue(busy[0])
+        self.assertEqual(sleeps, [0.01])
+        self.assertTrue(outcome.did_work)
+        self.assertFalse(ExportJob.objects.filter(pk=orphan.pk).exists())
 
     def test_terminal_cleanup_transient_unlink_failure_stays_pending(self):
         job, attempt, attempt_file, path, unused_directory = self._fixture()
@@ -1164,3 +1654,44 @@ class TerminalCleanupTests(ExportStorageMixin, TransactionTestCase):
         self.assertIsNotNone(attempt_file.receipt_size)
         self.assertIsNotNone(attempt_file.receipt_ctime_ns)
         self.assertFalse(first.claim_allowed)
+
+    def test_quarantine_matching_source_and_foreign_intent_blocks_both(self):
+        job, attempt, attempt_file, source, directory = self._fixture()
+        intent = directory / "quarantine.zip"
+        intent.write_bytes(b"foreign intent")
+        os.chmod(str(intent), 0o600)
+        relative = "{}/{}".format(attempt.relative_path, intent.name)
+        self._set_quarantine_open_receipt(attempt_file, source, relative)
+        token, heartbeat = self._worker()
+
+        outcome = self._cleanup(token, heartbeat)
+
+        job.refresh_from_db()
+        attempt_file.refresh_from_db()
+        self.assertTrue(source.exists())
+        self.assertTrue(intent.exists())
+        self.assertEqual(job.staging_cleanup_state, "blocked")
+        self.assertEqual(attempt_file.state, "writing")
+        self.assertEqual(attempt_file.intent_relative_path, relative)
+        self.assertFalse(outcome.claim_allowed)
+
+    def test_quarantine_matching_intent_and_foreign_source_blocks_both(self):
+        job, attempt, attempt_file, source, directory = self._fixture()
+        intent = directory / "quarantine.zip"
+        os.replace(str(source), str(intent))
+        source.write_bytes(b"foreign source")
+        os.chmod(str(source), 0o600)
+        relative = "{}/{}".format(attempt.relative_path, intent.name)
+        self._set_quarantine_open_receipt(attempt_file, intent, relative)
+        token, heartbeat = self._worker()
+
+        outcome = self._cleanup(token, heartbeat)
+
+        job.refresh_from_db()
+        attempt_file.refresh_from_db()
+        self.assertTrue(source.exists())
+        self.assertTrue(intent.exists())
+        self.assertEqual(job.staging_cleanup_state, "blocked")
+        self.assertEqual(attempt_file.state, "writing")
+        self.assertEqual(attempt_file.intent_relative_path, relative)
+        self.assertFalse(outcome.claim_allowed)

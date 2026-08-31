@@ -63,6 +63,7 @@ from exports.services.snapshot import (
 WORKER_LEASE_SECONDS = 30
 HEARTBEAT_INTERVAL_SECONDS = 5
 DATABASE_FENCE_MAX_SECONDS = 5
+DATABASE_RETRY_MAX_SECONDS = 15
 WORKER_HEALTH_STALE_SECONDS = 15
 IDLE_WAIT_SECONDS = 1
 MAX_ABNORMAL_RESUMES = 3
@@ -86,6 +87,10 @@ class _CleanupBlocked(ExportStorageError):
 
 
 class _HeartbeatFailed(Exception):
+    pass
+
+
+class _DatabaseRetryStopped(Exception):
     pass
 
 
@@ -130,10 +135,15 @@ def _database_error_is_busy(error):
     )
 
 
-def _retry_database(operation, monotonic=None, sleeper=None):
+def _retry_database(
+    operation,
+    monotonic=None,
+    sleeper=None,
+    retry_checkpoint=None,
+):
     monotonic = time.monotonic if monotonic is None else monotonic
     sleeper = time.sleep if sleeper is None else sleeper
-    deadline = monotonic() + DATABASE_FENCE_MAX_SECONDS
+    deadline = monotonic() + DATABASE_RETRY_MAX_SECONDS
     while True:
         try:
             return operation()
@@ -142,9 +152,33 @@ def _retry_database(operation, monotonic=None, sleeper=None):
         except DatabaseError as error:
             if not _database_error_is_busy(error):
                 raise
+        if retry_checkpoint is not None:
+            retry_checkpoint()
         if monotonic() >= deadline:
             raise DatabaseFenceBusy()
         sleeper(0.01)
+
+
+def _retry_control(heartbeat, stop_requested=None, lease=None):
+    def checkpoint():
+        if heartbeat.lost is not None:
+            raise heartbeat.lost
+        if heartbeat.fatal is not None:
+            raise _HeartbeatFailed()
+        if stop_requested is not None and stop_requested():
+            raise _DatabaseRetryStopped()
+        if lease is None:
+            heartbeat.renew_worker_now()
+        else:
+            heartbeat.renew_now(lease)
+        if heartbeat.lost is not None:
+            raise heartbeat.lost
+        if heartbeat.fatal is not None:
+            raise _HeartbeatFailed()
+        if stop_requested is not None and stop_requested():
+            raise _DatabaseRetryStopped()
+
+    return checkpoint
 
 
 def _worker_expiry(now):
@@ -404,12 +438,14 @@ def claim_next_job(
     using="default",
     monotonic=None,
     sleeper=None,
+    stop_requested=None,
 ):
     if heartbeat.current_job_token is not None:
         return None
-    with heartbeat.job_token_transition(None) as transition:
-        with heartbeat.foreground_write_guard():
-            def claim():
+
+    def claim():
+        with heartbeat.job_token_transition(None) as transition:
+            with heartbeat.foreground_write_guard():
                 with _worker_write_fence(
                     using,
                     monotonic=monotonic,
@@ -459,16 +495,19 @@ def claim_next_job(
                         "lease_expires_at", "heartbeat_at", "progress_at",
                         "started_at",
                     ))
-                    return lease
+            if lease is not None:
+                transition.publish(lease)
+            return lease
 
-            lease = _retry_database(
-                claim,
-                monotonic=monotonic,
-                sleeper=sleeper,
-            )
-        if lease is not None:
-            transition.publish(lease)
-        return lease
+    return _retry_database(
+        claim,
+        monotonic=monotonic,
+        sleeper=sleeper,
+        retry_checkpoint=_retry_control(
+            heartbeat,
+            stop_requested=stop_requested,
+        ),
+    )
 
 
 def _takeover_kind(job, worker_lease):
@@ -547,10 +586,11 @@ def _claim_recovery(
     using="default",
     monotonic=None,
     sleeper=None,
+    stop_requested=None,
 ):
-    with heartbeat.job_token_transition(None) as transition:
-        with heartbeat.foreground_write_guard():
-            def claim():
+    def claim():
+        with heartbeat.job_token_transition(None) as transition:
+            with heartbeat.foreground_write_guard():
                 with _worker_write_fence(
                     using,
                     monotonic=monotonic,
@@ -613,16 +653,20 @@ def _claim_recovery(
                         "resume_count", "worker_generation", "lease_uuid",
                         "lease_expires_at", "heartbeat_at",
                     ))
-                    return RecoveryClaimOutcome(lease, False)
+                    outcome = RecoveryClaimOutcome(lease, False)
+            if outcome.lease is not None:
+                transition.publish(outcome.lease)
+            return outcome
 
-            outcome = _retry_database(
-                claim,
-                monotonic=monotonic,
-                sleeper=sleeper,
-            )
-        if outcome.lease is not None:
-            transition.publish(outcome.lease)
-        return outcome
+    return _retry_database(
+        claim,
+        monotonic=monotonic,
+        sleeper=sleeper,
+        retry_checkpoint=_retry_control(
+            heartbeat,
+            stop_requested=stop_requested,
+        ),
+    )
 
 
 def claim_retiring_recovery(
@@ -632,6 +676,7 @@ def claim_retiring_recovery(
     using="default",
     monotonic=None,
     sleeper=None,
+    stop_requested=None,
 ):
     return _claim_recovery(
         worker_lease,
@@ -642,6 +687,7 @@ def claim_retiring_recovery(
         using=using,
         monotonic=monotonic,
         sleeper=sleeper,
+        stop_requested=stop_requested,
     )
 
 
@@ -652,6 +698,7 @@ def claim_verifying_recovery(
     using="default",
     monotonic=None,
     sleeper=None,
+    stop_requested=None,
 ):
     return _claim_recovery(
         worker_lease,
@@ -662,6 +709,7 @@ def claim_verifying_recovery(
         using=using,
         monotonic=monotonic,
         sleeper=sleeper,
+        stop_requested=stop_requested,
     )
 
 
@@ -721,6 +769,7 @@ def requeue_expired_nonverifying_jobs(
     sleeper=None,
     checkpoint=None,
     write_guard=None,
+    retry_checkpoint=None,
 ):
     checkpoint = (lambda: None) if checkpoint is None else checkpoint
     write_guard = _passthrough_guard if write_guard is None else write_guard
@@ -839,6 +888,7 @@ def requeue_expired_nonverifying_jobs(
         requeue,
         monotonic=monotonic,
         sleeper=sleeper,
+        retry_checkpoint=retry_checkpoint,
     )
 
 
@@ -865,9 +915,10 @@ def handoff_after_normal_stop(
             lambda: heartbeat.renew_now(lease),
         )
         has_items = job.items.exists()
-    with heartbeat.job_token_transition(lease) as transition:
-        with heartbeat.foreground_write_guard():
-            def handoff():
+
+    def handoff():
+        with heartbeat.job_token_transition(lease) as transition:
+            with heartbeat.foreground_write_guard():
                 with _worker_write_fence(using, monotonic) as deadline:
                     current = lock_current_lease(lease, using=using)
                     if current.state in ("snapshotting", "archiving"):
@@ -897,13 +948,14 @@ def handoff_after_normal_stop(
                     current.lease_expires_at = None
                     current.heartbeat_at = now
                     current.save()
+            transition.clear()
 
-            _retry_database(
-                handoff,
-                monotonic=monotonic,
-                sleeper=sleeper,
-            )
-        transition.clear()
+    _retry_database(
+        handoff,
+        monotonic=monotonic,
+        sleeper=sleeper,
+        retry_checkpoint=_retry_control(heartbeat, lease=lease),
+    )
 
 
 def fail_job(
@@ -920,12 +972,13 @@ def fail_job(
         lease.worker_generation,
         lease.worker_lease_uuid,
     )
-    with heartbeat.job_token_transition(lease) as transition:
-        with heartbeat.foreground_write_guard():
-            def fail():
+
+    def fail():
+        with heartbeat.job_token_transition(lease) as transition:
+            with heartbeat.foreground_write_guard():
                 with _worker_write_fence(using, monotonic):
                     job = ExportJob.objects.using(using).get(pk=lease.job_id)
-                    return _fail_locked(
+                    failed = _fail_locked(
                         job,
                         error_code,
                         worker_token,
@@ -933,14 +986,15 @@ def fail_job(
                         now=now,
                         using=using,
                     )
+            transition.clear()
+            return failed
 
-            failed = _retry_database(
-                fail,
-                monotonic=monotonic,
-                sleeper=sleeper,
-            )
-        transition.clear()
-        return failed
+    return _retry_database(
+        fail,
+        monotonic=monotonic,
+        sleeper=sleeper,
+        retry_checkpoint=_retry_control(heartbeat, lease=lease),
+    )
 
 
 def claim_complete_maintenance(
@@ -950,60 +1004,65 @@ def claim_complete_maintenance(
     using="default",
     monotonic=None,
     sleeper=None,
+    stop_requested=None,
 ):
     if heartbeat.current_job_token is not None:
         raise LeaseLost()
 
     def claim():
-        with _worker_write_fence(using, monotonic):
-            lock_current_worker_lease(worker_lease, using=using)
-            candidates = ExportJob.objects.using(
-                using,
-            ).select_for_update().filter(
-                state="complete",
-            ).filter(
-                Q(staging_cleanup_state__in=("pending", "blocked"))
-                | Q(lease_uuid__isnull=False)
-            ).exclude(
-                staging_cleanup_state="blocked",
-            ).order_by("created_at", "id")
-            current = candidates.first()
-            if current is not None:
-                if (
-                    current.lease_uuid is not None
-                    and current.worker_generation
-                    == worker_lease.worker_generation
-                ):
+        with heartbeat.foreground_write_guard():
+            with _worker_write_fence(using, monotonic):
+                lock_current_worker_lease(worker_lease, using=using)
+                candidates = ExportJob.objects.using(
+                    using,
+                ).select_for_update().filter(
+                    state="complete",
+                ).filter(
+                    Q(staging_cleanup_state__in=("pending", "blocked"))
+                    | Q(lease_uuid__isnull=False)
+                ).exclude(
+                    staging_cleanup_state="blocked",
+                ).order_by("created_at", "id")
+                current = candidates.first()
+                if current is not None:
+                    if (
+                        current.lease_uuid is not None
+                        and current.worker_generation
+                        == worker_lease.worker_generation
+                    ):
+                        current.lease_expires_at = _worker_expiry(now)
+                        current.heartbeat_at = now
+                        current.save(update_fields=(
+                            "lease_expires_at", "heartbeat_at",
+                        ))
+                        return LeaseToken(
+                            worker_lease.worker_generation,
+                            worker_lease.worker_lease_uuid,
+                            current.pk,
+                            current.lease_uuid,
+                            current.attempt_generation,
+                        )
+                    lease = _new_job_token(worker_lease, current)
+                    current.worker_generation = worker_lease.worker_generation
+                    current.lease_uuid = lease.job_lease_uuid
                     current.lease_expires_at = _worker_expiry(now)
                     current.heartbeat_at = now
                     current.save(update_fields=(
-                        "lease_expires_at", "heartbeat_at",
+                        "worker_generation", "lease_uuid", "lease_expires_at",
+                        "heartbeat_at",
                     ))
-                    return LeaseToken(
-                        worker_lease.worker_generation,
-                        worker_lease.worker_lease_uuid,
-                        current.pk,
-                        current.lease_uuid,
-                        current.attempt_generation,
-                    )
-                lease = _new_job_token(worker_lease, current)
-                current.worker_generation = worker_lease.worker_generation
-                current.lease_uuid = lease.job_lease_uuid
-                current.lease_expires_at = _worker_expiry(now)
-                current.heartbeat_at = now
-                current.save(update_fields=(
-                    "worker_generation", "lease_uuid", "lease_expires_at",
-                    "heartbeat_at",
-                ))
-                return lease
-            return None
+                    return lease
+                return None
 
-    with heartbeat.foreground_write_guard():
-        return _retry_database(
-            claim,
-            monotonic=monotonic,
-            sleeper=sleeper,
-        )
+    return _retry_database(
+        claim,
+        monotonic=monotonic,
+        sleeper=sleeper,
+        retry_checkpoint=_retry_control(
+            heartbeat,
+            stop_requested=stop_requested,
+        ),
+    )
 
 
 def release_job_lease(
@@ -1018,9 +1077,10 @@ def release_job_lease(
     expected = heartbeat.current_job_token
     if expected not in (None, lease):
         raise LeaseLost()
-    with heartbeat.job_token_transition(expected) as transition:
-        with heartbeat.foreground_write_guard():
-            def release():
+
+    def release():
+        with heartbeat.job_token_transition(expected) as transition:
+            with heartbeat.foreground_write_guard():
                 with _worker_write_fence(using, monotonic):
                     current = lock_current_lease(lease, using=using)
                     current.lease_uuid = None
@@ -1029,14 +1089,15 @@ def release_job_lease(
                     current.save(update_fields=(
                         "lease_uuid", "lease_expires_at", "heartbeat_at",
                     ))
+            if expected is not None:
+                transition.clear()
 
-            _retry_database(
-                release,
-                monotonic=monotonic,
-                sleeper=sleeper,
-            )
-        if expected is not None:
-            transition.clear()
+    _retry_database(
+        release,
+        monotonic=monotonic,
+        sleeper=sleeper,
+        retry_checkpoint=_retry_control(heartbeat, lease=lease),
+    )
 
 
 def _ready_snapshot(job):
@@ -1974,13 +2035,15 @@ def _terminalize_ownerless_active(worker_lease, heartbeat, now, using):
             return True
 
 
-def cleanup_expired_and_stale(
+def _cleanup_expired_and_stale_once(
     worker_lease,
     heartbeat,
     stop_requested,
     now=None,
     using="default",
     archive_service=None,
+    monotonic=None,
+    sleeper=None,
 ):
     now = timezone.now() if now is None else now
     archive_service = archive_service or ArchiveService(using=using)
@@ -2001,6 +2064,9 @@ def cleanup_expired_and_stale(
         heartbeat,
         now,
         using=using,
+        monotonic=monotonic,
+        sleeper=sleeper,
+        stop_requested=stop_requested,
     )
     if complete_lease is not None:
         try:
@@ -2039,12 +2105,50 @@ def cleanup_expired_and_stale(
         return MaintenanceOutcome(did_work, False)
     if _cleanup_one_terminal_staging(worker_lease, heartbeat, using):
         did_work = True
+    if stop_requested is not None and stop_requested():
+        return MaintenanceOutcome(did_work, False)
     if _delete_clean_orphans(worker_lease, heartbeat, using):
         did_work = True
     return MaintenanceOutcome(
         did_work,
         _maintenance_claim_allowed(using),
     )
+
+
+def cleanup_expired_and_stale(
+    worker_lease,
+    heartbeat,
+    stop_requested,
+    now=None,
+    using="default",
+    archive_service=None,
+    monotonic=None,
+    sleeper=None,
+):
+    def maintain():
+        return _cleanup_expired_and_stale_once(
+            worker_lease,
+            heartbeat,
+            stop_requested,
+            now=now,
+            using=using,
+            archive_service=archive_service,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
+
+    try:
+        return _retry_database(
+            maintain,
+            monotonic=monotonic,
+            sleeper=sleeper,
+            retry_checkpoint=_retry_control(
+                heartbeat,
+                stop_requested=stop_requested,
+            ),
+        )
+    except _DatabaseRetryStopped:
+        return MaintenanceOutcome(False, False)
 
 
 def release_worker_lease(
@@ -2109,7 +2213,13 @@ class ExportWorker(object):
         )
         return self.worker_token
 
-    def claim_next_job(self, worker_lease, heartbeat, now):
+    def claim_next_job(
+        self,
+        worker_lease,
+        heartbeat,
+        now,
+        stop_requested=None,
+    ):
         return claim_next_job(
             worker_lease,
             heartbeat,
@@ -2117,9 +2227,16 @@ class ExportWorker(object):
             using=self.using,
             monotonic=self.monotonic,
             sleeper=self.sleeper,
+            stop_requested=stop_requested,
         )
 
-    def claim_retiring_recovery(self, worker_lease, heartbeat, now):
+    def claim_retiring_recovery(
+        self,
+        worker_lease,
+        heartbeat,
+        now,
+        stop_requested=None,
+    ):
         return claim_retiring_recovery(
             worker_lease,
             heartbeat,
@@ -2127,9 +2244,16 @@ class ExportWorker(object):
             using=self.using,
             monotonic=self.monotonic,
             sleeper=self.sleeper,
+            stop_requested=stop_requested,
         )
 
-    def claim_verifying_recovery(self, worker_lease, heartbeat, now):
+    def claim_verifying_recovery(
+        self,
+        worker_lease,
+        heartbeat,
+        now,
+        stop_requested=None,
+    ):
         return claim_verifying_recovery(
             worker_lease,
             heartbeat,
@@ -2137,17 +2261,28 @@ class ExportWorker(object):
             using=self.using,
             monotonic=self.monotonic,
             sleeper=self.sleeper,
+            stop_requested=stop_requested,
         )
 
-    def requeue_expired_nonverifying_jobs(self, worker_lease, now):
+    def requeue_expired_nonverifying_jobs(
+        self,
+        worker_lease,
+        now,
+        stop_requested=None,
+    ):
+        retry_checkpoint = _retry_control(
+            self.heartbeat,
+            stop_requested=stop_requested,
+        )
         return requeue_expired_nonverifying_jobs(
             worker_lease,
             now,
             using=self.using,
             monotonic=self.monotonic,
             sleeper=self.sleeper,
-            checkpoint=self.heartbeat.renew_worker_now,
+            checkpoint=retry_checkpoint,
             write_guard=self.heartbeat.foreground_write_guard,
+            retry_checkpoint=retry_checkpoint,
         )
 
     def cleanup_expired_and_stale(
@@ -2163,6 +2298,8 @@ class ExportWorker(object):
             now=self.clock(),
             using=self.using,
             archive_service=self.archive_service,
+            monotonic=self.monotonic,
+            sleeper=self.sleeper,
         )
 
     def handoff_after_normal_stop(self, lease):
@@ -2279,6 +2416,8 @@ class ExportWorker(object):
     def run_once(self, stop_requested):
         try:
             return self._run_once_active(stop_requested)
+        except _DatabaseRetryStopped:
+            return False
         except StopRequested as stopped:
             current = ExportJob.objects.using(self.using).get(
                 pk=stopped.lease.job_id,
@@ -2309,7 +2448,7 @@ class ExportWorker(object):
             self.heartbeat,
             stop_requested,
         )
-        if not maintenance.claim_allowed:
+        if maintenance.did_work or not maintenance.claim_allowed:
             return maintenance.did_work
         if stop_requested():
             return False
@@ -2319,6 +2458,7 @@ class ExportWorker(object):
                 self.worker_token,
                 self.heartbeat,
                 self.clock(),
+                stop_requested,
             )
             if claim.terminalized:
                 return True
@@ -2330,6 +2470,7 @@ class ExportWorker(object):
                     self.worker_token,
                     self.heartbeat,
                     self.clock(),
+                    stop_requested,
                 )
                 if claim.terminalized:
                     return True
@@ -2340,6 +2481,7 @@ class ExportWorker(object):
                 requeue = self.requeue_expired_nonverifying_jobs(
                     self.worker_token,
                     self.clock(),
+                    stop_requested,
                 )
                 if requeue.terminalized:
                     return True
@@ -2348,6 +2490,7 @@ class ExportWorker(object):
                     self.worker_token,
                     self.heartbeat,
                     self.clock(),
+                    stop_requested,
                 )
                 if claim.terminalized:
                     return True
@@ -2359,6 +2502,7 @@ class ExportWorker(object):
                     self.worker_token,
                     self.heartbeat,
                     self.clock(),
+                    stop_requested,
                 )
             if lease is None:
                 return maintenance.did_work
@@ -2430,6 +2574,9 @@ class ExportWorker(object):
             lost = True
             return 1
         except _HeartbeatFailed:
+            lost = True
+            return 1
+        except DatabaseFenceError:
             lost = True
             return 1
         except ExportStorageError as error:
