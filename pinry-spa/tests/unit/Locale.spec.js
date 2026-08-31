@@ -139,6 +139,51 @@ const EXPECTED_LOCALE_KEYS = [
   'emailPlaceholder',
   'end',
   'error404',
+  'exportActiveExists',
+  'exportAnnouncement',
+  'exportAsOf',
+  'exportBytesProgress',
+  'exportConfirm',
+  'exportContractError',
+  'exportCurrentTitle',
+  'exportDownload',
+  'exportEligibleTotal',
+  'exportEmpty',
+  'exportErrorCode',
+  'exportErrorGeneric',
+  'exportExcludedTotal',
+  'exportExpiresAt',
+  'exportHeartbeat',
+  'exportIncludedTotal',
+  'exportLoginAction',
+  'exportLoginRequired',
+  'exportOriginalBytes',
+  'exportOriginalFiles',
+  'exportOwnedPrivateTotal',
+  'exportPhase',
+  'exportPreviewLoading',
+  'exportPreviousTitle',
+  'exportProgress',
+  'exportProgressUnknown',
+  'exportRefresh',
+  'exportResumeCount',
+  'exportRetryableHint',
+  'exportStateArchiving',
+  'exportStateComplete',
+  'exportStateExpired',
+  'exportStateFailed',
+  'exportStateQueued',
+  'exportStateSnapshotting',
+  'exportStateVerifying',
+  'exportStatusTemporaryError',
+  'exportSubmitting',
+  'exportTitle',
+  'exportWorkerWaiting',
+  'exportZipBytes',
+  'exportsLink',
+  'exportsLoading',
+  'exportsNewJobHint',
+  'exportsTitle',
   'filterSelectCreateNewBoardButton',
   'filterSelectSelectBoardPlaceholder',
   'forMoreDetailsParagraph',
@@ -265,6 +310,17 @@ const REQUIRED_KOREAN_TEXT = {
   boardCoverSaved: '대표 이미지를 저장했습니다.',
   boardDeleteOnly: '보드만 삭제',
   boardDeleteWithExclusivePins: '보드와 전용 Pin {count}개 삭제',
+  exportContractError: '내보내기 상태 형식이 현재 화면과 맞지 않습니다. 잠시 후 다시 확인하세요.',
+  exportLoginRequired: '내보내기 상태를 보려면 로그인하세요.',
+  exportStateArchiving: '압축 중',
+  exportStateComplete: '완료',
+  exportStateExpired: '만료됨',
+  exportStateFailed: '실패',
+  exportStateQueued: '대기 중',
+  exportStateSnapshotting: '스냅숏 준비 중',
+  exportStateVerifying: '검증 중',
+  exportsLink: '내보내기',
+  exportsTitle: '내보내기',
 };
 
 
@@ -281,6 +337,15 @@ describe('Korean-first locale contract', () => {
 
   it('uses the approved Korean product copy', () => {
     expect(ko).toMatchObject(REQUIRED_KOREAN_TEXT);
+  });
+
+  it.each([
+    ['en', en], ['ko', ko], ['zh', zh], ['fr', fr],
+  ])('resolves every export key without a fallback key leak for %s', (name, locale) => {
+    EXPECTED_LOCALE_KEYS.filter(key => key.startsWith('export')).forEach((key) => {
+      expect(locale[key]).toEqual(expect.any(String));
+      expect(locale[key]).not.toBe(key);
+    });
   });
 
   it.each([
@@ -390,7 +455,7 @@ describe('Header locale and extension menus', () => {
     return { i18n, wrapper };
   }
 
-  it('renders My menu as Pin, boards, and profile with exact route params', async () => {
+  it('renders My menu as Pin, boards, exports, and profile with exact route params', async () => {
     const { wrapper } = mountHeader();
     await wrapper.setData({
       user: { loggedIn: true, meta: { username: 'owner' } },
@@ -400,6 +465,7 @@ describe('Header locale and extension menus', () => {
     expect([...menu.element.children].map(item => item.dataset.test)).toEqual([
       'my-pins-link',
       'my-boards-link',
+      'my-exports-link',
       'my-profile-link',
     ]);
     expect(wrapper.find('[data-test="my-pins-link"]').props('to')).toEqual({
@@ -407,6 +473,9 @@ describe('Header locale and extension menus', () => {
     });
     expect(wrapper.find('[data-test="my-boards-link"]').props('to')).toEqual({
       name: 'boards4user', params: { username: 'owner' },
+    });
+    expect(wrapper.find('[data-test="my-exports-link"]').props('to')).toEqual({
+      name: 'exports',
     });
     expect(wrapper.find('[data-test="my-profile-link"]').props('to')).toEqual({
       name: 'profile4user', params: { username: 'owner' },

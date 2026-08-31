@@ -60,6 +60,12 @@
                   {{ $t("boardsLink") }}
                 </router-link>
                 <router-link
+                  :to="{ name: 'exports' }"
+                  class="navbar-item"
+                  data-test="my-exports-link">
+                  {{ $t("exportsLink") }}
+                </router-link>
+                <router-link
                   :to="{ name: 'profile4user', params: {username: user.meta.username} }"
                   class="navbar-item"
                   data-test="my-profile-link">
