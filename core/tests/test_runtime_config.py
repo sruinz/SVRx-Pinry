@@ -2404,6 +2404,32 @@ class RuntimeConfigTests(unittest.TestCase):
             1,
         )
 
+    def test_runtime_image_normalizes_uploaded_context_permissions(self):
+        source = (REPOSITORY_ROOT / "Dockerfile.autobuild").read_text()
+        final_stage = source[source.rindex("FROM python:"):]
+        permission_step = (
+            "RUN chown -R root:root /pinry "
+            "/usr/share/licenses/svrx-pinry \\\n"
+            "    && find /pinry /usr/share/licenses/svrx-pinry "
+            "-type d -exec chmod 0755 {} + \\\n"
+            "    && find /pinry /usr/share/licenses/svrx-pinry "
+            "-type f -exec chmod 0644 {} + \\\n"
+            "    && chmod 0755 /pinry/docker/scripts/*.sh"
+        )
+
+        self.assertEqual(final_stage.count(permission_step), 1)
+        self.assertGreater(
+            final_stage.index(permission_step),
+            final_stage.index(
+                "COPY LICENSE.md NOTICE.md UPSTREAM.md "
+                "/usr/share/licenses/svrx-pinry/"
+            ),
+        )
+        self.assertLess(
+            final_stage.index(permission_step),
+            final_stage.index("CMD    [\"/pinry/docker/scripts/start.sh\"]"),
+        )
+
     def test_nginx_validator_rejects_duplicate_direct_batch_break(self):
         source = (
             REPOSITORY_ROOT / "docker/nginx/sites-enabled/default"

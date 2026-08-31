@@ -82,6 +82,7 @@ archive_path="${smoke_root}/export.zip"
 second_archive_path="${smoke_root}/export-recreated.zip"
 diagnostic_json="${smoke_root}/diagnostic.json"
 diagnostic_log="${smoke_root}/container.log"
+migration_status_json="${smoke_root}/migration-status.json"
 recovery_before_json="${smoke_root}/recovery-before.json"
 name_suffix="$(basename "${smoke_root}" | tr -c 'a-zA-Z0-9_.-' '-')-$$-${RANDOM}"
 run_token="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
@@ -95,6 +96,7 @@ active_container_id=""
 base_url=""
 csrf_token=""
 diagnosing=0
+startup_error_code=""
 started_at="$(date +%s)"
 host_uid="$(id -u)"
 host_gid="$(id -g)"
@@ -488,16 +490,45 @@ csrf_from_cookie_jar() {
         "${cookie_jar}"
 }
 
+read_startup_error_code() {
+    local code
+    code="$(curl --silent --show-error --connect-timeout 2 --max-time 5 \
+        --output "${migration_status_json}" --write-out '%{http_code}' \
+        "${base_url}/migration-status.json" 2>/dev/null || true)"
+    [ "${code}" = "200" ] || return 0
+    python3 - "${migration_status_json}" <<'PY' 2>/dev/null
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    payload = json.load(stream)
+if payload.get("state") != "failed":
+    raise SystemExit(0)
+error_code = payload.get("error_code")
+if type(error_code) is not str or re.fullmatch(
+    r"[a-z][a-z0-9_]{0,127}", error_code,
+) is None:
+    error_code = "migration_status_invalid"
+print(error_code)
+PY
+}
+
 wait_ready() {
     local timeout="$1"
     local deadline=$(( $(date +%s) + timeout ))
     local code
+    startup_error_code=""
     while [ "$(date +%s)" -lt "${deadline}" ]; do
         code="$(curl --silent --show-error --connect-timeout 2 --max-time 5 \
             --output /dev/null --write-out '%{http_code}' \
             "${base_url}/readyz" 2>/dev/null || true)"
         if [ "${code}" = "200" ]; then
             return 0
+        fi
+        startup_error_code="$(read_startup_error_code || true)"
+        if [ "${startup_error_code}" != "" ]; then
+            return 2
         fi
         sleep 1
     done
@@ -539,7 +570,14 @@ start_app() {
         ''|*[!0-9]*) fail 'export_smoke_port_lookup_failed' ;;
     esac
     base_url="http://127.0.0.1:${port}"
-    wait_ready 180 || fail 'export_smoke_ready_timeout'
+    if ! wait_ready 180; then
+        if [ "${startup_error_code}" != "" ]; then
+            printf 'export_smoke_startup_failed_code=%s\n' \
+                "${startup_error_code}" >&2
+            fail 'export_smoke_startup_failed'
+        fi
+        fail 'export_smoke_ready_timeout'
+    fi
 }
 
 initialize_csrf() {

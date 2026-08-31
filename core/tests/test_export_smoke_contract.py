@@ -17,6 +17,116 @@ RUNTIME_SMOKE = REPOSITORY_ROOT / "docker/tests/export_runtime_smoke.sh"
 
 
 class ExportSmokeContractTests(unittest.TestCase):
+    @staticmethod
+    def _shell_function(source, name):
+        match = re.search(
+            r"^{}\(\) \{{\n.*?^\}}\n".format(re.escape(name)),
+            source,
+            re.MULTILINE | re.DOTALL,
+        )
+        if match is None:
+            raise AssertionError("missing shell function: {}".format(name))
+        return match.group(0)
+
+    def _run_wait_ready_harness(
+        self,
+        payload,
+        ready_code="503",
+        migration_code="200",
+    ):
+        source = RUNTIME_SMOKE.read_text("utf-8")
+        functions = "\n".join((
+            self._shell_function(source, "read_startup_error_code"),
+            self._shell_function(source, "wait_ready"),
+        ))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload_path = root / "payload.json"
+            harness_path = root / "harness.sh"
+            payload_path.write_text(payload, encoding="utf-8")
+            harness_path.write_text(
+                "#!/bin/bash\n"
+                "set -euo pipefail\n"
+                "base_url=http://runtime-smoke.invalid\n"
+                "migration_status_json=\"$1/status.json\"\n"
+                "payload_source=\"$2\"\n"
+                "ready_code=\"$3\"\n"
+                "migration_code=\"$4\"\n"
+                "clock_file=\"$1/clock\"\n"
+                "calls_file=\"$1/calls\"\n"
+                "sleeps_file=\"$1/sleeps\"\n"
+                "startup_error_code=\n"
+                "printf '0\\n' > \"${clock_file}\"\n"
+                ": > \"${calls_file}\"\n"
+                ": > \"${sleeps_file}\"\n"
+                "date() {\n"
+                "    local value\n"
+                "    value=\"$(cat \"${clock_file}\")\"\n"
+                "    value=$((value + 1))\n"
+                "    printf '%s\\n' \"${value}\" > \"${clock_file}\"\n"
+                "    printf '%s\\n' \"${value}\"\n"
+                "}\n"
+                "sleep() { printf 'sleep\\n' >> \"${sleeps_file}\"; }\n"
+                "curl() {\n"
+                "    local argument\n"
+                "    local capture_output=0\n"
+                "    local output=\n"
+                "    local url=\n"
+                "    for argument in \"$@\"; do\n"
+                "        if [ \"${capture_output}\" -eq 1 ]; then\n"
+                "            output=\"${argument}\"\n"
+                "            capture_output=0\n"
+                "        elif [ \"${argument}\" = --output ]; then\n"
+                "            capture_output=1\n"
+                "        fi\n"
+                "        url=\"${argument}\"\n"
+                "    done\n"
+                "    printf '%s\\n' \"${url}\" >> \"${calls_file}\"\n"
+                "    case \"${url}\" in\n"
+                "        */readyz) printf '%s' \"${ready_code}\" ;;\n"
+                "        */migration-status.json)\n"
+                "            cp \"${payload_source}\" \"${output}\"\n"
+                "            printf '%s' \"${migration_code}\"\n"
+                "            ;;\n"
+                "        *) return 90 ;;\n"
+                "    esac\n"
+                "}\n"
+                + functions
+                + "\nif wait_ready 2; then\n"
+                "    wait_status=0\n"
+                "else\n"
+                "    wait_status=$?\n"
+                "fi\n"
+                "printf 'status=%s\\n' \"${wait_status}\"\n"
+                "printf 'error=%s\\n' \"${startup_error_code}\"\n"
+                "printf 'calls=%s\\n' \"$(wc -l < \"${calls_file}\" | tr -d ' ')\"\n"
+                "printf 'sleeps=%s\\n' \"$(wc -l < \"${sleeps_file}\" | tr -d ' ')\"\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(harness_path),
+                    str(root),
+                    str(payload_path),
+                    ready_code,
+                    migration_code,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2,
+            )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8", "replace"),
+        )
+        return dict(
+            line.split("=", 1)
+            for line in completed.stdout.decode("utf-8").splitlines()
+        )
+
     def test_fixture_bootstraps_project_imports_outside_cwd(self):
         source = "\n".join((
             "import importlib.util",
@@ -146,6 +256,85 @@ class ExportSmokeContractTests(unittest.TestCase):
             source,
         )
         self.assertNotIn("http_request POST '/api/v2/users/'", source)
+
+    def test_runtime_smoke_fails_fast_on_terminal_startup_status(self):
+        source = RUNTIME_SMOKE.read_text("utf-8")
+
+        self.assertIn(
+            '"${base_url}/migration-status.json"',
+            source,
+        )
+        self.assertIn(
+            'if [ "${startup_error_code}" != "" ]; then',
+            source,
+        )
+        self.assertIn(
+            "export_smoke_startup_failed_code=%s",
+            source,
+        )
+        self.assertIn(
+            "fail 'export_smoke_startup_failed'",
+            source,
+        )
+
+        cases = (
+            (
+                "ready",
+                '{"state":"migrating","error_code":null}',
+                "200",
+                "200",
+                {"status": "0", "error": "", "calls": "1", "sleeps": "0"},
+            ),
+            (
+                "failed",
+                '{"state":"failed","error_code":'
+                '"bootstrap_persistent_settings_invalid"}',
+                "503",
+                "200",
+                {
+                    "status": "2",
+                    "error": "bootstrap_persistent_settings_invalid",
+                    "calls": "2",
+                    "sleeps": "0",
+                },
+            ),
+            (
+                "unsafe-error-code",
+                '{"state":"failed","error_code":"unsafe-code"}',
+                "503",
+                "200",
+                {
+                    "status": "2",
+                    "error": "migration_status_invalid",
+                    "calls": "2",
+                    "sleeps": "0",
+                },
+            ),
+            (
+                "migrating",
+                '{"state":"migrating","error_code":null}',
+                "503",
+                "200",
+                {"status": "1", "error": "", "calls": "2", "sleeps": "1"},
+            ),
+            (
+                "status-unavailable",
+                "{}",
+                "503",
+                "503",
+                {"status": "1", "error": "", "calls": "2", "sleeps": "1"},
+            ),
+        )
+        for name, payload, ready_code, migration_code, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._run_wait_ready_harness(
+                        payload,
+                        ready_code=ready_code,
+                        migration_code=migration_code,
+                    ),
+                    expected,
+                )
 
 
 if __name__ == "__main__":
