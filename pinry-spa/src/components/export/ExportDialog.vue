@@ -70,8 +70,6 @@ import {
   validateExportPreview,
 } from './exportContract';
 
-const ACTIVE_STATES = ['queued', 'snapshotting', 'archiving', 'verifying'];
-
 function isPositiveSafeInteger(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
@@ -176,6 +174,7 @@ export default {
       try {
         const response = await API.Export.create(this.requestPayload);
         if (!this.isCurrent(sequence)) return;
+        if (!response || response.status !== 202) throw new Error('invalid_export_contract');
         validateExportCreate(response.data);
         this.navigateAndClose();
       } catch (error) {
@@ -184,10 +183,7 @@ export default {
           try {
             const latest = await API.Export.fetchLatest();
             if (!this.isCurrent(sequence)) return;
-            if (
-              !latest.latest_attempt
-              || !ACTIVE_STATES.includes(latest.latest_attempt.state)
-            ) throw new Error('invalid_export_contract');
+            if (!latest.latest_attempt) throw new Error('invalid_export_contract');
             this.$buefy.toast.open({
               message: this.$t('exportActiveExists'),
               type: 'is-info',

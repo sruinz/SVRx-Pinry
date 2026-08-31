@@ -192,7 +192,10 @@ describe('ExportDialog', () => {
     expect(API.Export.create).toHaveBeenCalledTimes(1);
     expect(API.Export.create).toHaveBeenCalledWith({ scope: 'pins', pin_ids: [9, 4] });
 
-    createRequest.resolve({ data: created({ target_total: 1, excluded_total: 2 }) });
+    createRequest.resolve({
+      status: 202,
+      data: created({ target_total: 1, excluded_total: 2 }),
+    });
     await settle();
 
     expect(wrapper.push).toHaveBeenCalledWith({ name: 'exports' });
@@ -201,9 +204,26 @@ describe('ExportDialog', () => {
     expect(wrapper.find('[data-test="export-final-counts"]').exists()).toBe(false);
   });
 
+  it('keeps a valid create body with HTTP 200 in the dialog as a safe error', async () => {
+    API.Export.preview.mockResolvedValue({ data: preview() });
+    API.Export.create.mockResolvedValue({ status: 200, data: created() });
+    const wrapper = mountDialog();
+    await settle();
+
+    await wrapper.find('[data-test="export-confirm"]').trigger('click');
+    await settle();
+
+    expect(wrapper.find('[data-test="export-error"]').text()).toBe('exportErrorGeneric');
+    expect(wrapper.push).not.toHaveBeenCalled();
+    expect(wrapper.close).not.toHaveBeenCalled();
+  });
+
   it('does not navigate when the create exact contract is invalid', async () => {
     API.Export.preview.mockResolvedValue({ data: preview() });
-    API.Export.create.mockResolvedValue({ data: { ...created(), debug_path: '/secret' } });
+    API.Export.create.mockResolvedValue({
+      status: 202,
+      data: { ...created(), debug_path: '/secret' },
+    });
     const wrapper = mountDialog();
     await settle();
 
@@ -257,6 +277,37 @@ describe('ExportDialog', () => {
     await settle();
 
     expect(API.Export.fetchLatest).toHaveBeenCalledTimes(1);
+    expect(wrapper.toast.open).toHaveBeenCalledWith({
+      message: 'exportActiveExists',
+      type: 'is-info',
+    });
+    expect(wrapper.push).toHaveBeenCalledWith({ name: 'exports' });
+    expect(wrapper.close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['complete', {
+      state: 'complete',
+      download_url: `/api/v2/exports/${JOB_ID}/download/`,
+    }],
+    ['failed', { state: 'failed' }],
+  ])('recovers a conflict after latest_attempt becomes %s', async (_state, overrides) => {
+    API.Export.preview.mockResolvedValue({ data: preview() });
+    API.Export.create.mockRejectedValue({
+      response: { status: 409, data: { code: 'active_export_exists' } },
+    });
+    API.Export.fetchLatest.mockResolvedValue({
+      schema_version: 1,
+      latest_attempt: job(overrides),
+      downloadable_job: null,
+    });
+    const wrapper = mountDialog();
+    await settle();
+
+    await wrapper.find('[data-test="export-confirm"]').trigger('click');
+    await settle();
+
+    expect(wrapper.find('[data-test="export-error"]').exists()).toBe(false);
     expect(wrapper.toast.open).toHaveBeenCalledWith({
       message: 'exportActiveExists',
       type: 'is-info',
@@ -359,7 +410,7 @@ describe('ExportDialog', () => {
     if (outcome === 'resolve') {
       let value = latest();
       if (phase === 'preview') value = { data: preview() };
-      if (phase === 'create') value = { data: created() };
+      if (phase === 'create') value = { status: 202, data: created() };
       pending.resolve(value);
     } else {
       pending.reject(new Error('/private/late-error'));
