@@ -30,7 +30,6 @@ smoke_root="$(mktemp -d "${smoke_parent%/}/svrx-pinry-export-postgres.XXXXXX")"
 name_suffix="$(basename "${smoke_root}" | tr -c 'a-zA-Z0-9_.-' '-')-$$-${RANDOM}"
 run_token="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 network_name="svrx-export-pg-net-${name_suffix}"
-volume_name="svrx-export-pg-data-${name_suffix}"
 postgres_container="svrx-export-pg-${name_suffix}"
 test_container="svrx-export-pg-test-${name_suffix}"
 database_name="pinry_export_smoke"
@@ -38,6 +37,7 @@ database_user="pinry_export_smoke"
 database_password="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
 test_log="${smoke_root}/tests.log"
 network_id=""
+volume_name=""
 volume_fingerprint=""
 postgres_container_id=""
 test_container_id=""
@@ -62,17 +62,10 @@ owned_network() {
 }
 
 current_volume_fingerprint() {
+    local current_name="$1"
     docker volume inspect --format \
-        '{{.Name}}|{{.CreatedAt}}|{{.Mountpoint}}|{{index .Labels "com.svrx.pinry.export-postgres.run"}}' \
-        "${volume_name}" 2>/dev/null
-}
-
-owned_volume() {
-    local current
-    [ -n "${volume_fingerprint}" ] || return 1
-    current="$(current_volume_fingerprint)" || return 1
-    [ "${current}" = "${volume_fingerprint}" ] \
-        && [ "${current##*|}" = "${run_token}" ]
+        '{{.Name}}|{{.CreatedAt}}|{{.Mountpoint}}' \
+        "${current_name}" 2>/dev/null
 }
 
 cleanup() {
@@ -80,13 +73,10 @@ cleanup() {
         docker rm -f "${test_container_id}" >/dev/null 2>&1 || true
     fi
     if owned_container "${postgres_container_id}"; then
-        docker rm -f "${postgres_container_id}" >/dev/null 2>&1 || true
+        docker rm -f -v "${postgres_container_id}" >/dev/null 2>&1 || true
     fi
     if owned_network; then
         docker network rm "${network_id}" >/dev/null 2>&1 || true
-    fi
-    if owned_volume; then
-        docker volume rm "${volume_name}" >/dev/null 2>&1 || true
     fi
     if [ -n "${smoke_root}" ] && [ -d "${smoke_root}" ] \
         && [ ! -L "${smoke_root}" ]; then
@@ -125,27 +115,13 @@ network_id="$(docker network create \
     "${network_name}")" || fail 'export_postgres_network_create_failed'
 owned_network || fail 'export_postgres_network_identity_invalid'
 
-if docker volume inspect "${volume_name}" >/dev/null 2>&1; then
-    fail 'export_postgres_volume_name_collision'
-fi
-docker volume create \
-    --label "com.svrx.pinry.export-postgres.run=${run_token}" \
-    "${volume_name}" >/dev/null \
-    || fail 'export_postgres_volume_create_failed'
-volume_fingerprint="$(current_volume_fingerprint)" \
-    || fail 'export_postgres_volume_identity_missing'
-owned_volume || {
-    volume_fingerprint=""
-    fail 'export_postgres_volume_identity_invalid'
-}
-
 postgres_container_id="$(docker run -d \
     --name "${postgres_container}" \
     --label "com.svrx.pinry.export-postgres.run=${run_token}" \
     --label 'com.svrx.pinry.export-postgres.role=database' \
     --network "${network_id}" \
     --network-alias export-postgres \
-    --mount "type=volume,src=${volume_name},dst=/var/lib/postgresql/data" \
+    --mount 'type=volume,dst=/var/lib/postgresql/data' \
     --env "POSTGRES_DB=${database_name}" \
     --env "POSTGRES_USER=${database_user}" \
     --env "POSTGRES_PASSWORD=${database_password}" \
@@ -154,6 +130,16 @@ postgres_container_id="$(docker run -d \
 }
 owned_container "${postgres_container_id}" \
     || fail 'export_postgres_container_identity_invalid'
+volume_name="$(docker container inspect --format \
+    '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql/data"}}{{.Name}}{{end}}{{end}}' \
+    "${postgres_container_id}")" \
+    || fail 'export_postgres_volume_identity_missing'
+[ -n "${volume_name}" ] \
+    || fail 'export_postgres_volume_identity_missing'
+volume_fingerprint="$(current_volume_fingerprint "${volume_name}")" \
+    || fail 'export_postgres_volume_identity_missing'
+[ "${volume_fingerprint%%|*}" = "${volume_name}" ] \
+    || fail 'export_postgres_volume_identity_invalid'
 
 ready_deadline=$(( $(date +%s) + 90 ))
 while ! docker exec "${postgres_container_id}" pg_isready \

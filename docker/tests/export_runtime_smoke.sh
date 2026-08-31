@@ -30,6 +30,8 @@ if [ "${pin_count_value}" -gt 1000 ]; then
     printf '%s\n' 'PIN_COUNT must be between 0 and 1000' >&2
     exit 2
 fi
+interrupt_timeout=$((180 + pin_count_value * 4))
+completion_timeout=$((300 + pin_count_value * 12))
 
 for dependency in docker curl python3; do
     command -v "${dependency}" >/dev/null 2>&1 || {
@@ -42,10 +44,58 @@ script_directory="$({
     CDPATH= cd -- "$(dirname -- "$0")" && pwd -P
 })"
 fixture_script="${script_directory}/fixtures/create_export_fixture.py"
+repository_root="$({
+    CDPATH= cd -- "${script_directory}/../.." && pwd -P
+})"
+nginx_config="${repository_root}/docker/nginx/sites-enabled/default"
+nginx_contract="${repository_root}/docker/tests/nginx_maintenance_contract.sh"
 if [ ! -f "${fixture_script}" ] || [ -L "${fixture_script}" ]; then
     printf '%s\n' 'export_smoke_fixture_invalid' >&2
     exit 1
 fi
+for contract_file in "${nginx_config}" "${nginx_contract}"; do
+    if [ ! -f "${contract_file}" ] || [ -L "${contract_file}" ]; then
+        printf '%s\n' 'export_smoke_nginx_contract_invalid' >&2
+        exit 1
+    fi
+done
+python3 - "${nginx_config}" "${nginx_contract}" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    config = stream.read()
+with open(sys.argv[2], encoding="utf-8") as stream:
+    contract = stream.read()
+location = re.search(
+    r"location\s+\^~\s+/__protected_exports/\s*\{([^{}]*)\}",
+    config,
+    re.S,
+)
+if location is None:
+    raise SystemExit("export_smoke_nginx_contract_invalid")
+directives = {
+    re.sub(r"\s+", " ", value.strip())
+    for value in location.group(1).split(";")
+    if value.strip()
+}
+required_directives = {
+    "internal",
+    "alias /data/exports/ready/",
+    "disable_symlinks on",
+}
+required_contract = (
+    '"X-Accel-Redirect"',
+    '"/api/test-protected-export-symlink/"',
+    'request GET /api/test-protected-export-symlink/',
+    'if [[ "$status" != 403 && "$status" != 404 ]]',
+    'cmp -s "$body" "$outside_zip"',
+)
+if not required_directives.issubset(directives) or any(
+    value not in contract for value in required_contract
+):
+    raise SystemExit("export_smoke_nginx_contract_invalid")
+PY
 if ! docker info >/dev/null 2>&1; then
     printf '%s\n' 'export_smoke_docker_unavailable' >&2
     exit 1
@@ -489,7 +539,9 @@ PY
 validate_latest_complete() {
     local job_id="$1"
     python3 - "${response_json}" "${job_id}" "${pin_count_value}" <<'PY'
+from datetime import datetime
 import json
+import re
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
@@ -511,6 +563,25 @@ counter_keys = {
     "archive_done", "included_total", "excluded_total", "bytes_total",
     "bytes_done",
 }
+date_fields = (
+    "created_at", "snapshot_at", "heartbeat_at", "completed_at",
+    "expires_at",
+)
+
+def parse_utc(value):
+    if value is None:
+        return None
+    if type(value) is not str or re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z",
+        value,
+    ) is None:
+        raise SystemExit("export_smoke_latest_date_invalid")
+    datetime.strptime(
+        value,
+        "%Y-%m-%dT%H:%M:%S.%fZ" if "." in value else "%Y-%m-%dT%H:%M:%SZ",
+    )
+    return value
+
 for name in ("latest_attempt", "downloadable_job"):
     status = payload.get(name)
     if not isinstance(status, dict) or set(status) != status_keys:
@@ -524,6 +595,9 @@ for name in ("latest_attempt", "downloadable_job"):
         or type(status["resume_count"]) is not int
     ):
         raise SystemExit("export_smoke_latest_complete_invalid")
+    dates = {field: parse_utc(status[field]) for field in date_fields}
+    if any(dates[field] is None for field in date_fields):
+        raise SystemExit("export_smoke_latest_complete_date_missing")
     counters = status["counters"]
     if not isinstance(counters, dict) or set(counters) != counter_keys:
         raise SystemExit("export_smoke_latest_counters_schema_invalid")
@@ -539,19 +613,83 @@ for name in ("latest_attempt", "downloadable_job"):
         or counters["bytes_done"] != counters["bytes_total"]
     ):
         raise SystemExit("export_smoke_latest_counts_invalid")
+if payload["latest_attempt"] != payload["downloadable_job"]:
+    raise SystemExit("export_smoke_latest_complete_mismatch")
 PY
 }
 
-wait_for_active_job() {
+capture_archiving_interrupt() {
     local job_id="$1"
-    local deadline=$(( $(date +%s) + 60 ))
+    local worker_pid="$2"
+    local output="$3"
+    local deadline=$(( $(date +%s) + interrupt_timeout ))
     local current_id
     local state
     while [ "$(date +%s)" -lt "${deadline}" ]; do
+        docker exec "${active_container_id}" kill -STOP "${worker_pid}" \
+            >/dev/null 2>&1 || return 1
+        if docker exec --user 1000:1000 "${active_container_id}" python -c '
+import json
+import sys
+import django
+django.setup()
+from exports.models import ExportAttempt, ExportItem, ExportJob, ExportWorkerLease
+job = ExportJob.objects.get(pk=sys.argv[1])
+worker = ExportWorkerLease.objects.get(pk=1)
+attempts = list(ExportAttempt.objects.filter(
+    job=job,
+    attempt_generation=job.attempt_generation,
+))
+if (
+    job.state != "archiving" or job.snapshot_generation is None
+    or job.snapshot_at is None or job.lease_uuid is None
+    or job.worker_generation != worker.generation
+    or len(attempts) != 1 or attempts[0].state not in ("writing", "closed")
+    or attempts[0].lease_uuid != job.lease_uuid
+    or attempts[0].relative_path != "attempt-{}-{}".format(
+        job.pk, job.attempt_generation,
+    )
+):
+    raise SystemExit(1)
+item_generations = sorted(set(
+    str(value) for value in ExportItem.objects.filter(job=job).values_list(
+        "snapshot_generation", flat=True,
+    )
+))
+if item_generations != [str(job.snapshot_generation)]:
+    raise SystemExit(1)
+attempt = attempts[0]
+print(json.dumps({
+    "worker": {
+        "generation": worker.generation,
+        "lease_uuid": str(worker.lease_uuid),
+    },
+    "job": {
+        "state": job.state,
+        "worker_generation": job.worker_generation,
+        "lease_uuid": str(job.lease_uuid),
+        "attempt_generation": job.attempt_generation,
+        "snapshot_generation": str(job.snapshot_generation),
+        "snapshot_at": job.snapshot_at.isoformat().replace("+00:00", "Z"),
+        "snapshot_done": job.snapshot_done,
+        "resume_count": job.resume_count,
+    },
+    "attempt": {
+        "generation": attempt.attempt_generation,
+        "lease_uuid": str(attempt.lease_uuid),
+        "state": attempt.state,
+        "relative_path": attempt.relative_path,
+    },
+    "item_snapshot_generations": item_generations,
+}, separators=(",", ":"), sort_keys=True))
+' "${job_id}" > "${output}" 2>/dev/null; then
+            return 0
+        fi
+        docker exec "${active_container_id}" kill -CONT "${worker_pid}" \
+            >/dev/null 2>&1 || return 1
         read -r current_id state <<< "$(latest_state || printf '%s\n' 'none none')"
         if [ "${current_id}" = "${job_id}" ]; then
             case "${state}" in
-                archiving|verifying) return 0 ;;
                 complete|failed|expired) return 1 ;;
             esac
         fi
@@ -580,8 +718,7 @@ wait_for_new_worker() {
 
 wait_for_complete() {
     local job_id="$1"
-    local timeout=$((180 + pin_count_value * 8))
-    local deadline=$(( $(date +%s) + timeout ))
+    local deadline=$(( $(date +%s) + completion_timeout ))
     local current_id
     local state
     while [ "$(date +%s)" -lt "${deadline}" ]; do
@@ -623,19 +760,34 @@ PY
 validate_archive() {
     local job_id="$1"
     local archive="$2"
-    python3 - "${fixture_json}" "${archive}" "${job_id}" <<'PY'
+    python3 - "${fixture_json}" "${archive}" "${job_id}" \
+        "${response_json}" <<'PY'
 from datetime import datetime, timezone
 from xml.etree import ElementTree
 import hashlib
 import json
 import posixpath
+import re
 import sys
 import zipfile
 
-fixture_path, archive_path, job_id = sys.argv[1:]
+fixture_path, archive_path, job_id, latest_path = sys.argv[1:]
 with open(fixture_path, encoding="utf-8") as stream:
     fixture = json.load(stream)
+with open(latest_path, encoding="utf-8") as stream:
+    latest = json.load(stream)["latest_attempt"]
 expected = {item["id"]: item for item in fixture["pins"]}
+
+def parse_utc(value):
+    if type(value) is not str or re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z",
+        value,
+    ) is None:
+        raise SystemExit("export_smoke_manifest_date_invalid")
+    return datetime.strptime(
+        value,
+        "%Y-%m-%dT%H:%M:%S.%fZ" if "." in value else "%Y-%m-%dT%H:%M:%SZ",
+    ).replace(tzinfo=timezone.utc)
 
 def dos_time(value):
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -688,6 +840,13 @@ with zipfile.ZipFile(archive_path) as archive:
         raise SystemExit("export_smoke_manifest_schema_invalid")
     if manifest.get("schema_version") != 1 or manifest.get("export_id") != job_id:
         raise SystemExit("export_smoke_manifest_identity_invalid")
+    parse_utc(manifest.get("exported_at"))
+    parse_utc(manifest.get("snapshot_at"))
+    if (
+        manifest["exported_at"] != latest.get("completed_at")
+        or manifest["snapshot_at"] != latest.get("snapshot_at")
+    ):
+        raise SystemExit("export_smoke_manifest_date_mismatch")
     if manifest.get("scope") != {"type": "pins", "board": None}:
         raise SystemExit("export_smoke_manifest_scope_invalid")
     count = len(expected)
@@ -966,43 +1125,9 @@ print(payload["id"])
 PY
 )" || fail 'export_smoke_create_payload_invalid'
 
-wait_for_active_job "${job_id}" \
+capture_archiving_interrupt "${job_id}" "${old_worker_pid}" \
+    "${recovery_before_json}" \
     || fail 'export_smoke_worker_restart_window_missed'
-docker exec "${active_container_id}" kill -STOP "${old_worker_pid}" >/dev/null \
-    || fail 'export_smoke_worker_stop_failed'
-docker exec --user 1000:1000 "${active_container_id}" python -c '
-import json
-import sys
-import django
-django.setup()
-from exports.models import ExportAttempt, ExportJob, ExportWorkerLease
-job = ExportJob.objects.get(pk=sys.argv[1])
-worker = ExportWorkerLease.objects.get(pk=1)
-if job.state not in ("archiving", "verifying"):
-    raise SystemExit("export_smoke_interrupt_state_not_active")
-if job.lease_uuid is None or job.worker_generation != worker.generation:
-    raise SystemExit("export_smoke_interrupt_lease_invalid")
-attempts = list(ExportAttempt.objects.filter(job=job).order_by(
-    "attempt_generation",
-).values_list("attempt_generation", "state", "relative_path"))
-if (
-    not attempts or attempts[-1][0] != job.attempt_generation
-    or job.snapshot_generation is None
-):
-    raise SystemExit("export_smoke_interrupt_attempt_invalid")
-print(json.dumps({
-    "state": job.state,
-    "worker_generation": job.worker_generation,
-    "attempt_generation": job.attempt_generation,
-    "snapshot_generation": (
-        str(job.snapshot_generation) if job.snapshot_generation else None
-    ),
-    "attempts": attempts,
-    "snapshot_done": job.snapshot_done,
-    "archive_done": job.archive_done,
-}, separators=(",", ":"), sort_keys=True))
-' "${job_id}" > "${recovery_before_json}" \
-    || fail 'export_smoke_interrupt_state_invalid'
 wait_ready 15 || fail 'export_smoke_ready_dropped_during_worker_restart'
 docker exec "${active_container_id}" sh -c '
 kill -TERM "$1"
@@ -1022,59 +1147,153 @@ import json
 import sys
 import django
 django.setup()
-from exports.models import ExportAttempt, ExportItem, ExportJob, ExportTarget
+from exports.models import (
+    ExportAttempt, ExportItem, ExportJob, ExportTarget, ExportWorkerLease,
+)
 job = ExportJob.objects.get(pk=sys.argv[1])
-attempts = list(ExportAttempt.objects.filter(job=job).order_by(
+worker = ExportWorkerLease.objects.get(pk=1)
+attempts = [{
+    "generation": attempt.attempt_generation,
+    "state": attempt.state,
+    "relative_path": attempt.relative_path,
+    "lease_uuid": str(attempt.lease_uuid),
+} for attempt in ExportAttempt.objects.filter(job=job).order_by(
     "attempt_generation",
-).values_list("attempt_generation", "state", "relative_path"))
+)]
+item_generations = sorted(set(
+    str(value) for value in ExportItem.objects.filter(job=job).values_list(
+        "snapshot_generation", flat=True,
+    )
+))
 print(json.dumps({
     "attempts": attempts,
     "state": job.state,
     "worker_generation": job.worker_generation,
+    "worker": {
+        "generation": worker.generation,
+        "lease_uuid": str(worker.lease_uuid),
+    },
+    "lease_uuid": str(job.lease_uuid) if job.lease_uuid else None,
     "attempt_generation": job.attempt_generation,
     "snapshot_generation": (
         str(job.snapshot_generation) if job.snapshot_generation else None
     ),
+    "snapshot_at": (
+        job.snapshot_at.isoformat().replace("+00:00", "Z")
+        if job.snapshot_at else None
+    ),
+    "snapshot_done": job.snapshot_done,
+    "item_snapshot_generations": item_generations,
+    "resume_count": job.resume_count,
+    "staging_cleanup_state": job.staging_cleanup_state,
     "ready_cleanup_state": job.ready_cleanup_state,
-    "ready_relative_path": job.ready_relative_path,
+    "ready_receipt": {
+        "relative_path": job.ready_relative_path,
+        "display_name": job.ready_display_name,
+        "size": job.ready_size,
+        "sha256": job.ready_sha256,
+        "dev": job.ready_dev,
+        "ino": job.ready_ino,
+        "uid": job.ready_uid,
+        "gid": job.ready_gid,
+        "mode": job.ready_mode,
+        "nlink": job.ready_nlink,
+        "mtime_ns": job.ready_mtime_ns,
+        "ctime_ns": job.ready_ctime_ns,
+    },
     "items": ExportItem.objects.filter(job=job).count(),
     "targets": list(ExportTarget.objects.filter(job=job).order_by("position").values_list("position", flat=True)),
 }, separators=(",", ":"), sort_keys=True))
 ' "${job_id}" > "${diagnostic_json}" || fail 'export_smoke_job_audit_failed'
 python3 - "${diagnostic_json}" "${recovery_before_json}" "${pin_count_value}" <<'PY'
 import json
+import re
 import sys
+import uuid
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     payload = json.load(stream)
 with open(sys.argv[2], encoding="utf-8") as stream:
     before = json.load(stream)
 count = int(sys.argv[3])
-generations = [entry[0] for entry in payload.get("attempts", [])]
-if not generations or len(generations) != len(set(generations)):
+before_worker = before.get("worker", {})
+before_job = before.get("job", {})
+before_attempt = before.get("attempt", {})
+attempts = payload.get("attempts", [])
+generations = [entry.get("generation") for entry in attempts]
+if len(attempts) != 2 or len(generations) != len(set(generations)):
     raise SystemExit("export_smoke_attempt_generation_invalid")
-before_attempts = {entry[0]: entry[2] for entry in before.get("attempts", [])}
-after_attempts = {entry[0]: entry[2] for entry in payload["attempts"]}
-if any(
-    after_attempts.get(generation) != path
-    for generation, path in before_attempts.items()
+old_generation = before_attempt.get("generation")
+new_generation = old_generation + 1 if type(old_generation) is int else None
+if generations != [old_generation, new_generation]:
+    raise SystemExit("export_smoke_attempt_generation_invalid")
+old_attempt, new_attempt = attempts
+if (
+    old_attempt.get("state") != "cleaned"
+    or old_attempt.get("relative_path") != before_attempt.get("relative_path")
+    or old_attempt.get("lease_uuid") != before_attempt.get("lease_uuid")
 ):
     raise SystemExit("export_smoke_recovery_tombstone_missing")
+try:
+    old_lease = uuid.UUID(before_attempt["lease_uuid"])
+    new_lease = uuid.UUID(new_attempt["lease_uuid"])
+    before_worker_lease = uuid.UUID(before_worker["lease_uuid"])
+    after_worker_lease = uuid.UUID(payload["worker"]["lease_uuid"])
+except (KeyError, TypeError, ValueError):
+    raise SystemExit("export_smoke_recovery_lease_invalid")
+if (
+    before_attempt.get("state") not in ("writing", "closed")
+    or before_attempt.get("lease_uuid") != before_job.get("lease_uuid")
+    or new_attempt.get("state") != "cleaned"
+    or new_attempt.get("relative_path")
+    != "attempt-{}-{}".format(sys.argv[1], new_generation)
+    or new_lease == old_lease or after_worker_lease == before_worker_lease
+):
+    raise SystemExit("export_smoke_recovery_attempt_invalid")
 if (
     payload.get("state") != "complete"
-    or payload.get("worker_generation", 0) <= before.get("worker_generation", 0)
-    or payload.get("attempt_generation") != before.get("attempt_generation")
+    or before_job.get("state") != "archiving"
+    or payload.get("worker", {}).get("generation")
+    != before_worker.get("generation") + 1
+    or payload.get("worker_generation")
+    != payload.get("worker", {}).get("generation")
+    or payload.get("lease_uuid") is not None
+    or payload.get("attempt_generation") != new_generation
+    or payload.get("resume_count") != before_job.get("resume_count")
+    or payload.get("staging_cleanup_state") != "cleaned"
     or payload.get("ready_cleanup_state") != "retained"
-    or not payload.get("ready_relative_path")
 ):
     raise SystemExit("export_smoke_recovery_transition_invalid")
 if (
-    before.get("snapshot_generation") is not None
-    and payload.get("snapshot_generation") != before["snapshot_generation"]
+    payload.get("snapshot_generation") is not None
+    or payload.get("snapshot_at") != before_job.get("snapshot_at")
+    or payload.get("snapshot_done") != before_job.get("snapshot_done")
+    or before.get("item_snapshot_generations")
+    != [before_job.get("snapshot_generation")]
+    or payload.get("item_snapshot_generations")
+    != before.get("item_snapshot_generations")
 ):
     raise SystemExit("export_smoke_recovery_snapshot_changed")
 if payload.get("items") != count or payload.get("targets") != list(range(count)):
     raise SystemExit("export_smoke_job_rows_invalid")
+receipt = payload.get("ready_receipt")
+integer_fields = (
+    "size", "dev", "ino", "uid", "gid", "mode", "nlink", "mtime_ns",
+    "ctime_ns",
+)
+if (
+    not isinstance(receipt, dict)
+    or receipt.get("relative_path") != "ready/{}.zip".format(sys.argv[1])
+    or type(receipt.get("display_name")) is not str
+    or not receipt["display_name"].endswith(".zip")
+    or any(type(receipt.get(field)) is not int for field in integer_fields)
+    or receipt["size"] <= 0 or receipt["dev"] < 0 or receipt["ino"] < 0
+    or receipt["uid"] != 1000 or receipt["gid"] != 1000
+    or receipt["mode"] != 0o600 or receipt["nlink"] != 1
+    or receipt["mtime_ns"] < 0 or receipt["ctime_ns"] < 0
+    or re.fullmatch(r"[0-9a-f]{64}", receipt.get("sha256", "")) is None
+):
+    raise SystemExit("export_smoke_ready_receipt_invalid")
 PY
 
 download_archive "${job_id}" "${archive_path}" "${download_headers}"
