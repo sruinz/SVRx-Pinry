@@ -1429,7 +1429,7 @@ class WorkerLockTests(ExportStorageMixin, TransactionTestCase):
             first.close()
             root.close()
 
-    def test_idle_loop_uses_one_read_probe_without_fenced_sweep(self):
+    def test_idle_loop_uses_one_lightweight_read_probe(self):
         stopped = threading.Event()
         sleeps = []
 
@@ -1469,9 +1469,27 @@ class WorkerLockTests(ExportStorageMixin, TransactionTestCase):
         ]
 
         self.assertEqual(status, 0)
-        self.assertEqual(sleeps, [1])
+        self.assertEqual(len(sleeps), 1)
         self.assertEqual(len(job_reads), 1)
+        self.assertNotIn("EXISTS(", job_reads[0])
+        self.assertNotIn('"EXPORTS_EXPORTATTEMPT"', job_reads[0])
+        self.assertNotIn('"EXPORTS_EXPORTBLOB"', job_reads[0])
+        self.assertNotIn('"EXPORTS_EXPORTATTEMPTFILE"', job_reads[0])
         self.assertEqual(len(fence_entries), 2)
+
+    def test_idle_loop_waits_two_seconds_before_rechecking_empty_queue(self):
+        stopped = threading.Event()
+        sleeps = []
+
+        def stop_after_idle_wait(seconds):
+            sleeps.append(seconds)
+            stopped.set()
+
+        worker = ExportWorker(sleeper=stop_after_idle_wait)
+        status = worker.run(stopped.is_set)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(sleeps, [2])
 
     def test_queued_job_enters_full_scan_without_idle_wait(self):
         stopped = threading.Event()

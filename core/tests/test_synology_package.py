@@ -42,6 +42,25 @@ ACCEPTANCE_RUNNER_PATH = "docker/tests/nas_legacy_clone_acceptance.sh"
 ACCEPTANCE_FIXTURE_PATH = (
     "docker/tests/fixtures/create_legacy_fixture.py"
 )
+EXPORT_RUNTIME_SMOKE_PATH = "docker/tests/export_runtime_smoke.sh"
+EXPORT_POSTGRES_SMOKE_PATH = (
+    "docker/tests/export_postgres_concurrency_smoke.sh"
+)
+EXPORT_RUNTIME_FIXTURE_PATH = (
+    "docker/tests/fixtures/create_export_fixture.py"
+)
+EXPORT_POSTGRES_DEPENDENCY_PATHS = (
+    "exports/tests/__init__.py",
+    "exports/tests/helpers.py",
+    "exports/tests/test_api.py",
+    "exports/tests/test_archive_finalization.py",
+    "exports/tests/test_concurrency.py",
+    "exports/tests/test_download.py",
+    "exports/tests/test_snapshot.py",
+    "exports/tests/test_worker.py",
+    "exports/tests/test_worker_recovery.py",
+    "pinry/settings/test_postgres.py",
+)
 PACKAGED_SOURCE_SENTINELS = (
     "Dockerfile.autobuild",
     "core/models.py",
@@ -83,6 +102,9 @@ TASK_PRODUCTION_PATHS = (
     "deploy/synology/README_KO.md",
     ACCEPTANCE_RUNNER_PATH,
     ACCEPTANCE_FIXTURE_PATH,
+    EXPORT_RUNTIME_SMOKE_PATH,
+    EXPORT_POSTGRES_SMOKE_PATH,
+    EXPORT_RUNTIME_FIXTURE_PATH,
     "docker/nginx/sites-enabled/default",
 )
 PACKAGE_CONTROL_PATHS = (
@@ -93,6 +115,9 @@ PACKAGE_CONTROL_PATHS = (
     "deploy/synology/README_KO.md",
     ACCEPTANCE_RUNNER_PATH,
     ACCEPTANCE_FIXTURE_PATH,
+    EXPORT_RUNTIME_SMOKE_PATH,
+    EXPORT_POSTGRES_SMOKE_PATH,
+    EXPORT_RUNTIME_FIXTURE_PATH,
     "LICENSE.md",
     "NOTICE.md",
     "UPSTREAM.md",
@@ -1543,17 +1568,34 @@ class SynologyPackageTests(unittest.TestCase):
     def test_acceptance_tools_are_separate_exact_head_artifacts(self):
         self._create_package()
 
+        packaged_sources = {
+            "nas_legacy_clone_acceptance.sh": ACCEPTANCE_RUNNER_PATH,
+            "fixtures/create_legacy_fixture.py": ACCEPTANCE_FIXTURE_PATH,
+            EXPORT_RUNTIME_SMOKE_PATH: EXPORT_RUNTIME_SMOKE_PATH,
+            EXPORT_POSTGRES_SMOKE_PATH: EXPORT_POSTGRES_SMOKE_PATH,
+            EXPORT_RUNTIME_FIXTURE_PATH: EXPORT_RUNTIME_FIXTURE_PATH,
+        }
+        packaged_sources.update(
+            {
+                relative_path: relative_path
+                for relative_path in EXPORT_POSTGRES_DEPENDENCY_PATHS
+            }
+        )
+        expected_entries = {"BUILD_INFO"}
+        for packaged_path in packaged_sources:
+            path = Path(packaged_path)
+            expected_entries.add(str(path))
+            expected_entries.update(
+                str(parent)
+                for parent in path.parents
+                if str(parent) != "."
+            )
         self.assertEqual(
             {
                 str(path.relative_to(self.accept_tools_directory))
                 for path in self.accept_tools_directory.rglob("*")
             },
-            {
-                "BUILD_INFO",
-                "fixtures",
-                "fixtures/create_legacy_fixture.py",
-                "nas_legacy_clone_acceptance.sh",
-            },
+            expected_entries,
         )
         expected_build_info = (
             "source_commit={}\n"
@@ -1563,44 +1605,27 @@ class SynologyPackageTests(unittest.TestCase):
             (self.accept_tools_directory / "BUILD_INFO").read_bytes(),
             expected_build_info,
         )
-        self.assertEqual(
-            (
-                self.accept_tools_directory
-                / "nas_legacy_clone_acceptance.sh"
-            ).read_bytes(),
-            _git_blob(
-                self.repository_root,
-                self.full_sha,
-                ACCEPTANCE_RUNNER_PATH,
-            ),
-        )
-        self.assertEqual(
-            (
-                self.accept_tools_directory
-                / "fixtures/create_legacy_fixture.py"
-            ).read_bytes(),
-            _git_blob(
-                self.repository_root,
-                self.full_sha,
-                ACCEPTANCE_FIXTURE_PATH,
-            ),
-        )
-        self.assertEqual(
-            (
-                self.accept_tools_directory
-                / "nas_legacy_clone_acceptance.sh"
-            ).stat().st_mode
-            & 0o777,
-            0o755,
-        )
-        self.assertEqual(
-            (
-                self.accept_tools_directory
-                / "fixtures/create_legacy_fixture.py"
-            ).stat().st_mode
-            & 0o777,
-            0o644,
-        )
+        executable_paths = {
+            "nas_legacy_clone_acceptance.sh",
+            EXPORT_RUNTIME_SMOKE_PATH,
+            EXPORT_POSTGRES_SMOKE_PATH,
+            EXPORT_RUNTIME_FIXTURE_PATH,
+        }
+        for packaged_path, source_path in packaged_sources.items():
+            artifact_path = self.accept_tools_directory / packaged_path
+            with self.subTest(packaged_path=packaged_path):
+                self.assertEqual(
+                    artifact_path.read_bytes(),
+                    _git_blob(
+                        self.repository_root,
+                        self.full_sha,
+                        source_path,
+                    ),
+                )
+                self.assertEqual(
+                    artifact_path.stat().st_mode & 0o777,
+                    0o755 if packaged_path in executable_paths else 0o644,
+                )
         self.assertEqual(
             (self.accept_tools_directory / "BUILD_INFO").stat().st_mode
             & 0o777,

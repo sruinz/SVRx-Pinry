@@ -64,7 +64,7 @@ HEARTBEAT_INTERVAL_SECONDS = 5
 DATABASE_FENCE_MAX_SECONDS = 5
 DATABASE_RETRY_MAX_SECONDS = 15
 WORKER_HEALTH_STALE_SECONDS = 15
-IDLE_WAIT_SECONDS = 1
+IDLE_WAIT_SECONDS = 2
 MAX_ABNORMAL_RESUMES = 3
 MAINTENANCE_BATCH_SIZE = 100
 QUERY_BATCH_SIZE = 400
@@ -2910,6 +2910,38 @@ class ExportWorker(object):
     def has_runnable_work(self, stop_requested):
         now = self.clock()
 
+        def potential_probe(operation_deadline):
+            operation_deadline.checkpoint()
+            potential_work = (
+                Q(state__in=ACTIVE_STATES)
+                | Q(state="complete", staging_cleanup_state="pending")
+                | (
+                    Q(state="complete", lease_uuid__isnull=False)
+                    & ~Q(staging_cleanup_state="blocked")
+                )
+                | (
+                    Q(state="complete", ready_cleanup_state="retained")
+                    & (Q(expires_at__lte=now) | Q(owner_id__isnull=True))
+                )
+                | Q(state="expired", ready_cleanup_state="pending")
+                | Q(
+                    state__in=("failed", "expired"),
+                    staging_cleanup_state="pending",
+                )
+                | Q(
+                    owner_id__isnull=True,
+                    state__in=("failed", "expired"),
+                    staging_cleanup_state="cleaned",
+                    ready_cleanup_state__in=("absent", "cleaned"),
+                    snapshot_relative_path__isnull=True,
+                    candidate_snapshot_relative_path__isnull=True,
+                    ready_relative_path__isnull=True,
+                )
+            )
+            return ExportJob.objects.using(self.using).filter(
+                potential_work,
+            ).exists()
+
         def probe(operation_deadline):
             operation_deadline.checkpoint()
             current_attempt = ExportAttempt.objects.using(
@@ -3003,6 +3035,14 @@ class ExportWorker(object):
             ).exists()
 
         try:
+            if not _retry_maintenance_database(
+                potential_probe,
+                self.heartbeat,
+                stop_requested=stop_requested,
+                monotonic=self.monotonic,
+                sleeper=self.sleeper,
+            ):
+                return False
             return _retry_maintenance_database(
                 probe,
                 self.heartbeat,

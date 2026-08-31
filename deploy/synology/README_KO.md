@@ -57,8 +57,15 @@ svrx-pinry-server-<커밋 앞 12자리 SHA>/
 └── accept-tools/
     ├── BUILD_INFO
     ├── nas_legacy_clone_acceptance.sh
-    └── fixtures/
-        └── create_legacy_fixture.py
+    ├── fixtures/
+    │   └── create_legacy_fixture.py
+    ├── docker/tests/
+    │   ├── export_runtime_smoke.sh
+    │   ├── export_postgres_concurrency_smoke.sh
+    │   └── fixtures/create_export_fixture.py
+    ├── exports/tests/
+    │   └── PostgreSQL 검증에 필요한 테스트 모듈
+    └── pinry/settings/test_postgres.py
 ```
 
 압축 파일에는 아래 `svrx-pinry/`만 들어 있고 `sw-transition/`과
@@ -99,11 +106,16 @@ Docker는 `context/`만 build context로 사용한다. 바깥의 실행 안내�
 것과 정확히 같은 origin에 임시로 실행해 브라우저의
 기존 서비스 워커와 캐시를 네트워크 전용 버전으로 바꾸는 용도로만 사용한다.
 
-`accept-tools/`는 실제 레거시 데이터의 **복제본**으로 이관 계약을 확인하는
-선택 도구다. 일반 설치와 자동 이관에는 필요하지 않으며, 사용할 때만
-디렉터리째 NAS에 별도로 업로드한다. `BUILD_INFO`는 본 패키지와 같은
-40자리 source commit을 기록하며, script는 같은 디렉터리 아래의
-`fixtures/create_legacy_fixture.py`를 상대 경로로 찾아 사용한다.
+`accept-tools/`는 실제 레거시 데이터의 **복제본** 이관 계약과 내보내기
+런타임·PostgreSQL 동시성을 확인하는 선택 도구다. 일반 설치와 자동
+이관에는 필요하지 않으며, 사용할 때만 디렉터리째 NAS에 별도로
+업로드한다. `BUILD_INFO`는 본 패키지와 같은 40자리 source commit을
+기록한다. 각 script는 `accept-tools/` 아래의 필요한 fixture와 테스트
+모듈을 상대 경로로 찾아 사용한다.
+
+운영 이미지용 `svrx-pinry/context/`에는 이 테스트 파일을 의도적으로 넣지
+않는다. 따라서 `context/docker/tests/...`를 실행하면 파일을 찾을 수 없으며,
+반드시 최상위 산출물의 `accept-tools/docker/tests/...`를 실행해야 한다.
 
 ## 선택: 실제 NAS 복제 acceptance
 
@@ -149,6 +161,26 @@ bash accept-tools/nas_legacy_clone_acceptance.sh \
 물리 1,442개에는 DB가 참조하지 않는 고아 파일 58개도 포함되며, 이 payload는
 레거시 backup에 정확히 보존되어야 한다. DB snapshot은 무결성 검사와 핵심
 row count(Pin 345, Image 346, Thumbnail 1,038)를 모두 통과해야 한다.
+
+## 선택: 내보내기 런타임·PostgreSQL 검증
+
+새 배포 이미지를 실제 프로젝트에 적용하기 전에 격리된 임시 데이터로
+내보내기 런타임과 PostgreSQL 동시성 계약을 확인할 수 있다. NAS에
+`accept-tools/`를 디렉터리째 업로드한 뒤, 산출물 최상위 디렉터리에서
+다음을 실행한다.
+
+```sh
+bash accept-tools/docker/tests/export_runtime_smoke.sh svrx-pinry:latest 12
+bash accept-tools/docker/tests/export_postgres_concurrency_smoke.sh svrx-pinry:latest
+```
+
+사용자 지정 태그로 빌드했다면 두 명령의 `svrx-pinry:latest`를 방금
+빌드한 같은 이미지 태그로 바꿔야 한다.
+첫 명령의 `12`는 테스트할 Pin 수이며 0~1000 사이로 지정할 수 있다.
+두 스크립트는 고유한 임시 컨테이너·네트워크와 테스트 데이터를 사용하며,
+성공 시 자신이 만든 임시 자원을 정리한다. PostgreSQL 검증은
+`postgres:14-alpine` 이미지가 없으면 Docker Hub에서 받으므로 NAS의 외부
+네트워크 접근이 필요하다.
 
 ## 서비스 워커 전환 context 업로드와 실행
 

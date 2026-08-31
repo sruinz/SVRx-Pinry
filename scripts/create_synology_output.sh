@@ -34,7 +34,10 @@ package_control_paths=(
     deploy/synology/docker-compose.synology.yml
     deploy/synology/README_KO.md
     docker/tests/nas_legacy_clone_acceptance.sh
+    docker/tests/export_runtime_smoke.sh
+    docker/tests/export_postgres_concurrency_smoke.sh
     docker/tests/fixtures/create_legacy_fixture.py
+    docker/tests/fixtures/create_export_fixture.py
     LICENSE.md
     NOTICE.md
     UPSTREAM.md
@@ -587,6 +590,9 @@ mkdir "${temporary_directory}/context"
 mkdir "${temporary_transition_directory}"
 mkdir "${temporary_accept_tools_directory}"
 mkdir "${temporary_accept_tools_directory}/fixtures"
+mkdir -p "${temporary_accept_tools_directory}/docker/tests/fixtures"
+mkdir -p "${temporary_accept_tools_directory}/exports/tests"
+mkdir -p "${temporary_accept_tools_directory}/pinry/settings"
 temporary_directory_identity="$(
     temporary_path_identity "${temporary_directory}"
 )"
@@ -734,6 +740,32 @@ install_git_blob \
 install_git_blob \
     docker/tests/fixtures/create_legacy_fixture.py \
     "${temporary_accept_tools_directory}/fixtures/create_legacy_fixture.py" 0644
+install_git_blob \
+    docker/tests/export_runtime_smoke.sh \
+    "${temporary_accept_tools_directory}/docker/tests/export_runtime_smoke.sh" 0755
+install_git_blob \
+    docker/tests/export_postgres_concurrency_smoke.sh \
+    "${temporary_accept_tools_directory}/docker/tests/export_postgres_concurrency_smoke.sh" 0755
+install_git_blob \
+    docker/tests/fixtures/create_export_fixture.py \
+    "${temporary_accept_tools_directory}/docker/tests/fixtures/create_export_fixture.py" 0755
+accept_tools_postgres_paths=(
+    exports/tests/__init__.py
+    exports/tests/helpers.py
+    exports/tests/test_api.py
+    exports/tests/test_archive_finalization.py
+    exports/tests/test_concurrency.py
+    exports/tests/test_download.py
+    exports/tests/test_snapshot.py
+    exports/tests/test_worker.py
+    exports/tests/test_worker_recovery.py
+    pinry/settings/test_postgres.py
+)
+for source_path in "${accept_tools_postgres_paths[@]}"; do
+    install_git_blob \
+        "${source_path}" \
+        "${temporary_accept_tools_directory}/${source_path}" 0644
+done
 
 archive_parent_identity="${temporary_root_identity}"
 create_archive \
@@ -758,16 +790,38 @@ if [ "${#package_entries[@]}" -ne 8 ] \
 fi
 shopt -s nullglob dotglob
 accept_tools_entries=("${temporary_accept_tools_directory}"/*)
-accept_tools_fixture_entries=(
-    "${temporary_accept_tools_directory}/fixtures"/*
-)
 shopt -u dotglob nullglob
-if [ "${#accept_tools_entries[@]}" -ne 3 ] \
-    || [ "${#accept_tools_fixture_entries[@]}" -ne 1 ] \
+required_accept_tools_paths=(
+    BUILD_INFO
+    nas_legacy_clone_acceptance.sh
+    fixtures/create_legacy_fixture.py
+    docker/tests/export_runtime_smoke.sh
+    docker/tests/export_postgres_concurrency_smoke.sh
+    docker/tests/fixtures/create_export_fixture.py
+    "${accept_tools_postgres_paths[@]}"
+)
+if [ "${#accept_tools_entries[@]}" -ne 6 ]; then
+    echo "package_layout_changed" >&2
+    exit 1
+fi
+for required_path in "${required_accept_tools_paths[@]}"; do
+    if ! is_unsymlinked_regular_file \
+        "${temporary_accept_tools_directory}" "${required_path}";
+    then
+        echo "package_layout_changed" >&2
+        exit 1
+    fi
+done
+if [ ! -d "${temporary_accept_tools_directory}/fixtures" ] \
+    || [ -L "${temporary_accept_tools_directory}/fixtures" ] \
+    || [ ! -d "${temporary_accept_tools_directory}/docker/tests/fixtures" ] \
+    || [ -L "${temporary_accept_tools_directory}/docker/tests/fixtures" ] \
+    || [ ! -d "${temporary_accept_tools_directory}/exports/tests" ] \
+    || [ -L "${temporary_accept_tools_directory}/exports/tests" ] \
+    || [ ! -d "${temporary_accept_tools_directory}/pinry/settings" ] \
+    || [ -L "${temporary_accept_tools_directory}/pinry/settings" ] \
     || [ ! -f "${temporary_accept_tools_directory}/BUILD_INFO" ] \
-    || [ ! -f "${temporary_accept_tools_directory}/nas_legacy_clone_acceptance.sh" ] \
-    || [ ! -d "${temporary_accept_tools_directory}/fixtures" ] \
-    || [ ! -f "${temporary_accept_tools_directory}/fixtures/create_legacy_fixture.py" ]; then
+    || [ ! -f "${temporary_accept_tools_directory}/nas_legacy_clone_acceptance.sh" ]; then
     echo "package_layout_changed" >&2
     exit 1
 fi
