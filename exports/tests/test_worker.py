@@ -17,13 +17,20 @@ from django.db import (
 )
 from django.db.models.query import QuerySet
 from django.test import TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 import mock
 
 from core.services.database_fence import DatabaseFenceBusy
 from core.models import Pin
 from exports.contracts import ExportError, LeaseLost, LeaseToken, StopRequested
-from exports.models import ExportJob, ExportSlot, ExportTarget, ExportWorkerLease
+from exports.models import (
+    ExportAttempt,
+    ExportJob,
+    ExportSlot,
+    ExportTarget,
+    ExportWorkerLease,
+)
 from exports.services.archive import ArchiveService, RecoveryOutcome
 from exports.services.attempts import AttemptService
 from exports.services.file_ops import (
@@ -1422,6 +1429,220 @@ class WorkerLockTests(ExportStorageMixin, TransactionTestCase):
             first.close()
             root.close()
 
+    def test_idle_loop_uses_one_read_probe_without_fenced_sweep(self):
+        stopped = threading.Event()
+        sleeps = []
+
+        def stop_after_idle_wait(seconds):
+            sleeps.append(seconds)
+            stopped.set()
+
+        worker = ExportWorker(sleeper=stop_after_idle_wait)
+        with CaptureQueriesContext(connection) as captured:
+            status = worker.run(stopped.is_set)
+
+        statements = [
+            " ".join(query["sql"].upper().split())
+            for query in captured.captured_queries
+        ]
+        job_reads = [
+            statement for statement in statements
+            if (
+                statement.startswith("SELECT ")
+                and 'FROM "EXPORTS_EXPORTJOB"' in statement
+            )
+        ]
+        fence_entries = [
+            statement for statement in statements
+            if (
+                (
+                    statement.startswith(
+                        'UPDATE "EXPORTS_EXPORTWORKERLEASE"'
+                    )
+                    and "WHERE 0 = 1" in statement
+                )
+                or statement == (
+                    'LOCK TABLE "EXPORTS_EXPORTWORKERLEASE" '
+                    "IN EXCLUSIVE MODE NOWAIT"
+                )
+            )
+        ]
+
+        self.assertEqual(status, 0)
+        self.assertEqual(sleeps, [1])
+        self.assertEqual(len(job_reads), 1)
+        self.assertEqual(len(fence_entries), 2)
+
+    def test_queued_job_enters_full_scan_without_idle_wait(self):
+        stopped = threading.Event()
+        sleeps = []
+        owner = create_export_user("worker-preflight-queued")
+        ExportJob.objects.create(
+            owner=owner,
+            scope="pins",
+            state="queued",
+            requested_total=1,
+            target_total=1,
+            included_total=1,
+        )
+
+        def finish_full_scan(stop_requested):
+            del stop_requested
+            stopped.set()
+            return True
+
+        worker = ExportWorker(sleeper=lambda seconds: sleeps.append(seconds))
+        worker.run_once = mock.Mock(side_effect=finish_full_scan)
+        status = worker.run(stopped.is_set)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(sleeps, [])
+        worker.run_once.assert_called_once()
+
+    def test_runnable_work_preflight_matches_worker_contract(self):
+        now = timezone.now()
+        worker = ExportWorker(clock=lambda: now, sleeper=lambda seconds: None)
+        worker.worker_token = acquire_worker_lease(now)
+        worker.heartbeat = LeaseHeartbeat(
+            worker.worker_token,
+            clock=lambda: now,
+        )
+        serial = [0]
+
+        def create_job(**values):
+            serial[0] += 1
+            defaults = {
+                "owner": create_export_user(
+                    "worker-preflight-{}".format(serial[0]),
+                ),
+                "scope": "pins",
+                "state": "queued",
+            }
+            defaults.update(values)
+            return ExportJob.objects.create(**defaults)
+
+        def create_complete(expires_at, **values):
+            defaults = {
+                "state": "complete",
+                "completed_at": now,
+                "expires_at": expires_at,
+                "staging_cleanup_state": "cleaned",
+                "ready_cleanup_state": "retained",
+                "ready_relative_path": "ready/complete.zip",
+                "ready_display_name": "complete.zip",
+                "ready_size": 1,
+                "ready_sha256": "a" * 64,
+                "ready_dev": 1,
+                "ready_ino": 2,
+                "ready_uid": os.getuid(),
+                "ready_gid": os.getgid(),
+                "ready_mode": 0o600,
+                "ready_nlink": 1,
+                "ready_mtime_ns": 3,
+                "ready_ctime_ns": 4,
+            }
+            defaults.update(values)
+            return create_job(**defaults)
+
+        def create_failed(staging_cleanup_state, owner=True):
+            values = {
+                "state": "failed",
+                "staging_cleanup_state": staging_cleanup_state,
+                "error_code": "archive_failed",
+                "error_class": "retryable",
+                "error_retryable": True,
+            }
+            if not owner:
+                values["owner"] = None
+            return create_job(**values)
+
+        def create_blocked_and_queued():
+            create_failed("blocked")
+            create_job(requested_total=1, target_total=1, included_total=1)
+
+        def create_current_attempt():
+            job = create_job(
+                requested_total=1,
+                target_total=1,
+                included_total=1,
+            )
+            ExportAttempt.objects.create(
+                job=job,
+                attempt_generation=0,
+                lease_uuid=uuid.uuid4(),
+                state="cleaned",
+                relative_path="attempt-{}-0".format(job.pk),
+                dir_dev=1,
+                dir_ino=2,
+                dir_uid=os.getuid(),
+                dir_gid=os.getgid(),
+                dir_mode=0o700,
+            )
+
+        cases = (
+            ("empty", lambda: None, False),
+            ("queued", lambda: create_job(), True),
+            ("pending cleanup", lambda: create_failed("pending"), True),
+            ("blocked gate", create_blocked_and_queued, False),
+            (
+                "stale active",
+                lambda: create_job(
+                    state="snapshotting",
+                    worker_generation=0,
+                    lease_uuid=uuid.uuid4(),
+                ),
+                True,
+            ),
+            (
+                "current active",
+                lambda: create_job(
+                    state="snapshotting",
+                    worker_generation=worker.worker_token.worker_generation,
+                    lease_uuid=uuid.uuid4(),
+                    lease_expires_at=now - timedelta(seconds=1),
+                ),
+                False,
+            ),
+            ("current attempt", create_current_attempt, False),
+            (
+                "retained complete",
+                lambda: create_complete(now + timedelta(hours=1)),
+                False,
+            ),
+            (
+                "expired complete",
+                lambda: create_complete(now - timedelta(seconds=1)),
+                True,
+            ),
+            (
+                "complete lease cleanup",
+                lambda: create_complete(
+                    now + timedelta(hours=1),
+                    lease_uuid=uuid.uuid4(),
+                ),
+                True,
+            ),
+            (
+                "ownerless active",
+                lambda: create_job(owner=None),
+                True,
+            ),
+            (
+                "clean orphan",
+                lambda: create_failed("cleaned", owner=False),
+                True,
+            ),
+        )
+
+        for name, setup, expected in cases:
+            with self.subTest(name=name):
+                setup()
+                self.assertEqual(
+                    worker.has_runnable_work(lambda: False),
+                    expected,
+                )
+                ExportJob.objects.all().delete()
+
     def test_fatal_heartbeat_stops_main_loop_before_claim(self):
         class FatalHeartbeat(LeaseHeartbeat):
             def start(inner_self):
@@ -1606,6 +1827,7 @@ class WorkerLockTests(ExportStorageMixin, TransactionTestCase):
             monotonic=lambda: elapsed[0],
             sleeper=lambda seconds: None,
         )
+        worker.has_runnable_work = mock.Mock(return_value=True)
         worker.run_once = mock.Mock(
             side_effect=ExportStorageError("export_storage_unsafe"),
         )
@@ -1635,6 +1857,7 @@ class WorkerLockTests(ExportStorageMixin, TransactionTestCase):
             return original_update(queryset, **kwargs)
 
         worker = ExportWorker(clock=lambda: now, sleeper=lambda seconds: None)
+        worker.has_runnable_work = mock.Mock(return_value=True)
         worker.run_once = mock.Mock(
             side_effect=ExportStorageError("export_storage_unsafe"),
         )

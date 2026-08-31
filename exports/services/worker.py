@@ -2907,6 +2907,112 @@ class ExportWorker(object):
             sleeper=self.sleeper,
         )
 
+    def has_runnable_work(self, stop_requested):
+        now = self.clock()
+
+        def probe(operation_deadline):
+            operation_deadline.checkpoint()
+            current_attempt = ExportAttempt.objects.using(
+                self.using,
+            ).filter(
+                job_id=OuterRef("pk"),
+                attempt_generation=OuterRef("attempt_generation"),
+            )
+            unclean_attempt = ExportAttempt.objects.using(
+                self.using,
+            ).filter(
+                job_id=OuterRef("pk"),
+            ).exclude(state="cleaned")
+            unclean_blob = ExportBlob.objects.using(
+                self.using,
+            ).filter(
+                job_id=OuterRef("pk"),
+            ).exclude(cleanup_state="cleaned")
+            unclean_file = ExportAttemptFile.objects.using(
+                self.using,
+            ).filter(
+                attempt__job_id=OuterRef("pk"),
+            ).exclude(state="cleaned")
+            blocking_cleanup = ExportJob.objects.using(
+                self.using,
+            ).filter(
+                Q(
+                    state__in=("failed", "expired"),
+                    staging_cleanup_state__in=("pending", "blocked"),
+                )
+                | Q(state="complete", staging_cleanup_state="blocked")
+                | Q(ready_cleanup_state__in=("pending", "blocked"))
+            )
+            jobs = ExportJob.objects.using(self.using).annotate(
+                has_blocking_cleanup=Exists(blocking_cleanup),
+                has_current_attempt=Exists(current_attempt),
+                has_unclean_attempt=Exists(unclean_attempt),
+                has_unclean_blob=Exists(unclean_blob),
+                has_unclean_file=Exists(unclean_file),
+            )
+            stale_worker = (
+                Q(lease_uuid__isnull=True)
+                | ~Q(worker_generation=self.worker_token.worker_generation)
+            )
+            maintenance_work = (
+                Q(owner_id__isnull=True, state__in=ACTIVE_STATES)
+                | Q(state="complete", staging_cleanup_state="pending")
+                | (
+                    Q(state="complete", lease_uuid__isnull=False)
+                    & ~Q(staging_cleanup_state="blocked")
+                )
+                | (
+                    Q(state="complete", ready_cleanup_state="retained")
+                    & (Q(expires_at__lte=now) | Q(owner_id__isnull=True))
+                )
+                | Q(state="expired", ready_cleanup_state="pending")
+                | Q(
+                    state__in=("failed", "expired"),
+                    staging_cleanup_state="pending",
+                )
+                | Q(
+                    owner_id__isnull=True,
+                    state__in=("failed", "expired"),
+                    staging_cleanup_state="cleaned",
+                    ready_cleanup_state__in=("absent", "cleaned"),
+                    snapshot_relative_path__isnull=True,
+                    candidate_snapshot_relative_path__isnull=True,
+                    ready_relative_path__isnull=True,
+                    has_unclean_blob=False,
+                    has_unclean_attempt=False,
+                    has_unclean_file=False,
+                )
+            )
+            recovery_work = Q(
+                state__in=("snapshotting", "archiving", "verifying"),
+            ) & stale_worker
+            queued_work = Q(
+                state="queued",
+                owner_id__isnull=False,
+                lease_uuid__isnull=True,
+                candidate_snapshot_generation__isnull=True,
+                has_current_attempt=False,
+                has_unclean_attempt=False,
+            )
+            return jobs.filter(
+                maintenance_work
+                | (
+                    Q(has_blocking_cleanup=False)
+                    & (recovery_work | queued_work)
+                )
+            ).exists()
+
+        try:
+            return _retry_maintenance_database(
+                probe,
+                self.heartbeat,
+                stop_requested=stop_requested,
+                monotonic=self.monotonic,
+                sleeper=self.sleeper,
+            )
+        except _DatabaseRetryStopped:
+            return False
+
     def handoff_after_normal_stop(self, lease):
         return handoff_after_normal_stop(
             lease,
@@ -3170,6 +3276,10 @@ class ExportWorker(object):
                     raise self.heartbeat.lost
                 if self.heartbeat.fatal is not None:
                     raise _HeartbeatFailed()
+                if not self.has_runnable_work(stop_requested):
+                    if not stop_requested():
+                        self.sleeper(IDLE_WAIT_SECONDS)
+                    continue
                 did_work = self.run_once(stop_requested)
                 if not did_work:
                     self.sleeper(IDLE_WAIT_SECONDS)
