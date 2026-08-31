@@ -82,8 +82,9 @@ const createExportPoller = ({
         if (!isCurrent(epoch, sequence)) return;
         acceptedSequence = sequence;
         failureCount = 0;
+        clearTimer();
         onData(data);
-        if (ACTIVE_STATES.includes(data.state)) {
+        if (data.latest_attempt && ACTIVE_STATES.includes(data.latest_attempt.state)) {
           periodicEnabled = true;
           schedule(2000, epoch);
         } else if (stopOnTerminal) {

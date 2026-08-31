@@ -12,12 +12,53 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+const JOB_ID = '123e4567-e89b-42d3-a456-426614174000';
+
+function job(state, percent) {
+  return {
+    schema_version: 1,
+    id: JOB_ID,
+    state,
+    phase_label: '내보내기 진행 중',
+    scope: 'pins',
+    phase_percent: percent,
+    overall_percent: percent,
+    counters: {
+      requested_total: 1,
+      target_total: 1,
+      snapshot_done: 1,
+      archive_total: 1,
+      archive_done: 1,
+      included_total: 1,
+      excluded_total: 0,
+      bytes_total: 100,
+      bytes_done: 100,
+    },
+    created_at: '2026-08-30T12:34:56Z',
+    snapshot_at: null,
+    heartbeat_at: null,
+    completed_at: null,
+    expires_at: null,
+    resume_count: 0,
+    error: null,
+    download_url: state === 'complete' ? `/api/v2/exports/${JOB_ID}/download/` : null,
+  };
+}
+
+function latest(state, percent = 40) {
+  return {
+    schema_version: 1,
+    latest_attempt: job(state, percent),
+    downloadable_job: state === 'complete' ? job('complete', 100) : null,
+  };
+}
+
 function active(percent = 40) {
-  return { state: 'archiving', overall_percent: percent };
+  return latest('archiving', percent);
 }
 
 function terminal(state = 'complete') {
-  return { state, overall_percent: 100 };
+  return latest(state, 100);
 }
 
 function fakeDocument() {
@@ -97,7 +138,7 @@ describe('export poller', () => {
     jest.useRealTimers();
   });
 
-  it('requests immediately and waits for an active result before one two-second timer', async () => {
+  it('keeps polling when latest_attempt is an active exact latest envelope', async () => {
     const { poller, fetchLatest, requests } = setup();
     pollers.push(poller);
     poller.start();
@@ -165,6 +206,20 @@ describe('export poller', () => {
     expect(onError).not.toHaveBeenCalled();
     jest.advanceTimersByTime(2000);
     expect(fetchLatest).toHaveBeenCalledTimes(3);
+  });
+
+  it('clears an older active timer when a newer terminal envelope is accepted', async () => {
+    const { poller, fetchLatest, requests } = setup();
+    pollers.push(poller);
+    poller.start();
+    poller.refresh();
+    requests[0].resolve(active());
+    await flushPromises();
+    requests[1].resolve(terminal());
+    await flushPromises();
+    jest.advanceTimersByTime(30000);
+
+    expect(fetchLatest).toHaveBeenCalledTimes(2);
   });
 
   it('blocks stale success across stop then restart epochs', async () => {
