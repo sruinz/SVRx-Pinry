@@ -70,6 +70,8 @@ _LEGACY_EVIDENCE_STAGE_CODES = {
 # 정확한 스키마 변경만 등록한다. 알 수 없는 변경은 안전 경로를 유지한다.
 _SCHEMA_ONLY_MIGRATIONS = frozenset((
     ("django_images", "0007_startup_validation_state"),
+    ("exports", "0001_initial"),
+    ("exports", "0002_exporttarget_identity_snapshot"),
     ("users", "0002_admin_bootstrap"),
 ))
 

@@ -11,6 +11,9 @@ from django.core.management import CommandError
 from django.test import SimpleTestCase
 
 from core.services.media_asset_backfill import BackfillSummary
+from django_images.startup_validation import (
+    STARTUP_VALIDATION_CONTRACT_VERSION,
+)
 from django_images.services import migration_state
 from django_images.services.legacy_startup import (
     LegacyStartupCoordinator,
@@ -32,6 +35,10 @@ from django_images.services.startup_preflight import (
 
 
 RUN_ID = "20260825T120000Z-12345678-1234-4678-9234-567812345678"
+EXPORT_SCHEMA_MIGRATIONS = (
+    ("exports", "0001_initial"),
+    ("exports", "0002_exporttarget_identity_snapshot"),
+)
 
 
 class _Intent(object):
@@ -552,6 +559,70 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         self.assertFalse(self.backup_root.exists())
         available.assert_not_called()
         snapshot.assert_not_called()
+
+    def test_current_marker_exports_schema_uses_standard_migrate_without_media_run(
+        self,
+    ):
+        evidence = LegacyEvidence(
+            database_exists=True,
+            database_bytes=100,
+            distinct_legacy_bytes=0,
+            has_md5_paths=False,
+            has_fixed_slot_paths=False,
+            has_named_canonical_paths=True,
+            has_media_image_directory=False,
+            has_media_rows=True,
+            pending_migrations=EXPORT_SCHEMA_MIGRATIONS,
+            database_identity={"device": 1, "inode": 2},
+            media_root_identity={"device": 3, "inode": 4},
+            has_pinry_direct_md5_directory=False,
+            missing_unreferenced_images=(),
+        )
+        coordinator = self.coordinator()
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_startup_validation",
+            return_value=SimpleNamespace(
+                marker_version=STARTUP_VALIDATION_CONTRACT_VERSION,
+                is_current=False,
+                pending_migrations=EXPORT_SCHEMA_MIGRATIONS,
+            ),
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "StartupValidationState.invalidate",
+            return_value=1,
+        ) as invalidate, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.available_space_bytes",
+            return_value=10 ** 9,
+        ) as available, mock.patch(
+            "django_images.services.legacy_startup.snapshot_sqlite",
+        ) as snapshot, mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.validate_storage_configuration_preflight",
+            return_value=PreflightResult(ok=True),
+        ), mock.patch.object(
+            coordinator,
+            "_converge_media",
+            side_effect=AssertionError("media convergence must not run"),
+        ) as converge_media:
+            run = coordinator.prepare_before_schema()
+            self.assertIsNone(run)
+            self.assertTrue(coordinator.schema_required(run))
+            self.assertTrue(coordinator.invalidate_startup_validation())
+            result = coordinator.converge_after_schema(run)
+
+        self.assertIsNone(result)
+        self.assertFalse(self.backup_root.exists())
+        invalidate.assert_called_once_with()
+        available.assert_not_called()
+        snapshot.assert_not_called()
+        converge_media.assert_not_called()
 
     def test_adjust_ownership_excludes_backup_root_and_payload(self):
         self.database_path.write_bytes(b"database")
@@ -1728,6 +1799,55 @@ class LegacyStartupCoordinatorTests(SimpleTestCase):
         )
 
         with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_legacy_evidence",
+            return_value=pending_evidence,
+        ), mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.available_space_bytes",
+            return_value=10 ** 9,
+        ) as available, mock.patch(
+            "django_images.services.legacy_startup.snapshot_sqlite",
+            return_value=object(),
+        ) as snapshot:
+            resumed = coordinator.prepare_before_schema()
+
+        self.assertEqual(resumed.run_id, incomplete.run_id)
+        self.assertEqual(
+            migration_state.read_run_status(resumed).phase,
+            "snapshot_complete",
+        )
+        available.assert_called_once()
+        snapshot.assert_called_once()
+
+    def test_exports_schema_does_not_bypass_incomplete_legacy_run(self):
+        incomplete = self._summary_run()
+        coordinator = self.coordinator()
+        pending_evidence = LegacyEvidence(
+            database_exists=True,
+            database_bytes=100,
+            distinct_legacy_bytes=0,
+            has_md5_paths=False,
+            has_fixed_slot_paths=False,
+            has_named_canonical_paths=True,
+            has_media_image_directory=False,
+            has_media_rows=True,
+            pending_migrations=EXPORT_SCHEMA_MIGRATIONS,
+            database_identity={"device": 1, "inode": 2},
+            media_root_identity={"device": 3, "inode": 4},
+            has_pinry_direct_md5_directory=False,
+            missing_unreferenced_images=(),
+        )
+
+        with mock.patch(
+            "django_images.services.legacy_startup."
+            "startup_preflight.inspect_startup_validation",
+            return_value=SimpleNamespace(
+                marker_version=STARTUP_VALIDATION_CONTRACT_VERSION,
+                is_current=False,
+                pending_migrations=EXPORT_SCHEMA_MIGRATIONS,
+            ),
+        ), mock.patch(
             "django_images.services.legacy_startup."
             "startup_preflight.inspect_legacy_evidence",
             return_value=pending_evidence,

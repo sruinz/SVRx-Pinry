@@ -28,6 +28,10 @@ VALID_IMAGE_SIZES = {
     "standard": {"size": [600, 0]},
     "square": {"crop": True, "size": [125, 125]},
 }
+EXPORT_SCHEMA_MIGRATIONS = (
+    ("exports", "0001_initial"),
+    ("exports", "0002_exporttarget_identity_snapshot"),
+)
 
 
 class _DiskGraph(object):
@@ -43,6 +47,25 @@ class LegacyEvidenceTests(SimpleTestCase):
         self.media_root = self.root_path / "media"
         self.media_root.mkdir()
         self.database_path = self.root_path / "production.db"
+
+    def _current_evidence(self, pending_migrations, **overrides):
+        values = {
+            "database_exists": True,
+            "database_bytes": 100,
+            "distinct_legacy_bytes": 0,
+            "has_md5_paths": False,
+            "has_fixed_slot_paths": False,
+            "has_named_canonical_paths": True,
+            "has_media_image_directory": False,
+            "has_media_rows": True,
+            "pending_migrations": pending_migrations,
+            "database_identity": {"device": 1, "inode": 2},
+            "media_root_identity": {"device": 3, "inode": 4},
+            "has_pinry_direct_md5_directory": False,
+            "missing_unreferenced_images": (),
+        }
+        values.update(overrides)
+        return startup_preflight.LegacyEvidence(**values)
 
     def _create_database(
         self, image_paths=(), thumbnail_paths=(), applied=()
@@ -351,6 +374,49 @@ class LegacyEvidenceTests(SimpleTestCase):
                     evidence.requires_media_migration,
                     expected,
                 )
+
+    def test_exports_only_pending_schema_does_not_require_media_migration(
+        self,
+    ):
+        evidence = self._current_evidence(
+            pending_migrations=EXPORT_SCHEMA_MIGRATIONS,
+        )
+        self.assertFalse(evidence.requires_media_migration)
+
+    def test_exports_allowlist_remains_fail_closed_for_unknown_migration(
+        self,
+    ):
+        evidence = self._current_evidence(
+            pending_migrations=(
+                EXPORT_SCHEMA_MIGRATIONS
+                + (("core", "0017_unknown"),)
+            ),
+        )
+        self.assertTrue(evidence.requires_media_migration)
+
+    def test_exports_allowlist_never_overrides_each_legacy_evidence(self):
+        legacy_cases = (
+            {"has_md5_paths": True},
+            {"has_fixed_slot_paths": True},
+            {"has_media_image_directory": True},
+            {"has_pinry_direct_md5_directory": True},
+            {
+                "missing_unreferenced_images": (
+                    startup_preflight.MissingUnreferencedImage(
+                        image_id=1,
+                        image_path="originals/missing.png",
+                        thumbnail_rows=(),
+                    ),
+                ),
+            },
+        )
+        for override in legacy_cases:
+            with self.subTest(override=override):
+                evidence = self._current_evidence(
+                    pending_migrations=EXPORT_SCHEMA_MIGRATIONS,
+                    **override
+                )
+                self.assertTrue(evidence.requires_media_migration)
 
     def test_missing_database_never_connects_or_marks_schema_pending(self):
         graph = _DiskGraph(("django_images", "0001_initial"))
