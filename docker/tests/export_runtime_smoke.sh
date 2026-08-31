@@ -44,66 +44,31 @@ script_directory="$({
     CDPATH= cd -- "$(dirname -- "$0")" && pwd -P
 })"
 fixture_script="${script_directory}/fixtures/create_export_fixture.py"
-repository_root="$({
-    CDPATH= cd -- "${script_directory}/../.." && pwd -P
-})"
-nginx_config="${repository_root}/docker/nginx/sites-enabled/default"
-nginx_contract="${repository_root}/docker/tests/nginx_maintenance_contract.sh"
 if [ ! -f "${fixture_script}" ] || [ -L "${fixture_script}" ]; then
     printf '%s\n' 'export_smoke_fixture_invalid' >&2
     exit 1
 fi
-for contract_file in "${nginx_config}" "${nginx_contract}"; do
-    if [ ! -f "${contract_file}" ] || [ -L "${contract_file}" ]; then
-        printf '%s\n' 'export_smoke_nginx_contract_invalid' >&2
-        exit 1
-    fi
-done
-python3 - "${nginx_config}" "${nginx_contract}" <<'PY'
-import re
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as stream:
-    config = stream.read()
-with open(sys.argv[2], encoding="utf-8") as stream:
-    contract = stream.read()
-location = re.search(
-    r"location\s+\^~\s+/__protected_exports/\s*\{([^{}]*)\}",
-    config,
-    re.S,
-)
-if location is None:
-    raise SystemExit("export_smoke_nginx_contract_invalid")
-directives = {
-    re.sub(r"\s+", " ", value.strip())
-    for value in location.group(1).split(";")
-    if value.strip()
-}
-required_directives = {
-    "internal",
-    "alias /data/exports/ready/",
-    "disable_symlinks on",
-}
-required_contract = (
-    '"X-Accel-Redirect"',
-    '"/api/test-protected-export-symlink/"',
-    'request GET /api/test-protected-export-symlink/',
-    'if [[ "$status" != 403 && "$status" != 404 ]]',
-    'cmp -s "$body" "$outside_zip"',
-)
-if not required_directives.issubset(directives) or any(
-    value not in contract for value in required_contract
-):
-    raise SystemExit("export_smoke_nginx_contract_invalid")
-PY
 if ! docker info >/dev/null 2>&1; then
     printf '%s\n' 'export_smoke_docker_unavailable' >&2
     exit 1
 fi
-if ! docker image inspect "${image}" >/dev/null 2>&1; then
+if ! image_id="$(
+    docker image inspect --format '{{.Id}}' -- "${image}" 2>/dev/null
+)"; then
     printf '%s\n' 'export_smoke_image_unavailable' >&2
     exit 1
 fi
+image_hash="${image_id#sha256:}"
+if [ "${image_hash}" = "${image_id}" ] || [ "${#image_hash}" -ne 64 ]; then
+    printf '%s\n' 'export_smoke_image_identity_invalid' >&2
+    exit 1
+fi
+case "${image_hash}" in
+    *[!0-9a-f]*)
+        printf '%s\n' 'export_smoke_image_identity_invalid' >&2
+        exit 1
+        ;;
+esac
 
 smoke_parent="${TMPDIR:-/tmp}"
 smoke_root="$(mktemp -d "${smoke_parent%/}/svrx-pinry-export-smoke.XXXXXX")"
@@ -131,9 +96,14 @@ base_url=""
 csrf_token=""
 diagnosing=0
 started_at="$(date +%s)"
+host_uid="$(id -u)"
+host_gid="$(id -g)"
 
 mkdir -p -- "${data_root}"
 chmod 0700 "${data_root}"
+canonical_data_root="$({
+    CDPATH= cd -- "${data_root}" && pwd -P
+})"
 : > "${cookie_jar}"
 chmod 0600 "${cookie_jar}"
 
@@ -142,9 +112,10 @@ owned_container() {
     local identity
     [ -n "${container_id}" ] || return 1
     identity="$(docker container inspect --format \
-        '{{.Id}}|{{index .Config.Labels "com.svrx.pinry.export-smoke.run"}}' \
+        '{{.Id}}|{{.Image}}|{{index .Config.Labels "com.svrx.pinry.export-smoke.run"}}|{{range .Mounts}}{{if eq .Destination "/data"}}{{.Type}}:{{.Source}}{{end}}{{end}}' \
         "${container_id}" 2>/dev/null)" || return 1
-    [ "${identity}" = "${container_id}|${run_token}" ]
+    [ "${identity}" = \
+        "${container_id}|${image_id}|${run_token}|bind:${canonical_data_root}" ]
 }
 
 owned_network() {
@@ -156,31 +127,164 @@ owned_network() {
     [ "${identity}" = "${network_id}|${run_token}" ]
 }
 
+container_exists() {
+    docker container inspect "$1" >/dev/null 2>&1
+}
+
+network_exists() {
+    docker network inspect "$1" >/dev/null 2>&1
+}
+
+clear_runtime_data() {
+    local container_id="$1"
+    owned_container "${container_id}" || return 1
+    docker exec --user 0 "${container_id}" python -c '
+import os
+import shutil
+import sys
+
+root = "/data"
+for name in os.listdir(root):
+    path = os.path.join(root, name)
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+    else:
+        shutil.rmtree(path)
+if os.listdir(root):
+    raise SystemExit("export_smoke_data_cleanup_incomplete")
+os.chown(root, int(sys.argv[1]), int(sys.argv[2]))
+os.chmod(root, 0o700)
+' "${host_uid}" "${host_gid}" >/dev/null
+}
+
+remove_runtime_container() {
+    local container_id="$1"
+    local data_disposition="${2:-clear}"
+    if ! container_exists "${container_id}"; then
+        return 0
+    fi
+    if ! owned_container "${container_id}"; then
+        printf 'export_smoke_container_identity_changed=%s\n' \
+            "${container_id}" >&2
+        return 1
+    fi
+    if [ "${data_disposition}" = "clear" ]; then
+        if ! clear_runtime_data "${container_id}"; then
+            printf 'export_smoke_data_cleanup_failed=%s\n' \
+                "${container_id}" >&2
+            return 1
+        fi
+    elif [ "${data_disposition}" != "retain" ]; then
+        printf 'export_smoke_data_disposition_invalid=%s\n' \
+            "${data_disposition}" >&2
+        return 1
+    fi
+    if ! docker rm -f "${container_id}" >/dev/null 2>&1; then
+        printf 'export_smoke_container_cleanup_failed=%s\n' \
+            "${container_id}" >&2
+        return 1
+    fi
+    if container_exists "${container_id}"; then
+        printf 'export_smoke_container_leaked=%s\n' "${container_id}" >&2
+        return 1
+    fi
+}
+
+remove_owned_network() {
+    if ! network_exists "${network_id}"; then
+        return 0
+    fi
+    if ! owned_network; then
+        printf 'export_smoke_network_identity_changed=%s\n' \
+            "${network_id}" >&2
+        return 1
+    fi
+    if ! docker network rm "${network_id}" >/dev/null 2>&1; then
+        printf 'export_smoke_network_cleanup_failed=%s\n' \
+            "${network_id}" >&2
+        return 1
+    fi
+    if network_exists "${network_id}"; then
+        printf 'export_smoke_network_leaked=%s\n' "${network_id}" >&2
+        return 1
+    fi
+}
+
 cleanup() {
-    if owned_container "${first_container_id}"; then
-        docker rm -f "${first_container_id}" >/dev/null 2>&1 || true
+    local status=0
+    if [ -n "${first_container_id}" ]; then
+        if remove_runtime_container "${first_container_id}"; then
+            first_container_id=""
+        else
+            status=1
+        fi
     fi
-    if owned_container "${second_container_id}"; then
-        docker rm -f "${second_container_id}" >/dev/null 2>&1 || true
+    if [ -n "${second_container_id}" ]; then
+        if remove_runtime_container "${second_container_id}"; then
+            second_container_id=""
+        else
+            status=1
+        fi
     fi
-    if owned_network; then
-        docker network rm "${network_id}" >/dev/null 2>&1 || true
+    if [ -n "${network_id}" ]; then
+        if remove_owned_network; then
+            network_id=""
+        else
+            status=1
+        fi
     fi
-    if [ -n "${smoke_root}" ] && [ -d "${smoke_root}" ] \
-        && [ ! -L "${smoke_root}" ]; then
-        case "${smoke_root}" in
-            "${smoke_parent%/}"/svrx-pinry-export-smoke.*)
-                rm -rf -- "${smoke_root}"
-                ;;
-        esac
+    if [ "${status}" -eq 0 ] && [ -n "${smoke_root}" ] \
+        && { [ -e "${smoke_root}" ] || [ -L "${smoke_root}" ]; }; then
+        if [ ! -d "${smoke_root}" ] || [ -L "${smoke_root}" ]; then
+            printf 'export_smoke_host_cleanup_scope_invalid=%s\n' \
+                "${smoke_root}" >&2
+            status=1
+        else
+            case "${smoke_root}" in
+                "${smoke_parent%/}"/svrx-pinry-export-smoke.*)
+                    if ! rm -rf -- "${smoke_root}" \
+                        || [ -e "${smoke_root}" ] \
+                        || [ -L "${smoke_root}" ]; then
+                        printf 'export_smoke_host_cleanup_failed=%s\n' \
+                            "${smoke_root}" >&2
+                        status=1
+                    fi
+                    ;;
+                *)
+                    printf 'export_smoke_host_cleanup_scope_invalid=%s\n' \
+                        "${smoke_root}" >&2
+                    status=1
+                    ;;
+            esac
+        fi
     fi
+    return "${status}"
+}
+
+cleanup_on_exit() {
+    local original_status="$?"
+    trap - EXIT
+    if ! cleanup && [ "${original_status}" -eq 0 ]; then
+        original_status=1
+    fi
+    exit "${original_status}"
+}
+
+finish_success() {
+    local message="$1"
+    if ! cleanup; then
+        printf '%s\n' 'export_smoke_cleanup_failed' >&2
+        return 1
+    fi
+    trap - EXIT HUP INT TERM
+    printf '%s\n' "${message}"
 }
 
 on_signal() {
     exit 130
 }
 
-trap cleanup EXIT
+trap cleanup_on_exit EXIT
 trap on_signal HUP INT TERM
 
 diagnose() {
@@ -330,10 +434,10 @@ start_app() {
         --label "com.svrx.pinry.export-smoke.run=${run_token}" \
         --label "com.svrx.pinry.export-smoke.role=${container_role}" \
         --network "${network_id}" \
-        --mount "type=bind,src=${data_root},dst=/data" \
+        --mount "type=bind,src=${canonical_data_root},dst=/data" \
         --mount "type=bind,src=${fixture_script},dst=/tmp/create_export_fixture.py,readonly" \
         --publish 127.0.0.1::80 \
-        "${image}" \
+        "${image_id}" \
         /pinry/docker/scripts/start.sh --migrate-legacy \
     )" || {
         fail 'export_smoke_container_start_failed'
@@ -757,6 +861,189 @@ if "content-disposition: attachment;" not in headers:
 PY
 }
 
+verify_image_nginx_symlink_contract() {
+    owned_container "${active_container_id}" || return 1
+    docker exec -i --user 0 "${active_container_id}" python - <<'PY'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
+import os
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+
+
+def available_port():
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+    finally:
+        probe.close()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        protected = {
+            "/api/test-protected-export/": "known.zip",
+            "/api/test-protected-export-symlink/": "symlink.zip",
+        }
+        leaf = protected.get(self.path)
+        if leaf is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header(
+            "X-Accel-Redirect",
+            "/__protected_exports/{}".format(leaf),
+        )
+        self.send_header("Content-Type", "application/zip")
+        self.end_headers()
+
+    def log_message(self, unused_format, *unused_arguments):
+        return
+
+
+def request(url):
+    try:
+        response = urlopen(url, timeout=5)
+        try:
+            return response.getcode(), response.read()
+        finally:
+            response.close()
+    except HTTPError as error:
+        return error.code, error.read()
+
+
+nginx_binary = shutil.which("nginx")
+if nginx_binary is None:
+    raise SystemExit("export_smoke_image_nginx_missing")
+root = tempfile.mkdtemp(prefix="export-nginx-contract-", dir="/tmp")
+server = None
+thread = None
+nginx = None
+try:
+    ready = os.path.join(root, "ready")
+    os.mkdir(ready, 0o755)
+    known = b"PK exact image approved export bytes\n"
+    sentinel = b"PK forbidden symlink target bytes\n"
+    with open(os.path.join(ready, "known.zip"), "wb") as stream:
+        stream.write(known)
+    outside = os.path.join(root, "outside.zip")
+    with open(outside, "wb") as stream:
+        stream.write(sentinel)
+    os.chmod(os.path.join(ready, "known.zip"), 0o644)
+    os.chmod(outside, 0o644)
+    os.symlink(outside, os.path.join(ready, "symlink.zip"))
+
+    listen_port = available_port()
+    upstream_port = available_port()
+    server = HTTPServer(("127.0.0.1", upstream_port), Handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+
+    image_config_path = "/etc/nginx/sites-enabled/default"
+    with open(image_config_path, encoding="utf-8") as stream:
+        image_config = stream.read()
+    replacements = (
+        (
+            "listen 80 default;",
+            "listen 127.0.0.1:{};".format(listen_port),
+            1,
+        ),
+        (
+            "alias /data/exports/ready/;",
+            "alias {}/;".format(ready),
+            1,
+        ),
+    )
+    for old, new, expected_count in replacements:
+        if image_config.count(old) != expected_count:
+            raise SystemExit("export_smoke_image_nginx_config_invalid")
+        image_config = image_config.replace(old, new)
+    if "proxy_pass http://127.0.0.1:8000;" not in image_config:
+        raise SystemExit("export_smoke_image_nginx_config_invalid")
+    image_config = image_config.replace(
+        "proxy_pass http://127.0.0.1:8000;",
+        "proxy_pass http://127.0.0.1:{};".format(upstream_port),
+    )
+    server_config = os.path.join(root, "server.conf")
+    with open(server_config, "w", encoding="utf-8") as stream:
+        stream.write(image_config)
+    nginx_config = os.path.join(root, "nginx.conf")
+    with open(nginx_config, "w", encoding="utf-8") as stream:
+        stream.write("""user root;
+worker_processes 1;
+pid {root}/nginx.pid;
+error_log stderr warn;
+events {{ worker_connections 64; }}
+http {{
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+    include {server_config};
+}}
+""".format(root=root, server_config=server_config))
+    nginx = subprocess.Popen([
+        nginx_binary,
+        "-p", root + "/",
+        "-c", nginx_config,
+        "-g", "daemon off;",
+    ], stdout=subprocess.DEVNULL)
+
+    approved_url = "http://127.0.0.1:{}/api/test-protected-export/".format(
+        listen_port,
+    )
+    deadline = time.monotonic() + 10
+    while True:
+        if nginx.poll() is not None:
+            raise SystemExit("export_smoke_image_nginx_start_failed")
+        try:
+            approved_status, approved_body = request(approved_url)
+            break
+        except URLError:
+            if time.monotonic() >= deadline:
+                raise SystemExit("export_smoke_image_nginx_ready_timeout")
+            time.sleep(0.05)
+    if approved_status != 200 or approved_body != known:
+        raise SystemExit("export_smoke_image_nginx_accel_invalid")
+
+    direct_status, direct_body = request(
+        "http://127.0.0.1:{}/__protected_exports/known.zip".format(
+            listen_port,
+        )
+    )
+    if direct_status != 404 or direct_body == known:
+        raise SystemExit("export_smoke_image_nginx_internal_exposed")
+
+    symlink_status, symlink_body = request(
+        "http://127.0.0.1:{}/api/test-protected-export-symlink/".format(
+            listen_port,
+        )
+    )
+    if symlink_status not in (403, 404) or symlink_body == sentinel:
+        raise SystemExit("export_smoke_image_nginx_symlink_exposed")
+finally:
+    if nginx is not None and nginx.poll() is None:
+        nginx.terminate()
+        try:
+            nginx.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            nginx.kill()
+            nginx.wait()
+    if server is not None:
+        server.shutdown()
+        server.server_close()
+    if thread is not None:
+        thread.join(timeout=5)
+    shutil.rmtree(root)
+PY
+}
+
 validate_archive() {
     local job_id="$1"
     local archive="$2"
@@ -1046,7 +1333,8 @@ with open(sys.argv[1], encoding="utf-8") as stream:
 if payload != {"jobs": 0, "targets": 0, "staging": [], "ready": []}:
     raise SystemExit("export_smoke_zero_side_effect_detected")
 PY
-    printf '%s\n' 'EXPORT_RUNTIME_SMOKE_OK pin_count=0 invalid_target=verified'
+    finish_success \
+        'EXPORT_RUNTIME_SMOKE_OK pin_count=0 invalid_target=verified'
     exit 0
 fi
 
@@ -1205,7 +1493,8 @@ print(json.dumps({
     "targets": list(ExportTarget.objects.filter(job=job).order_by("position").values_list("position", flat=True)),
 }, separators=(",", ":"), sort_keys=True))
 ' "${job_id}" > "${diagnostic_json}" || fail 'export_smoke_job_audit_failed'
-python3 - "${diagnostic_json}" "${recovery_before_json}" "${pin_count_value}" <<'PY'
+python3 - "${diagnostic_json}" "${recovery_before_json}" \
+    "${pin_count_value}" "${job_id}" <<'PY'
 import json
 import re
 import sys
@@ -1216,6 +1505,7 @@ with open(sys.argv[1], encoding="utf-8") as stream:
 with open(sys.argv[2], encoding="utf-8") as stream:
     before = json.load(stream)
 count = int(sys.argv[3])
+job_id = sys.argv[4]
 before_worker = before.get("worker", {})
 before_job = before.get("job", {})
 before_attempt = before.get("attempt", {})
@@ -1246,7 +1536,7 @@ if (
     or before_attempt.get("lease_uuid") != before_job.get("lease_uuid")
     or new_attempt.get("state") != "cleaned"
     or new_attempt.get("relative_path")
-    != "attempt-{}-{}".format(sys.argv[1], new_generation)
+    != "attempt-{}-{}".format(job_id, new_generation)
     or new_lease == old_lease or after_worker_lease == before_worker_lease
 ):
     raise SystemExit("export_smoke_recovery_attempt_invalid")
@@ -1283,7 +1573,7 @@ integer_fields = (
 )
 if (
     not isinstance(receipt, dict)
-    or receipt.get("relative_path") != "ready/{}.zip".format(sys.argv[1])
+    or receipt.get("relative_path") != "ready/{}.zip".format(job_id)
     or type(receipt.get("display_name")) is not str
     or not receipt["display_name"].endswith(".zip")
     or any(type(receipt.get(field)) is not int for field in integer_fields)
@@ -1307,23 +1597,8 @@ direct_code="$(curl --silent --show-error --connect-timeout 2 --max-time 10 \
     || fail 'export_smoke_internal_probe_failed'
 [ "${direct_code}" = "404" ] || fail 'export_smoke_internal_uri_exposed'
 
-docker exec "${active_container_id}" sh -c '
-set -eu
-printf %s symlink-sentinel > /data/export-smoke-symlink-sentinel
-ln -s /data/export-smoke-symlink-sentinel /data/exports/ready/export-smoke-symlink.zip
-' >/dev/null || fail 'export_smoke_symlink_fixture_failed'
-symlink_body="${smoke_root}/symlink.body"
-symlink_code="$(curl --silent --show-error --connect-timeout 2 --max-time 10 \
-    --output "${symlink_body}" --write-out '%{http_code}' \
-    "${base_url}/__protected_exports/export-smoke-symlink.zip")" \
-    || fail 'export_smoke_symlink_probe_failed'
-case "${symlink_code}" in
-    403|404) ;;
-    *) fail 'export_smoke_symlink_exposed' ;;
-esac
-if [ "$(cat "${symlink_body}")" = 'symlink-sentinel' ]; then
-    fail 'export_smoke_symlink_bytes_exposed'
-fi
+verify_image_nginx_symlink_contract >/dev/null \
+    || fail 'export_smoke_image_nginx_contract_failed'
 
 archive_sha="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "${archive_path}")"
 archive_size="$(wc -c < "${archive_path}" | tr -d ' ')"
@@ -1331,7 +1606,7 @@ archive_entries=$((1 + pin_count_value * 2))
 
 owned_container "${first_container_id}" \
     || fail 'export_smoke_first_container_identity_changed'
-docker rm -f "${first_container_id}" >/dev/null \
+remove_runtime_container "${first_container_id}" retain \
     || fail 'export_smoke_first_container_remove_failed'
 first_container_id=""
 active_container_id=""
@@ -1352,5 +1627,5 @@ second_sha="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv
 job_resume_count="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["latest_attempt"]["resume_count"])' "${response_json}")"
 
 elapsed_seconds=$(( $(date +%s) - started_at ))
-printf '%s\n' \
+finish_success \
     "EXPORT_RUNTIME_SMOKE_OK requested=${pin_count_value} included=${pin_count_value} excluded=0 zip_pins=${pin_count_value} zip_entries=${archive_entries} zip_bytes=${archive_size} download_sha256=${archive_sha} worker_restarts=1 job_resume_count=${job_resume_count} elapsed_seconds=${elapsed_seconds}"
