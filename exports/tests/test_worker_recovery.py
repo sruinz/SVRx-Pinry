@@ -1480,6 +1480,61 @@ class TerminalCleanupTests(ExportStorageMixin, TransactionTestCase):
         self.assertIsNotNone(job.snapshot_generation)
         self.assertFalse(outcome.claim_allowed)
 
+    def test_terminal_snapshot_worker_renew_busy_defers_before_filesystem(self):
+        job, blobs, paths, directory = self._snapshot_fixture(count=1)
+        token, heartbeat = self._worker()
+
+        with mock.patch.object(
+                heartbeat,
+                "renew_worker_once",
+                side_effect=DatabaseFenceBusy(),
+        ), mock.patch(
+                "exports.services.worker._cleanup_snapshot_tree_fs",
+        ) as cleanup_tree:
+            outcome = self._cleanup(token, heartbeat)
+
+        blobs[0].refresh_from_db()
+        cleanup_tree.assert_not_called()
+        self.assertTrue(paths[0].exists())
+        self.assertTrue(directory.exists())
+        self.assertEqual(blobs[0].cleanup_state, "pending")
+        self.assertTrue(outcome.did_work)
+        self.assertFalse(outcome.claim_allowed)
+
+    def test_terminal_snapshot_stop_after_filesystem_skips_fresh_cas(self):
+        job, blobs, paths, directory = self._snapshot_fixture(count=1)
+        token, heartbeat = self._worker()
+        stop = threading.Event()
+        from exports.services import worker as worker_services
+        original_cleanup = worker_services._cleanup_snapshot_tree_fs
+
+        def cleanup_then_stop(*args, **kwargs):
+            original_cleanup(*args, **kwargs)
+            stop.set()
+
+        with mock.patch.object(
+                worker_services,
+                "_cleanup_snapshot_tree_fs",
+                side_effect=cleanup_then_stop,
+        ), mock.patch.object(
+                heartbeat,
+                "renew_worker_once",
+                wraps=heartbeat.renew_worker_once,
+        ) as renew_worker:
+            outcome = cleanup_expired_and_stale(
+                token,
+                heartbeat,
+                stop.is_set,
+                now=self.now,
+            )
+
+        blobs[0].refresh_from_db()
+        self.assertEqual(renew_worker.call_count, 1)
+        self.assertFalse(paths[0].exists())
+        self.assertTrue(directory.exists())
+        self.assertEqual(blobs[0].cleanup_state, "pending")
+        self.assertFalse(outcome.claim_allowed)
+
     def test_attempt_cleanup_busy_retries_after_releasing_guard(self):
         job, unused_attempt, attempt_file, path, unused_directory = self._fixture()
         del unused_attempt, unused_directory

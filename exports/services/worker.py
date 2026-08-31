@@ -155,13 +155,16 @@ def _retry_database(
     monotonic=None,
     sleeper=None,
     retry_checkpoint=None,
+    operation_deadline=None,
 ):
     monotonic = time.monotonic if monotonic is None else monotonic
     sleeper = time.sleep if sleeper is None else sleeper
-    deadline = DatabaseFenceDeadline(
-        monotonic,
-        budget_seconds=DATABASE_RETRY_MAX_SECONDS,
-    )
+    deadline = operation_deadline
+    if deadline is None:
+        deadline = DatabaseFenceDeadline(
+            monotonic,
+            budget_seconds=DATABASE_RETRY_MAX_SECONDS,
+        )
     while True:
         try:
             return operation(deadline)
@@ -332,6 +335,90 @@ class _TokenTransition(object):
         ))
 
 
+class _ServiceTokenTransition(object):
+    def __init__(self, adapter, transition, expected):
+        self.adapter = adapter
+        self.transition = transition
+        self.expected = expected
+
+    def publish(self, token):
+        self.transition.publish(token)
+        self.adapter._service_token = token
+
+    def replace(self, token):
+        self.transition.replace(token)
+        self.adapter._service_token = token
+
+    def clear(self):
+        self.transition.clear()
+        if self.adapter._service_token is None:
+            self.adapter._service_token = self.expected
+
+
+class _ServiceHeartbeatAdapter(object):
+    """Task 5/6 callback을 stop-aware one-shot 갱신으로 제한한다."""
+
+    def __init__(
+        self,
+        heartbeat,
+        stop_requested,
+        lease,
+        renew_busy,
+    ):
+        if renew_busy not in ("raise", "skip"):
+            raise ValueError("invalid_service_heartbeat_busy_policy")
+        self._heartbeat = heartbeat
+        self._stop_requested = stop_requested
+        self._service_token = lease
+        self._renew_busy = renew_busy
+
+    def _raise_control(self, token):
+        if self._heartbeat.lost is not None:
+            raise self._heartbeat.lost
+        if self._heartbeat.fatal is not None:
+            raise _HeartbeatFailed()
+        if self._stop_requested is not None and self._stop_requested():
+            raise StopRequested(token)
+
+    def _renew_one_shot(self, token, raise_busy):
+        self._raise_control(token)
+        busy = None
+        try:
+            self._heartbeat.renew_once(token)
+        except DatabaseFenceBusy as error:
+            busy = error
+        self._raise_control(token)
+        if busy is not None and raise_busy:
+            raise busy
+        return token
+
+    def __call__(self):
+        return self._renew_one_shot(
+            self._service_token,
+            raise_busy=False,
+        )
+
+    def renew_now(self, explicit_lease):
+        return self._renew_one_shot(
+            explicit_lease,
+            raise_busy=self._renew_busy == "raise",
+        )
+
+    def foreground_write_guard(self):
+        return self._heartbeat.foreground_write_guard()
+
+    @contextmanager
+    def job_token_transition(self, expected_token):
+        with self._heartbeat.job_token_transition(
+            expected_token,
+        ) as transition:
+            yield _ServiceTokenTransition(
+                self,
+                transition,
+                expected_token,
+            )
+
+
 class LeaseHeartbeat(object):
     """프로세스 로컬 토큰과 heartbeat DB 쓰기 직렬화를 소유한다."""
 
@@ -419,22 +506,11 @@ class LeaseHeartbeat(object):
                     raise LeaseLost()
 
     def _renew(self, token, now):
-        def renew(operation_deadline):
-            return self._renew_once(
-                token,
-                now,
-                operation_deadline=operation_deadline,
-            )
-
-        return _retry_database(
-            renew,
-            monotonic=self.monotonic,
-            sleeper=self.sleeper,
-        )
+        return self._renew_once(token, now)
 
     def tick(self, now=None):
         with self._mutex:
-            if not self._accept_ticks:
+            if not self._accept_ticks or self._stop_event.is_set():
                 return False
             current = self.clock() if now is None else now
             self._renew(self._job_token, current)
@@ -508,9 +584,9 @@ class LeaseHeartbeat(object):
             self._thread.start()
 
     def stop_accepting_ticks(self):
+        self._stop_event.set()
         with self._mutex:
             self._accept_ticks = False
-            self._stop_event.set()
 
     def join(self):
         thread = self._thread
@@ -1270,6 +1346,7 @@ def release_job_lease(
     expected = heartbeat.current_job_token
     if expected not in (None, lease):
         raise LeaseLost()
+    retry_lease = None if allow_released and expected is None else lease
 
     def release(operation_deadline):
         with heartbeat.job_token_transition(expected) as transition:
@@ -1296,6 +1373,7 @@ def release_job_lease(
                             worker_generation=lease.worker_generation,
                             attempt_generation=lease.attempt_generation,
                             lease_uuid__isnull=True,
+                            state__in=TERMINAL_STATES,
                         ).first()
                         if current is None:
                             raise LeaseLost() from None
@@ -1313,7 +1391,7 @@ def release_job_lease(
         release,
         monotonic=monotonic,
         sleeper=sleeper,
-        retry_checkpoint=_retry_control(heartbeat, lease=lease),
+        retry_checkpoint=_retry_control(heartbeat, lease=retry_lease),
     )
 
 
@@ -2208,9 +2286,20 @@ def _terminal_snapshot_cleanup(
     if selected is None:
         return False
     current, candidate, expected, blob, blob_snapshot = selected
-    heartbeat.renew_worker_now()
+    try:
+        _retry_control(
+            heartbeat,
+            stop_requested=stop_requested,
+        )()
+    except DatabaseFenceBusy:
+        return True
     _cleanup_snapshot_tree_fs(current, candidate, blob=blob)
-    heartbeat.renew_worker_now()
+    if heartbeat.lost is not None:
+        raise heartbeat.lost
+    if heartbeat.fatal is not None:
+        raise _HeartbeatFailed()
+    if stop_requested is not None and stop_requested():
+        raise _DatabaseRetryStopped()
 
     def persist_snapshot_cleanup(unused_deadline):
         del unused_deadline
@@ -2550,7 +2639,12 @@ def _cleanup_expired_and_stale_once(
         try:
             archive_service.recover_complete(
                 complete_lease,
-                heartbeat,
+                _ServiceHeartbeatAdapter(
+                    heartbeat,
+                    stop_requested,
+                    complete_lease,
+                    renew_busy="skip",
+                ),
                 stop_requested,
             )
         except ExportError:
@@ -2662,6 +2756,7 @@ def release_worker_lease(
     using="default",
     monotonic=None,
     sleeper=None,
+    operation_deadline=None,
 ):
     now = timezone.now() if now is None else now
 
@@ -2689,6 +2784,7 @@ def release_worker_lease(
         release,
         monotonic=monotonic,
         sleeper=sleeper,
+        operation_deadline=operation_deadline,
     )
 
 
@@ -2861,11 +2957,27 @@ class ExportWorker(object):
         else:
             self.fail_job(error.lease, error.code)
 
+    def _snapshot_heartbeat(self, lease, stop_requested):
+        return _ServiceHeartbeatAdapter(
+            self.heartbeat,
+            stop_requested,
+            lease,
+            renew_busy="raise",
+        )
+
+    def _archive_heartbeat(self, lease, stop_requested):
+        return _ServiceHeartbeatAdapter(
+            self.heartbeat,
+            stop_requested,
+            lease,
+            renew_busy="skip",
+        )
+
     def _dispatch_claim(self, lease, stop_requested, mode):
         if mode == "verifying":
             outcome = self.archive_service.recover_verifying(
                 lease,
-                self.heartbeat,
+                self._archive_heartbeat(lease, stop_requested),
                 stop_requested,
             )
             if outcome.job.state in TERMINAL_STATES:
@@ -2879,7 +2991,7 @@ class ExportWorker(object):
             ).exists():
                 outcome = self.archive_service.recover_retiring(
                     lease,
-                    self.heartbeat,
+                    self._archive_heartbeat(lease, stop_requested),
                     stop_requested,
                 )
                 lease = outcome.lease
@@ -2888,14 +3000,14 @@ class ExportWorker(object):
                 self.snapshot_service.capture(
                     job,
                     lease,
-                    self.heartbeat,
+                    self._snapshot_heartbeat(lease, stop_requested),
                     stop_requested,
                 )
                 job.refresh_from_db()
             if job.state == "archiving":
                 outcome = self.archive_service.recover_archiving(
                     lease,
-                    self.heartbeat,
+                    self._archive_heartbeat(lease, stop_requested),
                     stop_requested,
                 )
                 if outcome.job.state in TERMINAL_STATES:
@@ -2906,14 +3018,14 @@ class ExportWorker(object):
             self.snapshot_service.capture(
                 job,
                 lease,
-                self.heartbeat,
+                self._snapshot_heartbeat(lease, stop_requested),
                 stop_requested,
             )
             job.refresh_from_db()
         if job.state == "archiving":
             outcome = self.archive_service.recover_archiving(
                 lease,
-                self.heartbeat,
+                self._archive_heartbeat(lease, stop_requested),
                 stop_requested,
             )
             if outcome.job.state in TERMINAL_STATES:
@@ -3026,6 +3138,7 @@ class ExportWorker(object):
         root = worker_lock = None
         lost = False
         storage_failure_code = None
+        status = 0
         try:
             root = open_export_root(
                 settings.PINRY_EXPORT_ROOT,
@@ -3060,31 +3173,44 @@ class ExportWorker(object):
                 did_work = self.run_once(stop_requested)
                 if not did_work:
                     self.sleeper(IDLE_WAIT_SECONDS)
-            return 0
         except LeaseLost:
             lost = True
-            return 1
+            status = 1
         except _HeartbeatFailed:
             lost = True
-            return 1
+            status = 1
         except DatabaseFenceError:
             lost = True
-            return 1
+            status = 1
         except ExportStorageError as error:
             if error.code != "export_worker_unavailable":
                 storage_failure_code = error.code
-            return 1
+            status = 1
         finally:
+            shutdown_deadline = DatabaseFenceDeadline(
+                self.monotonic,
+                budget_seconds=DATABASE_RETRY_MAX_SECONDS,
+            )
             if self.heartbeat is not None:
                 self.heartbeat.stop_accepting_ticks()
                 self.heartbeat.join()
                 if self.heartbeat.lost is not None:
                     lost = True
+                    status = 1
                 if self.heartbeat.fatal is not None:
                     lost = True
+                    status = 1
+            storage_released_worker = False
             if storage_failure_code is not None:
-                self._record_storage_failure(storage_failure_code)
-            if self.worker_token is not None and not lost:
+                storage_released_worker = self._record_storage_failure(
+                    storage_failure_code,
+                    operation_deadline=shutdown_deadline,
+                )
+            if (
+                self.worker_token is not None
+                and not lost
+                and not storage_released_worker
+            ):
                 try:
                     release_worker_lease(
                         self.worker_token,
@@ -3092,18 +3218,22 @@ class ExportWorker(object):
                         using=self.using,
                         monotonic=self.monotonic,
                         sleeper=self.sleeper,
+                        operation_deadline=shutdown_deadline,
                     )
                 except LeaseLost:
                     pass
+                except (DatabaseError, DatabaseFenceError):
+                    status = 1
             if worker_lock is not None:
                 worker_lock.close()
             if root is not None:
                 root.close()
             close_old_connections()
+        return status
 
-    def _record_storage_failure(self, code):
+    def _record_storage_failure(self, code, operation_deadline=None):
         if code != "export_storage_unsafe":
-            return
+            return False
         now = self.clock()
 
         def record(operation_deadline):
@@ -3120,12 +3250,14 @@ class ExportWorker(object):
                     "lease_expires_at": None,
                 }
                 if self.worker_token is not None:
-                    ExportWorkerLease.objects.using(self.using).filter(
+                    updated = ExportWorkerLease.objects.using(
+                        self.using,
+                    ).filter(
                         pk=1,
                         generation=self.worker_token.worker_generation,
                         lease_uuid=self.worker_token.worker_lease_uuid,
                     ).update(**values)
-                    return
+                    return updated == 1
                 updated = ExportWorkerLease.objects.using(self.using).filter(
                     pk=1,
                     lease_uuid__isnull=True,
@@ -3140,15 +3272,17 @@ class ExportWorker(object):
                         )
                     except IntegrityError:
                         raise DatabaseFenceBusy() from None
+                return False
 
         try:
-            _retry_database(
+            return _retry_database(
                 record,
                 monotonic=self.monotonic,
                 sleeper=self.sleeper,
+                operation_deadline=operation_deadline,
             )
         except (DatabaseError, DatabaseFenceError):
-            pass
+            return False
 
 
 __all__ = (
