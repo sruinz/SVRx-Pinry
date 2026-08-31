@@ -55,13 +55,19 @@ if ! app_image_id="$(resolve_image_id "${image}")"; then
     printf '%s\n' 'export_postgres_app_image_unavailable' >&2
     exit 1
 fi
+printf '%s\n' \
+    'EXPORT_POSTGRES_PHASE phase=database_image status=checking'
 if ! postgres_image_id="$(resolve_image_id "${postgres_image}")"; then
+    printf '%s\n' \
+        'EXPORT_POSTGRES_PHASE phase=database_image status=pulling'
     if ! docker pull "${postgres_image}" >/dev/null \
         || ! postgres_image_id="$(resolve_image_id "${postgres_image}")"; then
         printf '%s\n' 'export_postgres_database_image_unavailable' >&2
         exit 1
     fi
 fi
+printf '%s\n' \
+    'EXPORT_POSTGRES_PHASE phase=database_image status=ready'
 
 smoke_parent="${TMPDIR:-/tmp}"
 smoke_root="$(mktemp -d "${smoke_parent%/}/svrx-pinry-export-postgres.XXXXXX")"
@@ -80,6 +86,9 @@ volume_name=""
 volume_fingerprint=""
 postgres_container_id=""
 test_container_id=""
+test_timeout_seconds=1800
+test_poll_seconds=2
+test_progress_seconds=10
 
 owned_container() {
     local container_id="$1"
@@ -397,6 +406,18 @@ sys.stdout.write(sys.stdin.read().replace(secret, "[REDACTED]"))
     exit 1
 }
 
+print_redacted_test_log() {
+    DATABASE_PASSWORD="${database_password}" python3 - "${test_log}" <<'PY'
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8", errors="replace") as stream:
+    content = stream.read()
+sys.stdout.write(content.replace(os.environ["DATABASE_PASSWORD"], "[REDACTED]"))
+PY
+}
+
+printf '%s\n' 'EXPORT_POSTGRES_PHASE phase=database status=starting'
 network_id="$(docker network create \
     --label "com.svrx.pinry.export-postgres.run=${run_token}" \
     "${network_name}")" || fail 'export_postgres_network_create_failed'
@@ -434,6 +455,8 @@ volume_fingerprint="$(current_volume_fingerprint "${volume_name}")" \
 [ "${volume_fingerprint%%|*}" = "${volume_name}" ] \
     || fail 'export_postgres_volume_identity_invalid'
 
+printf '%s\n' \
+    'EXPORT_POSTGRES_PHASE phase=database_ready status=waiting timeout_seconds=90'
 ready_deadline=$(( $(date +%s) + 90 ))
 while ! docker exec "${postgres_container_id}" pg_isready \
     --username "${database_user}" --dbname "${database_name}" \
@@ -450,6 +473,7 @@ case "${postgres_version}" in
     *' 14.'*) ;;
     *) fail 'export_postgres_version_invalid' ;;
 esac
+printf '%s\n' 'EXPORT_POSTGRES_PHASE phase=database_ready status=ready'
 
 cat > "${lock_probe}" <<'PY'
 import os
@@ -720,19 +744,47 @@ test_container_id="$(docker create \
     || fail 'export_postgres_test_container_create_failed'
 owned_container "${test_container_id}" "${app_image_id}" \
     || fail 'export_postgres_test_container_identity_invalid'
-set +e
-docker start --attach "${test_container_id}" > "${test_log}" 2>&1
-test_start_code=$?
-set -e
-DATABASE_PASSWORD="${database_password}" python3 - "${test_log}" <<'PY'
-import os
-import sys
-
-with open(sys.argv[1], encoding="utf-8", errors="replace") as stream:
-    content = stream.read()
-sys.stdout.write(content.replace(os.environ["DATABASE_PASSWORD"], "[REDACTED]"))
-PY
-[ "${test_start_code}" -eq 0 ] || fail 'export_postgres_test_failed'
+printf 'EXPORT_POSTGRES_PHASE phase=test_suite status=starting timeout_seconds=%s\n' \
+    "${test_timeout_seconds}"
+docker start "${test_container_id}" >/dev/null \
+    || fail 'export_postgres_test_start_failed'
+test_started_at="$(date +%s)"
+test_deadline=$(( test_started_at + test_timeout_seconds ))
+next_progress_at="${test_started_at}"
+while :; do
+    test_state="$(docker container inspect --format '{{.State.Status}}' \
+        "${test_container_id}")" \
+        || fail 'export_postgres_test_state_missing'
+    test_now="$(date +%s)"
+    case "${test_state}" in
+        exited)
+            break
+            ;;
+        running|restarting)
+            if [ "${test_now}" -ge "${test_deadline}" ]; then
+                docker logs "${test_container_id}" \
+                    > "${test_log}" 2>&1 || true
+                print_redacted_test_log >&2 || true
+                fail 'export_postgres_test_timeout'
+            fi
+            if [ "${test_now}" -ge "${next_progress_at}" ]; then
+                printf 'EXPORT_POSTGRES_PROGRESS phase=test_suite elapsed_seconds=%s timeout_seconds=%s state=%s\n' \
+                    "$(( test_now - test_started_at ))" \
+                    "${test_timeout_seconds}" "${test_state}"
+                next_progress_at=$(( test_now + test_progress_seconds ))
+            fi
+            sleep "${test_poll_seconds}"
+            ;;
+        *)
+            fail 'export_postgres_test_state_invalid'
+            ;;
+    esac
+done
+docker logs "${test_container_id}" > "${test_log}" 2>&1 \
+    || fail 'export_postgres_test_log_missing'
+printf 'EXPORT_POSTGRES_PHASE phase=test_suite status=completed elapsed_seconds=%s\n' \
+    "$(( $(date +%s) - test_started_at ))"
+print_redacted_test_log
 grep -Eq '^EXPORT_POSTGRES_ACTUAL_LOCK_RETRY_OK backend=postgresql version=14 fence_models=11 locked_tables=11 retries=[1-9][0-9]*$' \
     "${test_log}" || fail 'export_postgres_actual_lock_retry_missing'
 owned_container "${test_container_id}" "${app_image_id}" \

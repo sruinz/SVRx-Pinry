@@ -180,7 +180,9 @@ bash accept-tools/docker/tests/export_postgres_concurrency_smoke.sh svrx-pinry:l
 두 스크립트는 고유한 임시 컨테이너·네트워크와 테스트 데이터를 사용하며,
 성공 시 자신이 만든 임시 자원을 정리한다. PostgreSQL 검증은
 `postgres:14-alpine` 이미지가 없으면 Docker Hub에서 받으므로 NAS의 외부
-네트워크 접근이 필요하다.
+네트워크 접근이 필요하다. PostgreSQL 검증 중에는 10초마다 경과 시간이
+표시되며, 테스트 묶음이 30분 안에 끝나지 않으면 실패 처리하고 자신이 만든
+임시 자원을 정리한다.
 
 ## 서비스 워커 전환 context 업로드와 실행
 

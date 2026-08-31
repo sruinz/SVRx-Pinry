@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+from pathlib import Path
 import sys
 from datetime import timedelta
 from io import BytesIO
@@ -12,6 +13,35 @@ from io import BytesIO
 
 _FIXTURE_USERNAME = "export-smoke-user"
 _FIXTURE_PASSWORD = "export-smoke-password"
+
+
+def _is_repository_root(path):
+    try:
+        return (
+            path.is_dir()
+            and not path.is_symlink()
+            and (path / "manage.py").is_file()
+            and (path / "pinry" / "settings" / "base.py").is_file()
+        )
+    except OSError:
+        return False
+
+
+def _find_repository_root():
+    candidates = [Path("/pinry")]
+    candidates.extend(Path(__file__).resolve().parents)
+    for candidate in candidates:
+        if _is_repository_root(candidate):
+            return candidate.resolve()
+    return None
+
+
+_REPOSITORY_ROOT = _find_repository_root()
+if _REPOSITORY_ROOT is not None:
+    _repository_root_text = str(_REPOSITORY_ROOT)
+    while _repository_root_text in sys.path:
+        sys.path.remove(_repository_root_text)
+    sys.path.insert(0, _repository_root_text)
 
 
 def _pin_count(value):
