@@ -6,6 +6,7 @@ import Add2Board from './pin_edit/Add2Board.vue';
 import PinBulkBoardDialog from './bulk/PinBulkBoardDialog.vue';
 import PinBulkEdit from './bulk/PinBulkEdit.vue';
 import BoardDeleteDialog from './bulk/BoardDeleteDialog.vue';
+import ExportDialog from './export/ExportDialog.vue';
 
 
 function openPinEdit(vm, props = null, onCreated = null) {
@@ -152,6 +153,31 @@ export function openBoardDelete(vm, props, onCompleted = null, onClosed = null) 
   return vm.$buefy.modal.open(config);
 }
 
+function isPositiveSafeInteger(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+export function openExport(vm, props) {
+  const hasBoard = props && props.boardId !== undefined;
+  const hasPins = props && props.pinIds !== undefined;
+  const validBoard = hasBoard && isPositiveSafeInteger(props.boardId);
+  const validPins = hasPins
+    && Array.isArray(props.pinIds)
+    && props.pinIds.length > 0
+    && props.pinIds.every(isPositiveSafeInteger);
+  if (hasBoard === hasPins || (hasBoard && !validBoard) || (hasPins && !validPins)) {
+    throw new Error('invalid_export_target');
+  }
+  return vm.$buefy.modal.open({
+    parent: vm,
+    component: ExportDialog,
+    props: hasBoard ? { boardId: props.boardId } : { pinIds: props.pinIds.slice() },
+    hasModalCard: true,
+    canCancel: true,
+    trapFocus: true,
+  });
+}
+
 export default {
   openBoardCreate,
   openBoardEdit,
@@ -162,4 +188,5 @@ export default {
   openPinBulkBoard,
   openPinBulkEdit,
   openBoardDelete,
+  openExport,
 };

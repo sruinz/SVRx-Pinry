@@ -38,7 +38,7 @@
           type="button"
           class="button"
           data-test="pin-selection-select-all"
-          :disabled="operationInFlight"
+          :disabled="operationInFlight || !canSelectAll"
           @click="$emit('select-all')"
         >
           {{ $t('bulkPinSelectAll') }}
@@ -72,6 +72,16 @@
           @click="$emit('edit')"
         >
           {{ $t('bulkPinEdit') }}
+        </button>
+        <button
+          v-if="showExport"
+          type="button"
+          class="button"
+          data-test="pin-selection-export"
+          :disabled="operationInFlight || selectedCount === 0 || !canExport"
+          @click="$emit('export')"
+        >
+          {{ $t('exportPins') }}
         </button>
         <button
           v-if="showDelete"
@@ -120,8 +130,11 @@ export default {
     canMove: { type: Boolean, required: true },
     showEdit: { type: Boolean, required: true },
     canEdit: { type: Boolean, required: true },
+    showExport: { type: Boolean, required: true },
+    canExport: { type: Boolean, required: true },
     showDelete: { type: Boolean, required: true },
     canDelete: { type: Boolean, required: true },
+    canSelectAll: { type: Boolean, required: true },
     operationInFlight: { type: Boolean, required: true },
     enterDisabled: { type: Boolean, default: false },
     announcement: { type: String, default: '' },

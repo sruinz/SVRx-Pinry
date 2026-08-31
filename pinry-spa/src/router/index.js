@@ -10,6 +10,7 @@ import Profile4User from '../views/Profile4User.vue';
 import PinCreate from '../views/PinCreate.vue';
 import Search from '../views/Search.vue';
 import PageNotFound from '../views/PageNotFound.vue';
+import Exports from '../views/Exports.vue';
 
 Vue.use(VueRouter);
 
@@ -58,6 +59,11 @@ const routes = [
     path: '/search',
     name: 'search',
     component: Search,
+  },
+  {
+    path: '/exports',
+    name: 'exports',
+    component: Exports,
   },
   {
     path: '*',

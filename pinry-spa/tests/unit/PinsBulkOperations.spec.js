@@ -7,7 +7,8 @@ import API from '@/components/api';
 import bus from '@/components/utils/bus';
 import PinBulkBoardDialog from '@/components/bulk/PinBulkBoardDialog.vue';
 import PinBulkEdit, { buildChanges } from '@/components/bulk/PinBulkEdit.vue';
-import { openPinBulkBoard, openPinBulkEdit } from '@/components/modals';
+import ExportDialog from '@/components/export/ExportDialog.vue';
+import { openExport, openPinBulkBoard, openPinBulkEdit } from '@/components/modals';
 import Pins from '@/components/Pins.vue';
 
 let mountedWrappers = [];
@@ -580,6 +581,41 @@ describe('bulk operation dialogs', () => {
   });
 
   it.each([
+    ['Pins', { pinIds: [41, 42] }, { pinIds: [41, 42] }],
+    ['board', { boardId: 7 }, { boardId: 7 }],
+  ])('opens the %s export modal with XOR props and keyboard-safe config', (
+    _name, props, expectedProps,
+  ) => {
+    const handle = { close: jest.fn() };
+    const vm = { $buefy: { modal: { open: jest.fn(() => handle) } } };
+    const source = props.pinIds || null;
+
+    expect(openExport(vm, props)).toBe(handle);
+    if (source) source.push(99);
+
+    expect(vm.$buefy.modal.open).toHaveBeenCalledWith({
+      parent: vm,
+      component: ExportDialog,
+      props: expectedProps,
+      hasModalCard: true,
+      canCancel: true,
+      trapFocus: true,
+    });
+  });
+
+  it.each([
+    ['no target', {}],
+    ['both targets', { boardId: 7, pinIds: [41] }],
+    ['invalid board', { boardId: 0 }],
+    ['empty Pins', { pinIds: [] }],
+  ])('rejects an export modal helper with %s', (_name, props) => {
+    const vm = { $buefy: { modal: { open: jest.fn() } } };
+
+    expect(() => openExport(vm, props)).toThrow('invalid_export_target');
+    expect(vm.$buefy.modal.open).not.toHaveBeenCalled();
+  });
+
+  it.each([
     ['add', 'transport'],
     ['add', 'invalid response'],
     ['move', 'transport'],
@@ -851,6 +887,29 @@ describe('Pins bulk operation orchestration', () => {
     await board.find('[data-test="pin-selection-move"]').trigger('click');
     expect(board.modal.open.mock.calls[0][0].props).toMatchObject({
       mode: 'move', sourceBoardId: 3, selectedIds: [41], username: 'owner',
+    });
+  });
+
+  it('opens selection export with a copied explicit-ID snapshot even for non-owned Pins', async () => {
+    const wrapper = mountPins({
+      pinFilters: {},
+      pins: [pin(41, 'other'), pin(40, 'other')],
+    });
+    await settle();
+    wrapper.vm.enterSelection();
+    selectScope(wrapper, [41, 40], false);
+    await wrapper.vm.$nextTick();
+
+    await wrapper.find('[data-test="pin-selection-export"]').trigger('click');
+    wrapper.vm.selection.selectedIds.push(39);
+
+    expect(wrapper.modal.open).toHaveBeenCalledTimes(1);
+    expect(wrapper.modal.open.mock.calls[0][0]).toMatchObject({
+      component: ExportDialog,
+      props: { pinIds: [41, 40] },
+      hasModalCard: true,
+      canCancel: true,
+      trapFocus: true,
     });
   });
 

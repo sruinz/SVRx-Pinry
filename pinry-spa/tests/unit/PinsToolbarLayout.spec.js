@@ -126,13 +126,13 @@ describe('Pins responsive tool area', () => {
   });
 
   it.each([
-    ['main list', {}, 'owner', 'owner', false, false],
-    ['another user list', { userFilter: 'other' }, 'owner', 'owner', false, false],
-    ['My Pins list', { userFilter: 'owner' }, 'owner', 'owner', true, false],
-    ['owned Board Pin list', { boardFilter: 7 }, 'owner', 'owner', true, true],
-    ['foreign Board Pin list', { boardFilter: 7 }, 'owner', 'other', false, false],
+    ['main list', {}, 'owner', 'owner', true, false, false],
+    ['another user list', { userFilter: 'other' }, 'owner', 'owner', true, false, false],
+    ['My Pins list', { userFilter: 'owner' }, 'owner', 'owner', true, false, false],
+    ['owned Board Pin list', { boardFilter: 7 }, 'owner', 'owner', true, true, true],
+    ['foreign Board Pin list', { boardFilter: 7 }, 'owner', 'other', true, false, false],
   ])('groups available controls on the %s', async (
-    _name, pinFilters, username, boardOwner, showBulk, showCover,
+    _name, pinFilters, username, boardOwner, showBulk, showCover, showBoardExport,
   ) => {
     const wrapper = mountPins({ pinFilters, username, boardOwner });
     await settle();
@@ -147,6 +147,7 @@ describe('Pins responsive tool area', () => {
     );
     expect(tools.find('[data-test="pin-selection-enter"]').exists()).toBe(showBulk);
     expect(tools.find('[data-test="board-cover-enter"]').exists()).toBe(showCover);
+    expect(tools.find('[data-test="board-export"]').exists()).toBe(showBoardExport);
   });
 
   it('keeps bulk entry controls in the first row and actions in the second row', async () => {
@@ -167,11 +168,35 @@ describe('Pins responsive tool area', () => {
     expect(bulkToolbar.classes()).toContain('is-active');
     expect(bulkToolbar.find('[data-test="pin-selection-summary"]').exists()).toBe(true);
     expect(active.find('[data-test="pin-selection-select-loaded"]').exists()).toBe(true);
+    const actionNames = active.findAll('.pin-bulk-toolbar__buttons > button').wrappers
+      .map(button => button.attributes('data-test'));
+    expect(actionNames.indexOf('pin-selection-edit'))
+      .toBeLessThan(actionNames.indexOf('pin-selection-export'));
+    expect(actionNames.indexOf('pin-selection-export'))
+      .toBeLessThan(actionNames.indexOf('pin-selection-delete'));
+    expect(active.find('[data-test="pin-selection-select-all"]').attributes('disabled'))
+      .toBe('disabled');
 
     await active.find('[data-test="pin-selection-exit"]').trigger('click');
 
     expect(wrapper.vm.selection.active).toBe(false);
     expect(wrapper.find('[data-test="pin-tools-active"]').exists()).toBe(false);
+  });
+
+  it('places owned-board export only in the fixed management area', async () => {
+    const wrapper = mountPins({ pinFilters: { boardFilter: '7' } });
+    await settle();
+
+    const management = wrapper.find('.pin-tools__management');
+    const button = management.find('[data-test="board-export"]');
+    expect(button.exists()).toBe(true);
+    expect(wrapper.find('.pin-card [data-test="board-export"]').exists()).toBe(false);
+
+    await button.trigger('click');
+
+    const config = wrapper.vm.$buefy.modal.open.mock.calls[0][0];
+    expect(config.props).toEqual({ boardId: 7 });
+    expect(config.trapFocus).toBe(true);
   });
 
   it('keeps cover entry controls in the first row and status and actions in the second row', async () => {
@@ -200,7 +225,7 @@ describe('Pins responsive tool area', () => {
     );
   });
 
-  it('hides every active bulk control when Board management permission is lost', async () => {
+  it('keeps export selection while hiding owner actions when Board ownership is lost', async () => {
     const wrapper = mountPins({ pinFilters: { boardFilter: 7 } });
     await settle();
     await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
@@ -212,18 +237,16 @@ describe('Pins responsive tool area', () => {
     await wrapper.vm.$nextTick();
 
     expect(wrapper.vm.canManagePins).toBe(false);
-    expect(wrapper.vm.selection.active).toBe(false);
-    expect(wrapper.vm.interactionMode).toBe('browse');
-    expect(wrapper.find('[data-test="pin-tools-active"]').exists()).toBe(false);
-    expect(wrapper.find('[data-test="pin-selection-check-41"]').exists()).toBe(false);
-    expect(wrapper.find('[data-test="pin-card-41"]').attributes('role')).toBeUndefined();
-    expect(wrapper.find('[data-test="pin-card-41"]').attributes('tabindex')).toBeUndefined();
-    expect(wrapper.find('[data-test="pin-sort-latest"]').attributes('disabled')).toBeUndefined();
-    [
-      'summary', 'select-loaded', 'clear', 'select-all', 'move', 'edit', 'delete', 'exit',
-    ].forEach((name) => {
-      expect(wrapper.find(`[data-test="pin-selection-${name}"]`).exists()).toBe(false);
-    });
+    expect(wrapper.vm.canSelectPins).toBe(true);
+    expect(wrapper.vm.selection.active).toBe(true);
+    expect(wrapper.vm.interactionMode).toBe('bulk-selection');
+    expect(wrapper.find('[data-test="pin-tools-active"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="pin-selection-check-41"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="pin-selection-export"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="pin-selection-move"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="pin-selection-edit"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="pin-selection-delete"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="board-export"]').exists()).toBe(false);
   });
 
   it('hides every active cover control when Board ownership is lost', async () => {

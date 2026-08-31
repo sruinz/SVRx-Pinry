@@ -16,7 +16,7 @@
             :announcement="sortAnnouncement"
             @select="applySortMode"
           />
-          <div v-if="canManagePins" class="pin-tools__management">
+          <div v-if="canSelectPins" class="pin-tools__management">
             <PinBulkToolbar
               :active="false"
               :selected-count="selection.selectedIds.length"
@@ -27,15 +27,30 @@
               :can-add-to-board="canUseOwnedPinActions"
               :show-move="isOwnedBoardRoute"
               :can-move="isOwnedBoardRoute"
-              :show-edit="true"
+              :show-edit="canManagePins"
               :can-edit="canUseOwnedPinActions"
-              :show-delete="true"
+              :show-export="true"
+              :can-export="selection.selectedIds.length > 0"
+              :show-delete="canManagePins"
               :can-delete="canUseOwnedPinActions"
+              :can-select-all="false"
               :operation-in-flight="selection.operationInFlight"
               :enter-disabled="interactionMode !== 'browse' || coverSelection.inFlight"
               :announcement="selectionAnnouncement"
               @enter="enterSelection"
             />
+            <button
+              v-if="isOwnedBoardRoute"
+              type="button"
+              class="button"
+              data-test="board-export"
+              :disabled="interactionMode !== 'browse'
+                || coverSelection.inFlight
+                || selection.operationInFlight"
+              @click="openBoardExport"
+            >
+              {{ $t('exportBoard') }}
+            </button>
             <BoardCoverToolbar
               v-if="isOwnedBoardRoute"
               ref="boardCoverToolbar"
@@ -50,13 +65,13 @@
           </div>
         </div>
         <div
-          v-if="(selection.active && canManagePins)
+          v-if="(selection.active && canSelectPins)
             || (interactionMode === 'cover-selection' && isOwnedBoardRoute)"
           class="pin-tools__active"
           data-test="pin-tools-active"
         >
           <PinBulkToolbar
-            v-if="selection.active && canManagePins"
+            v-if="selection.active && canSelectPins"
             :active="true"
             :selected-count="selection.selectedIds.length"
             :loaded-count="blocks.length"
@@ -66,10 +81,13 @@
             :can-add-to-board="canUseOwnedPinActions"
             :show-move="isOwnedBoardRoute"
             :can-move="isOwnedBoardRoute"
-            :show-edit="true"
+            :show-edit="canManagePins"
             :can-edit="canUseOwnedPinActions"
-            :show-delete="true"
+            :show-export="true"
+            :can-export="selection.selectedIds.length > 0"
+            :show-delete="canManagePins"
             :can-delete="canUseOwnedPinActions"
+            :can-select-all="false"
             :operation-in-flight="selection.operationInFlight"
             :announcement="selectionAnnouncement"
             @exit="exitSelection"
@@ -79,6 +97,7 @@
             @add-to-board="openBulkBoard('add')"
             @move="openBulkBoard('move')"
             @edit="openBulkEdit"
+            @export="openSelectedExport"
             @delete="confirmBulkDelete"
           />
           <template v-else-if="interactionMode === 'cover-selection' && isOwnedBoardRoute">
@@ -259,7 +278,7 @@ import PinBulkToolbar from './bulk/PinBulkToolbar.vue';
 import BoardCoverToolbar from './board_cover/BoardCoverToolbar.vue';
 import PinSelection from './bulk/PinSelection';
 import { executeBulk, intersectRemaining } from './bulk/bulkExecutor';
-import { openPinBulkBoard, openPinBulkEdit } from './modals';
+import { openExport, openPinBulkBoard, openPinBulkEdit } from './modals';
 import PinSortControls from './sorting/PinSortControls.vue';
 import {
   generateRandomSeed,
@@ -434,8 +453,8 @@ export default {
         this.$nextTick(() => window.scrollTo(0, 0));
       },
     },
-    canManagePins(canManage) {
-      if (canManage || !this.selection.active) return;
+    canSelectPins(canSelect) {
+      if (canSelect || !this.selection.active) return;
       this.invalidateSelectionRequest();
       this.invalidateBulkOperation();
       this.updateSelection(this.selectionModel.selectLoaded([]), {
@@ -468,6 +487,10 @@ export default {
         this.pinFilters.boardFilter
         && this.metaReady.board
         && submitter
+        && typeof username === 'string'
+        && username.length > 0
+        && typeof submitter.username === 'string'
+        && submitter.username.length > 0
         && submitter.username === username,
       );
     },
@@ -477,6 +500,13 @@ export default {
     },
     canManagePins() {
       return this.isMyPinsRoute || this.isOwnedBoardRoute;
+    },
+    canSelectPins() {
+      return Boolean(
+        this.metaReady.user
+        && this.editorMeta.user.loggedIn
+        && (!this.pinFilters.boardFilter || this.metaReady.board),
+      );
     },
     hasNonOwnedSelection() {
       return this.selection.selectedIds.some(
@@ -608,7 +638,7 @@ export default {
     },
     enterSelection() {
       if (
-        !this.canManagePins
+        !this.canSelectPins
         || this.interactionMode !== 'browse'
         || this.selection.bulkOperationInFlight
       ) return;
@@ -629,6 +659,27 @@ export default {
         result: null,
       });
       this.interactionMode = 'browse';
+    },
+    openSelectedExport() {
+      if (
+        !this.canSelectPins
+        || !this.selection.active
+        || this.selection.operationInFlight
+        || this.selection.selectedIds.length === 0
+      ) return;
+      openExport(this, { pinIds: this.selection.selectedIds.slice() });
+    },
+    openBoardExport() {
+      const boardId = Number(this.pinFilters.boardFilter);
+      if (
+        !this.isOwnedBoardRoute
+        || this.interactionMode !== 'browse'
+        || this.coverSelection.inFlight
+        || this.selection.operationInFlight
+        || !Number.isSafeInteger(boardId)
+        || boardId <= 0
+      ) return;
+      openExport(this, { boardId });
     },
     enterCoverSelection() {
       if (
