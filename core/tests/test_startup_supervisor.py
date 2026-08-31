@@ -1582,6 +1582,31 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         self.assertNotIn("gate_created", self.events)
         self.assertEqual(self.status.failed_codes, [])
 
+    def test_export_bootstrap_timeout_is_bounded_and_nonfatal(self):
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            bootstrap_results=[
+                subprocess.TimeoutExpired(["bootstrap"], 15.0)
+            ],
+        )
+        self.status.ready = True
+        supervisor.nginx = supervisor._spawn_nginx()
+        supervisor.gunicorn = supervisor._spawn_gunicorn()
+
+        supervisor._maintain_export_worker()
+
+        self.assertEqual(
+            processes.bootstrap_runner.kwargs[0]["timeout"], 15.0
+        )
+        self.assertEqual(len(processes.export_processes), 1)
+        self.assertTrue(processes.export_processes[0].running)
+        self.assertTrue(supervisor.nginx.process.running)
+        self.assertTrue(supervisor.gunicorn.process.running)
+        self.assertTrue(self.status.ready)
+        self.assertNotIn("gate_created", self.events)
+        self.assertEqual(self.status.failed_codes, [])
+
     def test_worker_exit_waits_for_delayed_pipe_eof(self):
         supervisor, processes = self._supervisor(
             b"",
@@ -1703,6 +1728,51 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         supervisor.handle_signal(signal.SIGTERM, None)
         thread.join(2)
         self.assertEqual(result, [0])
+
+    def test_gunicorn_exit_recreates_gate_before_stopping_export(self):
+        now = [0.0]
+        holder = {}
+
+        def sleep(seconds):
+            now[0] += seconds
+            if "failed:gunicorn_start_failed" in self.events:
+                nginx = holder["processes"].processes["nginx"]
+                nginx.running = False
+                nginx.returncode = 1
+
+        supervisor, processes = self._supervisor(
+            b'{"phase":"complete"}\n',
+            0,
+            clock=lambda: now[0],
+            sleeper=sleep,
+        )
+        holder["processes"] = processes
+        self.status.ready = True
+        supervisor.nginx = supervisor._spawn_nginx()
+        supervisor.gunicorn = supervisor._spawn_gunicorn()
+        supervisor._maintain_export_worker()
+        export = processes.export_processes[0]
+        gunicorn = processes.processes["gunicorn"]
+        gunicorn.running = False
+        gunicorn.returncode = 1
+        original_signal = processes.signal
+
+        def ignore_export_term(pgid, signum):
+            if pgid == export.pid and signum == signal.SIGTERM:
+                processes.signal_order.append(("export", signum))
+                self.events.append("export_signal:{}".format(signum))
+                return
+            original_signal(pgid, signum)
+
+        supervisor.group_signaler = ignore_export_term
+
+        self.assertEqual(supervisor._serve_application(), 1)
+        self.assertLess(
+            self.events.index("gate_created"),
+            self.events.index("export_signal:{}".format(signal.SIGTERM)),
+        )
+        self.assertTrue(export.wait_called)
+        self.assertFalse(export.running)
 
     def test_gunicorn_exit_gate_recreation_failure_stops_nginx(self):
         class GateCreateFailure(_FakeStatusStore):

@@ -682,8 +682,9 @@ class RuntimeSupervisor(object):
                 cwd=PROJECT_ROOT,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                timeout=_SHUTDOWN_SECONDS,
             )
-        except (IOError, OSError):
+        except (IOError, OSError, subprocess.TimeoutExpired):
             self._log("내보내기 저장소를 준비하지 못했습니다.")
             return False
         if completed.returncode != 0:
@@ -1155,13 +1156,13 @@ class RuntimeSupervisor(object):
                 return 1
             if self.gunicorn.process.poll() is not None:
                 self._reap_record(self.gunicorn)
-                self._terminate_record(self.export_worker)
-                self._terminate_record(self.gunicorn)
                 try:
                     self.status_store.create_gate()
                 except StatusError:
                     self._terminate_record(self.nginx)
                     return 1
+                self._terminate_record(self.export_worker)
+                self._terminate_record(self.gunicorn)
                 return self._hold_failed("gunicorn_start_failed")
             self._maintain_export_worker()
             sleep_seconds = _POLL_SECONDS
