@@ -127,12 +127,57 @@ owned_network() {
     [ "${identity}" = "${network_id}|${run_token}" ]
 }
 
+container_state() {
+    local container_id="$1"
+    local listed_ids
+    if docker container inspect "${container_id}" >/dev/null 2>&1; then
+        printf '%s\n' exists
+        return 0
+    fi
+    listed_ids="$(docker container ls --all --no-trunc \
+        --filter "id=${container_id}" --format '{{.ID}}' 2>/dev/null)" \
+        || return 1
+    if [ -z "${listed_ids}" ]; then
+        printf '%s\n' absent
+    elif [ "${listed_ids}" = "${container_id}" ]; then
+        printf '%s\n' exists
+    else
+        return 1
+    fi
+}
+
 container_exists() {
-    docker container inspect "$1" >/dev/null 2>&1
+    [ "$(container_state "$1")" = exists ]
+}
+
+container_absent() {
+    [ "$(container_state "$1")" = absent ]
+}
+
+network_state() {
+    local current_id="$1"
+    local listed_ids
+    if docker network inspect "${current_id}" >/dev/null 2>&1; then
+        printf '%s\n' exists
+        return 0
+    fi
+    listed_ids="$(docker network ls --no-trunc --filter "id=${current_id}" \
+        --format '{{.ID}}' 2>/dev/null)" || return 1
+    if [ -z "${listed_ids}" ]; then
+        printf '%s\n' absent
+    elif [ "${listed_ids}" = "${current_id}" ]; then
+        printf '%s\n' exists
+    else
+        return 1
+    fi
 }
 
 network_exists() {
-    docker network inspect "$1" >/dev/null 2>&1
+    [ "$(network_state "$1")" = exists ]
+}
+
+network_absent() {
+    [ "$(network_state "$1")" = absent ]
 }
 
 clear_runtime_data() {
@@ -160,8 +205,14 @@ os.chmod(root, 0o700)
 remove_runtime_container() {
     local container_id="$1"
     local data_disposition="${2:-clear}"
+    local remove_status=0
     if ! container_exists "${container_id}"; then
-        return 0
+        if container_absent "${container_id}"; then
+            return 0
+        fi
+        printf 'export_smoke_container_state_unknown=%s\n' \
+            "${container_id}" >&2
+        return 1
     fi
     if ! owned_container "${container_id}"; then
         printf 'export_smoke_container_identity_changed=%s\n' \
@@ -182,17 +233,29 @@ remove_runtime_container() {
     if ! docker rm -f "${container_id}" >/dev/null 2>&1; then
         printf 'export_smoke_container_cleanup_failed=%s\n' \
             "${container_id}" >&2
-        return 1
+        remove_status=1
     fi
     if container_exists "${container_id}"; then
         printf 'export_smoke_container_leaked=%s\n' "${container_id}" >&2
         return 1
     fi
+    if ! container_absent "${container_id}"; then
+        printf 'export_smoke_container_state_unknown=%s\n' \
+            "${container_id}" >&2
+        return 1
+    fi
+    return "${remove_status}"
 }
 
 remove_owned_network() {
+    local remove_status=0
     if ! network_exists "${network_id}"; then
-        return 0
+        if network_absent "${network_id}"; then
+            return 0
+        fi
+        printf 'export_smoke_network_state_unknown=%s\n' \
+            "${network_id}" >&2
+        return 1
     fi
     if ! owned_network; then
         printf 'export_smoke_network_identity_changed=%s\n' \
@@ -202,12 +265,18 @@ remove_owned_network() {
     if ! docker network rm "${network_id}" >/dev/null 2>&1; then
         printf 'export_smoke_network_cleanup_failed=%s\n' \
             "${network_id}" >&2
-        return 1
+        remove_status=1
     fi
     if network_exists "${network_id}"; then
         printf 'export_smoke_network_leaked=%s\n' "${network_id}" >&2
         return 1
     fi
+    if ! network_absent "${network_id}"; then
+        printf 'export_smoke_network_state_unknown=%s\n' \
+            "${network_id}" >&2
+        return 1
+    fi
+    return "${remove_status}"
 }
 
 cleanup() {
@@ -217,6 +286,9 @@ cleanup() {
             first_container_id=""
         else
             status=1
+            if container_absent "${first_container_id}"; then
+                first_container_id=""
+            fi
         fi
     fi
     if [ -n "${second_container_id}" ]; then
@@ -224,6 +296,9 @@ cleanup() {
             second_container_id=""
         else
             status=1
+            if container_absent "${second_container_id}"; then
+                second_container_id=""
+            fi
         fi
     fi
     if [ -n "${network_id}" ]; then
@@ -231,9 +306,14 @@ cleanup() {
             network_id=""
         else
             status=1
+            if network_absent "${network_id}"; then
+                network_id=""
+            fi
         fi
     fi
-    if [ "${status}" -eq 0 ] && [ -n "${smoke_root}" ] \
+    if [ -z "${first_container_id}" ] \
+        && [ -z "${second_container_id}" ] \
+        && [ -n "${smoke_root}" ] \
         && { [ -e "${smoke_root}" ] || [ -L "${smoke_root}" ]; }; then
         if [ ! -d "${smoke_root}" ] || [ -L "${smoke_root}" ]; then
             printf 'export_smoke_host_cleanup_scope_invalid=%s\n' \
@@ -264,6 +344,7 @@ cleanup() {
 cleanup_on_exit() {
     local original_status="$?"
     trap - EXIT
+    trap '' HUP INT TERM
     if ! cleanup && [ "${original_status}" -eq 0 ]; then
         original_status=1
     fi
@@ -272,6 +353,7 @@ cleanup_on_exit() {
 
 finish_success() {
     local message="$1"
+    trap '' HUP INT TERM
     if ! cleanup; then
         printf '%s\n' 'export_smoke_cleanup_failed' >&2
         return 1
@@ -1359,7 +1441,9 @@ preview_code="$(http_request POST '/api/v2/exports/preview/' "${response_json}" 
     || fail 'export_smoke_preview_failed'
 [ "${preview_code}" = "200" ] || fail 'export_smoke_preview_status_invalid'
 python3 - "${response_json}" "${pin_count_value}" <<'PY'
+from datetime import datetime
 import json
+import re
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
@@ -1371,6 +1455,16 @@ if set(payload) != {
     "estimated_original_bytes", "estimated_zip_bytes",
 }:
     raise SystemExit("export_smoke_preview_keys_invalid")
+as_of = payload["as_of"]
+if type(as_of) is not str or re.fullmatch(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z",
+    as_of,
+) is None:
+    raise SystemExit("export_smoke_preview_as_of_invalid")
+datetime.strptime(
+    as_of,
+    "%Y-%m-%dT%H:%M:%S.%fZ" if "." in as_of else "%Y-%m-%dT%H:%M:%SZ",
+)
 if (
     payload["schema_version"] != 1 or payload["scope"] != "pins"
     or payload["requested_total"] != count or payload["eligible_total"] != count

@@ -94,28 +94,107 @@ current_volume_fingerprint() {
         "${current_name}" 2>/dev/null
 }
 
+container_state() {
+    local container_id="$1"
+    local listed_ids
+    if docker container inspect "${container_id}" >/dev/null 2>&1; then
+        printf '%s\n' exists
+        return 0
+    fi
+    listed_ids="$(docker container ls --all --no-trunc \
+        --filter "id=${container_id}" --format '{{.ID}}' 2>/dev/null)" \
+        || return 1
+    if [ -z "${listed_ids}" ]; then
+        printf '%s\n' absent
+    elif [ "${listed_ids}" = "${container_id}" ]; then
+        printf '%s\n' exists
+    else
+        return 1
+    fi
+}
+
 container_exists() {
-    docker container inspect "$1" >/dev/null 2>&1
+    [ "$(container_state "$1")" = exists ]
+}
+
+container_absent() {
+    [ "$(container_state "$1")" = absent ]
+}
+
+network_state() {
+    local current_id="$1"
+    local listed_ids
+    if docker network inspect "${current_id}" >/dev/null 2>&1; then
+        printf '%s\n' exists
+        return 0
+    fi
+    listed_ids="$(docker network ls --no-trunc --filter "id=${current_id}" \
+        --format '{{.ID}}' 2>/dev/null)" || return 1
+    if [ -z "${listed_ids}" ]; then
+        printf '%s\n' absent
+    elif [ "${listed_ids}" = "${current_id}" ]; then
+        printf '%s\n' exists
+    else
+        return 1
+    fi
 }
 
 network_exists() {
-    docker network inspect "$1" >/dev/null 2>&1
+    [ "$(network_state "$1")" = exists ]
+}
+
+network_absent() {
+    [ "$(network_state "$1")" = absent ]
+}
+
+volume_state() {
+    local current_name="$1"
+    local listed_names
+    if docker volume inspect "${current_name}" >/dev/null 2>&1; then
+        printf '%s\n' exists
+        return 0
+    fi
+    listed_names="$(docker volume ls --filter "name=${current_name}" \
+        --format '{{.Name}}' 2>/dev/null)" || return 1
+    if [ -z "${listed_names}" ]; then
+        printf '%s\n' absent
+    elif [ "${listed_names}" = "${current_name}" ]; then
+        printf '%s\n' exists
+    else
+        return 1
+    fi
 }
 
 volume_exists() {
-    docker volume inspect "$1" >/dev/null 2>&1
+    [ "$(volume_state "$1")" = exists ]
+}
+
+volume_absent() {
+    [ "$(volume_state "$1")" = absent ]
 }
 
 remove_owned_container() {
     local container_id="$1"
     local expected_image_id="$2"
     local remove_volumes="$3"
+    local status=0
     if ! container_exists "${container_id}"; then
+        if ! container_absent "${container_id}"; then
+            printf 'export_postgres_container_state_unknown=%s\n' \
+                "${container_id}" >&2
+            return 1
+        fi
         if [ "${remove_volumes}" = "yes" ] && [ -n "${volume_name}" ] \
             && volume_exists "${volume_name}"; then
             printf 'export_postgres_anonymous_volume_leaked=%s\n' \
                 "${volume_name}" >&2
             current_volume_fingerprint "${volume_name}" >&2 || true
+            return 1
+        fi
+        if [ "${remove_volumes}" = "yes" ] && [ -n "${volume_name}" ] \
+            && ! volume_absent "${volume_name}"; then
+            printf 'export_postgres_volume_state_unknown=%s\n' \
+                "${volume_name}" >&2
             return 1
         fi
         return 0
@@ -129,13 +208,13 @@ remove_owned_container() {
         if ! docker rm -f -v "${container_id}" >/dev/null 2>&1; then
             printf 'export_postgres_container_cleanup_failed=%s\n' \
                 "${container_id}" >&2
-            return 1
+            status=1
         fi
     elif [ "${remove_volumes}" = "no" ]; then
         if ! docker rm -f "${container_id}" >/dev/null 2>&1; then
             printf 'export_postgres_container_cleanup_failed=%s\n' \
                 "${container_id}" >&2
-            return 1
+            status=1
         fi
     else
         printf 'export_postgres_volume_cleanup_mode_invalid=%s\n' \
@@ -145,20 +224,36 @@ remove_owned_container() {
     if container_exists "${container_id}"; then
         printf 'export_postgres_container_leaked=%s\n' \
             "${container_id}" >&2
-        return 1
+        status=1
+    elif ! container_absent "${container_id}"; then
+        printf 'export_postgres_container_state_unknown=%s\n' \
+            "${container_id}" >&2
+        status=1
     fi
     if [ "${remove_volumes}" = "yes" ] && [ -n "${volume_name}" ] \
         && volume_exists "${volume_name}"; then
         printf 'export_postgres_anonymous_volume_leaked=%s\n' \
             "${volume_name}" >&2
         current_volume_fingerprint "${volume_name}" >&2 || true
-        return 1
+        status=1
+    elif [ "${remove_volumes}" = "yes" ] && [ -n "${volume_name}" ] \
+        && ! volume_absent "${volume_name}"; then
+        printf 'export_postgres_volume_state_unknown=%s\n' \
+            "${volume_name}" >&2
+        status=1
     fi
+    return "${status}"
 }
 
 remove_owned_network() {
+    local remove_status=0
     if ! network_exists "${network_id}"; then
-        return 0
+        if network_absent "${network_id}"; then
+            return 0
+        fi
+        printf 'export_postgres_network_state_unknown=%s\n' \
+            "${network_id}" >&2
+        return 1
     fi
     if ! owned_network; then
         printf 'export_postgres_network_identity_changed=%s\n' \
@@ -168,12 +263,18 @@ remove_owned_network() {
     if ! docker network rm "${network_id}" >/dev/null 2>&1; then
         printf 'export_postgres_network_cleanup_failed=%s\n' \
             "${network_id}" >&2
-        return 1
+        remove_status=1
     fi
     if network_exists "${network_id}"; then
         printf 'export_postgres_network_leaked=%s\n' "${network_id}" >&2
         return 1
     fi
+    if ! network_absent "${network_id}"; then
+        printf 'export_postgres_network_state_unknown=%s\n' \
+            "${network_id}" >&2
+        return 1
+    fi
+    return "${remove_status}"
 }
 
 cleanup() {
@@ -184,6 +285,9 @@ cleanup() {
             test_container_id=""
         else
             status=1
+            if container_absent "${test_container_id}"; then
+                test_container_id=""
+            fi
         fi
     fi
     if [ -n "${postgres_container_id}" ]; then
@@ -192,6 +296,9 @@ cleanup() {
             postgres_container_id=""
         else
             status=1
+            if container_absent "${postgres_container_id}"; then
+                postgres_container_id=""
+            fi
         fi
     fi
     if [ -n "${network_id}" ]; then
@@ -199,9 +306,12 @@ cleanup() {
             network_id=""
         else
             status=1
+            if network_absent "${network_id}"; then
+                network_id=""
+            fi
         fi
     fi
-    if [ "${status}" -eq 0 ] && [ -n "${smoke_root}" ] \
+    if [ -n "${smoke_root}" ] \
         && { [ -e "${smoke_root}" ] || [ -L "${smoke_root}" ]; }; then
         if [ ! -d "${smoke_root}" ] || [ -L "${smoke_root}" ]; then
             printf 'export_postgres_host_cleanup_scope_invalid=%s\n' \
@@ -232,6 +342,7 @@ cleanup() {
 cleanup_on_exit() {
     local original_status="$?"
     trap - EXIT
+    trap '' HUP INT TERM
     if ! cleanup && [ "${original_status}" -eq 0 ]; then
         original_status=1
     fi
@@ -240,6 +351,7 @@ cleanup_on_exit() {
 
 finish_success() {
     local message="$1"
+    trap '' HUP INT TERM
     if ! cleanup; then
         printf '%s\n' 'export_postgres_cleanup_failed' >&2
         return 1
