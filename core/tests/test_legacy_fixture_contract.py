@@ -40,6 +40,371 @@ class LegacyFixtureContractTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def test_host_linear_commit_recording_does_not_require_repository_checkout(
+        self,
+    ):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            isolated_root = Path(temporary)
+            fixture_script = isolated_root / "create_legacy_fixture.py"
+            fixture_script.write_bytes(FIXTURE_SCRIPT.read_bytes())
+            data_root = isolated_root / "data"
+            run_path = data_root / "migration-backups" / "fixture-run"
+            run_path.mkdir(parents=True)
+            payload = {
+                "event": "batch_commit",
+                "batch_id": "fixture-batch-1",
+            }
+            canonical = json.dumps(
+                payload,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            frame = {
+                "checksum": hashlib.sha256(canonical).hexdigest(),
+                "payload": payload,
+            }
+            journal = run_path / "linear-migration-v1.jsonl"
+            journal.write_text(
+                json.dumps(
+                    frame,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\n",
+                encoding="ascii",
+            )
+            output = data_root / "linear-commit-observation.json"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(fixture_script),
+                    "record-linear-commit",
+                    "--data-root",
+                    str(data_root),
+                    "--output",
+                    str(output),
+                    "--timeout",
+                    "1",
+                ],
+                cwd=str(isolated_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                completed.stderr.decode("utf-8", "replace"),
+            )
+            self.assertEqual(
+                completed.stdout,
+                b"FIXTURE_LINEAR_COMMIT_RECORDED\n",
+            )
+            self.assertTrue(output.is_file())
+
+    def test_repository_fixture_bootstraps_project_imports_outside_cwd(self):
+        source = "\n".join((
+            "import importlib.util",
+            "spec = importlib.util.spec_from_file_location(",
+            "    'isolated_fixture', {!r})".format(str(FIXTURE_SCRIPT)),
+            "module = importlib.util.module_from_spec(spec)",
+            "spec.loader.exec_module(module)",
+            "from django_images.services import migration_batch_log",
+            "assert migration_batch_log._canonical_json({",
+            "    'second': 2, 'first': 1",
+            "}) == b'{\"first\":1,\"second\":2}'",
+            "print('FIXTURE_PROJECT_IMPORT_OK')",
+        ))
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            completed = subprocess.run(
+                [sys.executable, "-I", "-c", source],
+                cwd=temporary,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stderr.decode("utf-8", "replace"),
+        )
+        self.assertEqual(
+            completed.stdout,
+            b"FIXTURE_PROJECT_IMPORT_OK\n",
+        )
+
+    def test_copying_observation_uses_linear_commits_and_legacy_fallback(
+        self,
+    ):
+        fixture = self.load_fixture_module()
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            data_root = Path(temporary, "data")
+            backup_root = data_root / "legacy-backup"
+            run_path = backup_root / "fixture-run"
+            run_path.mkdir(parents=True)
+            backup_root.chmod(0o700)
+            run_path.chmod(0o700)
+            state_path = run_path / "migration-state.json"
+            state_path.write_text(
+                json.dumps({
+                    "run_id": "fixture-run",
+                    "phase": "copying",
+                }),
+                encoding="ascii",
+            )
+            state_path.chmod(0o600)
+            media_path = run_path / "media-migration.jsonl"
+            media_path.write_bytes(
+                b'{"event":"planned_skeleton"}\n'
+                b'{"event":"plan_complete"}\n'
+            )
+            (run_path / "production.db.before-migration").write_bytes(
+                b"fixture-snapshot"
+            )
+
+            with mock.patch.object(
+                fixture.pwd, "getpwnam", side_effect=KeyError
+            ):
+                self.assertIsNone(fixture._copying_observation(str(data_root)))
+
+                payload = {
+                    "event": "batch_commit",
+                    "batch_id": "fixture-batch-1",
+                }
+                canonical = json.dumps(
+                    payload,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+                frame = {
+                    "checksum": hashlib.sha256(canonical).hexdigest(),
+                    "payload": payload,
+                }
+                linear_path = run_path / "linear-migration-v1.jsonl"
+                linear_path.write_text(
+                    json.dumps(
+                        frame,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n",
+                    encoding="ascii",
+                )
+
+                observation_path = data_root / "resume-observation.json"
+                with mock.patch.object(
+                    fixture.time,
+                    "sleep",
+                    side_effect=AssertionError("unexpected polling"),
+                ):
+                    fixture._record_resume(
+                        str(data_root),
+                        str(observation_path),
+                        0.01,
+                    )
+                observation, _raw, observation_stat = (
+                    fixture._load_json_file(observation_path)
+                )
+                self.assertEqual(
+                    observation_stat.st_mode & 0o777,
+                    0o600,
+                )
+                fixture._validate_resume_observation(observation)
+                fixture._verify_recorded_copying(
+                    str(data_root), observation
+                )
+                self.assertIsNotNone(observation)
+                self.assertEqual(observation["run_id"], "fixture-run")
+
+                state_path.write_text(
+                    json.dumps({
+                        "run_id": "fixture-run",
+                        "phase": "complete",
+                    }),
+                    encoding="ascii",
+                )
+                self.assertIsNone(
+                    fixture._copying_observation(str(data_root))
+                )
+
+                linear_path.unlink()
+                state_path.write_text(
+                    json.dumps({
+                        "run_id": "fixture-run",
+                        "phase": "copying",
+                    }),
+                    encoding="ascii",
+                )
+                media_path.write_bytes(
+                    b'{"event":"planned_skeleton"}\n'
+                    b'{"event":"published","image_id":1}\n'
+                )
+                self.assertIsNotNone(
+                    fixture._copying_observation(str(data_root))
+                )
+
+    def test_receipt_privacy_keeps_relative_paths_but_rejects_private_values(
+        self,
+    ):
+        fixture = self.load_fixture_module()
+
+        fixture._validate_receipt_value({
+            "legacy_original_path": "a/fixture-original.png",
+            "file_key": "original:1",
+        })
+
+        unsafe_values = (
+            "/data/production.db",
+            "https://private.example/media/image.png",
+            "//private-host/share/image.png",
+        )
+        for value in unsafe_values:
+            with self.subTest(value=value), self.assertRaises(
+                fixture.FixtureError
+            ) as raised:
+                fixture._validate_receipt_value({
+                    "prior_image_media_url": value,
+                })
+            self.assertEqual(
+                str(raised.exception), "receipt_contains_private_data"
+            )
+
+        with self.assertRaises(fixture.FixtureError) as raised:
+            fixture._validate_receipt_value({"api_token": "private"})
+        self.assertEqual(
+            str(raised.exception), "receipt_contains_private_data"
+        )
+
+    def test_completed_linear_summary_matches_fixture_receipt(self):
+        fixture = self.load_fixture_module()
+        receipt = {
+            "kind": "legacy-md5",
+            "items": [{"derivatives": [{}, {}, {}]}],
+        }
+        media_summary = types.SimpleNamespace(
+            image_count=1,
+            md5_legacy=1,
+            fixed_slot=0,
+            named_canonical=0,
+        )
+        backfill_summary = types.SimpleNamespace(
+            scanned=1,
+            eligible=1,
+            registered=1,
+            already_registered=0,
+            skipped=0,
+            reason_counts={},
+        )
+
+        fixture._assert_completed_linear_summaries(
+            receipt,
+            media_summary,
+            backfill_summary,
+            {
+                "images_total": 1,
+                "files_total": 4,
+                "backfill_total": 1,
+            },
+        )
+
+        media_summary.md5_legacy = 0
+        with self.assertRaisesRegex(
+            fixture.FixtureError, "manifest_incomplete"
+        ):
+            fixture._assert_completed_linear_summaries(
+                receipt,
+                media_summary,
+                backfill_summary,
+                {
+                    "images_total": 1,
+                    "files_total": 4,
+                    "backfill_total": 1,
+                },
+            )
+
+    def test_api_failure_code_exposes_only_mode_and_http_status(self):
+        fixture = self.load_fixture_module()
+
+        self.assertEqual(
+            fixture._api_failure_code(
+                "api_local_upload_failed", "new", 503
+            ),
+            "api_local_upload_failed_new_503",
+        )
+        self.assertEqual(
+            fixture._api_failure_code(
+                "api_local_upload_failed", "migrated", "private"
+            ),
+            "api_local_upload_failed_migrated_unknown",
+        )
+
+    def test_completed_manifest_accepts_linear_authority(self):
+        fixture = self.load_fixture_module()
+        receipt = {
+            "kind": "legacy-md5",
+            "items": [{"image_id": 1, "derivatives": [{}, {}, {}]}],
+        }
+        summaries = (
+            types.SimpleNamespace(
+                image_count=1,
+                md5_legacy=1,
+                fixed_slot=0,
+                named_canonical=0,
+            ),
+            types.SimpleNamespace(
+                scanned=1,
+                registered=1,
+                already_registered=0,
+                skipped=0,
+                reason_counts={},
+            ),
+            {
+                "images_total": 1,
+                "files_total": 4,
+                "backfill_total": 1,
+            },
+        )
+
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as temporary:
+            data_root = Path(temporary, "data")
+            run_path = data_root / "migration-backups" / "fixture-run"
+            run_path.mkdir(parents=True)
+            media_raw = b'{"event":"planned_skeleton"}\n'
+            backfill_raw = b'{"event":"planned_skeleton"}\n'
+            artifacts = {
+                "media-migration.jsonl": media_raw,
+                "media-asset-backfill.jsonl": backfill_raw,
+                "linear-migration-v1.jsonl": b"linear-authority\n",
+                "migration-summary.json": json.dumps({
+                    "phase": "complete",
+                    "media_manifest_sha256": hashlib.sha256(
+                        media_raw
+                    ).hexdigest(),
+                    "backfill_manifest_sha256": hashlib.sha256(
+                        backfill_raw
+                    ).hexdigest(),
+                }).encode("ascii"),
+            }
+            for filename, payload in artifacts.items():
+                path = run_path / filename
+                path.write_bytes(payload)
+                path.chmod(0o600)
+            summary_path = run_path / "migration-summary.json"
+            os.chown(summary_path, os.geteuid(), os.getegid())
+            summary_path.chmod(0o644)
+
+            with mock.patch.object(
+                fixture,
+                "_load_completed_linear_summaries",
+                return_value=summaries,
+            ):
+                fixture._assert_completed_manifests(
+                    str(data_root), str(run_path), receipt
+                )
+
     @staticmethod
     def write_auth_database(data_root, users=(), tokens=()):
         database = data_root / "production.db"
@@ -3634,6 +3999,12 @@ class LegacyFixtureContractTests(unittest.TestCase):
                 completed.returncode, 0, completed.stderr.decode("utf-8")
             )
             receipt = json.loads(receipt_path.read_text("ascii"))
+            fixture = self.load_fixture_module()
+            fixture._validate_receipt_value(receipt)
+            self.assertTrue(all(
+                "prior_image_media_url" not in item
+                for item in receipt["items"]
+            ))
             expected_roots = list("0123456789abcdef")
             self.assertEqual(receipt["expected_direct_roots"], expected_roots)
             self.assertEqual(

@@ -83,6 +83,7 @@ _FIXTURE_USERNAME = "fixture-reviewer"
 _FIXTURE_PASSWORD = "fixture-review-password"
 _MEDIA_MANIFEST = "media-migration.jsonl"
 _BACKFILL_MANIFEST = "media-asset-backfill.jsonl"
+_LINEAR_MANIFEST = "linear-migration-v1.jsonl"
 _STATE_FILENAME = "migration-state.json"
 _SUMMARY_FILENAME = "migration-summary.json"
 _SNAPSHOT_FILENAME = "production.db.before-migration"
@@ -241,18 +242,21 @@ def _is_repository_root(path):
         return False
 
 
-def _find_repository_root():
+def _find_repository_root(required=True):
     candidates = [Path("/pinry")]
     script_path = Path(__file__).resolve()
     candidates.extend(script_path.parents)
     for candidate in candidates:
         if _is_repository_root(candidate):
             return candidate.resolve()
-    raise RuntimeError("repository_root_missing")
+    if required:
+        raise RuntimeError("repository_root_missing")
+    return None
 
 
-_REPOSITORY_ROOT = _find_repository_root()
-if str(_REPOSITORY_ROOT) not in sys.path:
+_REPOSITORY_ROOT = _find_repository_root(required=False)
+if _REPOSITORY_ROOT is not None \
+        and str(_REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPOSITORY_ROOT))
 
 
@@ -265,6 +269,11 @@ class FixtureError(Exception):
 
 
 def _repo_root():
+    global _REPOSITORY_ROOT
+    if _REPOSITORY_ROOT is None:
+        _REPOSITORY_ROOT = _find_repository_root()
+        if str(_REPOSITORY_ROOT) not in sys.path:
+            sys.path.insert(0, str(_REPOSITORY_ROOT))
     return _REPOSITORY_ROOT
 
 
@@ -406,6 +415,7 @@ def _md5(value):
 
 
 def _configure_django(data_root):
+    _repo_root()
     data_root = os.path.abspath(os.fspath(data_root))
     database_path = os.path.join(data_root, "production.db")
     media_root = os.path.join(data_root, "static", "media")
@@ -681,7 +691,6 @@ def _create_fixture(kind, data_root, count, receipt_path, linear=False):
                 original_filename if kind != "legacy-md5" else None
             ),
             "legacy_original_path": original_path,
-            "prior_image_media_url": "/media/{}".format(original_path),
             "original_sha256": prepared["original"]["sha256"],
             "original_format": prepared["original"]["format"],
             "original_width": prepared["original"]["width"],
@@ -4419,7 +4428,120 @@ def _assert_backup_file(
         raise FixtureError("backup_identity_mismatch")
 
 
-def _assert_completed_manifests(run_path, receipt):
+def _load_completed_linear_summaries(
+    data_root, run_path, run_stat, error_code="manifest_incomplete"
+):
+    _configure_django(data_root)
+    from django.core.management import CommandError
+    from core.services.media_asset_backfill import (
+        load_completed_media_asset_backfill_summary,
+    )
+    from django_images.file_ops import (
+        MediaPathError,
+        open_verified_media_root,
+    )
+    from django_images.services.media_migration_v2 import (
+        load_auto_v2_plan,
+        load_completed_auto_v2_summary,
+    )
+    from django_images.services.migration_batch_log import (
+        MigrationBatchJournal,
+        MigrationBatchLogError,
+    )
+
+    run_id = os.path.basename(run_path)
+    try:
+        plan = load_auto_v2_plan(
+            run_path,
+            _MEDIA_MANIFEST,
+            run_id,
+            run_stat.st_uid,
+            run_stat.st_gid,
+        )
+        with ExitStack() as stack:
+            run_directory = open_verified_media_root(run_path)
+            stack.callback(run_directory.close)
+            journal = stack.enter_context(MigrationBatchJournal.open(
+                run_directory,
+                _LINEAR_MANIFEST,
+                run_id,
+                run_stat.st_uid,
+                run_stat.st_gid,
+                plan.plan_sha256,
+                plan.manifest_sha256,
+                create=False,
+            ))
+            media_summary = load_completed_auto_v2_summary(
+                run_path,
+                _MEDIA_MANIFEST,
+                run_id,
+                run_stat.st_uid,
+                run_stat.st_gid,
+                batch_journal=journal,
+            )
+            backfill_summary = (
+                load_completed_media_asset_backfill_summary(
+                    run_path,
+                    _BACKFILL_MANIFEST,
+                    run_id,
+                    run_stat.st_uid,
+                    run_stat.st_gid,
+                    batch_journal=journal,
+                )
+            )
+            work_totals = dict(journal.state.work_totals or {})
+    except (
+        CommandError,
+        MigrationBatchLogError,
+        MediaPathError,
+        OSError,
+    ):
+        raise FixtureError(error_code) from None
+    return media_summary, backfill_summary, work_totals
+
+
+def _assert_completed_linear_summaries(
+    receipt, media_summary, backfill_summary, work_totals
+):
+    image_count = len(receipt["items"])
+    expected_generation = {
+        "legacy-md5": "md5_legacy",
+        "transitional-fixed-slot": "fixed_slot",
+        "pending-schema": "named_canonical",
+    }[receipt["kind"]]
+    generation_counts = {
+        "md5_legacy": media_summary.md5_legacy,
+        "fixed_slot": media_summary.fixed_slot,
+        "named_canonical": media_summary.named_canonical,
+    }
+    expected_files = sum(
+        1 + len(item["derivatives"])
+        for item in receipt["items"]
+    )
+    if (
+        media_summary.image_count != image_count
+        or generation_counts.get(expected_generation) != image_count
+        or any(
+            count != (image_count if generation == expected_generation else 0)
+            for generation, count in generation_counts.items()
+        )
+        or backfill_summary.scanned != image_count
+        or (
+            backfill_summary.registered
+            + backfill_summary.already_registered
+        ) != image_count
+        or backfill_summary.skipped != 0
+        or backfill_summary.reason_counts != {}
+        or work_totals != {
+            "images_total": image_count,
+            "files_total": expected_files,
+            "backfill_total": image_count,
+        }
+    ):
+        raise FixtureError("manifest_incomplete")
+
+
+def _assert_completed_manifests(data_root, run_path, receipt):
     run_stat = os.stat(run_path, follow_symlinks=False)
     media_events, media_raw, media_stat = _load_json_lines(
         os.path.join(run_path, _MEDIA_MANIFEST)
@@ -4427,35 +4549,49 @@ def _assert_completed_manifests(run_path, receipt):
     backfill_events, backfill_raw, backfill_stat = _load_json_lines(
         os.path.join(run_path, _BACKFILL_MANIFEST)
     )
-    image_ids = {item["image_id"] for item in receipt["items"]}
-    media_terminal = {
-        event.get("image_id")
-        for event in media_events
-        if event.get("event") in (
-            "committed", "recovered_commit", "already_current"
+    if os.path.lexists(os.path.join(run_path, _LINEAR_MANIFEST)):
+        _assert_completed_linear_summaries(
+            receipt,
+            *_load_completed_linear_summaries(
+                data_root, run_path, run_stat
+            )
         )
-    }
-    registry_terminal = {
-        event.get("image_id")
-        for event in backfill_events
-        if event.get("event") in (
-            "registered", "already_registered", "recovered_registered"
-        )
-    }
-    if not image_ids.issubset(media_terminal) or not image_ids.issubset(
-        registry_terminal
-    ):
-        raise FixtureError("manifest_incomplete")
+    else:
+        image_ids = {item["image_id"] for item in receipt["items"]}
+        media_terminal = {
+            event.get("image_id")
+            for event in media_events
+            if event.get("event") in (
+                "committed", "recovered_commit", "already_current"
+            )
+        }
+        registry_terminal = {
+            event.get("image_id")
+            for event in backfill_events
+            if event.get("event") in (
+                "registered", "already_registered", "recovered_registered"
+            )
+        }
+        if not image_ids.issubset(media_terminal) or not image_ids.issubset(
+            registry_terminal
+        ):
+            raise FixtureError("manifest_incomplete")
     summary, _summary_raw, summary_stat = _load_json_file(
         os.path.join(run_path, _SUMMARY_FILENAME)
     )
-    for artifact_stat in (media_stat, backfill_stat, summary_stat):
+    for artifact_stat in (media_stat, backfill_stat):
         if (
             stat.S_IMODE(artifact_stat.st_mode) != 0o600
             or artifact_stat.st_uid != run_stat.st_uid
             or artifact_stat.st_gid != run_stat.st_gid
         ):
             raise FixtureError("migration_artifact_permissions_invalid")
+    if (
+        stat.S_IMODE(summary_stat.st_mode) != 0o644
+        or summary_stat.st_uid != os.geteuid()
+        or summary_stat.st_gid != os.getegid()
+    ):
+        raise FixtureError("migration_artifact_permissions_invalid")
     if (
         not isinstance(summary, dict)
         or summary.get("phase") != "complete"
@@ -4585,7 +4721,7 @@ def _verify_migration(data_root, receipt_path):  # noqa: C901
         or snapshot_stat.st_gid != _run_stat.st_gid
     ):
         raise FixtureError("migration_artifact_permissions_invalid")
-    _assert_completed_manifests(run_path, receipt)
+    _assert_completed_manifests(data_root, run_path, receipt)
     media_root = os.path.join(data_root, "static", "media")
     connection = _open_sqlite_read_only(database_path)
     try:
@@ -4670,11 +4806,10 @@ def _verify_migration(data_root, receipt_path):  # noqa: C901
                 or registry["content_sha256"] != item["original_sha256"]
             ):
                 raise FixtureError("migrated_registry_mismatch")
-            current_url = "/media/{}".format(original_path)
             if receipt["kind"] == "pending-schema":
-                if item["prior_image_media_url"] != current_url:
+                if item["legacy_original_path"] != original_path:
                     raise FixtureError("pending_schema_path_changed")
-            elif item["prior_image_media_url"] == current_url:
+            elif item["legacy_original_path"] == original_path:
                 raise FixtureError("legacy_path_not_changed")
             old_original = os.path.join(
                 media_root, item["legacy_original_path"]
@@ -5009,6 +5144,14 @@ def _response_pin_identity(response):
     return pin_id, image_id
 
 
+def _api_failure_code(prefix, mode, status_code):
+    if mode not in ("new", "migrated"):
+        mode = "unknown"
+    if type(status_code) is not int or not (100 <= status_code <= 599):
+        status_code = "unknown"
+    return "{}_{}_{}".format(prefix, mode, status_code)
+
+
 def _api_check(  # noqa: C901
     mode, base_url, remote_url, data_root, receipt_path=None,
     require_existing_auth=False,
@@ -5064,7 +5207,11 @@ def _api_check(  # noqa: C901
             timeout=30,
         )
         if local_response.status_code != 201:
-            raise FixtureError("api_local_upload_failed")
+            raise FixtureError(_api_failure_code(
+                "api_local_upload_failed",
+                mode,
+                local_response.status_code,
+            ))
         local_pin, local_image = _response_pin_identity(local_response)
         created_pins.append(local_pin)
         duplicate_response = session.post(
@@ -5081,7 +5228,11 @@ def _api_check(  # noqa: C901
             timeout=30,
         )
         if duplicate_response.status_code != 201:
-            raise FixtureError("api_duplicate_upload_failed")
+            raise FixtureError(_api_failure_code(
+                "api_duplicate_upload_failed",
+                mode,
+                duplicate_response.status_code,
+            ))
         duplicate_pin, duplicate_image = _response_pin_identity(
             duplicate_response
         )
@@ -5098,7 +5249,11 @@ def _api_check(  # noqa: C901
             timeout=30,
         )
         if remote_response.status_code != 201:
-            raise FixtureError("api_remote_upload_failed")
+            raise FixtureError(_api_failure_code(
+                "api_remote_upload_failed",
+                mode,
+                remote_response.status_code,
+            ))
         remote_pin, remote_image = _response_pin_identity(remote_response)
         created_pins.append(remote_pin)
         if (
@@ -5127,14 +5282,27 @@ def _api_check(  # noqa: C901
             remote_paths,
             _sha256(_deterministic_png(10000)),
         )
-        for pin_id in tuple(created_pins):
+        for delete_ordinal, pin_id in enumerate(
+            tuple(created_pins), start=1
+        ):
             deleted = session.delete(
                 "{}/api/v2/pins/{}/".format(base_url, pin_id),
                 headers=headers,
                 timeout=30,
             )
             if deleted.status_code != 204:
-                raise FixtureError("api_delete_failed")
+                status_code = deleted.status_code
+                if type(status_code) is not int or not (
+                    100 <= status_code <= 599
+                ):
+                    status_code = "unknown"
+                raise FixtureError(
+                    "api_delete_failed_{}_{}_{}".format(
+                        mode,
+                        delete_ordinal,
+                        status_code,
+                    )
+                )
             created_pins.remove(pin_id)
         connection = _open_sqlite_read_only(
             os.path.join(data_root, "production.db")
@@ -5594,15 +5762,25 @@ def _copying_observation(data_root):
         return None
     run_id, run_path, state, _run_stat = copying[0]
     manifest_path = os.path.join(run_path, _MEDIA_MANIFEST)
+    linear_path = os.path.join(run_path, _LINEAR_MANIFEST)
     snapshot_path = os.path.join(run_path, _SNAPSHOT_FILENAME)
     try:
         events, manifest_prefix, manifest_stat = _load_json_lines(
             manifest_path,
             allow_torn_tail=True,
         )
-        if not any(
-            event.get("event") in ("published", "committed")
-            for event in events
+        if os.path.lexists(linear_path):
+            commits, _journal_prefix, _journal_stat = (
+                _linear_commit_snapshot_path(
+                    linear_path,
+                    allow_torn_tail=True,
+                )
+            )
+            if not commits:
+                return None
+        elif not any(
+                event.get("event") in ("published", "committed")
+                for event in events
         ):
             return None
         snapshot_sha256, snapshot_stat = _file_sha256(snapshot_path)
@@ -5687,13 +5865,8 @@ def _record_resume(data_root, output_path, timeout):
     _atomic_write(output_path, payload, mode=0o600)
 
 
-def _linear_commit_snapshot(data_root, allow_torn_tail=False):
-    matches = glob.glob(os.path.join(
-        data_root, "**", "linear-migration-v1.jsonl"
-    ), recursive=True)
-    if len(matches) != 1:
-        raise FixtureError("linear_journal_missing")
-    raw, journal_stat = _read_regular_file(matches[0])
+def _linear_commit_snapshot_path(journal_path, allow_torn_tail=False):
+    raw, journal_stat = _read_regular_file(journal_path)
     lines = raw.splitlines(keepends=True)
     commits = []
     prefix_end = None
@@ -5721,6 +5894,18 @@ def _linear_commit_snapshot(data_root, allow_torn_tail=False):
                 prefix_end = consumed
     prefix = None if prefix_end is None else raw[:prefix_end]
     return commits, prefix, journal_stat
+
+
+def _linear_commit_snapshot(data_root, allow_torn_tail=False):
+    matches = glob.glob(os.path.join(
+        data_root, "**", "linear-migration-v1.jsonl"
+    ), recursive=True)
+    if len(matches) != 1:
+        raise FixtureError("linear_journal_missing")
+    return _linear_commit_snapshot_path(
+        matches[0],
+        allow_torn_tail=allow_torn_tail,
+    )
 
 
 def _record_linear_commit(data_root, output_path, timeout):
@@ -5986,20 +6171,32 @@ def _verify_resume(data_root, input_path):
     ):
         raise FixtureError("resume_manifest_prefix_changed")
     media_events, media_raw, _media_stat = _load_json_lines(manifest_path)
-    planned = {
-        event.get("plan", {}).get("image_id")
-        for event in media_events
-        if event.get("event") == "planned"
-    }
-    terminal = {
-        event.get("image_id")
-        for event in media_events
-        if event.get("event") in (
-            "committed", "recovered_commit", "already_current"
+    if os.path.lexists(os.path.join(run_path, _LINEAR_MANIFEST)):
+        media_summary, _backfill_summary, _work_totals = (
+            _load_completed_linear_summaries(
+                data_root,
+                run_path,
+                _run_stat,
+                error_code="resume_manifest_incomplete",
+            )
         )
-    }
-    if not planned or None in planned or not planned.issubset(terminal):
-        raise FixtureError("resume_manifest_incomplete")
+        if media_summary.image_count <= 0:
+            raise FixtureError("resume_manifest_incomplete")
+    else:
+        planned = {
+            event.get("plan", {}).get("image_id")
+            for event in media_events
+            if event.get("event") == "planned"
+        }
+        terminal = {
+            event.get("image_id")
+            for event in media_events
+            if event.get("event") in (
+                "committed", "recovered_commit", "already_current"
+            )
+        }
+        if not planned or None in planned or not planned.issubset(terminal):
+            raise FixtureError("resume_manifest_incomplete")
     if state.get("manifests", {}).get("media", {}).get(
         "manifest_sha256"
     ) != _sha256(media_raw):
