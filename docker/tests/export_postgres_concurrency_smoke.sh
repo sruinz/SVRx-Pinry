@@ -733,13 +733,18 @@ test_container_id="$(docker create \
         --settings=pinry.settings.test_postgres \
       && python /pinry/actual_lock_retry.py \
       && python manage.py test \
-        exports.tests.test_concurrency \
-        exports.tests.test_snapshot \
-        exports.tests.test_archive_finalization \
-        exports.tests.test_worker \
-        exports.tests.test_worker_recovery \
-        exports.tests.test_download \
-        exports.tests.test_api.ExportAPITests.test_postgresql_fence_model_list_is_complete_and_excludes_worker_lease \
+        exports.tests.test_concurrency.ExportCreateConcurrencyTests.test_two_file_sqlite_connections_commit_one_job_and_one_conflict \
+        exports.tests.test_snapshot.SnapshotServiceTests.test_open_closed_and_progress_busy_cleanup_then_use_new_generation \
+        exports.tests.test_snapshot.SnapshotServiceTests.test_short_lease_cas_uses_nowait_worker_and_job_row_locks \
+        exports.tests.test_snapshot.SnapshotServiceTests.test_postgresql_nowait_lock_error_is_normalized_as_busy \
+        exports.tests.test_worker.WorkerLeaseTests.test_claim_transition_blocks_tick_until_new_token_is_published \
+        exports.tests.test_worker.WorkerLeaseTests.test_replace_and_clear_transitions_hide_old_token_from_tick \
+        exports.tests.test_worker.WorkerLeaseTests.test_old_generation_heartbeat_fails_after_takeover \
+        exports.tests.test_worker.WorkerLeaseTests.test_claim_deadline_rolls_back_then_retries_outside_the_guards \
+        exports.tests.test_archive_finalization.ArchiveServiceTests.test_complete_rollback_keeps_previous_ready_job_valid \
+        exports.tests.test_archive_finalization.ArchiveServiceTests.test_middle_revocations_release_guard_between_real_batches \
+        exports.tests.test_archive_finalization.ArchiveServiceTests.test_final_revocation_deadline_rolls_back_db_and_keeps_old_tokens \
+        exports.tests.test_download.ExportDownloadAPITests.test_mismatch_cas_preserves_concurrent_expired_pending \
         --settings=pinry.settings.test_postgres --noinput -v 2')" \
     || fail 'export_postgres_test_container_create_failed'
 owned_container "${test_container_id}" "${app_image_id}" \
@@ -798,4 +803,4 @@ remove_owned_container "${test_container_id}" "${app_image_id}" no \
 test_container_id=""
 
 finish_success \
-    'EXPORT_POSTGRES_CONCURRENCY_SMOKE_OK backend=postgresql version=14 modules=6 fence_contract=1 actual_lock_retry=1'
+    'EXPORT_POSTGRES_CONCURRENCY_SMOKE_OK backend=postgresql version=14 tests=12 fence_contract=1 actual_lock_retry=1'

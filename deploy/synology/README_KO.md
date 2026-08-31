@@ -180,9 +180,12 @@ bash accept-tools/docker/tests/export_postgres_concurrency_smoke.sh svrx-pinry:l
 두 스크립트는 고유한 임시 컨테이너·네트워크와 테스트 데이터를 사용하며,
 성공 시 자신이 만든 임시 자원을 정리한다. PostgreSQL 검증은
 `postgres:14-alpine` 이미지가 없으면 Docker Hub에서 받으므로 NAS의 외부
-네트워크 접근이 필요하다. PostgreSQL 검증 중에는 10초마다 경과 시간이
-표시되며, 테스트 묶음이 30분 안에 끝나지 않으면 실패 처리하고 자신이 만든
-임시 자원을 정리한다.
+네트워크 접근이 필요하다. 이 검증은 실제 PostgreSQL `NOWAIT` 잠금·재시도
+probe와 동시 생성, worker lease, rollback, download CAS 경계의 핵심 회귀
+테스트 12개만 실행한다. 5만 건 fixture를 사용하는 대량 회귀 테스트는
+기능 코드와 전체 테스트에는 그대로 유지하지만 NAS 배포 전 필수 smoke에는
+포함하지 않는다. 검증 중에는 10초마다 경과 시간이 표시되며, 테스트 묶음이
+30분 안에 끝나지 않으면 실패 처리하고 자신이 만든 임시 자원을 정리한다.
 
 ## 서비스 워커 전환 context 업로드와 실행
 
