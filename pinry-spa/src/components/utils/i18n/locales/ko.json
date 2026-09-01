@@ -135,6 +135,8 @@
   "pinDeleted": "Pin을 삭제했습니다",
   "pinDeleteError": "Pin을 삭제하지 못했습니다",
   "pinCreateError": "Pin을 만들지 못했습니다",
+  "pinBoardAlreadyIncluded": "이미 포함됨",
+  "pinBoardMembershipLoadError": "보드 포함 상태를 불러오지 못했습니다.",
   "buildInfoTitle": "빌드 정보",
   "buildBrandLabel": "제품",
   "buildVersionLabel": "실행 버전",

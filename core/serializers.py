@@ -34,6 +34,18 @@ def filter_private_board(request, query):
     return query
 
 
+class PinBoardMembershipSerializer(serializers.ModelSerializer):
+    contains_pin = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Board
+        fields = (
+            "id",
+            "name",
+            "contains_pin",
+        )
+
+
 class ThumbnailSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = Thumbnail

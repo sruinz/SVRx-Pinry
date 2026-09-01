@@ -28,7 +28,8 @@
         <template v-for="option in availableOptions">
           <option
             v-bind:key="option.value"
-            :value="option.value">{{ option.name }}</option>
+            :disabled="option.disabled === true"
+            :value="option.value">{{ option.displayName || option.name }}</option>
         </template>
       </b-select>
     </b-field>
@@ -47,12 +48,18 @@ function getBoardFromResp(boardObject) {
 }
 
 function getAvailableOptions(vm, filter) {
+  const knownValues = new Set(
+    vm.allOptions.map(option => String(option.value)),
+  );
+  const options = vm.createdOptions
+    .filter(option => !knownValues.has(String(option.value)))
+    .concat(vm.allOptions);
   let availableOptions;
   if (filter === '' || filter === null) {
-    availableOptions = vm.allOptions;
+    availableOptions = options;
   } else {
     availableOptions = AutoComplete.getFilteredOptions(
-      vm.allOptions, vm.form.name.value,
+      options, vm.form.name.value,
     );
   }
   return availableOptions;
@@ -91,8 +98,9 @@ export default {
           self.$emit('boardCreated', data);
           const board = getBoardFromResp(data);
           self.createdOptions.unshift(board);
-          const options = getAvailableOptions(this);
-          this.availableOptions = this.createdOptions.concat(options);
+          this.availableOptions = getAvailableOptions(
+            this, this.form.name.value,
+          );
           self.select(board);
           self.form.name.value = null;
         },
@@ -105,11 +113,12 @@ export default {
   watch: {
     // eslint-disable-next-line func-names
     'form.name.value': function (newVal) {
-      const options = getAvailableOptions(this, newVal);
-      this.availableOptions = this.createdOptions.concat(options);
+      this.availableOptions = getAvailableOptions(this, newVal);
     },
     allOptions() {
-      this.availableOptions = this.allOptions;
+      this.availableOptions = getAvailableOptions(
+        this, this.form.name.value,
+      );
     },
     selectedOptions() {
       this.helper.resetAllFields();

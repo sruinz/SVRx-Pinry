@@ -210,6 +210,8 @@ const EXPECTED_LOCALE_KEYS = [
   'passwordLoginPlaceholder',
   'passwordSignUpPlaceholder',
   'permalinkButton',
+  'pinBoardAlreadyIncluded',
+  'pinBoardMembershipLoadError',
   'pinCreateError',
   'pinCreateModalCreatePinButton',
   'pinCreateModalEmptySlot',
@@ -258,6 +260,8 @@ const EXPECTED_LOCALE_KEYS = [
 ];
 
 const REQUIRED_KOREAN_TEXT = {
+  pinBoardAlreadyIncluded: '이미 포함됨',
+  pinBoardMembershipLoadError: '보드 포함 상태를 불러오지 못했습니다.',
   NewPinTitle: '새 Pin',
   adminSettingsLink: '관리자 설정',
   closeButton: '닫기',

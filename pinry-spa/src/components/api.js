@@ -112,6 +112,10 @@ const Pin = {
       data,
     );
   },
+  fetchBoardMemberships(pinId) {
+    const url = `${API_PREFIX}pins/${pinId}/board-memberships/`;
+    return axios.get(url);
+  },
   fetchSelectionIds({ boardId = null, exclusiveOwned = false } = {}) {
     const params = {};
     if (boardId !== null) params.board_id = boardId;

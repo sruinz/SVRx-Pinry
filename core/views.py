@@ -5,6 +5,7 @@ from functools import wraps
 
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.shortcuts import get_object_or_404
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import viewsets, mixins, routers, status
@@ -213,6 +214,41 @@ class PinViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         return filter_private_pin(self.request, Pin.objects.all())
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super(PinViewSet, self).finalize_response(
+            request, response, *args, **kwargs
+        )
+        if getattr(self, "action", None) == "board_memberships":
+            response["Cache-Control"] = "private, no-store"
+        return response
+
+    @action(
+        detail=True,
+        methods=["get"],
+        permission_classes=[
+            IsAuthenticated,
+            IsOwnerOrReadOnly("submitter"),
+            OwnerOnlyIfPrivate("submitter"),
+        ],
+        url_path="board-memberships",
+        url_name="board-memberships",
+    )
+    def board_memberships(self, request, pk=None):
+        pin = self.get_object()
+        through = Board.pins.through
+        membership = through.objects.filter(
+            board_id=OuterRef("pk"),
+            pin_id=pin.pk,
+        )
+        boards = (
+            Board.objects.filter(submitter=request.user)
+            .annotate(contains_pin=Exists(membership))
+            .only("id", "name")
+            .order_by("-id")
+        )
+        serializer = api.PinBoardMembershipSerializer(boards, many=True)
+        return Response({"boards": serializer.data})
 
     @staticmethod
     def _get_owned_pin(request, pin_id):

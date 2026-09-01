@@ -135,6 +135,8 @@
     "pinDeleted": "Pin deleted",
     "pinDeleteError": "Failed to delete Pin",
     "pinCreateError": "Failed to create Pin",
+    "pinBoardAlreadyIncluded": "Already included",
+    "pinBoardMembershipLoadError": "Could not load board membership status.",
     "buildInfoTitle": "Build information",
     "buildBrandLabel": "Product",
     "buildVersionLabel": "Running version",
