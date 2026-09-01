@@ -850,8 +850,12 @@ capture_archiving_interrupt() {
     local current_id
     local state
     while [ "$(date +%s)" -lt "${deadline}" ]; do
-        docker exec "${active_container_id}" kill -STOP "${worker_pid}" \
-            >/dev/null 2>&1 || return 1
+        if ! docker exec "${active_container_id}" sh -c '
+kill -STOP "$1"
+' sh "${worker_pid}" >/dev/null 2>&1; then
+            printf '%s\n' 'export_smoke_worker_stop_failed' >&2
+            return 1
+        fi
         if docker exec --user 1000:1000 "${active_container_id}" python -c '
 import json
 import sys
@@ -909,16 +913,25 @@ print(json.dumps({
 ' "${job_id}" > "${output}" 2>/dev/null; then
             return 0
         fi
-        docker exec "${active_container_id}" kill -CONT "${worker_pid}" \
-            >/dev/null 2>&1 || return 1
+        if ! docker exec "${active_container_id}" sh -c '
+kill -CONT "$1"
+' sh "${worker_pid}" >/dev/null 2>&1; then
+            printf '%s\n' 'export_smoke_worker_continue_failed' >&2
+            return 1
+        fi
         read -r current_id state <<< "$(latest_state || printf '%s\n' 'none none')"
         if [ "${current_id}" = "${job_id}" ]; then
             case "${state}" in
-                complete|failed|expired) return 1 ;;
+                complete|failed|expired)
+                    printf 'export_smoke_worker_interrupt_terminal=%s\n' \
+                        "${state}" >&2
+                    return 1
+                    ;;
             esac
         fi
         sleep 0.05
     done
+    printf '%s\n' 'export_smoke_worker_interrupt_timeout' >&2
     return 1
 }
 

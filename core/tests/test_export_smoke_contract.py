@@ -257,6 +257,24 @@ class ExportSmokeContractTests(unittest.TestCase):
         )
         self.assertNotIn("http_request POST '/api/v2/users/'", source)
 
+    def test_runtime_smoke_uses_shell_builtin_for_worker_signals(self):
+        source = RUNTIME_SMOKE.read_text("utf-8")
+
+        self.assertNotIn(
+            'docker exec "${active_container_id}" kill -',
+            source,
+        )
+        for signal in ("STOP", "CONT"):
+            expected = (
+                'docker exec "${active_container_id}" sh -c \'\n'
+                + 'kill -{} "$1"\n'.format(signal)
+                + '\' sh "${worker_pid}"'
+            )
+            self.assertIn(
+                expected,
+                source,
+            )
+
     def test_runtime_smoke_fails_fast_on_terminal_startup_status(self):
         source = RUNTIME_SMOKE.read_text("utf-8")
 
