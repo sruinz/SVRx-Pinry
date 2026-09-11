@@ -2112,17 +2112,17 @@ class SynologyPackageTests(unittest.TestCase):
             re.findall(
                 r"^FROM python:([^\s]+)", synology_source, re.MULTILINE
             ),
-            ["3.12-slim-bookworm", "3.12-slim-bookworm"],
+            ["3.14-slim-bookworm", "3.14-slim-bookworm"],
         )
         self.assertEqual(
             re.findall(r"^FROM python:([^\s]+)", root_source, re.MULTILINE),
-            ["3.12-bookworm"],
+            ["3.14-bookworm"],
         )
         self.assertEqual(
             re.findall(
                 r"python-version:\s*\['([^']+)'\]", workflow_source
             ),
-            ["3.12"],
+            ["3.14"],
         )
         self.assertNotIn("buster", synology_source)
         self.assertIn("libtiff-dev", synology_source)

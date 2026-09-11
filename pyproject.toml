@@ -6,7 +6,7 @@ authors = ["winkidney <winkidney@gmail.com>"]
 license = "BSD 2-Clause"
 
 [tool.poetry.dependencies]
-python = ">=3.12,<3.13"
+python = ">=3.14,<3.15"
 requests = "^2.27.1"
 urllib3 = "==1.26.20"
 django = "==5.2.17"
@@ -14,7 +14,9 @@ pillow = "==12.3.0"
 markdown = "*"
 django-filter = "==26.1"
 coreapi = "^2.3.3"
-psycopg2-binary = "2.9.9"
+# 기존 API 문서의 cgi 사용을 Python 3.14에서도 유지한다.
+legacy-cgi = "==2.6.4"
+psycopg2-binary = "2.9.11"
 django-taggit = "6.1.0"
 django-braces = "^1.15.0"
 django-compressor = "==4.6.0"

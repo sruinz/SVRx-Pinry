@@ -142,8 +142,8 @@ class LimitedJSONParserTests(SimpleTestCase):
         self.assertEqual(stream.read_count, 1)
 
     def test_deeply_nested_json_is_reported_as_invalid_json(self):
-        # Python 3.12는 2,000단계도 파싱하므로 실제 재귀 한도를 넘긴다.
-        body = (b"[" * 10000) + (b"]" * 10000)
+        # Python 3.14의 C 파서는 10,000단계도 허용하므로 실제 한도를 넘긴다.
+        body = (b"[" * 100000) + (b"]" * 100000)
         stream = RecordingStream(body)
 
         with self.assertRaises(ParseError) as raised:
@@ -1087,7 +1087,7 @@ class BatchActionTests(TestCase):
         self.assertEqual(factory.call_count, 0)
 
     def test_deeply_nested_json_is_rejected_before_service(self):
-        body = (b"[" * 10000) + (b"]" * 10000)
+        body = (b"[" * 100000) + (b"]" * 100000)
         request, stream = self._request(body=body)
 
         with mock.patch.object(

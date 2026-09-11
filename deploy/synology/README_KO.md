@@ -682,9 +682,9 @@ curl -s http://NAS주소:2048/api/v2/version/
 값도 같은 SHA의 앞 12자와 일치해야 한다. 값이 다르면 이전 산출물을 다시
 빌드했거나 `latest` 이미지로 컨테이너를 교체하지 않은 것이다.
 
-## Python 3.12와 데이터베이스 호환 범위
+## Python 3.14와 데이터베이스 호환 범위
 
-현재 산출물은 Python 3.12의 Debian Bookworm 이미지와 Django 5.2.17을
+현재 산출물은 Python 3.14의 Debian Bookworm 이미지와 Django 5.2.17 LTS를
 사용한다. Django 5.2가 지원하는 SQLite, PostgreSQL, MariaDB, MySQL,
 Oracle 계열을 제거하지 않았지만, 서버가 아래 최소 버전보다 오래되었다면
 이미지를 적용하지 않는다.
@@ -696,8 +696,8 @@ Oracle 계열을 제거하지 않았지만, 서버가 아래 최소 버전보다
 - Oracle Database 19c 이상
 
 SQLite는 Python 표준 라이브러리를 사용하고, PostgreSQL은 기존
-`psycopg2-binary==2.9.9`를 유지한다(Django 최소 요구 2.8.4).
-MySQL과 MariaDB는 Django 최소 요구 1.4.3보다 새롭고 Python 3.12를 지원하는
+`psycopg2-binary==2.9.11`을 사용한다(Python 3.14 지원).
+MySQL과 MariaDB는 Django 최소 요구 1.4.3보다 새로운
 `mysqlclient==2.2.8`을 사용한다. Oracle은 더 이상 `cx_Oracle`을 설치하지
 않고 Django 5.2가 요구하는 `oracledb>=2.3.0` 계열의
 `oracledb==4.0.2`를 사용한다. 두 추가 드라이버와 그 의존성은 최종 이미지의
@@ -713,16 +713,27 @@ Oracle Instant Client, `init_oracle_client()`, `lib_dir`, `TNS_ADMIN`, wallet
 Instant Client도 포함하지 않는다. 기존 설정과 client library 마운트·환경
 변수를 확인하고 격리된 복제 환경에서 별도로 검증한 뒤에만 전환한다.
 
-이번 전환에서는 Docker CLI가 없는 로컬 환경 때문에 컨테이너 빌드를
-실행하지 않았고, Synology NAS와 외부 PostgreSQL·MariaDB·MySQL·Oracle
-서버에도 연결하지 않았다. SQLite를 포함해 실제 운영 데이터가 있는 모든
-DB는 배포 전에 백업하고, 운영 복제본으로 이관·기동·읽기·쓰기 회귀를
-확인해야 한다.
+Python 3.12 / Django 5.2.17 기준선은 Synology 실제 빌드·격리 SQLite
+업그레이드·PostgreSQL 14 시험을 통과했다. Python 3.14 후속 후보의 결과는
+저장소의 B3 실행 기록 중 Python 3.14 후속 구간과 산출물 검증 기록을 확인한다.
+MySQL/MariaDB·Oracle 실서버와 NAS 전체 재부팅은 별도 검증 대상이다.
+실제 운영 DB는 배포 전에 백업하고 이관·기동·읽기·쓰기 회귀를 확인한다.
+
+Django는 5.2 LTS를 유지하며 DB 최소 버전을 올리지 않는다. 기존 CoreAPI
+URL 구성과 CoreAPI 의존성의 기동 호환성을 보존하기 위해 DRF 3.16.1과
+`legacy-cgi==2.6.4`를 사용한다.
+후자는 Python 3.13에서 제거된 cgi의 호환 패키지로, Python 공식팀이
+유지보수하는 표준 라이브러리는 아니다. DRF의 Python 3.14 공식 지원은
+3.17부터지만 CoreAPI가 제거되므로 이번 런타임 전환과 문서 API 교체는 분리한다.
+현재 조합의 동작 검증을 모든 의존성의 공식 Python 3.14 지원으로 표현하지 않는다.
+개발자용 `/api/v2/docs/` 화면은 기존 Python 3.12 기준선에서도 django-filter의
+`get_schema_fields` 제거로 오류가 발생한다. 이번 전환의 신규 회귀가 아니며,
+DRF·문서 API 교체 시 함께 수정할 별도 알려진 문제다.
 
 ## 빌드 실패 참고
 
 `DEPRECATED: The legacy builder is deprecated`는 경고이며 빌드 실패 원인이
-아니다. 현재 산출물은 Python 3.12의 Debian Bookworm 이미지를 사용한다.
+아니다. 현재 산출물은 Python 3.14의 Debian Bookworm 이미지를 사용한다.
 
 컨테이너를 다시 만들기 전에 데이터 폴더를 별도 위치에 백업한다.
 `docker compose down`은 바인드 마운트 데이터 폴더를 삭제하지 않지만,

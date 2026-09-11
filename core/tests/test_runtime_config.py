@@ -469,12 +469,13 @@ def _assert_nginx_contract(source):
     if _direct_values(batch, "break") != [[]]:
         raise AssertionError("batch break must be direct and unique")
     expected_headers = {
-        ("Host", "$host"),
+        ("Host", "$http_host"),
+        ("X-Forwarded-Host", '\"\"'),
         ("X-Real-IP", "$remote_addr"),
         ("X-Forwarded-For", "$remote_addr"),
     }
     headers = _direct_values(batch, "proxy_set_header")
-    if len(headers) != 3 or {tuple(value) for value in headers} != (
+    if len(headers) != 4 or {tuple(value) for value in headers} != (
         expected_headers
     ):
         raise AssertionError("batch proxy headers are incomplete or duplicated")
