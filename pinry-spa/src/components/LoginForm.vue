@@ -6,6 +6,12 @@
           <p class="modal-card-title">{{ $t("loginTitle") }}</p>
         </header>
         <section class="modal-card-body">
+          <p v-if="policyError" role="alert">{{ $t('ssoSettingsFailed') }}</p>
+          <p v-else-if="!policy">{{ $t('ssoLoading') }}</p>
+          <a v-for="provider in providers" :key="provider.id"
+             class="button is-link" :href="provider.login_url">{{ provider.name }}</a>
+          <p v-if="policy && !policy.password_login_enabled">{{ $t('ssoPasswordDisabled') }}</p>
+          <div v-if="passwordAllowed" data-test="password-form">
           <b-field v-bind:label="$t('usernameLabel')"
                    :type="form.username.type"
                    :message="form.username.error">
@@ -30,10 +36,12 @@
               required>
             </b-input>
           </b-field>
+          </div>
         </section>
         <footer class="modal-card-foot">
           <button class="button" type="button" @click="$parent.close()">{{ $t("closeButton") }}</button>
           <button
+            v-if="passwordAllowed"
             @click="doLogin"
             class="button is-primary">{{ $t("loginButton") }}</button>
         </footer>
@@ -55,7 +63,17 @@ export default {
     return {
       form: model.form,
       helper: model,
+      policy: null,
+      policyError: false,
     };
+  },
+  computed: {
+    passwordAllowed() { return this.policy && this.policy.password_login_enabled; },
+    providers() { return this.policy ? this.policy.providers : []; },
+  },
+  created() {
+    api.SSO.policy().then((policy) => { this.policy = policy; })
+      .catch(() => { this.policyError = true; });
   },
   methods: {
     triggerDoLogin(e) {
@@ -66,6 +84,7 @@ export default {
       return true;
     },
     doLogin() {
+      if (!this.passwordAllowed) return;
       this.helper.resetAllFields();
       const self = this;
       const promise = api.User.logIn(

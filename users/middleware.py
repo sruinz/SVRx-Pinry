@@ -1,26 +1,28 @@
 from django.conf import settings
-from django.contrib.auth import logout
 from django.http import HttpResponseForbidden
 from django.urls import Resolver404, resolve
 from django.utils.deprecation import MiddlewareMixin
-from rest_framework.authentication import TokenAuthentication
 from rest_framework.exceptions import AuthenticationFailed
 
-from users.models import ExternalIdentity, SSOProvider
+from users.sso.authentication import PolicyTokenAuthentication
+from users.sso.policy import enforce_session_policy, password_login_allowed, policy_request
 
 
 class SSOSessionMiddleware(MiddlewareMixin):
+    def __call__(self, request):
+        # 요청 인자를 받지 않는 사용자 저장 signal도 같은 정책 스냅샷을 사용한다.
+        token = policy_request.set(request)
+        try:
+            return super().__call__(request)
+        finally:
+            policy_request.reset(token)
+
     def process_request(self, request):
-        if request.session.get('auth_method') != 'sso':
-            return
-        provider_id = request.session.get('sso_provider_id')
-        revision = request.session.get('sso_provider_revision')
-        if (not request.user.is_authenticated or not SSOProvider.objects.filter(
-            pk=provider_id, revision=revision, enabled=True,
-        ).exists() or not ExternalIdentity.objects.filter(
-            user=request.user, provider_id=provider_id,
-        ).exists()):
-            logout(request)
+        enforce_session_policy(request)
+        request.password_login_enabled = password_login_allowed(request)
+        if (request.method == 'POST' and request.path in ('/admin/login/', '/api-auth/login/')
+                and not password_login_allowed(request)):
+            return HttpResponseForbidden('비밀번호 로그인이 비활성화되어 있습니다. SSO를 이용해 주세요.')
 
 
 class Public(MiddlewareMixin):
@@ -36,7 +38,7 @@ class Public(MiddlewareMixin):
         if not request.path.startswith("/api/v2/"):
             return False
         try:
-            authenticated = TokenAuthentication().authenticate(request)
+            authenticated = PolicyTokenAuthentication().authenticate(request)
         except AuthenticationFailed:
             return False
         if authenticated is None:
@@ -48,7 +50,7 @@ class Public(MiddlewareMixin):
         if settings.PUBLIC is False and not request.user.is_authenticated:
             try:
                 public_sso = resolve(request.path_info).view_name in {
-                    'sso:providers', 'sso:login', 'sso:callback',
+                    'sso:providers', 'sso:login', 'sso:callback', 'login-page',
                 }
             except Resolver404:
                 public_sso = False

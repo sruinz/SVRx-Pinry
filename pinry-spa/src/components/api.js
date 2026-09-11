@@ -284,17 +284,9 @@ const User = {
       },
     );
   },
-  fetchUserInfo(force = false) {
+  fetchUserInfo() {
     /* returns null if user not logged in */
-    const self = this;
-    if (!force) {
-      const userInfo = storage.get(self.storageKey);
-      if (userInfo !== null) {
-        return new Promise(
-          resolve => resolve(userInfo),
-        );
-      }
-    }
+    storage.set(this.storageKey, null, 1);
     const url = `${API_PREFIX}profile/users/`;
     return new Promise(
       (resolve) => {
@@ -304,13 +296,40 @@ const User = {
             if (users.length === 0) {
               return resolve(null);
             }
-            const value = users[0];
-            storage.set(self.storageKey, value, 60 * 5 * 1000);
             return resolve(users[0]);
           },
+          () => resolve(null),
         );
       },
     );
+  },
+};
+
+const SSO = {
+  policy() {
+    return axios.get(`${API_PREFIX}sso/providers/`).then(({ data }) => {
+      if (!data || !Array.isArray(data.providers)
+        || typeof data.password_login_enabled !== 'boolean'
+        || typeof data.api_tokens_enabled !== 'boolean') throw new Error('invalid SSO policy');
+      return { ...data, providers: data.providers.filter(provider => provider.enabled !== false) };
+    });
+  },
+  identities() {
+    return axios.get(`${API_PREFIX}sso/identities/`).then(({ data }) => {
+      if (!Array.isArray(data)) throw new Error('invalid identities');
+      return data;
+    });
+  },
+  csrfToken() {
+    const cookie = document.cookie.split(';').map(value => value.trim())
+      .find(value => value.startsWith('csrftoken='));
+    return cookie ? decodeURIComponent(cookie.slice('csrftoken='.length)) : '';
+  },
+  passwordReauth(password) {
+    return axios.post(`${API_PREFIX}sso/password/reauth/`, { password });
+  },
+  unlink(id) {
+    return axios.post(`${API_PREFIX}sso/identities/${id}/unlink/`);
   },
 };
 
@@ -345,6 +364,7 @@ const Export = {
 };
 
 export default {
+  SSO,
   Tag,
   Pin,
   Board,

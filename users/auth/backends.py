@@ -1,4 +1,5 @@
 import re
+from django.core.exceptions import PermissionDenied
 
 from users.models import User
 
@@ -15,7 +16,12 @@ email_re = re.compile(
 
 
 class CombinedAuthBackend(object):
-    def authenticate(self, username=None, password=None):
+    def authenticate(self, request=None, username=None, password=None, **kwargs):
+        from users.sso.policy import password_login_allowed
+        if not password_login_allowed(request):
+            raise PermissionDenied('비밀번호 로그인이 비활성화되어 있습니다.')
+        if not isinstance(username, str):
+            return None
         is_email = email_re.match(username)
         if is_email:
             qs = User.objects.filter(email=username)
@@ -26,7 +32,7 @@ class CombinedAuthBackend(object):
             user = qs.get()
         except User.DoesNotExist:
             return None
-        if user.check_password(password):
+        if user.is_active and user.check_password(password):
             return user
         return None
 

@@ -42,6 +42,8 @@ function currentUser(username, canAccessAdmin = false) {
 
 
 function mountProfile(propsData = {}) {
+  jest.spyOn(API.SSO, 'policy').mockReturnValue(new Promise(() => {}));
+  jest.spyOn(API.SSO, 'identities').mockReturnValue(new Promise(() => {}));
   return shallowMount(Profile, {
     propsData: { token: 'owner-token', ...propsData },
     mocks: { $t: key => ko[key] || key },

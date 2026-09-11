@@ -157,7 +157,7 @@
               <div class="buttons">
                 <a
                   @click="signUp"
-                  v-show="!user.loggedIn"
+                  v-show="!user.loggedIn && passwordAllowed"
                   class="button is-primary">
                   <strong>{{ $t("signUpLink") }}</strong>
                 </a>
@@ -196,6 +196,7 @@ export default {
   data() {
     return {
       active: false,
+      passwordAllowed: false,
       user: {
         loggedIn: false,
         meta: {},
@@ -264,6 +265,8 @@ export default {
   },
   beforeMount() {
     this.initializeUser();
+    api.SSO.policy().then((policy) => { this.passwordAllowed = policy.password_login_enabled; })
+      .catch(() => {});
   },
 };
 </script>

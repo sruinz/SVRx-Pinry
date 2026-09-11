@@ -95,7 +95,7 @@ describe('Profile build version', () => {
       .forEach(value => expect(card.text()).toContain(value));
     expect(card.element.previousElementSibling.classList.contains('build-info-card')).toBe(true);
     expect(card.element.nextElementSibling.classList.contains('open-source-card')).toBe(true);
-    expect(axios.get).toHaveBeenCalledTimes(1);
+    expect(axios.get.mock.calls.filter(([url]) => url === '/api/v2/version/')).toHaveLength(1);
   });
 
   it.each([undefined, {
@@ -147,9 +147,9 @@ describe('Profile build version', () => {
   it('keeps the newest response when requests settle out of order', async () => {
     const oldRequest = deferred();
     const newRequest = deferred();
-    axios.get
-      .mockReturnValueOnce(oldRequest.promise)
-      .mockReturnValueOnce(newRequest.promise);
+    const versionRequests = [oldRequest.promise, newRequest.promise];
+    axios.get.mockImplementation(url => (url === '/api/v2/version/'
+      ? versionRequests.shift() : new Promise(() => {})));
     const wrapper = mountProfile();
 
     wrapper.vm.fetchBuildVersion();
@@ -193,7 +193,7 @@ describe('Profile build version', () => {
     const first = mountProfile();
     const second = mountProfile();
 
-    expect(axios.get).toHaveBeenCalledTimes(2);
+    expect(axios.get.mock.calls.filter(([url]) => url === '/api/v2/version/')).toHaveLength(2);
     first.destroy();
     second.destroy();
   });

@@ -5,7 +5,9 @@
         <header class="modal-card-head">
           <p class="modal-card-title">{{ $t("signUpTitle") }}</p>
         </header>
-        <section class="modal-card-body">
+        <p v-if="policyError" role="alert">{{ $t('ssoSettingsFailed') }}</p>
+        <p v-else-if="!passwordAllowed">{{ $t('ssoPasswordDisabled') }}</p>
+        <section v-if="passwordAllowed" class="modal-card-body">
           <b-field v-bind:label="$t('usernameLabel')"
                    :type="form.username.type"
                    :message="form.username.error">
@@ -55,6 +57,7 @@
         <footer class="modal-card-foot">
           <button class="button" type="button" @click="$parent.close()">{{ $t("closeButton") }}</button>
           <button
+            v-if="passwordAllowed"
             @click="doRegister"
             class="button is-primary">{{ $t("registerButton") }}</button>
         </footer>
@@ -81,10 +84,17 @@ export default {
     return {
       form: model.form,
       helper: model,
+      passwordAllowed: false,
+      policyError: false,
     };
+  },
+  created() {
+    api.SSO.policy().then((policy) => { this.passwordAllowed = policy.password_login_enabled; })
+      .catch(() => { this.policyError = true; });
   },
   methods: {
     doRegister() {
+      if (!this.passwordAllowed) return;
       this.helper.resetAllFields();
       const self = this;
       const promise = api.User.signUp(

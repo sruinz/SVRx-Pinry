@@ -24,6 +24,20 @@ const LEGACY_CHROME_URL = 'https://chrome.google.com/webstore/detail/jmhdcnmfkgl
 const FIREFOX_URL = 'https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/';
 
 const EXPECTED_LOCALE_KEYS = [
+  'ssoAccounts',
+  'ssoActionFailed',
+  'ssoIdentitiesFailed',
+  'ssoLink',
+  'ssoLoading',
+  'ssoPasswordDisabled',
+  'ssoReauth',
+  'ssoReauthHelp',
+  'ssoReauthenticated',
+  'ssoRecentAuthHelp',
+  'ssoSettingsFailed',
+  'ssoTokensDisabled',
+  'ssoUnavailable',
+  'ssoUnlink',
   'Add2BoardModalCardButton',
   'Add2BoardModalCardTitle',
   'BoardCreateTitle',
@@ -345,7 +359,7 @@ describe('Korean-first locale contract', () => {
   it.each([
     ['en', en], ['ko', ko], ['zh', zh], ['fr', fr],
   ])('keeps the complete nonempty key set for %s', (_name, locale) => {
-    expect(Object.keys(locale).sort()).toEqual(EXPECTED_LOCALE_KEYS);
+    expect(Object.keys(locale).sort()).toEqual(EXPECTED_LOCALE_KEYS.slice().sort());
     Object.values(locale).forEach((value) => {
       expect(typeof value).toBe('string');
       expect(value.trim()).not.toBe('');

@@ -1,6 +1,7 @@
 import json
 
 from django.conf import settings
+from django.core.exceptions import PermissionDenied
 from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.decorators import login_required
@@ -15,6 +16,8 @@ from rest_framework.viewsets import GenericViewSet
 
 from users.models import User
 from users.serializers import CurrentUserSerializer, PublicUserSerializer
+from users.sso.policy import password_login_allowed
+from users.sso.flows import mark_recent_auth
 
 
 def reverse_lazy(name=None, *args):
@@ -64,6 +67,8 @@ class UserViewSet(
 
 
 def login_user(request):
+    if not password_login_allowed(request):
+        raise PermissionDenied('비밀번호 로그인이 비활성화되어 있습니다.')
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -85,7 +90,12 @@ def login_user(request):
         return HttpResponseBadRequest(
             json.dumps({"password": "username and password doesn't match"})
         )
-    login(request, user)
+    if request.user.is_authenticated and request.user.pk != user.pk:
+        raise PermissionDenied('로그인한 계정을 변경할 수 없습니다.')
+    if not request.user.is_authenticated:
+        login(request, user)
+        request.session['auth_method'] = 'password'
+    mark_recent_auth(request, 'password')
     current_user = User.objects.get(pk=user.pk)
     data = CurrentUserSerializer(
         current_user,

@@ -12,7 +12,7 @@ from django.utils import timezone
 
 from users.models import AuthPolicy, AuthVerification, ExternalIdentity, SSOAttempt, SSOProvider, User, make_identity_digest
 from users.sso import client
-from users.sso.config import read_policy
+from users.sso.policy import identity_is_usable, password_login_allowed, sso_session_usable
 from users.sso.secrets import decrypt_secret, encrypt_secret
 
 
@@ -64,13 +64,10 @@ def require_recent_auth(request):
             or not 0 <= timezone.now().timestamp() - timestamp <= 300):
         raise PermissionDenied('최근 5분 이내의 재인증이 필요합니다.')
     if value.get('method') == 'password':
-        if read_policy().password_login_enabled and request.user.has_usable_password():
+        if password_login_allowed(request) and request.user.has_usable_password():
             return
     elif value.get('method') == 'sso':
-        if SSOProvider.objects.filter(
-            pk=value.get('provider_id'), revision=value.get('provider_revision'),
-            enabled=True, external_identities__user=request.user,
-        ).exists():
+        if sso_session_usable(request.user, value.get('provider_id'), value.get('provider_revision')):
             return
     raise PermissionDenied('사용할 수 있는 인증 수단으로 다시 인증해 주세요.')
 
@@ -220,6 +217,7 @@ def unlink_identity(request, identity_id):
     if identity is None:
         raise PermissionDenied('내 계정의 SSO 연결만 해제할 수 있습니다.')
     alternatives = ExternalIdentity.objects.filter(user=user, provider__enabled=True).exclude(pk=identity.pk)
-    if not (policy.password_login_enabled and user.has_usable_password()) and not alternatives.exists():
+    usable = any(identity_is_usable(item) for item in alternatives.select_related('provider'))
+    if not (policy.password_login_enabled and user.has_usable_password()) and not usable:
         raise PermissionDenied('마지막으로 사용할 수 있는 로그인 수단은 해제할 수 없습니다.')
     identity.delete()

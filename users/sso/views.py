@@ -4,12 +4,12 @@ import logging
 from django.contrib import messages
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
-from django.shortcuts import get_object_or_404
+from django.shortcuts import get_object_or_404, render
 from django.urls import reverse
 from django.views.decorators.http import require_GET, require_POST
 
 from users.models import ExternalIdentity, SSOProvider
-from users.sso.config import read_policy
+from users.sso.policy import api_token_allowed, identity_is_usable, password_login_allowed
 from users.sso.flows import begin_attempt, finish_attempt, mark_recent_auth, require_user, unlink_identity
 
 
@@ -41,11 +41,25 @@ def _begin(request, provider_id, purpose):
 
 @require_GET
 def providers(request):
-    return JsonResponse([
+    response = JsonResponse({'providers': [
         {'id': str(provider.pk), 'name': provider.name,
          'login_url': reverse('sso:login', args=[provider.pk])}
         for provider in SSOProvider.objects.filter(enabled=True)
-    ], safe=False)
+    ], 'password_login_enabled': password_login_allowed(request),
+        'api_tokens_enabled': api_token_allowed(request)})
+    response['Cache-Control'] = 'no-store'
+    return response
+
+
+@require_GET
+def login_page(request):
+    response = render(request, 'sso/login.html', {
+        'providers': SSOProvider.objects.filter(enabled=True),
+        'password_login_enabled': password_login_allowed(request),
+    })
+    response['Cache-Control'] = 'no-store'
+    response['Referrer-Policy'] = 'no-referrer'
+    return response
 
 
 @require_GET
@@ -88,7 +102,7 @@ def password_reauth(request):
         password = _data(request).get('password')
     except ValidationError as error:
         return JsonResponse({'detail': error.messages}, status=400)
-    if (not read_policy().password_login_enabled or not isinstance(password, str)
+    if (not password_login_allowed(request) or not isinstance(password, str)
             or not request.user.check_password(password)):
         raise PermissionDenied('현재 계정의 비밀번호로 다시 인증해 주세요.')
     mark_recent_auth(request, 'password')
@@ -100,7 +114,7 @@ def identities(request):
     require_user(request)
     return JsonResponse([
         {'id': identity.pk, 'provider_id': str(identity.provider_id),
-         'provider_name': identity.provider.name, 'enabled': identity.provider.enabled}
+         'provider_name': identity.provider.name, 'enabled': identity_is_usable(identity)}
         for identity in ExternalIdentity.objects.filter(user=request.user).select_related('provider')
     ], safe=False)
 

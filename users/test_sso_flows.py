@@ -76,8 +76,9 @@ class SSOFlowTests(TestCase):
         SSOProvider.objects.create(kind='oidc', name='숨김')
         response = self.client.get('/api/v2/sso/providers/')
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), [{'id': str(self.provider.pk), 'name': '시험',
-                                           'login_url': f'/api/v2/sso/{self.provider.pk}/login/'}])
+        self.assertEqual(response.json(), {'providers': [{'id': str(self.provider.pk), 'name': '시험',
+                                           'login_url': f'/api/v2/sso/{self.provider.pk}/login/'}],
+                                           'password_login_enabled': True, 'api_tokens_enabled': True})
 
     def test_login_uses_existing_exact_identity_and_session_backend(self):
         self.connect()
@@ -246,7 +247,30 @@ class SSOFlowTests(TestCase):
 
     def test_last_usable_login_identity_cannot_be_unlinked(self):
         identity = self.connect()
-        self.reauthenticate()
+        self.callback(self.start())
+        AuthPolicy.objects.filter(pk=1).update(password_login_enabled=False)
+        response = self.client.post(f'/api/v2/sso/identities/{identity.pk}/unlink/')
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.client.session['recent_auth']['method'], 'sso')
+        self.assertTrue(ExternalIdentity.objects.filter(pk=identity.pk).exists())
+
+    def test_password_reauth_through_login_keeps_existing_sso_session_method(self):
+        self.connect()
+        self.callback(self.start())
+        response = self.client.post('/api/v2/profile/login/', {
+            'username': self.user.username, 'password': 'member-password',
+        }, content_type='application/json')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.client.session['auth_method'], 'sso')
+        self.assertEqual(self.client.session['recent_auth']['method'], 'password')
+
+    def test_old_issuer_identity_is_not_an_alternative_login_method(self):
+        identity = self.connect()
+        other = SSOProvider.objects.create(kind='oidc', name='변경됨', enabled=True,
+                                           issuer='https://changed.example', client_id='client',
+                                           public_base_url='https://pinry.example')
+        self.connect(subject='other', provider=other)
+        self.callback(self.start())
         AuthPolicy.objects.filter(pk=1).update(password_login_enabled=False)
         response = self.client.post(f'/api/v2/sso/identities/{identity.pk}/unlink/')
         self.assertEqual(response.status_code, 403)

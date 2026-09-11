@@ -53,8 +53,11 @@ def make_identity_digest(provider_id, issuer, subject):
     return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
 
-def create_token_if_necessary(user: BaseUser):
+def create_token_if_necessary(user: BaseUser, request=None):
     from rest_framework.authtoken.models import Token
+    from users.sso.policy import api_token_allowed
+    if not api_token_allowed(request):
+        return None
     token = Token.objects.filter(user=user).first()
     if token is not None:
         return token
@@ -264,4 +267,8 @@ class AuthenticationThrottle(models.Model):
 
 @receiver(post_save, sender=User)
 def create_profile(sender, instance: User, **kwargs):
+    # 과거 스키마를 구성하는 migration에서는 정책 테이블을 조회하지 않는다.
+    from django.db import connection
+    if AuthPolicy._meta.db_table not in connection.introspection.table_names():
+        return
     create_token_if_necessary(instance)

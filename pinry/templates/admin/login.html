@@ -1,0 +1,7 @@
+{% extends "admin/login.html" %}
+{% block content %}
+<p><a href="/login/">SSO 로그인</a></p>
+{% if request.password_login_enabled %}{{ block.super }}{% else %}
+<p>비밀번호 로그인이 비활성화되어 있습니다. 연결된 관리자 SSO 계정으로 로그인해 주세요.</p>
+{% endif %}
+{% endblock %}

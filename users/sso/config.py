@@ -1,7 +1,12 @@
+import uuid
+from datetime import timedelta
+from urllib.parse import urlsplit
+
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
+from django.utils import timezone
 
-from users.models import AuthPolicy, SSOProvider
+from users.models import AuthPolicy, AuthVerification, ExternalIdentity, SSOProvider
 
 
 POLICY_FIELDS = {
@@ -25,6 +30,70 @@ PROVIDER_CREATE_FIELDS = {
     'allow_signup',
 }
 PROVIDER_UPDATE_FIELDS = PROVIDER_CREATE_FIELDS - {'kind'}
+
+PRESET_ORIGINS = {
+    'google': ['https://accounts.google.com', 'https://oauth2.googleapis.com', 'https://www.googleapis.com'],
+    'microsoft': ['https://login.microsoftonline.com'],
+    'github': ['https://github.com', 'https://api.github.com'],
+}
+
+
+def expected_issuer(provider):
+    if provider.kind == 'google':
+        return 'https://accounts.google.com'
+    if provider.kind == 'github':
+        return 'https://github.com'
+    if provider.kind == 'microsoft':
+        try:
+            return 'https://login.microsoftonline.com/' + str(uuid.UUID(provider.tenant_id)) + '/v2.0'
+        except (ValueError, AttributeError):
+            raise ValidationError('Microsoft의 명시적인 테넌트 UUID가 필요합니다.') from None
+    return provider.issuer
+
+
+def validate_provider(provider):
+    from users.sso.flows import callback_url
+    callback_url(provider)
+    issuer = expected_issuer(provider)
+    if not provider.client_id or not issuer:
+        raise ValidationError('Client ID와 발급자 설정을 확인해 주세요.')
+    for value in [issuer, provider.discovery_url or issuer]:
+        parsed = urlsplit(value)
+        if (parsed.scheme != 'https' or not parsed.hostname or parsed.username
+                or parsed.password or parsed.query or parsed.fragment):
+            raise ValidationError('제공자 주소는 사용자 정보 없는 HTTPS URL이어야 합니다.')
+    if not isinstance(provider.allowed_endpoint_origins, list):
+        raise ValidationError('허용 endpoint origin은 배열이어야 합니다.')
+    for origin in provider.allowed_endpoint_origins:
+        if not isinstance(origin, str):
+            raise ValidationError('허용 endpoint origin은 HTTPS 문자열이어야 합니다.')
+        parsed = urlsplit(origin)
+        if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+                or parsed.query or parsed.fragment or parsed.path not in ('', '/')):
+            raise ValidationError('허용 endpoint origin을 확인해 주세요.')
+
+
+def current_recovery_fingerprint():
+    # 작업 5의 실제 배포 검증 전에는 복구 성공 증거를 수락하지 않는다.
+    return None
+
+
+def _require_sso_only_proof(actor, policy):
+    from users.sso.policy import identity_is_usable
+    identities = ExternalIdentity.objects.filter(user=actor).select_related('provider')
+    verified = any(identity_is_usable(identity) and AuthVerification.objects.filter(
+        user=actor, kind='sso', provider=identity.provider,
+        provider_revision=identity.provider.revision, policy_revision=policy.revision,
+    ).exists() for identity in identities)
+    fingerprint = current_recovery_fingerprint()
+    recovered = bool(fingerprint and AuthVerification.objects.filter(
+        user=actor, kind='recovery', policy_revision=policy.revision,
+        deployment_fingerprint=fingerprint,
+        verified_at__gte=timezone.now() - timedelta(minutes=10),
+        verified_at__lte=timezone.now(),
+    ).exists())
+    if not verified or not recovered:
+        raise ValidationError('현재 설정의 관리자 SSO 연결·로그인과 최근 10분 이내 복구 로그인 확인이 필요합니다.')
 
 
 def read_policy():
@@ -67,12 +136,21 @@ def _changed_fields(instance, original_values, field_names):
 def _save_provider(provider_changes):
     changes = dict(provider_changes)
     provider_id = changes.pop('id', None)
+    secret = changes.pop('client_secret', '')
+    expected_revision = changes.pop('expected_revision', None)
 
     if provider_id is None:
         _reject_unknown_fields(changes, PROVIDER_CREATE_FIELDS)
         provider = SSOProvider(**changes)
+        if not provider.allowed_endpoint_origins:
+            provider.allowed_endpoint_origins = PRESET_ORIGINS.get(provider.kind, [])[:]
+        if secret:
+            from users.sso.secrets import encrypt_secret
+            provider.encrypted_client_secret = encrypt_secret(secret)
         if provider.enabled:
-            raise ValidationError('SSO 제공자를 아직 활성화할 수 없습니다.')
+            validate_provider(provider)
+            if not provider.encrypted_client_secret or not provider.allowed_endpoint_origins:
+                raise ValidationError('Client Secret과 허용 endpoint origin이 필요합니다.')
         provider.full_clean()
         provider.save()
         return provider
@@ -84,21 +162,28 @@ def _save_provider(provider_changes):
         provider = SSOProvider.objects.select_for_update().get(pk=provider_id)
     except (SSOProvider.DoesNotExist, ValidationError) as error:
         raise ValidationError('등록된 SSO 제공자를 찾을 수 없습니다.') from error
+    if expected_revision is not None and expected_revision != provider.revision:
+        raise ValidationError('제공자 설정이 변경되었습니다. 새로고침 후 다시 저장해 주세요.')
 
     original_values = {
         field_name: getattr(provider, field_name)
         for field_name in PROVIDER_UPDATE_FIELDS
     }
-    was_enabled = provider.enabled
     _apply_changes(provider, changes)
-    if not was_enabled and provider.enabled:
-        raise ValidationError('SSO 제공자를 아직 활성화할 수 없습니다.')
+    if provider.enabled:
+        validate_provider(provider)
+        if not (secret or provider.encrypted_client_secret) or not provider.allowed_endpoint_origins:
+            raise ValidationError('Client Secret과 허용 endpoint origin이 필요합니다.')
     provider.full_clean()
     changed_fields = _changed_fields(
         provider,
         original_values,
         PROVIDER_UPDATE_FIELDS,
     )
+    if secret:
+        from users.sso.secrets import encrypt_secret
+        provider.encrypted_client_secret = encrypt_secret(secret)
+        changed_fields.append('encrypted_client_secret')
     if changed_fields:
         provider.revision += 1
         provider.save(update_fields=changed_fields + ['revision'])
@@ -106,24 +191,18 @@ def _save_provider(provider_changes):
 
 
 @transaction.atomic
-def save_configuration(actor, policy_changes, provider_changes=None):
+def save_configuration(actor, policy_changes, provider_changes=None, expected_revision=None):
     _require_active_superuser(actor)
     _reject_unknown_fields(policy_changes, POLICY_FIELDS)
 
     policy = AuthPolicy.objects.select_for_update().get(pk=1)
+    if expected_revision is not None and expected_revision != policy.revision:
+        raise ValidationError('인증 정책이 변경되었습니다. 새로고침 후 다시 저장해 주세요.')
     original_values = {
         field_name: getattr(policy, field_name)
         for field_name in POLICY_FIELDS
     }
     _apply_changes(policy, policy_changes)
-
-    if (
-        original_values['password_login_enabled']
-        and not policy.password_login_enabled
-    ):
-        raise ValidationError('비밀번호 로그인을 아직 끌 수 없습니다.')
-    if original_values['api_tokens_enabled'] and not policy.api_tokens_enabled:
-        raise ValidationError('API 토큰 인증을 아직 끌 수 없습니다.')
 
     policy.full_clean()
     changed_fields = _changed_fields(policy, original_values, POLICY_FIELDS)
@@ -131,6 +210,15 @@ def save_configuration(actor, policy_changes, provider_changes=None):
     saved_provider = None
     if provider_changes is not None:
         saved_provider = _save_provider(provider_changes)
+
+    if not policy.password_login_enabled:
+        if not SSOProvider.objects.filter(enabled=True).exists():
+            raise ValidationError('마지막 활성 SSO 제공자를 비활성화할 수 없습니다.')
+        if original_values['password_login_enabled']:
+            # 함께 바뀐 다른 정책은 기존 성공 증거로 검증할 수 없다.
+            if set(changed_fields) - {'password_login_enabled'}:
+                raise ValidationError('다른 정책을 먼저 저장하고 SSO·복구 로그인을 다시 확인해 주세요.')
+            _require_sso_only_proof(actor, policy)
 
     if changed_fields:
         policy.revision += 1

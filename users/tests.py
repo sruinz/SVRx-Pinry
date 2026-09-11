@@ -164,6 +164,8 @@ class CreateUserTest(TestCase):
 class AdminBootstrapConcurrencyTest(TransactionTestCase):
     def setUp(self):
         super(AdminBootstrapConcurrencyTest, self).setUp()
+        from users.models import AuthPolicy
+        AuthPolicy.objects.get_or_create(pk=1)
         if connection.vendor != 'sqlite':
             self.skipTest('This concurrency contract requires SQLite.')
         if connection.creation.is_in_memory_db(

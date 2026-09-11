@@ -177,8 +177,8 @@ class SSOConfigurationTest(TestCase):
                 },
             )
 
-    def test_refuses_disabling_login_methods_until_enforcement_exists(self):
-        for field_name in ("password_login_enabled", "api_tokens_enabled"):
+    def test_refuses_disabling_password_until_recovery_is_verified(self):
+        for field_name in ("password_login_enabled",):
             with self.subTest(field_name=field_name):
                 with self.assertRaises(ValidationError):
                     save_configuration(self.superuser, {field_name: False})
@@ -187,6 +187,39 @@ class SSOConfigurationTest(TestCase):
         self.assertTrue(policy.password_login_enabled)
         self.assertTrue(policy.api_tokens_enabled)
         self.assertEqual(policy.revision, 1)
+
+    def test_token_policy_can_be_disabled(self):
+        policy = save_configuration(self.superuser, {'api_tokens_enabled': False})
+        self.assertFalse(policy.api_tokens_enabled)
+
+    def test_stale_revision_is_rejected(self):
+        save_configuration(self.superuser, {'api_tokens_enabled': False})
+        with self.assertRaises(ValidationError):
+            save_configuration(self.superuser, {'api_tokens_enabled': True}, expected_revision=1)
+
+    def test_provider_preset_and_write_only_secret_enable_real_configuration(self):
+        import tempfile
+        from pathlib import Path
+        from django.test import override_settings
+        from users.sso.secrets import decrypt_secret
+        with tempfile.TemporaryDirectory() as directory, override_settings(
+            SSO_SECRET_KEY_FILE=str(Path(directory) / 'key'),
+        ):
+            result = save_configuration(self.superuser, {}, {
+                'kind': 'google', 'name': 'Google', 'enabled': True,
+                'public_base_url': 'https://pinry.example', 'client_id': 'client',
+                'client_secret': 'private-value',
+            })
+            provider = result._saved_provider
+            self.assertTrue(provider.enabled)
+            self.assertEqual(provider.allowed_endpoint_origins, [
+                'https://accounts.google.com', 'https://oauth2.googleapis.com', 'https://www.googleapis.com',
+            ])
+            self.assertEqual(decrypt_secret(provider.encrypted_client_secret), 'private-value')
+            saved = provider.encrypted_client_secret
+            save_configuration(self.superuser, {}, {'id': provider.pk, 'client_secret': ''})
+            provider.refresh_from_db()
+            self.assertEqual(provider.encrypted_client_secret, saved)
 
     def test_provider_activation_failure_rolls_back_policy_changes(self):
         with self.assertRaises(ValidationError):
@@ -304,6 +337,8 @@ class SSOConfigurationAdminTest(TestCase):
             "allowed_endpoint_origins": "[]",
             "internal_cidrs": "[]",
             "_save": "저장",
+            "expected_revision": "1",
+            "expected_policy_revision": "1",
         }
         data.update(overrides)
         return data
@@ -315,24 +350,25 @@ class SSOConfigurationAdminTest(TestCase):
 
         self.assertEqual(response.status_code, 403)
 
-    def test_admin_policy_form_reports_temporary_guard_as_form_error(self):
+    def test_admin_policy_form_reports_missing_sso_proof(self):
         self.client.force_login(self.superuser)
 
         response = self.client.post(
             self.policy_change_url(),
             {
                 "api_tokens_enabled": "on",
+                "expected_revision": "1",
                 "recovery_allowed_cidrs": "[]",
                 "recovery_denied_cidrs": "[]",
                 "_save": "저장",
             },
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "비밀번호 로그인을 아직 끌 수 없습니다")
+        self.assertEqual(response.status_code, 302)
+        self.assertContains(self.client.get(response['Location']), "마지막 활성 SSO 제공자")
         self.assertTrue(read_policy().password_login_enabled)
 
-    def test_admin_provider_form_reports_activation_guard_as_form_error(self):
+    def test_admin_provider_form_reports_invalid_public_url(self):
         self.client.force_login(self.superuser)
 
         response = self.client.post(
@@ -340,8 +376,8 @@ class SSOConfigurationAdminTest(TestCase):
             self.provider_form_data(enabled="on"),
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "SSO 제공자를 아직 활성화할 수 없습니다")
+        self.assertEqual(response.status_code, 302)
+        self.assertContains(self.client.get(response['Location']), "HTTPS 기준 URL")
         self.assertFalse(SSOProvider.objects.exists())
 
     def test_admin_save_uses_configuration_revision(self):
@@ -351,6 +387,7 @@ class SSOConfigurationAdminTest(TestCase):
             self.policy_change_url(),
             {
                 "password_login_enabled": "on",
+                "expected_revision": "1",
                 "api_tokens_enabled": "on",
                 "recovery_allowed_cidrs": '["192.168.50.0/24"]',
                 "recovery_denied_cidrs": "[]",

@@ -9,9 +9,46 @@
       <div class="card-content">
         <div class="content">
           <p>{{ $t("tokenUserProfileCardContent") }}</p>
-          <pre>{{ token }}</pre>
+          <pre v-if="policy && policy.api_tokens_enabled">{{ token }}</pre>
+          <p v-else>{{ $t('ssoTokensDisabled') }}</p>
           {{ $t("pleaseReadTokenUserProfileCardContent") }}<a target="_blank" href="https://www.django-rest-framework.org/api-guide/authentication/#tokenauthentication">{{ $t("drfApiDocumentationLink") }}</a>{{ $t("forMoreDetailsParagraph") }}
           <br>
+        </div>
+      </div>
+    </div>
+    <div class="card sso-card">
+      <header class="card-header"><p class="card-header-title">{{ $t('ssoAccounts') }}</p></header>
+      <div class="card-content">
+        <p v-if="policyError" role="alert">{{ $t('ssoSettingsFailed') }}</p>
+        <p v-if="identityError" role="alert">{{ $t('ssoIdentitiesFailed') }}</p>
+        <p v-if="actionError" role="alert">{{ $t('ssoActionFailed') }}</p>
+        <p v-if="reauthenticated" role="status">{{ $t('ssoReauthenticated') }}</p>
+        <p>{{ $t('ssoRecentAuthHelp') }}</p>
+        <form v-if="policy && policy.password_login_enabled" @submit.prevent="passwordReauth">
+          <label>{{ $t('passwordLabel') }}
+            <input v-model="password" type="password" autocomplete="current-password" required>
+          </label>
+          <button class="button" type="submit">{{ $t('ssoReauth') }}</button>
+        </form>
+        <p>{{ $t('ssoReauthHelp') }}</p>
+        <div v-for="identity in identities" :key="identity.id">
+          <span>{{ identity.provider_name }}</span>
+          <span v-if="!identity.enabled">{{ $t('ssoUnavailable') }}</span>
+          <form v-if="identity.enabled" method="post"
+                :action="`/api/v2/sso/${identity.provider_id}/reauth/`">
+            <input type="hidden" name="csrfmiddlewaretoken" :value="csrfToken">
+            <input type="hidden" name="next" :value="returnPath">
+            <button class="button" type="submit">{{ $t('ssoReauth') }}</button>
+          </form>
+          <button class="button" type="button" @click="unlink(identity.id)">{{ $t('ssoUnlink') }}</button>
+        </div>
+        <div v-if="policy && !identityError">
+          <form v-for="provider in policy.providers" :key="provider.id" method="post"
+                :action="`/api/v2/sso/${provider.id}/link/`">
+            <input type="hidden" name="csrfmiddlewaretoken" :value="csrfToken">
+            <input type="hidden" name="next" :value="returnPath">
+            <button class="button" type="submit">{{ provider.name }} — {{ $t('ssoLink') }}</button>
+          </form>
         </div>
       </div>
     </div>
@@ -100,6 +137,15 @@ export default {
   data() {
     return {
       componentAlive: true,
+      policy: null,
+      policyError: false,
+      identities: [],
+      identityError: false,
+      actionError: false,
+      reauthenticated: false,
+      password: '',
+      csrfToken: API.SSO.csrfToken(),
+      returnPath: window.location.pathname,
       displayVersion: null,
       dependencies: [
         { key: 'python', label: 'Python', version: null },
@@ -112,12 +158,32 @@ export default {
   },
   created() {
     this.fetchBuildVersion();
+    API.SSO.policy().then((policy) => { if (this.componentAlive) this.policy = policy; })
+      .catch(() => { if (this.componentAlive) this.policyError = true; });
+    this.fetchIdentities();
   },
   beforeDestroy() {
     this.componentAlive = false;
     this.versionRequestSequence += 1;
   },
   methods: {
+    fetchIdentities() {
+      return API.SSO.identities().then((identities) => {
+        if (this.componentAlive) { this.identities = identities; this.identityError = false; }
+      }).catch(() => { if (this.componentAlive) this.identityError = true; });
+    },
+    passwordReauth() {
+      this.actionError = false;
+      this.reauthenticated = false;
+      API.SSO.passwordReauth(this.password).then(() => { this.reauthenticated = true; })
+        .catch(() => { this.actionError = true; });
+      this.password = '';
+    },
+    unlink(id) {
+      this.actionError = false;
+      API.SSO.unlink(id).then(() => this.fetchIdentities())
+        .catch(() => { this.actionError = true; });
+    },
     fetchBuildVersion() {
       const requestSequence = this.versionRequestSequence + 1;
       this.versionRequestSequence = requestSequence;

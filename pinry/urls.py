@@ -7,12 +7,14 @@ from rest_framework.documentation import include_docs_urls
 
 from core.version import version
 from core.views import drf_router
+from users.sso.views import login_page
 
 
 admin.autodiscover()
 
 
 urlpatterns = [
+    path('login/', login_page, name='login-page'),
     # drf api
     path('api/v2/version/', version, name='version'),
     path('api/v2/sso/', include('users.sso.urls')),
