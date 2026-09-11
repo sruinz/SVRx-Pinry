@@ -23,6 +23,7 @@ django-compressor = "==4.6.0"
 mock = "^4.0.3"
 gunicorn = "^20.1.0"
 djangorestframework = "==3.16.1"
+authlib = "==1.8.0"
 
 
 [tool.poetry.dev-dependencies]
