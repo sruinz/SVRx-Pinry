@@ -3,6 +3,7 @@ import fcntl
 import http.client
 import importlib.util
 import importlib
+import io
 import json
 import os
 from pathlib import Path
@@ -1294,6 +1295,7 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         return self.lock
 
     def test_auth_recovery_starts_after_migration_and_cleans_up_on_shutdown(self):
+        self.enterContext(mock.patch('sys.stdout', new=io.StringIO()))
         supervisor, processes = self._supervisor(b'{"phase":"complete"}\n', 0)
         with tempfile.TemporaryDirectory() as directory:
             supervisor.auth_recovery_config_path = Path(directory) / 'recovery.conf'
@@ -1323,6 +1325,7 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
             self.assertFalse(supervisor.auth_recovery_config_path.exists())
 
     def test_invalid_auth_recovery_config_keeps_public_service_and_removes_stale_listener(self):
+        self.enterContext(mock.patch('sys.stdout', new=io.StringIO()))
         supervisor, processes = self._supervisor(b'{"phase":"complete"}\n', 0)
         with tempfile.TemporaryDirectory() as directory:
             supervisor.auth_recovery_config_path = Path(directory) / 'recovery.conf'
@@ -1340,6 +1343,7 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
             self.assertNotIn('auth_recovery', processes.processes)
 
     def test_recovery_nginx_validation_failure_only_retires_recovery_child(self):
+        self.enterContext(mock.patch('sys.stdout', new=io.StringIO()))
         supervisor, processes = self._supervisor(b'{"phase":"complete"}\n', 0)
         with tempfile.TemporaryDirectory() as directory:
             supervisor.auth_recovery_config_path = Path(directory) / 'recovery.conf'

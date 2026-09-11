@@ -9,7 +9,7 @@ from django.core.exceptions import ValidationError
 from django.db import DatabaseError, transaction
 from django.http import HttpResponse, HttpResponseForbidden
 from django.shortcuts import redirect, render
-from django.utils import timezone
+from django.utils import timezone, translation
 from django.views.decorators.http import require_http_methods, require_POST
 
 from pinry.recovery_config import deployment_configuration
@@ -59,7 +59,8 @@ class RecoveryBoundaryMiddleware:
             logout(request)
         token = policy_request.set(request)
         try:
-            response = self.get_response(request)
+            with translation.override('ko'):
+                response = self.get_response(request)
             response['Cache-Control'] = 'no-store'
             response['X-Frame-Options'] = 'DENY'
             response['Referrer-Policy'] = 'no-referrer'

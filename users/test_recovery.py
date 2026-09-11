@@ -1,9 +1,11 @@
+import importlib.util
 import io
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import types
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from unittest.mock import patch
@@ -133,7 +135,7 @@ class RecoveryRequestTests(TestCase):
         self.admin = User.objects.create_superuser('administrator', 'admin@example.test', 'secret-pass')
         self.enterContext(patch('users.recovery.deployment_configuration', return_value={
             'origin': 'https://recovery.example:9443', 'host': 'recovery.example:9443',
-            'fingerprint': 'deployment-v1',
+            'hostname': 'recovery.example', 'fingerprint': 'deployment-v1',
         }))
         self.client = Client(enforce_csrf_checks=True)
         self.headers = dict(
@@ -157,6 +159,42 @@ class RecoveryRequestTests(TestCase):
     def login(self):
         self.assertEqual(self.get().status_code, 200)
         return self.post()
+
+    def test_recovery_origin_host_works_when_public_hosts_are_restricted(self):
+        public_settings = types.ModuleType('pinry.settings.docker')
+        public_settings.ALLOWED_HOSTS = ['public.example']
+        spec = importlib.util.spec_from_file_location(
+            'pinry.settings.recovery_review', Path(__file__).resolve().parents[1] / 'pinry/settings/recovery.py',
+        )
+        recovery_settings = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'pinry.settings.docker': public_settings}), patch(
+            'pinry.recovery_config.deployment_configuration', return_value={
+                'hostname': 'recovery.example', 'host': 'recovery.example:9443',
+                'origin': 'https://recovery.example:9443', 'fingerprint': 'deployment-v1',
+            },
+        ):
+            spec.loader.exec_module(recovery_settings)
+        with override_settings(ALLOWED_HOSTS=recovery_settings.ALLOWED_HOSTS):
+            self.assertEqual(self.get().status_code, 200)
+            self.assertIn(self.get(HTTP_HOST='public.example:9443').status_code, (400, 403))
+            self.assertIn(self.get(HTTP_HOST='unrelated.example:9443').status_code, (400, 403))
+            self.assertEqual(self.get(HTTP_HOST='recovery.example:9444').status_code, 403)
+        self.assertEqual(public_settings.ALLOWED_HOSTS, ['public.example'])
+
+    @override_settings(LANGUAGE_CODE='en-us', DEBUG=False)
+    def test_default_form_validation_errors_are_korean(self):
+        self.login()
+        for revision, message in [('bad', '정수를 입력하세요.'), ('', '이 필드는 필수 항목입니다.')]:
+            with self.subTest(revision=revision):
+                response = self.post('/recovery/settings/', {'revision': revision})
+                self.assertContains(response, message, status_code=400)
+
+    @override_settings(LANGUAGE_CODE='en-us', DEBUG=False)
+    def test_csrf_failure_guidance_is_korean(self):
+        self.get()
+        response = self.post(HTTP_X_CSRFTOKEN='')
+        self.assertContains(response, 'CSRF 검증에 실패했습니다.', status_code=403)
+        self.assertFalse(AuthVerification.objects.exists())
 
     def test_active_superuser_session_and_current_policy_proof_without_token(self):
         self.assertEqual(self.login().status_code, 302)

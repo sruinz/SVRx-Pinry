@@ -1,7 +1,13 @@
 from .docker import *  # noqa: F401,F403
+from pinry.recovery_config import deployment_configuration
 
 
 DEBUG = False
+_recovery_deployment = deployment_configuration()
+ALLOWED_HOSTS = []
+if _recovery_deployment:
+    _recovery_hostname = _recovery_deployment['hostname']
+    ALLOWED_HOSTS = ['[{}]'.format(_recovery_hostname) if ':' in _recovery_hostname else _recovery_hostname]
 ROOT_URLCONF = 'users.recovery_urls'
 WSGI_APPLICATION = 'pinry.recovery_wsgi.application'
 MIDDLEWARE = [
