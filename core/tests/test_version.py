@@ -1,4 +1,9 @@
 import base64
+import platform
+
+import django
+import PIL
+import rest_framework
 
 from django.test import SimpleTestCase, override_settings
 from rest_framework.authtoken.models import Token
@@ -112,6 +117,28 @@ class PrivateTokenAccessTests(APITestCase):
             password="private-token-password",
         )
         self.token = Token.objects.get(user=self.user)
+
+    def test_profile_session_receives_actual_runtime_versions(self):
+        self.client.force_login(self.user)
+
+        response = self.client.get("/api/v2/version/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["dependencies"], {
+            "python": platform.python_version(),
+            "django": django.get_version(),
+            "drf": rest_framework.VERSION,
+            "pillow": PIL.__version__,
+        })
+        self.assertIn("no-store", response["Cache-Control"])
+
+    def test_logout_removes_dependency_details(self):
+        self.client.force_login(self.user)
+        self.client.logout()
+
+        response = self.client.get("/api/v2/version/")
+
+        self.assertNotIn("dependencies", response.json())
 
     def test_valid_token_can_access_private_api(self):
         self.client.credentials(

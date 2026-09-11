@@ -52,6 +52,8 @@ SVRx Pinry Server는 개인 서버나 NAS에 설치해 이미지를 보드와 �
 - 여러 태그를 모두 포함한 Pin을 찾는 복수 태그 검색
 - Pin을 보드에 추가할 때 기존 포함 상태 표시와 중복 추가 방지
 - 프로필과 버전 API에서 실행 중인 소스 커밋 확인
+- 프로필의 빌드 정보와 오픈소스 라이선스 사이에서 Python·Django·Django REST Framework·Pillow의 실제 실행 버전 확인
+  (로그인 사용자만 조회, 기존 빌드 정보 요청에 포함하며 주기적으로 조회하지 않음)
 - 선택 Pin과 소유 보드의 원본·XMP·매니페스트 ZIP 내보내기
 - Synology NAS에서 직접 빌드할 수 있는 전용 Docker 산출물
 

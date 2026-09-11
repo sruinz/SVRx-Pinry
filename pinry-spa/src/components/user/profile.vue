@@ -48,6 +48,26 @@
       </div>
     </div>
     <div
+      class="card dependency-info-card"
+      data-test="dependency-versions">
+      <header class="card-header">
+        <p class="card-header-title">
+          {{ $t("dependencyVersionsTitle") }}
+        </p>
+      </header>
+      <div class="card-content">
+        <div class="content">
+          <div
+            v-for="dependency in dependencies"
+            :key="dependency.key">
+            <span>{{ dependency.label }}:</span>
+            <code v-if="dependency.version">{{ dependency.version }}</code>
+            <span v-else>—</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div
       class="card open-source-card"
       data-test="open-source-license">
       <header class="card-header">
@@ -81,6 +101,12 @@ export default {
     return {
       componentAlive: true,
       displayVersion: null,
+      dependencies: [
+        { key: 'python', label: 'Python', version: null },
+        { key: 'django', label: 'Django', version: null },
+        { key: 'drf', label: 'Django REST Framework', version: null },
+        { key: 'pillow', label: 'Pillow', version: null },
+      ],
       versionRequestSequence: 0,
     };
   },
@@ -103,6 +129,15 @@ export default {
         if (typeof value === 'string' && value.trim() !== '') {
           this.displayVersion = value;
         }
+        const versions = response && response.data && response.data.dependencies;
+        this.dependencies = this.dependencies.map((dependency) => {
+          const version = versions && versions[dependency.key];
+          return {
+            ...dependency,
+            version: typeof version === 'string' && version.trim() !== ''
+              ? version.trim() : null,
+          };
+        });
       }).catch(() => {});
     },
   },
@@ -119,6 +154,7 @@ export default {
 
 .admin-settings-card,
 .build-info-card,
+.dependency-info-card,
 .open-source-card {
   margin-top: 1rem;
 }
@@ -127,7 +163,8 @@ export default {
   color: inherit;
 }
 
-[data-test="build-version"] {
+[data-test="build-version"],
+.dependency-info-card code {
   margin-left: .5rem;
   user-select: text;
 }

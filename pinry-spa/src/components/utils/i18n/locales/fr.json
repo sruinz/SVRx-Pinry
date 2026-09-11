@@ -144,6 +144,7 @@
     "pinCreateError": "Impossible de créer la fiche",
     "pinBoardAlreadyIncluded": "Déjà inclus",
     "pinBoardMembershipLoadError": "Impossible de charger l’état d’inclusion dans les tableaux.",
+    "dependencyVersionsTitle": "Versions des dépendances",
     "buildInfoTitle": "Informations de compilation",
     "buildBrandLabel": "Produit",
     "buildVersionLabel": "Version en cours d'exécution",

@@ -144,6 +144,7 @@
   "pinCreateError": "无法创建 Pin",
   "pinBoardAlreadyIncluded": "已包含",
   "pinBoardMembershipLoadError": "无法加载画板包含状态。",
+  "dependencyVersionsTitle": "依赖版本",
   "buildInfoTitle": "构建信息",
   "buildBrandLabel": "产品",
   "buildVersionLabel": "运行版本",

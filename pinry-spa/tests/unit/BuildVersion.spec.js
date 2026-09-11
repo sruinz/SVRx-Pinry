@@ -77,6 +77,42 @@ describe('Profile build version', () => {
     expect(notice.find('a').exists()).toBe(false);
   });
 
+  it('renders runtime dependencies between build and license cards with one request', async () => {
+    axios.get.mockResolvedValue({
+      data: {
+        display_version: '9b54cf1b5a5a',
+        dependencies: {
+          python: '3.14.7', django: '5.2.17', drf: '3.16.1', pillow: '12.3.0',
+        },
+      },
+    });
+    const wrapper = mountProfile();
+    await flushPromises();
+
+    const card = wrapper.find('[data-test="dependency-versions"]');
+    expect(card.text()).toContain('의존성 버전');
+    ['Python', 'Django', 'Django REST Framework', 'Pillow', '3.14.7', '5.2.17', '3.16.1', '12.3.0']
+      .forEach(value => expect(card.text()).toContain(value));
+    expect(card.element.previousElementSibling.classList.contains('build-info-card')).toBe(true);
+    expect(card.element.nextElementSibling.classList.contains('open-source-card')).toBe(true);
+    expect(axios.get).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([undefined, {
+    python: null, django: {}, drf: '', pillow: 123, secret: 'hidden',
+  }])(
+    'renders placeholders for unavailable or malformed dependency versions', async (dependencies) => {
+      axios.get.mockResolvedValue({ data: { display_version: 'development', dependencies } });
+      const wrapper = mountProfile();
+      await flushPromises();
+      const card = wrapper.find('[data-test="dependency-versions"]');
+      expect(card.findAll('code')).toHaveLength(0);
+      expect(card.text().match(/—/g)).toHaveLength(4);
+      expect(card.text()).not.toContain('hidden');
+      expect(card.text()).not.toContain('[object Object]');
+    },
+  );
+
   it('does not render a fabricated version when the request fails', async () => {
     axios.get.mockRejectedValue(new Error('/private/build/path'));
 

@@ -144,6 +144,7 @@
     "pinCreateError": "Failed to create Pin",
     "pinBoardAlreadyIncluded": "Already included",
     "pinBoardMembershipLoadError": "Could not load board membership status.",
+    "dependencyVersionsTitle": "Dependency versions",
     "buildInfoTitle": "Build information",
     "buildBrandLabel": "Product",
     "buildVersionLabel": "Running version",

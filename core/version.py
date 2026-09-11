@@ -1,4 +1,9 @@
+import platform
 import re
+
+import django
+import PIL
+import rest_framework
 
 from django.conf import settings
 from django.http import JsonResponse
@@ -27,6 +32,12 @@ def normalize_source_commit(value):
 @never_cache
 @require_GET
 def version(request):
-    return JsonResponse(
-        normalize_source_commit(settings.PINRY_SOURCE_COMMIT)
-    )
+    payload = normalize_source_commit(settings.PINRY_SOURCE_COMMIT)
+    if request.user.is_authenticated:
+        payload["dependencies"] = {
+            "python": platform.python_version(),
+            "django": django.get_version(),
+            "drf": rest_framework.VERSION,
+            "pillow": PIL.__version__,
+        }
+    return JsonResponse(payload)
