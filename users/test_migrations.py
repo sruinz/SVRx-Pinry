@@ -172,6 +172,7 @@ class SSOModelsMigrationTest(TransactionTestCase):
 
         apps = self.migrate_forward()
         Policy = apps.get_model('users', 'AuthPolicy')
+        Identity = apps.get_model('users', 'ExternalIdentity')
 
         policy = Policy.objects.get(pk=1)
         self.assertTrue(policy.password_login_enabled)
@@ -185,3 +186,8 @@ class SSOModelsMigrationTest(TransactionTestCase):
         self.assertTrue(
             Token.objects.filter(user_id=user_id, key=token_key).exists(),
         )
+        digest_field = Identity._meta.get_field('identity_digest')
+        self.assertEqual(digest_field.max_length, 64)
+        self.assertTrue(digest_field.unique)
+        self.assertFalse(digest_field.editable)
+        self.assertEqual(Identity._meta.constraints, [])

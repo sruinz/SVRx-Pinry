@@ -102,11 +102,9 @@ class Migration(migrations.Migration):
                 ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
                 ('issuer', models.CharField(max_length=2048)),
                 ('subject', models.CharField(max_length=255)),
+                ('identity_digest', models.CharField(editable=False, max_length=64, unique=True)),
                 ('user', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='external_identities', to=settings.AUTH_USER_MODEL)),
                 ('provider', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='external_identities', to='users.ssoprovider')),
             ],
-            options={
-                'constraints': [models.UniqueConstraint(fields=('provider', 'issuer', 'subject'), name='users_external_identity_unique')],
-            },
         ),
     ]

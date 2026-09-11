@@ -1,5 +1,6 @@
 import hashlib
 import ipaddress
+import json
 import uuid
 
 from django.conf import settings
@@ -41,6 +42,15 @@ def normalize_cidrs(values, private_only):
             raise ValidationError('RFC1918 또는 IPv6 ULA 대역만 허용됩니다.')
         normalized.append(str(network))
     return normalized
+
+
+def make_identity_digest(provider_id, issuer, subject):
+    serialized = json.dumps(
+        [str(provider_id), issuer, subject],
+        ensure_ascii=False,
+        separators=(',', ':'),
+    )
+    return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
 
 def create_token_if_necessary(user: BaseUser):
@@ -167,14 +177,31 @@ class ExternalIdentity(models.Model):
     )
     issuer = models.CharField(max_length=2048)
     subject = models.CharField(max_length=255)
+    identity_digest = models.CharField(
+        max_length=64,
+        unique=True,
+        editable=False,
+    )
 
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=('provider', 'issuer', 'subject'),
-                name='users_external_identity_unique',
-            ),
-        ]
+    def clean(self):
+        self.identity_digest = make_identity_digest(
+            self.provider_id,
+            self.issuer,
+            self.subject,
+        )
+        super().clean()
+
+    def save(self, *args, **kwargs):
+        self.identity_digest = make_identity_digest(
+            self.provider_id,
+            self.issuer,
+            self.subject,
+        )
+        if kwargs.get('update_fields') is not None:
+            kwargs['update_fields'] = set(kwargs['update_fields']) | {
+                'identity_digest',
+            }
+        return super().save(*args, **kwargs)
 
 
 class SSOAttempt(models.Model):

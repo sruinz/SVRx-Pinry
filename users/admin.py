@@ -109,14 +109,25 @@ class SSOProviderAdmin(ActiveSuperuserAdminMixin, admin.ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return False
 
+    def get_readonly_fields(self, request, obj=None):
+        if obj is None:
+            return self.readonly_fields
+        return self.readonly_fields + ('kind',)
+
     def save_model(self, request, obj, form, change):
+        field_names = PROVIDER_FIELDS
+        if change:
+            field_names = tuple(
+                field_name
+                for field_name in PROVIDER_FIELDS
+                if field_name != 'kind'
+            )
         provider_changes = {
             field_name: getattr(obj, field_name)
-            for field_name in PROVIDER_FIELDS
+            for field_name in field_names
         }
         if change:
             provider_changes['id'] = obj.pk
-            provider_changes.pop('kind')
 
         saved_policy = save_configuration(
             request.user,

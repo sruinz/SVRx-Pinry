@@ -1,9 +1,19 @@
+import uuid
+
 from django.contrib import admin
+from django.contrib.admin.models import LogEntry
 from django.core.exceptions import PermissionDenied, ValidationError
+from django.db import IntegrityError, transaction
 from django.test import RequestFactory, TestCase
 from django.urls import reverse
 
-from .models import AuthPolicy, SSOProvider, User
+from .models import (
+    AuthPolicy,
+    ExternalIdentity,
+    SSOProvider,
+    User,
+    make_identity_digest,
+)
 from .sso.config import read_policy, save_configuration
 
 
@@ -196,6 +206,75 @@ class SSOConfigurationTest(TestCase):
         self.assertFalse(SSOProvider.objects.exists())
 
 
+class ExternalIdentityTest(TestCase):
+    def setUp(self):
+        self.user = User.objects.create_user("identity-user")
+        self.provider = SSOProvider.objects.create(
+            id=uuid.UUID("00000000-0000-0000-0000-000000000001"),
+            kind=SSOProvider.Kind.OIDC,
+            name="Identity Provider",
+        )
+
+    def test_identity_digest_uses_unambiguous_case_sensitive_values(self):
+        digest = make_identity_digest(
+            self.provider.pk,
+            "https://idp.example/issuer",
+            "CaseSensitive",
+        )
+
+        self.assertEqual(
+            digest,
+            "000a2a552d3c430e2de2920ce174e240"
+            "18364d04b21870fdf2a2c02b4e7084d0",
+        )
+        self.assertNotEqual(
+            digest,
+            make_identity_digest(
+                self.provider.pk,
+                "https://idp.example/issuer",
+                "casesensitive",
+            ),
+        )
+
+    def test_creation_generates_digest_and_preserves_long_original_values(self):
+        issuer = "https://idp.example/" + "i" * 2028
+
+        identity = ExternalIdentity.objects.create(
+            user=self.user,
+            provider=self.provider,
+            issuer=issuer,
+            subject="CaseSensitive",
+            identity_digest="not-user-controlled",
+        )
+
+        self.assertEqual(identity.issuer, issuer)
+        self.assertEqual(identity.subject, "CaseSensitive")
+        self.assertEqual(len(identity.identity_digest), 64)
+        self.assertEqual(
+            identity.identity_digest,
+            make_identity_digest(self.provider.pk, issuer, "CaseSensitive"),
+        )
+
+    def test_case_variants_are_distinct_but_exact_duplicate_is_rejected(self):
+        for subject in ("Subject", "subject"):
+            ExternalIdentity.objects.create(
+                user=self.user,
+                provider=self.provider,
+                issuer="https://idp.example/issuer",
+                subject=subject,
+            )
+
+        self.assertEqual(ExternalIdentity.objects.count(), 2)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                ExternalIdentity.objects.create(
+                    user=self.user,
+                    provider=self.provider,
+                    issuer="https://idp.example/issuer",
+                    subject="Subject",
+                )
+
+
 class SSOConfigurationAdminTest(TestCase):
     def setUp(self):
         self.superuser = User.objects.create_superuser(
@@ -305,3 +384,34 @@ class SSOConfigurationAdminTest(TestCase):
         form_class = provider_admin.get_form(request)
 
         self.assertNotIn("encrypted_client_secret", form_class.base_fields)
+
+    def test_provider_kind_is_editable_only_during_creation(self):
+        provider = SSOProvider.objects.create(
+            kind=SSOProvider.Kind.GOOGLE,
+            name="Google",
+            client_id="client-id",
+        )
+        request = RequestFactory().get("/admin/users/ssoprovider/")
+        request.user = self.superuser
+        provider_admin = admin.site._registry[SSOProvider]
+
+        add_form = provider_admin.get_form(request)
+        change_form = provider_admin.get_form(request, obj=provider)
+
+        self.assertIn("kind", add_form.base_fields)
+        self.assertNotIn("kind", change_form.base_fields)
+
+        self.client.force_login(self.superuser)
+        response = self.client.post(
+            reverse("admin:users_ssoprovider_change", args=[provider.pk]),
+            self.provider_form_data(kind=SSOProvider.Kind.OIDC),
+        )
+
+        self.assertEqual(response.status_code, 302)
+        provider.refresh_from_db()
+        self.assertEqual(provider.kind, SSOProvider.Kind.GOOGLE)
+        self.assertEqual(provider.revision, 1)
+        self.assertNotIn(
+            "Kind",
+            LogEntry.objects.get(object_id=str(provider.pk)).change_message,
+        )
