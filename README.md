@@ -15,7 +15,7 @@ SVRx Pinry Server는 개인 서버나 NAS에 설치해 이미지를 보드와 �
 
 이 프로젝트는 Pinry를 기반으로 만든 비공식 수정 배포판입니다.
 
-## 기동 복구 패치 작업선
+## 기동 복구 패치 이력
 
 `fix/startup-recovery-patch`는 운영 기준 `64388c7`에서 분리한 긴급 패치다.
 현대화 작업선과 별도로 배포하며 Python·Django·Vue 버전, DB 스키마,
