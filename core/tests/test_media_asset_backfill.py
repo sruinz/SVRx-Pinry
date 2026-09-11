@@ -3110,9 +3110,6 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         self.assertFalse(MediaAsset.objects.exists())
         output = stdout.getvalue() + stderr.getvalue()
         forbidden = (
-            str(candidate["image"].pk),
-            str(candidate["pins"][0].pk),
-            str(self.owner.pk),
             sentinel,
             candidate["paths"]["original"],
             self.temporary_media.name,
@@ -3120,8 +3117,12 @@ class MediaAssetBackfillTests(TemporaryMediaMixin, TransactionTestCase):
         )
         for value in forbidden:
             self.assertNotIn(value, output)
-        self.assertIn("scanned=1", output)
-        self.assertIn("registered=0", output)
+        # 숫자 PK 1과 집계값 1을 혼동하지 않고 허용된 집계 출력만 확인한다.
+        self.assertEqual(
+            output,
+            "scanned=1 eligible=1 registered=0 already_registered=0 "
+            "skipped=0 reasons=none\n",
+        )
 
     def test_fail_closed_error_suppresses_sensitive_storage_cause(self):
         self._create_candidate()

@@ -166,6 +166,8 @@ PINRY_SOURCE_COMMIT = os.environ.get('PINRY_SOURCE_COMMIT')
 # IS_TEST is a variable to mark if the test is running
 IS_TEST = False
 
+DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
+
 # User custom settings
 IMAGE_AUTO_DELETE = True
 

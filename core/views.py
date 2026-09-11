@@ -86,7 +86,7 @@ class PinViewSet(viewsets.ModelViewSet):
         SearchFilter,
         PinSortFilter,
     )
-    filter_fields = ("submitter__username", "pins__id")
+    filterset_fields = ("submitter__username", "pins__id")
     ordering_fields = ('-id', )
     ordering = ('-id', )
     permission_classes = [
@@ -480,7 +480,7 @@ class BoardViewSet(viewsets.ModelViewSet):
         BoardSortFilter,
     )
     search_fields = ("name", )
-    filter_fields = ("submitter__username", )
+    filterset_fields = ("submitter__username", )
     ordering_fields = ('-id', )
     ordering = ('-id', )
     permission_classes = [
@@ -596,7 +596,7 @@ class BoardAutoCompleteViewSet(
 ):
     serializer_class = api.BoardAutoCompleteSerializer
     filter_backends = (DjangoFilterBackend, OrderingFilter)
-    filter_fields = ("submitter__username", )
+    filterset_fields = ("submitter__username", )
     ordering_fields = ('-id', )
     ordering = ('-id', )
     pagination_class = None

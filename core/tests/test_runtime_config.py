@@ -363,10 +363,10 @@ def _compose_web_command(source):
 
 
 def _nginx_tokens(source):
-    without_comments = "\n".join(
-        line.split("#", 1)[0] for line in source.splitlines()
-    )
-    return re.findall(r"[{};]|[^\s{};]+", without_comments)
+    # 인용된 JSON·헤더 안의 기호를 Nginx 블록이나 주석으로 해석하지 않는다.
+    pattern = r"""'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|#[^\n]*|[{};]|[^\s{};'"#]+"""
+    return [token for token in re.findall(pattern, source)
+            if not token.startswith("#")]
 
 
 def _parse_nginx_block(tokens, index=0, closing=False):
@@ -551,7 +551,7 @@ def _assert_nginx_maintenance_contract(source):
     for arguments in public_locations:
         location = _single_nginx_location(server, arguments)
         if _direct_values(location, "add_header").count(
-                ["Allow", '"GET,', 'HEAD"', "always"]) != 1:
+                ["Allow", '"GET, HEAD"', "always"]) != 1:
             raise AssertionError(
                 "public location {} must expose GET/HEAD Allow".format(
                     " ".join(arguments)
@@ -563,7 +563,7 @@ def _assert_nginx_maintenance_contract(source):
         ("Cache-Control", '"no-store"', "always"),
         ("Service-Worker-Allowed", "/", "always"),
         ("X-Content-Type-Options", "nosniff", "always"),
-        ("Allow", '"GET,', 'HEAD"', "always"),
+        ("Allow", '"GET, HEAD"', "always"),
     }
     worker_headers = {
         tuple(arguments)
@@ -1469,7 +1469,14 @@ class RuntimeConfigTests(unittest.TestCase):
         )
         self.assertLess(
             run_source.index("self._acquire_lock()"),
-            run_source.index("self._spawn_worker("),
+            run_source.index("self._run_startup_attempt()"),
+        )
+        attempt_start = supervisor_source.index("    def _run_startup_attempt(self):")
+        attempt_end = supervisor_source.index("\n    def ", attempt_start + 1)
+        attempt_source = supervisor_source[attempt_start:attempt_end]
+        self.assertLess(
+            attempt_source.index("self._spawn_worker("),
+            attempt_source.index("self._start_application_and_serve()"),
         )
         self.assertLess(
             supervisor_source.index("def _spawn_worker"),
@@ -2389,6 +2396,13 @@ class RuntimeConfigTests(unittest.TestCase):
 
         _assert_nginx_contract(source)
 
+    def test_nginx_tokens_preserve_quoted_json_punctuation_and_comments(self):
+        source = "return 400 '{\"reason\":\"#a;{}\"}'; # 주석\n"
+        self.assertEqual(
+            _nginx_tokens(source),
+            ["return", "400", "'{\"reason\":\"#a;{}\"}'", ";"],
+        )
+
     def test_nginx_maintenance_contract_is_fail_closed(self):
         source = (
             REPOSITORY_ROOT / "docker/nginx/sites-enabled/default"
@@ -2495,8 +2509,10 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(source.count(block), 1)
         for original, replacement in replacements:
             with self.subTest(original=original):
-                self.assertEqual(source.count(original), 1)
-                mutant = source.replace(original, replacement, 1)
+                self.assertEqual(block.count(original), 1)
+                mutant = source.replace(
+                    block, block.replace(original, replacement, 1), 1,
+                )
                 with self.assertRaises(AssertionError):
                     _assert_nginx_contract(mutant)
 

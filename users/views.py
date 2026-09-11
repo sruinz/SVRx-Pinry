@@ -28,7 +28,7 @@ class PublicUserViewSet(
 ):
     serializer_class = PublicUserSerializer
     filter_backends = (DjangoFilterBackend, )
-    filter_fields = ("username", )
+    filterset_fields = ("username", )
     pagination_class = None
 
     def get_queryset(self):

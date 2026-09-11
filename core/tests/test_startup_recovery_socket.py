@@ -9,7 +9,10 @@ import time
 import unittest
 from unittest import mock
 
-from test_startup_recovery import startup_recovery, RecoveryPolicy
+if __package__:
+    from .test_startup_recovery import startup_recovery, RecoveryPolicy
+else:
+    from test_startup_recovery import startup_recovery, RecoveryPolicy
 
 
 class RecoverySocketTests(unittest.TestCase):

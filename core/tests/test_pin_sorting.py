@@ -128,4 +128,7 @@ class PinSortAPITests(TemporaryMediaMixin, APITestCase):
         postgres = DatabaseWrapper({"NAME": "pinry"}, "postgresql")
         sql = query.get_compiler(connection=postgres).as_sql()[0]
 
-        self.assertIn('(\"core_pin\".\"id\")::bigint', sql)
+        self.assertRegex(
+            sql,
+            r'(?:\("core_pin"\."id"\)::bigint|CAST\("core_pin"\."id" AS bigint\))',
+        )
