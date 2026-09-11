@@ -73,6 +73,8 @@ cat > "$temporary_root/fake_upstream.py" <<'PY'
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import sys
+import socketserver
+import threading
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -123,11 +125,41 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
+class RecoveryHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"host": self.headers.get("Host")}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        with open(sys.argv[2] + ".recovery", "a") as capture:
+            capture.write("POST\n")
+        self.send_response(429)
+        self.send_header("Retry-After", "17")
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"reason":"cooldown"}')
+
+    def log_message(self, *_args):
+        pass
+
+def recovery_server():
+    # 소켓 부재 시험이 끝난 다음에만 내부 수신을 시작한다.
+    import time
+    from pathlib import Path
+    while not Path(sys.argv[3] + "/enable-recovery").exists():
+        time.sleep(0.02)
+    socketserver.UnixStreamServer(sys.argv[3] + "/startup-recovery.sock", RecoveryHandler).serve_forever()
+
+threading.Thread(target=recovery_server, daemon=True).start()
 HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()
 PY
 
 python3 "$temporary_root/fake_upstream.py" \
-    "$upstream_port" "$temporary_root/upstream.requests" &
+    "$upstream_port" "$temporary_root/upstream.requests" "$runtime_directory" &
 upstream_pid=$!
 
 sed \
@@ -149,6 +181,12 @@ pid $temporary_root/nginx.pid;
 error_log $temporary_root/logs/main-error.log warn;
 events { worker_connections 64; }
 http {
+    client_body_temp_path $temporary_root/client_body;
+    proxy_temp_path $temporary_root/proxy;
+    fastcgi_temp_path $temporary_root/fastcgi;
+    uwsgi_temp_path $temporary_root/uwsgi;
+    scgi_temp_path $temporary_root/scgi;
+    limit_req_zone \$server_name zone=startup_recovery:1m rate=2r/s;
     include mime.types;
     default_type application/octet-stream;
     include $temporary_root/server.conf;
@@ -243,13 +281,141 @@ assert_header() {
     fi
 }
 
+assert_control_headers() {
+    assert_header Content-Type application/json
+    assert_header Cache-Control no-store
+    assert_header X-Content-Type-Options nosniff
+    python3 -m json.tool "$body" >/dev/null
+}
+
+# location 선택 전 거부도 정확한 제어 경로에서만 JSON으로 응답한다.
+python3 - "$listen_port" <<'PY'
+import http.client
+import json
+import socket
+import sys
+
+# 경로를 읽기도 전에 실패한 요청은 원래의 일반 HTML 400으로 남긴다.
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5) as client:
+    client.sendall(b"G@T / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    response = http.client.HTTPResponse(client)
+    response.begin()
+    assert response.status == 400, response.status
+    assert response.getheader("Content-Type") == "text/html"
+    assert b"400 Bad Request" in response.read()
+
+cases = [({"Content-Length": "x"}, b"400 Bad Request"),
+         ({"X-Large": "x" * 16384}, b"Request Header Or Cookie Too Large")]
+for extra_headers, html_message in cases:
+    for path, method, control in (
+        ("/migration/recovery", "GET", True),
+        ("/migration/restart", "POST", True),
+        ("/migration/recovery?probe=1", "GET", True),
+        ("/migration/restart/", "POST", False),
+        ("/api/v2/version/", "GET", False),
+    ):
+        connection = http.client.HTTPConnection("127.0.0.1", int(sys.argv[1]), timeout=5)
+        try:
+            connection.request(method, path, headers=extra_headers)
+            response = connection.getresponse()
+            payload = response.read()
+            headers = dict((key.lower(), value) for key, value in response.getheaders())
+            assert response.status == 400, (path, response.status)
+            if control:
+                assert headers.get("content-type") == "application/json", (path, headers)
+                assert headers.get("cache-control") == "no-store", (path, headers)
+                assert headers.get("x-content-type-options") == "nosniff", (path, headers)
+                assert json.loads(payload)["reason"] in ("invalid_body", "invalid_headers")
+            else:
+                assert headers.get("content-type") == "text/html", (path, headers)
+                assert "cache-control" not in headers and "x-content-type-options" not in headers
+                assert headers.get("x-frame-options") == "sameorigin", (path, headers)
+                assert html_message in payload, (path, payload)
+            print("parser_rejection=PASS", path, next(iter(extra_headers)), flush=True)
+        finally:
+            connection.close()
+PY
+
+for path in /migration/recovery /migration/restart; do
+    method=GET
+    [[ "$path" == /migration/restart ]] && method=POST
+    request "$method" "$path"
+    assert_status 503
+    assert_control_headers
+    request OPTIONS "$path"
+    assert_status 405
+    assert_control_headers
+done
+: > "$runtime_directory/enable-recovery"
+for _attempt in $(seq 1 100); do
+    [[ -S "$runtime_directory/startup-recovery.sock" ]] && break
+    sleep 0.02
+done
+sleep 1
+request GET /migration/recovery
+assert_status 200
+assert_control_headers
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["host"] == sys.argv[2]' "$body" "127.0.0.1:$listen_port"
+request POST /migration/restart
+assert_status 429
+assert_control_headers
+assert_header Retry-After 17
+grep -q cooldown "$body"
+# 본문을 전송하지 않고 크기 제한 선행 거부의 JSON 계약을 확인한다.
+for path in /migration/recovery /migration/restart; do
+    method=GET
+    [[ "$path" == /migration/restart ]] && method=POST
+    status="$(curl --silent --show-error --max-time 5 \
+        --dump-header "$headers" --output "$body" --write-out '%{http_code}' \
+        --request "$method" --header 'Content-Length: 52428801' \
+        "$base_url$path")"
+    assert_status 413
+    assert_control_headers
+done
+request POST /migration/restart forbidden
+assert_status 400
+assert_control_headers
+status="$(curl --silent --dump-header "$headers" --output "$body" --write-out '%{http_code}' -X POST -H 'Transfer-Encoding: chunked' --data-binary '' "$base_url/migration/restart")"
+assert_status 400
+assert_control_headers
+[[ "$(wc -l < "$temporary_root/upstream.requests.recovery" | tr -d ' ')" == 1 ]]
+
+# 두 경로를 섞은 동시 요청에도 서버 전체 예산과 JSON 오류가 적용된다.
+python3 - "$base_url" <<'PY'
+import concurrent.futures
+import json
+import sys
+import urllib.error
+import urllib.request
+
+def request_control(index):
+    path, method = ("recovery", "GET") if index % 2 == 0 else ("restart", "POST")
+    request = urllib.request.Request(sys.argv[1] + "/migration/" + path, method=method)
+    try:
+        result = urllib.request.urlopen(request, timeout=8)
+    except urllib.error.HTTPError as error:
+        result = error
+    with result:
+        assert result.headers["Content-Type"] == "application/json"
+        assert result.headers["Cache-Control"] == "no-store"
+        assert result.headers["X-Content-Type-Options"] == "nosniff"
+        payload = json.load(result)
+        if payload.get("reason") == "rate_limited":
+            assert result.code == 429
+            return True
+        return False
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+    assert any(list(pool.map(request_control, range(12)))), "Nginx 전체 요청 제한 누락"
+PY
+
 for method in GET HEAD; do
     request "$method" /migration
     assert_status 308
     assert_header Location "$base_url/migration/"
     assert_header Cache-Control no-store
 
-    for path in /migration/ /migration-status.json /healthz; do
+    for path in /migration/ /migration/index.html /migration-status.json /healthz; do
         request "$method" "$path"
         assert_status 200
         assert_header Allow 'GET, HEAD'
@@ -259,6 +425,8 @@ for method in GET HEAD; do
     request "$method" /migration/
     assert_status 200
     assert_header Content-Type 'text/html; charset=utf-8'
+    assert_header X-Frame-Options SAMEORIGIN
+    assert_header Content-Security-Policy "frame-ancestors 'self'"
 
     request "$method" /migration/migration.css
     assert_status 200
@@ -275,7 +443,7 @@ for method in GET HEAD; do
 done
 
 for method in POST PUT; do
-    for path in /migration /migration/ /migration-status.json /healthz /readyz; do
+    for path in /migration /migration/ /migration/index.html /migration-status.json /healthz /readyz; do
         request "$method" "$path"
         assert_status 405
         assert_header Allow 'GET, HEAD'
@@ -335,6 +503,66 @@ if [[ -s "$temporary_root/upstream.requests" ]]; then
     exit 1
 fi
 
+rm "$runtime_directory/maintenance"
+
+for path in /migration/recovery /migration/restart; do
+    method=GET
+    [[ "$path" == /migration/restart ]] && method=POST
+    request "$method" "$path"
+    assert_status 409
+    assert_control_headers
+done
+
+# 정상 상태에서는 브라우저 스크립트 없이 세 페이지가 바로 메인으로 이동한다.
+for method in GET HEAD; do
+    for path in /migration /migration/ /migration/index.html \
+        '/migration/index.html?next=https://example.invalid/'; do
+        request "$method" "$path"
+        assert_status 302
+        assert_header Location /
+        assert_header Cache-Control no-store
+        if grep -Fq '/migration/migration.js' "$body"; then
+            echo "정상 상태에서 유지보수 HTML이 노출됐습니다." >&2
+            exit 1
+        fi
+    done
+    for path in /migration-status.json /migration/migration.css /migration/migration.js; do
+        request "$method" "$path"
+        assert_status 200
+        assert_header Cache-Control no-store
+    done
+done
+for method in POST PUT; do
+    for path in /migration /migration/ /migration/index.html; do
+        request "$method" "$path"
+        assert_status 405
+        assert_header Allow 'GET, HEAD'
+        assert_header Cache-Control no-store
+    done
+done
+
+# 상태 JSON이 아니라 게이트가 닫히면 같은 Nginx에서 다시 페이지를 제공한다.
+: > "$runtime_directory/maintenance"
+for state in starting migrating failed; do
+    printf '{"state":"%s"}\n' "$state" > "$runtime_directory/migration-status.json"
+    for method in GET HEAD; do
+        request "$method" /migration
+        assert_status 308
+        assert_header Location "$base_url/migration/"
+        assert_header Cache-Control no-store
+        for path in /migration/ /migration/index.html; do
+            request "$method" "$path"
+            assert_status 200
+            assert_header Cache-Control no-store
+            if [[ "$method" == GET ]] && ! grep -Fq '/migration/migration.js' "$body"; then
+                echo "게이트 재진입 후 유지보수 HTML이 없습니다." >&2
+                exit 1
+            fi
+        done
+    done
+    request POST /migration/index.html
+    assert_status 405
+done
 rm "$runtime_directory/maintenance"
 
 request GET /service-worker.js

@@ -79,6 +79,34 @@ class MigrationStatusStoreTests(SimpleTestCase):
     def payload(self):
         return json.loads(self.status_path.read_text(encoding="utf-8"))
 
+    def test_restart_status_requires_failed_and_preserves_gate(self):
+        store = self.initialized_store()
+        with self.assertRaises(migration_status.StatusError):
+            store.restart_startup()
+        store.apply_worker_event({"phase": "complete"})
+        store.failed("gunicorn_start_failed")
+        store.restart_startup()
+        state = self.payload()
+        self.assertEqual(state["state"], "starting")
+        self.assertIsNone(state["error_code"])
+        self.assertTrue(self.marker_path.exists())
+        store.apply_worker_event({"phase": "complete"})
+        store.starting_service()
+
+    def test_restart_rejects_missing_gate_and_unpublished_failure(self):
+        for damaged in ("gate", "publication"):
+            with self.subTest(damaged=damaged):
+                store = self.initialized_store()
+                store.failed("gunicorn_start_failed")
+                if damaged == "gate":
+                    self.marker_path.unlink()
+                else:
+                    store._dirty = True
+                with self.assertRaises(migration_status.StatusError):
+                    store.restart_startup()
+                self.assertEqual(self.payload()["state"], "failed")
+                store.create_gate()
+
     def planning(self, **updates):
         event = {
             "phase": "planning",
@@ -992,11 +1020,11 @@ class MigrationStatusStoreTests(SimpleTestCase):
             "files_total": 200,
         })
         before = self.payload()
-        store.failed("migration_status_write_failed")
+        store.failed("worker_exit_timeout")
         after = self.payload()
         self.assertEqual(after["state"], "failed")
         self.assertEqual(after["error_class"], "retryable")
-        self.assertEqual(after["error_code"], "migration_status_write_failed")
+        self.assertEqual(after["error_code"], "worker_exit_timeout")
         for key in (
             "phase",
             "phase_label",
@@ -1088,6 +1116,7 @@ class MigrationStatusStoreTests(SimpleTestCase):
             "unsafe_storage_ownership": "operator_action_required",
             "unsupported_legacy_database_backend": "operator_action_required",
             "worker_protocol_invalid": "fatal",
+            "worker_exit_timeout": "retryable",
         }
         self.assertEqual(migration_status.ERROR_CODE_CLASSES, expected)
         self.assertEqual(

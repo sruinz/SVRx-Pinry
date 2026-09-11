@@ -17,15 +17,21 @@ from docker.scripts.migration_status import (
     MigrationStatusStore,
     StatusError,
 )
+from docker.scripts.startup_recovery import (
+    RECOVERABLE_CODES, RecoveryPolicy, RecoveryServer,
+)
+from django_images.services.startup_lock import StartupLockError
 
 
 _MAX_FRAME_BYTES = 4096
 _HEARTBEAT_SECONDS = 5.0
 _POLL_SECONDS = 1.0
+_RECOVERY_POLL_SECONDS = 0.1
 _READINESS_SECONDS = 60.0
 _READINESS_INTERVAL_SECONDS = 0.5
 _QUIESCE_SECONDS = 5.0
 _SHUTDOWN_SECONDS = 15.0
+_WORKER_EXIT_SECONDS = 15.0
 _EXPORT_STABLE_SECONDS = 60.0
 _EXPORT_RESTART_MAX_SECONDS = 30.0
 _READINESS_URL = "http://127.0.0.1:8000/api/v2/version/"
@@ -50,6 +56,7 @@ GUNICORN_PATH = os.path.join(
 
 _WORKER_SHUTDOWN = -2
 _NGINX_EXITED = -3
+_RETRY_STARTUP = object()
 
 
 class SupervisorError(Exception):
@@ -281,6 +288,7 @@ class RuntimeSupervisor(object):
         readiness_probe=None,
         quiescence_probe=None,
         sleeper=time.sleep,
+        recovery_server_factory=RecoveryServer,
     ):
         self.arguments = list(arguments)
         self.data_root = data_root
@@ -299,6 +307,8 @@ class RuntimeSupervisor(object):
         self.readiness_probe = readiness_probe
         self.quiescence_probe = quiescence_probe
         self.sleeper = sleeper
+        self.recovery_server_factory = recovery_server_factory
+        self.recovery_policy = RecoveryPolicy(clock=clock)
 
         self.startup_lock = None
         self.progress_reader = None
@@ -318,6 +328,13 @@ class RuntimeSupervisor(object):
         self._shutdown_deadline = None
         self._shutdown_signaled = set()
         self._worker_terminal = None
+        self._worker_eof = False
+        self._worker_succeeded = False
+        self._worker_exit_timed_out = False
+        self._failed_code = None
+        self._failure_published = False
+        self._attempt_status_failed = False
+        self._recovery_identity_failed = False
 
     @staticmethod
     def _log(message):
@@ -335,12 +352,14 @@ class RuntimeSupervisor(object):
             method(*arguments)
             return True
         except StatusError as error:
+            self._attempt_status_failed = True
             code = _safe_error_code(error)
             if code == "migration_status_write_failed":
                 self._log("이전 상태 기록을 재시도합니다.")
                 return False
             raise SupervisorError(code)
         except (IOError, OSError):
+            self._attempt_status_failed = True
             self._log("이전 상태 기록을 재시도합니다.")
             return False
 
@@ -383,6 +402,7 @@ class RuntimeSupervisor(object):
         try:
             identity = self.identity_reader(process.pid)
         except (IOError, OSError, ValueError):
+            self._recovery_identity_failed = True
             if process.poll() is None:
                 self._terminate_unregistered(process)
                 raise SupervisorError("runtime_supervisor_failed")
@@ -390,6 +410,7 @@ class RuntimeSupervisor(object):
             identity["pgid"] != process.pid
             or identity["session"] != process.pid
         ):
+            self._recovery_identity_failed = True
             self._terminate_unregistered(process)
             raise SupervisorError("runtime_supervisor_failed")
         record = _ChildRecord(role, process, identity)
@@ -794,6 +815,15 @@ class RuntimeSupervisor(object):
         if phase in ("complete", "error"):
             self._worker_terminal = phase
 
+    def _worker_interruption_result(self):
+        if self._shutdown_signal is not None:
+            return _WORKER_SHUTDOWN
+        if self.nginx.process.poll() is not None:
+            self._reap_record(self.nginx)
+            self._terminate_records((self.nginx, self.worker))
+            return _NGINX_EXITED
+        return None
+
     def _drive_worker_and_heartbeat(self):  # noqa: C901
         decoder = ProgressFrameDecoder()
         selector = self.selector_factory()
@@ -802,12 +832,9 @@ class RuntimeSupervisor(object):
             selector.register(self.progress_reader, selectors.EVENT_READ)
             while not eof:
                 self._status_tick()
-                if self._shutdown_signal is not None:
-                    return _WORKER_SHUTDOWN
-                if self.nginx.process.poll() is not None:
-                    self._reap_record(self.nginx)
-                    self._terminate_records((self.nginx, self.worker))
-                    return _NGINX_EXITED
+                interruption = self._worker_interruption_result()
+                if interruption is not None:
+                    return interruption
                 ready = selector.select(_POLL_SECONDS)
                 for key, _mask in ready:
                     if key.fileobj != self.progress_reader:
@@ -827,14 +854,44 @@ class RuntimeSupervisor(object):
                         if len(payload) < 65536:
                             break
             decoder.finish()
-            result = self._reap_record(self.worker, timeout=_POLL_SECONDS)
-            if result is None:
-                raise SupervisorError("worker_protocol_invalid")
-            if self._record_is_registered(self.worker):
-                self._terminate_record(self.worker)
-            if self._record_is_registered(self.worker):
-                raise SupervisorError("runtime_supervisor_failed")
+            self._worker_eof = True
+            deadline = self.clock() + _WORKER_EXIT_SECONDS
+            result = None
+            while self._record_is_registered(self.worker):
+                self._status_tick()
+                interruption = self._worker_interruption_result()
+                if interruption is not None:
+                    return interruption
+                remaining = max(0, deadline - self.clock())
+                result = self._reap_record(
+                    self.worker,
+                    timeout=min(_POLL_SECONDS, remaining),
+                )
+                interruption = self._worker_interruption_result()
+                if interruption is not None:
+                    return interruption
+                if not self._record_is_registered(self.worker):
+                    break
+                now = self.clock()
+                if now >= deadline:
+                    result = self._reap_record(self.worker, timeout=0)
+                    if not self._record_is_registered(self.worker):
+                        break
+                    if self._worker_terminal == "complete":
+                        self._worker_exit_timed_out = True
+                        self.last_worker_error = "worker_exit_timeout"
+                    self._terminate_record(self.worker)
+                    if self._record_is_registered(self.worker):
+                        self.last_worker_error = "runtime_supervisor_failed"
+                    return 1
+                if self.worker.master_reaped:
+                    self.sleeper(min(_POLL_SECONDS, deadline - now))
             if result == 0 and self._worker_terminal == "complete":
+                self._status_tick()
+                interruption = self._worker_interruption_result()
+                if interruption is not None:
+                    return interruption
+                self._worker_succeeded = True
                 return 0
             if result != 0 and self._worker_terminal == "error":
                 return 1
@@ -1125,8 +1182,8 @@ class RuntimeSupervisor(object):
         self._raise_if_shutdown()
         try:
             self.gunicorn = self._spawn_gunicorn()
-        except SupervisorError:
-            return self._hold_failed("gunicorn_start_failed")
+        except SupervisorError as error:
+            return self._hold_failed(_safe_error_code(error))
         self._raise_if_shutdown()
         if not self._child_survived_start(self.gunicorn):
             return self._hold_failed("gunicorn_start_failed")
@@ -1175,20 +1232,118 @@ class RuntimeSupervisor(object):
                 self.sleeper(sleep_seconds)
         return 0
 
-    def _hold_failed(self, code):
+    def _recovery_eligible(self, code):
+        # HTTP 기한 안에서는 읽기 전용 확인만 한다. 종료 대기는 진입 시 수행한다.
+        if (
+            self._shutdown_signal is not None or self._failed_code != code
+            or code not in RECOVERABLE_CODES or not self._failure_published
+            or self._attempt_status_failed or self._recovery_identity_failed
+            or self._worker_terminal != "complete" or not self._worker_eof
+            or self.startup_lock is None or self.worker is None
+            or self.nginx is None or self.nginx.process.poll() is not None
+            or any(role != "nginx" for role in self.children)
+        ):
+            return False
+        for record in (self.worker, self.gunicorn, self.export_worker):
+            if record is not None and (
+                not record.master_reaped or record.starttime is None
+            ):
+                return False
+        if code == "worker_exit_timeout" and not self._worker_exit_timed_out:
+            return False
+        if code == "gunicorn_start_failed" and not self._worker_succeeded:
+            return False
         try:
-            self._project_status(self.status_store.failed, code)
+            self.startup_lock.verify_held()
+            self.status_store.verify_failed_gate()
+        except (StartupLockError, StatusError, AttributeError,
+                OSError, ValueError):
+            return False
+        return (
+            self._shutdown_signal is None
+            and self.nginx.process.poll() is None
+        )
+
+    def _hold_failed(self, code):
+        self._failed_code = code
+        self._failure_published = False
+        server = None
+        try:
+            self._failure_published = self._project_status(
+                self.status_store.failed, code
+            )
         except SupervisorError:
             pass
-        while self._shutdown_signal is None:
-            self._status_tick()
-            if self.nginx is None or self.nginx.process.poll() is not None:
-                if self.nginx is not None:
-                    self._reap_record(self.nginx)
-                    self._terminate_record(self.nginx)
-                return 1
-            self.sleeper(_POLL_SECONDS)
-        return 0
+        self.recovery_policy.enter_failure(code)
+        try:
+            if code in RECOVERABLE_CODES:
+                self._terminate_records(
+                    (self.worker, self.gunicorn, self.export_worker)
+                )
+            try:
+                server = self.recovery_server_factory(
+                    self.status_store.status_directory,
+                    os.geteuid(), self.service_gid,
+                    self.recovery_policy, lambda: self._recovery_eligible(code),
+                    clock=self.clock,
+                )
+                server.open()
+            except (AttributeError, OSError):
+                if server is not None:
+                    server.close()
+                server = None
+            while self._shutdown_signal is None:
+                self._status_tick()
+                if self.nginx is None or self.nginx.process.poll() is not None:
+                    if self.nginx is not None:
+                        self._reap_record(self.nginx)
+                        self._terminate_record(self.nginx)
+                    return 1
+                if server is not None and server.poll_once():
+                    return _RETRY_STARTUP
+                self.sleeper(
+                    _RECOVERY_POLL_SECONDS if server is not None else _POLL_SECONDS
+                )
+            return 0
+        finally:
+            self._failed_code = None
+            self.recovery_policy.leave_failure()
+            if server is not None:
+                server.close()
+
+    def _reset_startup_attempt(self):
+        if any(role != "nginx" for role in self.children):
+            raise SupervisorError("runtime_supervisor_failed")
+        if self.progress_reader is not None:
+            os.close(self.progress_reader)
+            self.progress_reader = None
+        self.worker = self.gunicorn = self.export_worker = None
+        self.export_started_at = self.export_restart_at = None
+        self.export_restart_delay = 1.0
+        self._export_stop_deadline = None
+        self.last_worker_error = "legacy_startup_failed"
+        self._worker_terminal = None
+        self._worker_eof = False
+        self._worker_succeeded = False
+        self._worker_exit_timed_out = False
+        self._failure_published = False
+
+    def _run_startup_attempt(self):
+        self._raise_if_shutdown()
+        if self.nginx is None or self.nginx.process.poll() is not None:
+            return 1
+        self.worker, self.progress_reader = self._spawn_worker(
+            self.startup_lock.fileno()
+        )
+        worker_result = self._drive_worker_and_heartbeat()
+        if worker_result == _WORKER_SHUTDOWN:
+            return 0
+        if worker_result == _NGINX_EXITED:
+            return 1
+        if worker_result != 0:
+            return self._hold_failed(self.last_worker_error)
+        self._raise_if_shutdown()
+        return self._start_application_and_serve()
 
     def _signal_shutdown_children(self):
         if "migration" in self.children:
@@ -1252,27 +1407,23 @@ class RuntimeSupervisor(object):
                 if isinstance(error, _ShutdownRequested):
                     raise
                 return self._hold_failed(_safe_error_code(error))
-            self._raise_if_shutdown()
-            self.worker, self.progress_reader = self._spawn_worker(
-                self.startup_lock.fileno()
-            )
-            worker_result = self._drive_worker_and_heartbeat()
-            if worker_result == _WORKER_SHUTDOWN:
-                return 0
-            if worker_result == _NGINX_EXITED:
-                return 1
-            if worker_result != 0:
-                return self._hold_failed(self.last_worker_error)
-            self._raise_if_shutdown()
-            result = self._start_application_and_serve()
-            return result
+            while self._shutdown_signal is None:
+                result = self._run_startup_attempt()
+                if result is not _RETRY_STARTUP:
+                    return result
+                self._raise_if_shutdown()
+                self.startup_lock.verify_held()
+                self.status_store.restart_startup()
+                self._raise_if_shutdown()
+                self._reset_startup_attempt()
+            return 0
         except _ShutdownRequested:
             return 0
         except SupervisorError as error:
             if self.nginx is not None and self.nginx.process.poll() is None:
                 return self._hold_failed(_safe_error_code(error))
             return 1
-        except StatusError as error:
+        except (StatusError, StartupLockError) as error:
             self._log(
                 "유지보수 게이트를 준비하지 못했습니다: {}".format(
                     _safe_error_code(error)

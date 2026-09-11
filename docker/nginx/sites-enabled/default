@@ -12,11 +12,48 @@ server {
 
     error_page 418 = @migration_page;
     error_page 419 = @migration_unavailable;
+    error_page 420 = @migration_home;
+
+    # 헤더 파싱은 location 선택보다 먼저 실행되므로 서버 단계에서 분기한다.
+    error_page 400 = /__startup_recovery_bad_request;
+    error_page 494 = /__startup_recovery_header_too_large;
+
+    location = /__startup_recovery_bad_request {
+        internal;
+        default_type application/json;
+        if ($request_uri ~ "^/migration/(recovery|restart)(\?|$)") {
+            add_header Cache-Control "no-store" always;
+            add_header X-Content-Type-Options nosniff always;
+            return 400 '{"reason":"invalid_body"}';
+        }
+        return 400;
+    }
+
+    location = /__startup_recovery_header_too_large {
+        internal;
+        default_type application/json;
+        if ($request_uri ~ "^/migration/(recovery|restart)(\?|$)") {
+            add_header Cache-Control "no-store" always;
+            add_header X-Content-Type-Options nosniff always;
+            return 400 '{"reason":"invalid_headers"}';
+        }
+        # 제어 외 요청은 기존 큰 헤더 전용 HTML 400 응답을 유지한다.
+        return 494;
+    }
+
+    location @migration_home {
+        absolute_redirect off;
+        add_header Cache-Control "no-store" always;
+        return 302 /;
+    }
 
     location @migration_page {
         root /pinry/docker;
         charset utf-8;
+        add_header X-Frame-Options SAMEORIGIN always;
+        add_header Content-Security-Policy "frame-ancestors 'self'" always;
         add_header Cache-Control "no-store" always;
+        add_header Allow "GET, HEAD" always;
         try_files /migration/index.html =503;
     }
 
@@ -28,9 +65,94 @@ server {
 
     location = /migration {
         if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+        if (!-f /run/svrx-pinry/maintenance) { return 420; }
         add_header Cache-Control "no-store" always;
         add_header Allow "GET, HEAD" always;
         return 308 /migration/;
+    }
+
+    location = /migration/ {
+        if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+        if (!-f /run/svrx-pinry/maintenance) { return 420; }
+        add_header Cache-Control "no-store" always;
+        add_header Allow "GET, HEAD" always;
+        return 418;
+    }
+
+    location = /migration/index.html {
+        if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+        if (!-f /run/svrx-pinry/maintenance) { return 420; }
+        add_header Cache-Control "no-store" always;
+        add_header Allow "GET, HEAD" always;
+        return 418;
+    }
+
+    location @recovery_unavailable {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+        return 503 '{"reason":"unavailable"}';
+    }
+
+    location @recovery_body_too_large {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+        return 413 '{"reason":"invalid_body"}';
+    }
+
+    location @recovery_rate_limit {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+        return 429 '{"reason":"rate_limited"}';
+    }
+
+    location = /migration/recovery {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+        if ($request_method != GET) { return 405 '{"reason":"method_not_allowed"}'; }
+        if (!-f /run/svrx-pinry/maintenance) { return 409 '{"reason":"unavailable"}'; }
+        if ($http_transfer_encoding != "") { return 400 '{"reason":"invalid_body"}'; }
+        if ($http_content_length !~ "^(0)?$") { return 400 '{"reason":"invalid_body"}'; }
+        limit_req zone=startup_recovery burst=4;
+        limit_req_status 429;
+        error_page 413 = @recovery_body_too_large;
+        error_page 429 = @recovery_rate_limit;
+        error_page 502 504 = @recovery_unavailable;
+        # 상류 정책의 429와 Retry-After를 그대로 전달한다.
+        proxy_intercept_errors off;
+        proxy_hide_header Cache-Control;
+        proxy_hide_header X-Content-Type-Options;
+        proxy_set_header Host $http_host;
+        proxy_connect_timeout 1s;
+        proxy_read_timeout 1s;
+        proxy_send_timeout 1s;
+        proxy_pass http://unix:/run/svrx-pinry/startup-recovery.sock;
+    }
+
+    location = /migration/restart {
+        default_type application/json;
+        add_header Cache-Control "no-store" always;
+        add_header X-Content-Type-Options nosniff always;
+        if ($request_method != POST) { return 405 '{"reason":"method_not_allowed"}'; }
+        if (!-f /run/svrx-pinry/maintenance) { return 409 '{"reason":"unavailable"}'; }
+        if ($http_transfer_encoding != "") { return 400 '{"reason":"invalid_body"}'; }
+        if ($http_content_length !~ "^(0)?$") { return 400 '{"reason":"invalid_body"}'; }
+        limit_req zone=startup_recovery burst=4;
+        limit_req_status 429;
+        error_page 413 = @recovery_body_too_large;
+        error_page 429 = @recovery_rate_limit;
+        error_page 502 504 = @recovery_unavailable;
+        proxy_intercept_errors off;
+        proxy_hide_header Cache-Control;
+        proxy_hide_header X-Content-Type-Options;
+        proxy_set_header Host $http_host;
+        proxy_connect_timeout 1s;
+        proxy_read_timeout 1s;
+        proxy_send_timeout 1s;
+        proxy_pass http://unix:/run/svrx-pinry/startup-recovery.sock;
     }
 
     location = /migration-status.json {

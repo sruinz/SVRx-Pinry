@@ -119,6 +119,7 @@ ERROR_CODE_CLASSES = {
     "unsafe_sqlite_source_symlink": "fatal",
     "unsafe_storage_ownership": "operator_action_required",
     "unsupported_legacy_database_backend": "operator_action_required",
+    "worker_exit_timeout": "retryable",
     "worker_protocol_invalid": "fatal",
 }
 
@@ -452,6 +453,30 @@ class MigrationStatusStore(object):
             self._atomic_write(self.marker_path, _MARKER_BYTES)
         except Exception:
             raise StatusError("runtime_gate_fail_closed_failed")
+
+    def verify_failed_gate(self):
+        if (
+            not self._prepared or not self._initialized
+            or self._status["state"] != "failed"
+        ):
+            raise StatusError("runtime_gate_not_prepared")
+        if self._dirty or self._durable_bytes != self._pending_bytes:
+            raise StatusError("migration_status_write_failed")
+        try:
+            self._validate_directory()
+            self._validate_regular(self.marker_path, _MARKER_BYTES)
+            self._validate_regular(self.status_path, self._durable_bytes)
+        except OSError:
+            raise StatusError("runtime_gate_not_prepared")
+
+    def restart_startup(self):
+        self.verify_failed_gate()
+        self._last_worker_event = None
+        self._worker_terminal = False
+        self._ordinal_events = {}
+        self._readiness_latch = False
+        self._gate_removed = False
+        self._project(self._initial_status(self._now()))
 
     def publish_pending(self):
         if not self._dirty:

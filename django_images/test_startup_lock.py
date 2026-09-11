@@ -30,6 +30,85 @@ class StartupLockTests(SimpleTestCase):
         elif self.lock_path.is_dir():
             self.lock_path.rmdir()
 
+    def test_verify_held_requires_open_descriptor_evidence(self):
+        acquired = startup_lock.acquire_startup_lock(str(self.data_root))
+        self.addCleanup(acquired.close)
+        if sys.platform.startswith("linux"):
+            acquired.verify_held()
+            completed = subprocess.run(
+                [sys.executable, "-c", (
+                    "import sys; from django_images.services.startup_lock import "
+                    "acquire_startup_lock, StartupLockError\n"
+                    "try: acquire_startup_lock(sys.argv[1])\n"
+                    "except StartupLockError as error: print(error.code)\n"
+                ), str(self.data_root)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=5, check=True,
+            )
+            self.assertEqual(completed.stdout.strip(), "startup_lock_busy")
+            acquired.verify_held()
+            independent = os.open(str(self.lock_path), os.O_RDWR)
+            try:
+                with self.assertRaises(startup_lock.StartupLockError):
+                    startup_lock._verify_fd_lock(independent)
+            finally:
+                os.close(independent)
+            startup_lock.fcntl.flock(acquired.fileno(), startup_lock.fcntl.LOCK_UN)
+        self._assert_lock_error("startup_lock_failed", acquired.verify_held)
+        acquired.close()
+        self._assert_lock_error("startup_lock_failed", acquired.verify_held)
+
+    def test_fdinfo_parser_rejects_incomplete_or_unrelated_locks(self):
+        acquired = startup_lock.acquire_startup_lock(str(self.data_root))
+        self.addCleanup(acquired.close)
+        info = os.fstat(acquired.fileno())
+        line = "lock: 1: FLOCK ADVISORY WRITE {} {:x}:{:x}:{} 0 EOF\n".format(
+            os.getpid(), os.major(info.st_dev), os.minor(info.st_dev), info.st_ino,
+        )
+        for payload, valid in ((line, True), ("", False),
+                               (line.replace("FLOCK", "POSIX"), False),
+                               (line.replace("WRITE", "READ"), False),
+                               (line.replace("0 EOF", "1 EOF"), False),
+                               (line.replace(str(info.st_ino), str(info.st_ino + 1)), False),
+                               (line.replace("lock: 1:", "lock: bad:"), False),
+                               (line.replace("ADVISORY", "MANDATORY"), False),
+                               (line + line, False),
+                               (line.replace(str(os.getpid()) + " ", "-1 "), False)):
+            with self.subTest(payload=payload), mock.patch.object(
+                startup_lock.sys, "platform", "linux"
+            ), mock.patch("builtins.open", mock.mock_open(read_data=payload)):
+                if valid:
+                    acquired.verify_held()
+                else:
+                    self._assert_lock_error("startup_lock_failed", acquired.verify_held)
+
+    def test_verify_held_rejects_structure_changes_even_with_lock_evidence(self):
+        for damage in ("mode", "replacement", "descriptor", "root"):
+            with self.subTest(damage=damage):
+                acquired = startup_lock.acquire_startup_lock(str(self.data_root))
+                try:
+                    if damage == "mode":
+                        self.lock_path.chmod(0o644)
+                    elif damage == "replacement":
+                        self.lock_path.unlink()
+                        self.lock_path.touch(mode=0o600)
+                    elif damage == "descriptor":
+                        os.close(acquired.fileno())
+                    else:
+                        moved = self.data_root.with_name(self.data_root.name + "-moved")
+                        self.data_root.rename(moved)
+                        self.data_root.mkdir()
+                    with mock.patch.object(startup_lock, "_verify_fd_lock"):
+                        self._assert_lock_error("startup_lock_failed", acquired.verify_held)
+                finally:
+                    if damage == "descriptor":
+                        acquired._lock_descriptor = None
+                    acquired.close()
+                    if damage == "root":
+                        self.data_root.rmdir()
+                        moved.rename(self.data_root)
+                    self._remove_lock_entry()
+
     def test_new_lock_is_direct_child_with_exact_security_contract(self):
         acquired = startup_lock.acquire_startup_lock(str(self.data_root))
         self.addCleanup(acquired.close)

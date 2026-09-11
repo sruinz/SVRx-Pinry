@@ -110,6 +110,12 @@
           </dl>
         </section>
 
+        <section id="recovery-panel" class="recovery-panel" hidden aria-label="서버 재시동">
+          <p id="recovery-hint">Pinry 시작 절차를 다시 시도합니다. NAS는 재부팅하지 않습니다.</p>
+          <button id="restart-button" type="button" disabled aria-describedby="recovery-hint recovery-status">서버 재시동</button>
+          <p id="recovery-status" role="status" aria-live="polite"></p>
+        </section>
+
         <div class="action-row">
           <button id="refresh-button" type="button">상태 다시 확인</button>
           <button id="copy-error-button" type="button">오류 코드 복사</button>

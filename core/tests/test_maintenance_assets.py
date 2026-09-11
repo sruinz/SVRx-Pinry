@@ -159,7 +159,7 @@ class MaintenanceAssetTests(SimpleTestCase):
             ],
         )
         self.assertEqual(
-            len([attrs for tag, attrs in parser.tags if tag == "button"]), 4
+            len([attrs for tag, attrs in parser.tags if tag == "button"]), 5
         )
 
     def test_css_supports_mobile_zoom_focus_and_reduced_motion(self):

@@ -422,6 +422,25 @@
     };
   }
 
+  function validateRecovery(payload) {
+    var fields = ["schema_version", "available", "reason", "remaining_attempts",
+      "retry_after_seconds", "generation", "token"];
+    if (!payload || Object.keys(payload).length !== fields.length
+        || !fields.every(function hasField(field) { return Object.prototype.hasOwnProperty.call(payload, field); })
+        || payload.schema_version !== 1 || typeof payload.available !== "boolean"
+        || !["available", "cooldown", "exhausted", "unavailable", "unsafe_state", "accepted", "invalid_token"].includes(payload.reason)
+        || !Number.isInteger(payload.remaining_attempts) || payload.remaining_attempts < 0 || payload.remaining_attempts > 3
+        || !Number.isInteger(payload.retry_after_seconds) || payload.retry_after_seconds < 0
+        || ![payload.generation, payload.token].every(function validCredential(value) {
+          return value === null || (typeof value === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(value));
+        })
+        || (payload.available && (payload.reason !== "available" || !payload.token || !payload.generation
+          || payload.retry_after_seconds !== 0 || payload.remaining_attempts === 0))) {
+      throw new Error("recovery schema");
+    }
+    return payload;
+  }
+
   function MigrationController(options) {
     this.fetchFn = options.fetchFn;
     this.adapter = options.adapter;
@@ -437,6 +456,9 @@
     this.timer = null;
     this.pendingController = null;
     this.lastStatus = null;
+    this.recovery = null;
+    this.restarting = false;
+    this.submittedGeneration = null;
     this.originalDestination = readyDestination(
       this.locationRef.pathname,
       this.locationRef.search,
@@ -480,6 +502,7 @@
   MigrationController.prototype.stop = function stop() {
     this.stopped = true;
     this.sequence += 1;
+    this._renderRecovery(null, false);
     this._clearTimer();
     this._abortPending();
     this.documentRef.removeEventListener("visibilitychange", this.visibilityListener);
@@ -504,6 +527,7 @@
     this._abortPending();
     var requestSequence = this.sequence + 1;
     this.sequence = requestSequence;
+    this._renderRecovery(null, false);
     var requestController = this.AbortControllerCtor
       ? new this.AbortControllerCtor()
       : fallbackAbortController();
@@ -529,6 +553,10 @@
       this.failureCount = 0;
       this.lastStatus = payload;
       this.adapter.renderStatus(payload, this.nowFn());
+      if (payload.state === "failed") {
+        await this._loadRecovery(requestSequence);
+        if (requestSequence !== this.sequence || this.stopped) return;
+      }
       if (payload.state === "ready") {
         var destination = this.originalDestination;
         var location = this.locationRef;
@@ -557,6 +585,61 @@
     }
   };
 
+  MigrationController.prototype._renderRecovery = function renderRecovery(snapshot, visible, message) {
+    this.recovery = snapshot;
+    var accepted = snapshot && snapshot.generation === this.submittedGeneration;
+    var text = message || "DSM Container Manager의 컨테이너 로그를 확인하세요.";
+    if (!message && snapshot) {
+      if (accepted) text = "재시동 요청을 접수했습니다.";
+      else if (snapshot.reason === "exhausted") text = "재시도 한도에 도달했습니다. DSM에서 컨테이너 로그를 확인하세요.";
+      else if (snapshot.reason === "cooldown") text = String(snapshot.retry_after_seconds) + "초 후 다시 시도할 수 있습니다. 남은 재시도 " + String(snapshot.remaining_attempts) + "회";
+      else if (snapshot.available) text = "남은 재시도 " + String(snapshot.remaining_attempts) + "회";
+    }
+    this.adapter.renderRecovery({visible: visible, enabled: !!(snapshot && snapshot.available && !this.restarting && !accepted), message: text});
+  };
+
+  MigrationController.prototype._loadRecovery = async function loadRecovery(sequence) {
+    try {
+      var response = await this.fetchFn("/migration/recovery", {
+        cache: "no-store", credentials: "same-origin", headers: {Accept: "application/json"},
+      });
+      if (!response || !response.ok) throw new Error("recovery http");
+      var snapshot = validateRecovery(await response.json());
+      if (this.stopped || sequence !== this.sequence || !this.lastStatus || this.lastStatus.state !== "failed") return;
+      this._renderRecovery(snapshot, true);
+    } catch (error) {
+      if (!this.stopped && sequence === this.sequence) this._renderRecovery(null, true);
+    }
+  };
+
+  MigrationController.prototype.restart = async function restart() {
+    var snapshot = this.recovery;
+    if (this.stopped || this.restarting || !snapshot || !snapshot.available
+        || snapshot.generation === this.submittedGeneration
+        || !this.lastStatus || this.lastStatus.state !== "failed") return;
+    this.restarting = true;
+    var sequence = this.sequence;
+    this._renderRecovery(null, true, "재시동 요청을 보내고 있습니다.");
+    try {
+      var response = await this.fetchFn("/migration/restart", {
+        method: "POST", cache: "no-store", credentials: "same-origin",
+        headers: {"X-SVRX-Recovery-Token": snapshot.token, "X-SVRX-Recovery-Generation": snapshot.generation},
+      });
+      if (response && response.status === 202) {
+        this.submittedGeneration = snapshot.generation;
+        if (!this.stopped && sequence === this.sequence && this.lastStatus.state === "failed") {
+          this._renderRecovery(null, true, "재시동 요청을 접수했습니다.");
+        }
+        return;
+      }
+    } catch (error) {
+      // 응답 유실은 접수 여부가 불명확하므로 POST를 재전송하지 않는다.
+    } finally {
+      this.restarting = false;
+    }
+    if (!this.stopped && sequence === this.sequence) await this.refreshNow();
+  };
+
   function requiredElement(documentRef, id) {
     var element = documentRef.getElementById(id);
     if (!element) {
@@ -575,16 +658,24 @@
       "notice-text", "error-panel", "error-title", "operator-hint",
       "error-class", "error-code", "refresh-button", "copy-error-button",
       "copy-diagnostics-button", "open-button", "copy-result", "live-status",
+      "recovery-panel", "restart-button", "recovery-status",
     ].forEach(function loadElement(id) {
       elements[id] = requiredElement(documentRef, id);
     });
     elements["error-panel"].hidden = true;
     elements["open-button"].hidden = true;
+    elements["recovery-panel"].hidden = true;
+    elements["restart-button"].disabled = true;
 
     var previousLiveSignature = null;
     var openDestination = "/";
     return {
       elements: elements,
+      renderRecovery: function renderRecovery(view) {
+        elements["recovery-panel"].hidden = !view.visible;
+        elements["restart-button"].disabled = !view.enabled;
+        elements["recovery-status"].textContent = view.message;
+      },
       renderStatus: function renderStatus(payload, now) {
         var view = deriveViewModel(payload, now);
         elements["page-title"].textContent = view.title;
@@ -641,6 +732,7 @@
         elements["copy-result"].textContent = message;
       },
       bindActions: function bindActions(actions) {
+        elements["restart-button"].addEventListener("click", actions.restart);
         elements["refresh-button"].addEventListener("click", actions.refresh);
         elements["copy-error-button"].addEventListener("click", actions.copyError);
         elements["copy-diagnostics-button"].addEventListener("click", actions.copyDiagnostics);
@@ -678,6 +770,7 @@
     }
 
     adapter.bindActions({
+      restart: function restart() { controller.restart(); },
       refresh: function refresh() {
         controller.refreshNow();
       },

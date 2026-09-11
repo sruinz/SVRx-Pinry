@@ -93,10 +93,133 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
+function recovery(overrides = {}) {
+  return { schema_version: 1, available: true, reason: "available",
+    remaining_attempts: 3, retry_after_seconds: 0,
+    generation: "generation", token: "token", ...overrides };
+}
+
+const failedStatus = () => status({state: "failed", error_class: "retryable", error_code: "gunicorn_start_failed"});
+
+test("실패만 조회하고 연속 클릭과 응답 유실에도 POST 하나만 보낸다", async () => {
+  const calls = [];
+  const post = deferred();
+  let payload = status();
+  const h = controllerHarness((url, options) => {
+    calls.push({url, options});
+    if (url === "/migration/restart") return post.promise;
+    return Promise.resolve(response(url === "/migration/recovery" ? recovery() : payload));
+  });
+  await h.controller.pollNow();
+  assert.deepEqual(calls.map(call => call.url), ["/migration-status.json"]);
+  payload = failedStatus();
+  await h.controller.pollNow();
+  assert.equal(h.recoveryViews.at(-1).enabled, true);
+  const first = h.controller.restart();
+  assert.equal(h.recoveryViews.at(-1).enabled, false);
+  await h.controller.restart();
+  const restartPosts = calls.filter(call => call.url === "/migration/restart");
+  assert.equal(restartPosts.length, 1);
+  assert.equal(restartPosts[0].options.method, "POST");
+  assert.equal(restartPosts[0].options.body, undefined);
+  assert.deepEqual(restartPosts[0].options.headers, {
+    "X-SVRX-Recovery-Token": "token", "X-SVRX-Recovery-Generation": "generation",
+  });
+  post.reject(new Error("응답 유실"));
+  await first;
+  assert.ok(calls.filter(call => call.url === "/migration/recovery").length >= 2);
+  assert.equal(calls.filter(call => call.url === "/migration/restart").length, 1);
+});
+
+test("쿨다운·소진·잘못된 응답은 비활성이고 접수 뒤 자동 재전송하지 않는다", async () => {
+  let snapshot = recovery({available: false, reason: "cooldown", retry_after_seconds: 12});
+  const calls = [];
+  const h = controllerHarness(async (url, options) => {
+    calls.push({url, options});
+    if (url === "/migration/restart") return response(recovery({available: false, reason: "accepted", token: null}), {status: 202});
+    return response(url === "/migration/recovery" ? snapshot : failedStatus());
+  });
+  await h.controller.pollNow();
+  assert.equal(h.recoveryViews.at(-1).enabled, false);
+  assert.match(h.recoveryViews.at(-1).message, /12초/);
+  snapshot = recovery({available: false, reason: "exhausted", remaining_attempts: 0, token: null});
+  await h.controller.pollNow();
+  assert.equal(h.recoveryViews.at(-1).message, "재시도 한도에 도달했습니다. DSM에서 컨테이너 로그를 확인하세요.");
+  snapshot = {available: true};
+  await h.controller.pollNow();
+  await h.controller.restart();
+  assert.equal(h.recoveryViews.at(-1).enabled, false);
+  snapshot = recovery();
+  await h.controller.pollNow();
+  await h.controller.restart();
+  assert.equal(h.recoveryViews.at(-1).message, "재시동 요청을 접수했습니다.");
+  await h.controller.pollNow();
+  await h.controller.restart();
+  assert.equal(calls.filter(call => call.url === "/migration/restart").length, 1);
+});
+
+test("늦은 제어 조회는 ready 뒤 버튼을 되살리지 않는다", async () => {
+  const pending = deferred();
+  let payload = failedStatus();
+  const h = controllerHarness(url => url === "/migration/recovery" ? pending.promise : Promise.resolve(response(payload)));
+  const older = h.controller.pollNow();
+  await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+  payload = status({state: "ready", phase: "complete", phase_percent: 100, overall_percent: 100});
+  await h.controller.pollNow();
+  pending.resolve(response(recovery()));
+  await older;
+  assert.equal(h.recoveryViews.at(-1).enabled, false);
+  assert.equal(h.recoveryViews.at(-1).visible, false);
+  assert.deepEqual(h.location.replacements, ["/pins/42?x=1#y"]);
+});
+
+test("진행·정상·상태 불명은 제어 조회 없이 버튼을 숨기고 잘못된 자격은 거부한다", async () => {
+  const calls = [];
+  let payload = failedStatus();
+  let snapshot = recovery();
+  const h = controllerHarness(async url => {
+    calls.push(url);
+    return response(url === "/migration/recovery" ? snapshot : payload);
+  });
+  for (const invalid of [recovery({token: null}), recovery({remaining_attempts: -1}),
+    recovery({retry_after_seconds: 2}), {...recovery(), private: true}]) {
+    snapshot = invalid;
+    await h.controller.pollNow();
+    assert.equal(h.recoveryViews.at(-1).enabled, false);
+  }
+  snapshot = recovery();
+  await h.controller.pollNow();
+  assert.equal(h.recoveryViews.at(-1).enabled, true);
+  for (const next of [null, schemaOnlyStatus(), status(), status({state: "starting_service"}),
+    status({state: "ready", phase: "complete", phase_percent: 100, overall_percent: 100})]) {
+    const count = calls.filter(url => url === "/migration/recovery").length;
+    payload = next;
+    await h.controller.pollNow();
+    assert.equal(calls.filter(url => url === "/migration/recovery").length, count);
+    assert.equal(h.recoveryViews.at(-1).visible, false);
+    assert.equal(h.recoveryViews.at(-1).enabled, false);
+  }
+});
+
+test("재시동 버튼은 기본 비활성이며 키보드 동작과 설명·진단 분리를 유지한다", () => {
+  const documentRef = fakeDocument();
+  const adapter = ui.createDomAdapter(documentRef);
+  let clicks = 0;
+  adapter.bindActions({restart() { clicks += 1; }});
+  assert.equal(documentRef.nodes["restart-button"].disabled, true);
+  adapter.renderRecovery({visible: true, enabled: true, message: "남은 재시도 3회"});
+  documentRef.nodes["restart-button"].listeners.click();
+  assert.equal(clicks, 1);
+  assert.match(html, /id="restart-button"[^>]+type="button"[^>]+disabled[^>]+aria-describedby="recovery-hint recovery-status"/);
+  assert.match(html, /Pinry 시작 절차를 다시 시도합니다\. NAS는 재부팅하지 않습니다\./);
+  assert.equal("token" in ui.publicDiagnosticProjection({...status(), token: "secret"}), false);
+});
+
 
 function controllerHarness(fetchFn, overrides = {}) {
   const renders = [];
   const staticErrors = [];
+  const recoveryViews = [];
   const openDestinations = [];
   const scheduled = [];
   const location = {
@@ -120,6 +243,7 @@ function controllerHarness(fetchFn, overrides = {}) {
     },
   };
   const adapter = {
+    renderRecovery(view) { recoveryViews.push(view); },
     renderStatus(payload, now) {
       renders.push({ payload, now });
     },
@@ -153,6 +277,7 @@ function controllerHarness(fetchFn, overrides = {}) {
     renders,
     scheduled,
     staticErrors,
+    recoveryViews,
   };
 }
 
@@ -166,6 +291,7 @@ function fakeDocument() {
     "notice-text", "error-panel", "error-title", "operator-hint",
     "error-class", "error-code", "refresh-button", "copy-error-button",
     "copy-diagnostics-button", "open-button", "copy-result", "live-status",
+    "recovery-panel", "restart-button", "recovery-status",
   ];
   const nodes = Object.fromEntries(ids.map((id) => [id, {
     id,
@@ -283,7 +409,7 @@ test("한국어 fallback과 접근 가능한 진행률·키보드 동작 순서�
   const positions = actionLabels.map((label) => html.indexOf(label));
   assert.ok(positions.every((position) => position >= 0));
   assert.deepEqual(positions, positions.slice().sort((a, b) => a - b));
-  assert.equal((html.match(/<button\b/g) || []).length, 4);
+  assert.equal((html.match(/<button\b/g) || []).length, 5);
   assert.doesNotMatch(html, /<script(?![^>]+src=)[^>]*>/);
   assert.doesNotMatch(html, /<style\b/);
 });

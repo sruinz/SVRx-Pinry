@@ -683,20 +683,34 @@ class ProcessGroupIntegrationTests(unittest.TestCase):
             "lambda signum, frame: sys.exit(0))\n"
             "    while True:\n"
             "        time.sleep(0.05)\n"
-            "with open(sys.argv[1], 'w') as target:\n"
+            "temporary = sys.argv[1] + '.tmp'\n"
+            "with open(temporary, 'w') as target:\n"
             "    json.dump({'master': os.getpid(), 'child': child, "
             "'pgid': os.getpgrp(), 'session': os.getsid(0)}, target)\n"
+            "os.replace(temporary, sys.argv[1])\n"
             "time.sleep(0.2)\n"
         )
         process = subprocess.Popen(
             [sys.executable, "-c", script, str(info_path)],
             start_new_session=True,
         )
-        deadline = time.monotonic() + 3
-        while not info_path.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        self.assertTrue(info_path.exists())
-        info = json.loads(info_path.read_text("utf-8"))
+        try:
+            deadline = time.monotonic() + 3
+            while not info_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(info_path.exists())
+            info = json.loads(info_path.read_text("utf-8"))
+        except BaseException:
+            if process.pid != os.getpgrp():
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
         child_pid = info["child"]
 
         def child_alive():
@@ -759,6 +773,114 @@ class ProcessGroupIntegrationTests(unittest.TestCase):
                 try:
                     os.killpg(info["pgid"], signal.SIGKILL)
                 except OSError:
+                    pass
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and os.path.isdir("/proc"),
+        "Linux /proc is required",
+    )
+    def test_complete_waits_for_real_process_group_to_exit_without_signal(self):
+        supervisor_module = _load_script("supervisor")
+        progress_reader, progress_writer = os.pipe()
+        gate_reader, gate_writer = os.pipe()
+        script = (
+            "import os, sys, time\n"
+            "progress = int(sys.argv[1])\n"
+            "gate = int(sys.argv[2])\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    os.close(progress)\n"
+            "    os.read(gate, 1)\n"
+            "    os.close(gate)\n"
+            "    time.sleep(1.5)\n"
+            "    os._exit(0)\n"
+            "os.read(gate, 1)\n"
+            "os.close(gate)\n"
+            "os.write(progress, b'{\"phase\":\"complete\"}\\n')\n"
+            "os.close(progress)\n"
+        )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(progress_writer),
+                str(gate_reader),
+            ],
+            close_fds=True,
+            pass_fds=(progress_writer, gate_reader),
+            start_new_session=True,
+        )
+        runtime = None
+        worker = None
+        signals = []
+        try:
+            os.close(progress_writer)
+            progress_writer = -1
+            os.close(gate_reader)
+            gate_reader = -1
+            identity = supervisor_module._read_proc_identity(process.pid)
+
+            def signal_group(pgid, signum):
+                signals.append((pgid, signum))
+                os.killpg(pgid, signum)
+
+            status = _FakeStatusStore([], supervisor_module.StatusError)
+            runtime = supervisor_module.RuntimeSupervisor(
+                [],
+                "/data",
+                33,
+                33,
+                status,
+                group_signaler=signal_group,
+            )
+            worker = supervisor_module._ChildRecord(
+                "migration", process, identity
+            )
+            nginx = supervisor_module._ChildRecord(
+                "nginx", _FakeProcess("nginx", 4990), None
+            )
+            runtime.worker = worker
+            runtime.nginx = nginx
+            runtime.children["migration"] = worker
+            runtime.progress_reader = progress_reader
+            os.close(gate_writer)
+            gate_writer = -1
+            started_at = time.monotonic()
+
+            self.assertEqual(runtime._drive_worker_and_heartbeat(), 0)
+            self.assertEqual(process.poll(), 0)
+            self.assertGreaterEqual(time.monotonic() - started_at, 1.3)
+            self.assertNotIn("migration", runtime.children)
+            self.assertEqual(signals, [])
+        finally:
+            for descriptor in (progress_writer, gate_reader, gate_writer):
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+            if (
+                runtime is None
+                or runtime.progress_reader is not None
+            ):
+                try:
+                    os.close(progress_reader)
+                except OSError:
+                    pass
+            record_remains = (
+                runtime is not None
+                and worker is not None
+                and runtime._record_is_registered(worker)
+            )
+            if process.poll() is None or record_remains:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
                     pass
 
 
@@ -858,6 +980,87 @@ class _FakeProcess(object):
         self.kill_called = True
         self.running = False
         self.returncode = -signal.SIGKILL
+
+
+class _TimedProcess(object):
+    def __init__(
+        self,
+        role,
+        pid,
+        now,
+        exit_at,
+        returncode=0,
+        wait_observer=None,
+        terminate_works=True,
+        kill_works=True,
+    ):
+        self.role = role
+        self.pid = pid
+        self.now = now
+        self.exit_at = exit_at
+        self.returncode = returncode
+        self.wait_observer = wait_observer
+        self.terminate_works = terminate_works
+        self.kill_works = kill_works
+        self.running = True
+        self.wait_timeouts = []
+        self.terminate_called = False
+        self.kill_called = False
+
+    def poll(self):
+        if self.running and self.now[0] >= self.exit_at:
+            self.running = False
+        if self.running:
+            return None
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        result = self.poll()
+        if result is not None:
+            return result
+        if timeout is None:
+            self.now[0] = self.exit_at
+        else:
+            self.now[0] += min(timeout, self.exit_at - self.now[0])
+        if self.wait_observer is not None:
+            self.wait_observer()
+        result = self.poll()
+        if result is None:
+            raise subprocess.TimeoutExpired(self.role, timeout)
+        return result
+
+    def terminate(self):
+        self.terminate_called = True
+        if self.terminate_works:
+            self.running = False
+            self.returncode = -signal.SIGTERM
+
+    def kill(self):
+        self.kill_called = True
+        if self.kill_works:
+            self.running = False
+            self.returncode = -signal.SIGKILL
+
+
+class _RecordingProcess(object):
+    def __init__(self, process):
+        self.process = process
+        self.pid = process.pid
+        self.wait_timeouts = []
+
+    def poll(self):
+        return self.process.poll()
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        return self.process.wait(timeout=timeout)
+
+    def terminate(self):
+        return self.process.terminate()
+
+    def kill(self):
+        return self.process.kill()
 
 
 class _FakeProcesses(object):
@@ -1094,6 +1297,43 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         if not predicate():
             raise AssertionError("condition did not become true")
 
+    def _drive_after_eof(
+        self,
+        process,
+        payload=b'{"phase":"complete"}\n',
+        clock=time.monotonic,
+        sleeper=time.sleep,
+        identity=None,
+        group_reader=lambda pgid: {},
+        group_signaler=lambda pgid, signum: None,
+    ):
+        reader, writer = os.pipe()
+        os.write(writer, payload)
+        os.close(writer)
+        supervisor = self.supervisor_module.RuntimeSupervisor(
+            [],
+            "/data",
+            33,
+            33,
+            self.status,
+            clock=clock,
+            group_reader=group_reader,
+            group_signaler=group_signaler,
+            sleeper=sleeper,
+        )
+        worker = self.supervisor_module._ChildRecord(
+            "migration", process, identity
+        )
+        nginx = self.supervisor_module._ChildRecord(
+            "nginx", _FakeProcess("nginx", 4900), None
+        )
+        supervisor.worker = worker
+        supervisor.nginx = nginx
+        supervisor.children["migration"] = worker
+        supervisor.children["nginx"] = nginx
+        supervisor.progress_reader = reader
+        return supervisor
+
     def test_gate_nginx_status_lock_and_worker_start_in_exact_order(self):
         supervisor, processes = self._supervisor(
             b'{"error_code":"legacy_startup_failed","phase":"error"}\n',
@@ -1217,7 +1457,7 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         thread = threading.Thread(target=lambda: result.append(supervisor.run()))
         thread.start()
         try:
-            self._wait_until(lambda: bool(processes.export_processes))
+            self._wait_until(lambda: supervisor.export_worker is not None)
 
             ordered_events = (
                 "migration_started",
@@ -1626,25 +1866,296 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         thread.join(2)
         self.assertEqual(result, [0])
 
-    def test_worker_eof_never_blocks_on_a_still_live_process(self):
-        supervisor, processes = self._supervisor(
-            b'{"phase":"complete"}\n',
-            0,
-            worker_running=True,
-            block_worker_wait=True,
+    def test_complete_eof_waits_for_real_worker_exit_before_success(self):
+        reader, writer = os.pipe()
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os, sys, time\n"
+                    "descriptor = int(sys.argv[1])\n"
+                    "os.write(descriptor, "
+                    "b'{\"phase\":\"complete\"}\\n')\n"
+                    "os.close(descriptor)\n"
+                    "time.sleep(1.5)\n"
+                ),
+                str(writer),
+            ],
+            close_fds=True,
+            pass_fds=(writer,),
+            start_new_session=True,
         )
+        process = _RecordingProcess(child)
+        os.close(writer)
+        supervisor, processes = self._supervisor(b"", 0)
+        worker = self.supervisor_module._ChildRecord(
+            "migration", process, None
+        )
+
+        def spawn_real_worker(lock_fd):
+            del lock_fd
+            supervisor.children["migration"] = worker
+            return worker, reader
+
+        supervisor._spawn_worker = spawn_real_worker
         result = []
         thread = threading.Thread(target=lambda: result.append(supervisor.run()))
         thread.start()
-        self._wait_until(lambda: bool(self.status.failed_codes))
+        try:
+            self._wait_until(
+                lambda: "worker_event:complete" in self.events
+            )
+            self.assertIsNone(process.poll())
+            self.assertNotIn("gunicorn", processes.processes)
 
-        self.assertEqual(self.status.failed_codes[-1], "worker_protocol_invalid")
-        self.assertIn(("migration", signal.SIGTERM), processes.signal_order)
-        self.assertTrue(processes.processes["migration"].wait_called)
-        supervisor.handle_signal(signal.SIGTERM, None)
-        thread.join(2)
+            self._wait_until(lambda: "gunicorn_started" in self.events)
+            self.assertEqual(process.poll(), 0)
+            self.assertLess(
+                self.events.index("worker_event:complete"),
+                self.events.index("gunicorn_started"),
+            )
+            self.assertTrue(process.wait_timeouts)
+            self.assertTrue(all(
+                timeout is not None and 0 <= timeout <= 1.0
+                for timeout in process.wait_timeouts
+            ))
+        finally:
+            supervisor.handle_signal(signal.SIGTERM, None)
+            thread.join(2)
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, [0])
+
+    def test_worker_exit_at_exact_deadline_is_success(self):
+        now = [0.0]
+        sleeps = []
+        process = _TimedProcess("migration", 4910, now, 15.0)
+        supervisor = self._drive_after_eof(
+            process,
+            clock=lambda: now[0],
+            sleeper=lambda seconds: (
+                sleeps.append(seconds),
+                now.__setitem__(0, now[0] + seconds),
+            ),
+        )
+
+        self.assertEqual(supervisor._drive_worker_and_heartbeat(), 0)
+
+        self.assertEqual(now[0], 15.0)
+        self.assertEqual(process.wait_timeouts, [1.0] * 15)
+        self.assertEqual(sleeps, [])
+        self.assertNotIn("migration", supervisor.children)
+
+    def test_complete_worker_exit_after_deadline_is_retryable_timeout(self):
+        now = [0.0]
+        process = _TimedProcess("migration", 4920, now, 15.1)
+        supervisor = self._drive_after_eof(
+            process,
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+
+        self.assertEqual(supervisor._drive_worker_and_heartbeat(), 1)
+
+        self.assertEqual(supervisor.last_worker_error, "worker_exit_timeout")
+        self.assertTrue(supervisor._worker_eof)
+        self.assertTrue(supervisor._worker_exit_timed_out)
+        self.assertFalse(supervisor._worker_succeeded)
+        self.assertTrue(process.terminate_called)
+        self.assertNotIn("migration", supervisor.children)
+        self.assertEqual(process.wait_timeouts[:15], [1.0] * 15)
+        self.assertIn(0, process.wait_timeouts[15:])
+        self.assertGreaterEqual(self.status.publish_count, 15)
+        self.assertGreaterEqual(self.status.heartbeat_count, 3)
+
+    def test_error_worker_exit_timeout_preserves_terminal_error(self):
+        now = [0.0]
+        process = _TimedProcess(
+            "migration", 4930, now, 15.1, returncode=1
+        )
+        supervisor = self._drive_after_eof(
+            process,
+            payload=(
+                b'{"error_code":"bootstrap_failed","phase":"error"}\n'
+            ),
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+
+        self.assertEqual(supervisor._drive_worker_and_heartbeat(), 1)
+
+        self.assertEqual(supervisor.last_worker_error, "bootstrap_failed")
+        self.assertFalse(supervisor._worker_exit_timed_out)
+        self.assertTrue(process.terminate_called)
+        self.assertNotIn("migration", supervisor.children)
+
+    def test_worker_exit_timeout_cleanup_failure_is_fail_closed(self):
+        now = [0.0]
+        process = _TimedProcess(
+            "migration",
+            4940,
+            now,
+            60.0,
+            terminate_works=False,
+            kill_works=False,
+        )
+        supervisor = self._drive_after_eof(
+            process,
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        try:
+            self.assertEqual(supervisor._drive_worker_and_heartbeat(), 1)
+
+            self.assertEqual(
+                supervisor.last_worker_error, "runtime_supervisor_failed"
+            )
+            self.assertTrue(process.terminate_called)
+            self.assertTrue(process.kill_called)
+            self.assertIn("migration", supervisor.children)
+            self.assertEqual(now[0], 30.0)
+        finally:
+            process.kill_works = True
+            process.kill()
+            supervisor._reap_record(supervisor.worker, timeout=0)
+
+    def test_master_exit_waits_in_bounded_slices_for_group_removal(self):
+        now = [0.0]
+        sleeps = []
+        signals = []
+        process = _TimedProcess("migration", 4950, now, 0.0)
+        identity = {
+            "pid": 4950,
+            "pgid": 4950,
+            "session": 4950,
+            "starttime": "100",
+            "state": "S",
+        }
+
+        def read_group(pgid):
+            self.assertEqual(pgid, 4950)
+            if now[0] >= 2.0:
+                return {}
+            return {4951: {
+                "pid": 4951,
+                "pgid": 4950,
+                "session": 4950,
+                "starttime": "101",
+                "state": "S",
+            }}
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        supervisor = self._drive_after_eof(
+            process,
+            clock=lambda: now[0],
+            sleeper=sleep,
+            identity=identity,
+            group_reader=read_group,
+            group_signaler=lambda pgid, signum: signals.append(
+                (pgid, signum)
+            ),
+        )
+
+        self.assertEqual(supervisor._drive_worker_and_heartbeat(), 0)
+
+        self.assertEqual(sleeps, [1.0, 1.0])
+        self.assertEqual(signals, [])
+        self.assertNotIn("migration", supervisor.children)
+
+    def test_shutdown_is_observed_between_worker_exit_wait_slices(self):
+        now = [0.0]
+        holder = {}
+        process = _TimedProcess(
+            "migration",
+            4960,
+            now,
+            30.0,
+            wait_observer=lambda: holder["supervisor"].handle_signal(
+                signal.SIGTERM, None
+            ),
+        )
+        supervisor = self._drive_after_eof(
+            process,
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        holder["supervisor"] = supervisor
+        try:
+            self.assertEqual(
+                supervisor._drive_worker_and_heartbeat(),
+                self.supervisor_module._WORKER_SHUTDOWN,
+            )
+            self.assertEqual(process.wait_timeouts, [1.0])
+        finally:
+            process.terminate()
+            supervisor._reap_record(supervisor.worker, timeout=0)
+
+    def test_nginx_exit_is_observed_between_worker_exit_wait_slices(self):
+        now = [0.0]
+        holder = {}
+
+        def stop_nginx():
+            nginx = holder["supervisor"].nginx.process
+            nginx.running = False
+            nginx.returncode = 1
+
+        process = _TimedProcess(
+            "migration", 4970, now, 30.0, wait_observer=stop_nginx
+        )
+        supervisor = self._drive_after_eof(
+            process,
+            clock=lambda: now[0],
+            sleeper=lambda seconds: now.__setitem__(0, now[0] + seconds),
+        )
+        holder["supervisor"] = supervisor
+
+        self.assertEqual(
+            supervisor._drive_worker_and_heartbeat(),
+            self.supervisor_module._NGINX_EXITED,
+        )
+
+        self.assertEqual(process.wait_timeouts[0], 1.0)
+        self.assertTrue(all(
+            timeout is not None and 0 <= timeout <= 1.0
+            for timeout in process.wait_timeouts
+        ))
+        self.assertTrue(process.terminate_called)
+        self.assertNotIn("migration", supervisor.children)
+
+    def test_worker_eof_never_blocks_on_a_still_live_process(self):
+        now = [0.0]
+
+        def clock():
+            value = now[0]
+            now[0] += 1.0
+            return value
+
+        process = _FakeProcess(
+            "migration",
+            4980,
+            running=True,
+            block_wait_while_running=True,
+        )
+        supervisor = self._drive_after_eof(
+            process,
+            clock=clock,
+            sleeper=lambda seconds: now.__setitem__(
+                0, now[0] + seconds
+            ),
+        )
+
+        self.assertEqual(supervisor._drive_worker_and_heartbeat(), 1)
+
+        self.assertEqual(supervisor.last_worker_error, "worker_exit_timeout")
+        self.assertTrue(process.wait_called)
+        self.assertTrue(process.kill_called)
+        self.assertNotIn("migration", supervisor.children)
 
     def test_protocol_error_terminates_and_reaps_live_worker_group(self):
         supervisor, processes = self._supervisor(

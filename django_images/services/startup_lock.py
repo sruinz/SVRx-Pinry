@@ -1,6 +1,7 @@
 import errno
 import os
 import stat
+import sys
 
 from django_images import file_ops
 
@@ -84,6 +85,18 @@ class StartupLock(object):
                 pass
             raise
 
+    def verify_held(self):
+        try:
+            descriptor = self.fileno()
+            _verify_fd_lock(descriptor)
+            _verify_held_startup_lock(
+                self._data_root, descriptor, self._lock_stat,
+                self._owner_uid, self._owner_gid,
+            )
+            _verify_fd_lock(descriptor)
+        except (OSError, ValueError) as error:
+            raise StartupLockError("startup_lock_failed") from error
+
     def close(self):
         first_error = None
         if self._lock_descriptor is not None:
@@ -103,6 +116,39 @@ class StartupLock(object):
                     first_error = error
         if first_error is not None:
             raise first_error
+
+
+def _verify_fd_lock(descriptor):
+    # 같은 파일의 다른 open description이나 해제된 FD는 증거가 없다.
+    if not sys.platform.startswith("linux"):
+        raise StartupLockError("startup_lock_failed")
+    try:
+        info = os.fstat(descriptor)
+        path = "/proc/self/fdinfo/{}".format(descriptor)
+        with open(path, "r", encoding="ascii") as source:
+            payload = source.read(16385)
+        locks = [
+            line.split() for line in payload.splitlines()
+            if line.startswith("lock:")
+        ]
+        if len(payload) > 16384 or len(locks) != 1:
+            raise ValueError("잠금 증거 누락")
+        fields = locks[0]
+        if (
+            len(fields) != 9 or not fields[1].endswith(":")
+            or not fields[1][:-1].isdigit()
+            or fields[2:5] != ["FLOCK", "ADVISORY", "WRITE"]
+            or int(fields[5]) != os.getpid()
+            or fields[7:] != ["0", "EOF"]
+        ):
+            raise ValueError("잠금 증거 불일치")
+        major, minor, inode = fields[6].split(":")
+        if (int(major, 16), int(minor, 16), int(inode)) != (
+            os.major(info.st_dev), os.minor(info.st_dev), info.st_ino,
+        ):
+            raise ValueError("잠금 파일 불일치")
+    except (OSError, UnicodeError, ValueError) as error:
+        raise StartupLockError("startup_lock_failed") from error
 
 
 def acquire_startup_lock(data_root, service_uid=None, service_gid=None):
