@@ -1800,7 +1800,12 @@ class SnapshotServiceTests(ExportStorageMixin, TransactionTestCase):
         self.assertEqual(delete_deadline.calls, 6)
         self.assertEqual(job.items.count(), 0)
         self.assertEqual(job.blobs.count(), 0)
-        self.assertLessEqual(len(delete_queries), 40)
+        # Django 4.2부터 수집되는 COMMIT 등 트랜잭션 제어문은 제외한다.
+        data_queries = [
+            query for query in delete_queries
+            if query["sql"].strip().upper() not in {"BEGIN", "COMMIT", "ROLLBACK"}
+        ]
+        self.assertLessEqual(len(data_queries), 39)
         batched_id_reads = [
             query["sql"]
             for query in delete_queries

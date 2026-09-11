@@ -61,8 +61,14 @@ def _nonnegative_check(fields):
 
 
 def _job_error_contract_check():
-    condition = Q(pk__isnull=True)
-    for code in JOB_ERROR_CODES:
+    first_code = JOB_ERROR_CODES[0]
+    error_class, retryable, _ = ERROR_CONTRACTS[first_code]
+    condition = Q(
+        error_code=first_code,
+        error_class=error_class,
+        error_retryable=retryable,
+    )
+    for code in JOB_ERROR_CODES[1:]:
         error_class, retryable, _ = ERROR_CONTRACTS[code]
         condition |= Q(
             error_code=code,
@@ -83,7 +89,7 @@ class ExportJob(models.Model):
     state = models.CharField(max_length=16, default="queued", db_index=True, choices=_choices(JOB_STATES))
     board_id_snapshot = models.PositiveIntegerField(null=True, blank=True)
     board_name_snapshot = models.CharField(max_length=128, null=True, blank=True)
-    board_private_snapshot = models.NullBooleanField(blank=True)
+    board_private_snapshot = models.BooleanField(null=True, blank=True)
     board_owner_username_snapshot = models.CharField(max_length=150, null=True, blank=True)
     requested_total = models.PositiveIntegerField(default=0)
     target_total = models.PositiveIntegerField(default=0)
@@ -130,7 +136,7 @@ class ExportJob(models.Model):
     resume_count = models.PositiveSmallIntegerField(default=0)
     error_code = models.CharField(max_length=64, null=True, blank=True, choices=_choices(ERROR_CONTRACTS))
     error_class = models.CharField(max_length=32, null=True, blank=True, choices=_choices(ERROR_CLASSES))
-    error_retryable = models.NullBooleanField(blank=True)
+    error_retryable = models.BooleanField(null=True, blank=True)
     ready_relative_path = models.CharField(max_length=512, null=True, blank=True)
     ready_display_name = models.CharField(max_length=255, null=True, blank=True)
     ready_size = _nonnegative(null=True)
@@ -423,8 +429,8 @@ class ExportAttemptFile(models.Model):
             models.CheckConstraint(check=(Q(receipt_level="open", receipt_size__isnull=True, receipt_mtime_ns__isnull=True, receipt_ctime_ns__isnull=True, receipt_sha256__isnull=True) | Q(receipt_level="full", receipt_size__isnull=False, receipt_mtime_ns__isnull=False, receipt_ctime_ns__isnull=False)), name="export_attempt_file_level_receipt"),
             models.CheckConstraint(check=~Q(state__in=("verifying", "publishing", "ready_candidate", "published")) | Q(receipt_level="full", receipt_sha256__isnull=False), name="export_attempt_file_verified_receipt_valid"),
             models.CheckConstraint(check=~Q(state="closed") | Q(receipt_level="full"), name="export_attempt_file_closed_receipt_valid"),
-            models.CheckConstraint(check=~(Q(kind="archive", state="publishing") | Q(kind="quarantine", state="writing")) | Q(intent_relative_path__isnull=False), name="export_attempt_file_intent_valid"),
-            models.CheckConstraint(check=~(Q(state__in=("ready_candidate", "published", "cleaned")) | Q(kind="quarantine", state="closed")) | Q(intent_relative_path__isnull=True), name="export_attempt_file_final_intent_valid"),
+            models.CheckConstraint(check=~Q(Q(kind="archive", state="publishing") | Q(kind="quarantine", state="writing")) | Q(intent_relative_path__isnull=False), name="export_attempt_file_intent_valid"),
+            models.CheckConstraint(check=~Q(Q(state__in=("ready_candidate", "published", "cleaned")) | Q(kind="quarantine", state="closed")) | Q(intent_relative_path__isnull=True), name="export_attempt_file_final_intent_valid"),
             models.CheckConstraint(check=~Q(kind="quarantine") | Q(state__in=("writing", "closed", "cleaned")), name="export_quarantine_state_valid"),
             models.CheckConstraint(check=_nullable_sha_check("receipt_sha256"), name="export_attempt_file_sha_valid"),
         )

@@ -804,7 +804,7 @@ class BulkPinWriteAPITests(
         )
         for mode, values, before, expected in cases:
             with self.subTest(mode=mode, values=values):
-                self.first.tags.set(*before)
+                self.first.tags.set(before)
                 response = self.client.post(
                     self._url(),
                     {

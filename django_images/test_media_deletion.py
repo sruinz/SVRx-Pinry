@@ -12,6 +12,7 @@ from django.apps import apps
 from django.core.management import CommandError, call_command
 from django.db import close_old_connections, connections, transaction
 from django.db.migrations.executor import MigrationExecutor
+from django.db.utils import ConnectionHandler
 from django.test import SimpleTestCase, TransactionTestCase
 
 from django_images import file_ops
@@ -1377,10 +1378,13 @@ class MediaDeletionDatabaseAliasTest(
     @classmethod
     def setUpClass(cls):
         cls.other_database = tempfile.TemporaryDirectory()
-        connections.databases["other"] = {
+        other_settings = {
             "ENGINE": "django.db.backends.sqlite3",
             "NAME": str(Path(cls.other_database.name, "other.sqlite3")),
         }
+        connections.databases["other"] = ConnectionHandler(
+            {"default": other_settings}
+        )["default"].settings_dict
         cls.databases = {"default", "other"}
         super(MediaDeletionDatabaseAliasTest, cls).setUpClass()
         other = connections["other"]

@@ -349,9 +349,9 @@ class PinSerializer(serializers.HyperlinkedModelSerializer):
 
     def _update_locked_pin(self, instance, validated_data, tags):
         if tags:
-            instance.tags.set(*tags)
+            instance.tags.set(tags)
         else:
-            instance.tags.set()
+            instance.tags.set([])
         # change for image-id or image is not allowed
         validated_data.pop('image_file', None)
         validated_data.pop('board_ids', None)

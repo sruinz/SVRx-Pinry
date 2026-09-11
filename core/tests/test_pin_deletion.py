@@ -1,6 +1,7 @@
 from io import StringIO
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 import queue
 import threading
 import traceback
@@ -1187,8 +1188,8 @@ class PinMediaLifecycleTest(
             "core.models.media_dedup_lock",
             return_value=stripe,
         ), mock.patch(
-            "core.models.time.monotonic",
-            side_effect=(0.0, 1.0, 12.0),
+            "core.models.time",
+            SimpleNamespace(monotonic=mock.Mock(side_effect=(0.0, 1.0, 12.0))),
         ):
             with self.assertRaisesRegex(
                 RuntimeError,

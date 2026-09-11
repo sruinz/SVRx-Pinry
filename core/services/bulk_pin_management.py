@@ -234,7 +234,7 @@ class BulkPinManagementService(object):
             elif mode == "remove":
                 pin.tags.remove(*values)
             else:
-                pin.tags.set(*values)
+                pin.tags.set(values)
 
     def _delete_if_exclusive_to_board(
         self,

@@ -163,7 +163,7 @@ class PinQuerySet(models.QuerySet):
         probe._for_write = True
         probe.query.select_for_update = False
         probe.query.select_related = False
-        probe.query.clear_ordering(force_empty=True)
+        probe = probe.order_by()
         probe = probe.using(database_alias)
         pin_ids = list(
             probe
@@ -263,7 +263,7 @@ class BatchImportItem(models.Model):
         on_delete=models.SET_NULL,
     )
     error_code = models.CharField(max_length=64, null=True, blank=True)
-    retryable = models.NullBooleanField()
+    retryable = models.BooleanField(null=True, blank=True)
     lease_uuid = models.UUIDField(null=True, blank=True)
     lease_generation = models.PositiveIntegerField(default=0)
     lease_expires_at = models.DateTimeField(null=True, blank=True)

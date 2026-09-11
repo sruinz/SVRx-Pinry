@@ -620,5 +620,5 @@ drf_router.register(r'tags-auto-complete', TagAutoCompleteViewSet)
 drf_router.register(
     r'boards-auto-complete',
     BoardAutoCompleteViewSet,
-    basename="board",
+    basename="board-auto-complete",
 )

@@ -128,16 +128,32 @@ class BoardPrivacyTests(TemporaryMediaMixin, APITestCase):
 
     def test_should_non_owner_and_anonymous_user_has_no_permission_to_list_private_board(self):
         resp = self.client.get(self.boards_url)
-        self.assertEqual(len(resp.json()), 0, resp.json())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['results'], [])
 
         self.client.login(username=self.non_owner.username, password='password')
         resp = self.client.get(self.boards_url)
-        self.assertEqual(len(resp.json()), 0, resp.content)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['results'], [])
 
     def test_should_owner_has_permission_to_list_private_board(self):
-        self.client.login(username=self.non_owner.username, password='password')
+        self.client.login(username=self.owner.username, password='password')
         resp = self.client.get(self.boards_url)
-        self.assertEqual(len(resp.json()), 0, resp.content)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            [board['id'] for board in resp.json()['results']],
+            [self.private_board.pk],
+        )
+
+    def test_private_board_autocomplete_is_visible_only_to_its_owner(self):
+        url = reverse('board-auto-complete-list')
+        for user in (None, self.non_owner, self.owner):
+            with self.subTest(user=user):
+                self.client.force_authenticate(user)
+                resp = self.client.get(url)
+                self.assertEqual(resp.status_code, 200)
+                expected = [self.private_board.pk] if user == self.owner else []
+                self.assertEqual([board['id'] for board in resp.json()], expected)
 
     def test_should_non_owner_and_anonymous_user_has_no_permission_to_view_private_board(self):
         resp = self.client.get(self.board_url)

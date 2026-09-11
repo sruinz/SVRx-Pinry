@@ -415,7 +415,7 @@ class BoardCoverPrivacyTransitionTests(TemporaryMediaMixin, APITestCase):
         self.assertIsNone(self.board.cover_pin_id)
 
     def test_pin_privacy_patch_preserves_scalar_and_tag_update_contract(self):
-        self.public_pin.tags.set("old")
+        self.public_pin.tags.set(["old"])
 
         response = self.client.patch(
             self.pin_url,

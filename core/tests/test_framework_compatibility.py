@@ -53,6 +53,13 @@ class UserURLCompatibilityTests(APITestCase):
         self.assertEqual(match.namespace, "users")
         self.assertEqual(match.url_name, "public-user-list")
 
+    def test_board_and_autocomplete_reverse_to_distinct_endpoints(self):
+        self.assertEqual(reverse("board-list"), "/api/v2/boards/")
+        self.assertEqual(
+            reverse("board-auto-complete-list"),
+            "/api/v2/boards-auto-complete/",
+        )
+
 
 class FilterCompatibilityTests(TemporaryMediaMixin, APITestCase):
     def setUp(self):
@@ -133,3 +140,20 @@ class PrimaryKeyCompatibilityTests(APITestCase):
         for model in (Board, Pin, AdminBootstrapState):
             with self.subTest(model=model.__name__):
                 self.assertIs(type(model._meta.pk), models.AutoField)
+
+
+class TagReplacementCompatibilityTests(TemporaryMediaMixin, APITestCase):
+    def test_pin_update_replaces_whole_tag_names_and_clears_with_empty_list(self):
+        owner = create_user("framework-tag-owner")
+        pin = Pin.objects.create(submitter=owner, image=create_image())
+        pin.tags.add("old")
+        self.client.force_authenticate(owner)
+        url = reverse("pin-detail", kwargs={"pk": pin.pk})
+
+        response = self.client.patch(url, {"tags": ["긴 태그", "second"]}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(pin.tags.names()), {"긴 태그", "second"})
+        response = self.client.patch(url, {"tags": []}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(pin.tags.exists())
