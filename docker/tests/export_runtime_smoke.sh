@@ -1109,6 +1109,12 @@ try:
     with open(server_config, "w", encoding="utf-8") as stream:
         stream.write(image_config)
     nginx_config = os.path.join(root, "nginx.conf")
+    # 이미지의 서버 설정이 참조하는 요청 제한 영역도 함께 사용한다.
+    with open("/etc/nginx/nginx.conf", encoding="utf-8") as stream:
+        rate_zones = "\n".join(
+            line.strip() for line in stream
+            if line.strip().startswith("limit_req_zone ")
+        )
     with open(nginx_config, "w", encoding="utf-8") as stream:
         stream.write("""user root;
 worker_processes 1;
@@ -1116,11 +1122,12 @@ pid {root}/nginx.pid;
 error_log stderr warn;
 events {{ worker_connections 64; }}
 http {{
+    {rate_zones}
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
     include {server_config};
 }}
-""".format(root=root, server_config=server_config))
+""".format(root=root, server_config=server_config, rate_zones=rate_zones))
     nginx = subprocess.Popen([
         nginx_binary,
         "-p", root + "/",
