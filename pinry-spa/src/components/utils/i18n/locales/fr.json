@@ -1,4 +1,11 @@
 {
+  "previewNavigation": "Navigation des épingles",
+  "previewPrevious": "Précédente",
+  "previewNext": "Suivante",
+  "previewPageError": "Impossible de charger les épingles. Sélectionnez Suivante pour réessayer.",
+  "previewImageError": "Impossible de charger cette image. Essayez le lien original ou une autre épingle.",
+  "previewImageLoading": "Chargement de l’image…",
+  "previewImage": "Image de l’épingle",
     "NewPinTitle": "Nouvelle fiche",
     "EditPinTitle": "Éditer la fiche",
     "BoardCreateTitle": "Créer un tableau",

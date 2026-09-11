@@ -1,44 +1,65 @@
 <template>
   <div class="pin-preview-modal">
     <section>
+        <nav v-if="navigation" class="preview-navigation" data-test="preview-navigation"
+             :aria-label="$t('previewNavigation')">
+          <button type="button" data-test="preview-previous" :disabled="busy || !hasPrevious"
+                  @click.stop="move(-1)" :aria-label="$t('previewPrevious')">
+            <span aria-hidden="true">‹</span> {{ $t('previewPrevious') }}
+          </button>
+          <span aria-live="polite" class="preview-position">
+            {{ currentIndex + 1 }} / {{ context.items.length }}{{ context.hasNext ? '+' : '' }}
+          </span>
+          <button type="button" data-test="preview-next" :disabled="busy || !hasNext"
+                  @click.stop="move(1)" :aria-label="$t('previewNext')">
+            {{ $t('previewNext') }} <span aria-hidden="true">›</span>
+          </button>
+        </nav>
+        <p v-if="pageError" role="status" class="preview-message">{{ $t('previewPageError') }}</p>
         <div class="card">
           <div class="card-image">
-            <figure class="image">
-              <img :src="pinItem.large_image_url" alt="Image">
+            <figure class="image" :aria-busy="!imageReady && !imageError ? 'true' : 'false'">
+              <p v-if="!imageReady" role="status" class="preview-message">
+                {{ $t(imageError ? 'previewImageError' : 'previewImageLoading') }}
+              </p>
+              <img :key="currentPin.id" ref="previewImage" data-test="preview-image"
+                   v-show="imageReady" :src="currentPin.large_image_url"
+                   :alt="currentPin.description || $t('previewImage')"
+                   @load="onImageLoaded" @error="onImageError">
             </figure>
           </div>
           <div class="card-content">
             <div class="content">
-                <p class="description title" v-html="niceLinks(pinItem.description)"></p>
+                <p class="description title" v-html="niceLinks(currentPin.description)"></p>
             </div>
             <div class="media">
               <div class="media-left">
                 <figure class="image is-48x48">
-                  <img :src="pinItem.avatar" alt="Image">
+                  <img :src="currentPin.avatar" alt="Image">
                 </figure>
               </div>
               <div class="media-content">
                 <div class="is-pulled-left">
-                  <p class="title is-4 pin-meta-info"><span class="dim">{{ $t("pinnedByTitle") }}</span><span class="author">{{ pinItem.author }}</span></p>
-                  <p class="subtitle is-6" v-show="pinItem.tags.length > 0">
+                  <p class="title is-4 pin-meta-info"><span class="dim">{{ $t("pinnedByTitle") }}</span><span class="author">{{ currentPin.author }}</span></p>
+                  <p class="subtitle is-6" v-show="currentPin.tags.length > 0">
                     <span class="subtitle dim">in&nbsp;</span>
-                    <template v-for="tag in pinItem.tags">
+                    <template v-for="tag in currentPin.tags">
                       <b-tag v-bind:key="tag" type="is-info" class="pin-preview-tag">{{ tag }}</b-tag>
                     </template>
                   </p>
                 </div>
                 <div class="is-pulled-right">
-                  <a :href="pinItem.referer" target="_blank">
+                  <a :href="currentPin.referer" target="_blank">
                     <b-button
-                        v-show="pinItem.referer !== null"
+                        v-show="currentPin.referer !== null"
                         class="meta-link"
                         type="is-warning">
                       {{ $t("sourceButton") }}
                     </b-button>
                   </a>
-                  <a :href="pinItem.original_image_url" target="_blank">
+                  <a :href="currentPin.original_image_url" target="_blank">
                     <b-button
-                        v-show="pinItem.original_image_url !== null"
+                        v-show="currentPin.original_image_url !== null"
                         class="meta-link"
                         type="is-link">
                         {{ $t("originalImageButton") }}
@@ -64,12 +85,97 @@ import niceLinks from './utils/niceLinks';
 
 export default {
   name: 'PinPreview',
-  props: ['pinItem'],
+  props: {
+    pinItem: { type: Object, required: true },
+    navigation: { type: Function, default: null },
+    loadNext: { type: Function, default: null },
+  },
+  data() {
+    return {
+      currentPin: this.pinItem,
+      busy: false,
+      pageError: false,
+      imageReady: false,
+      imageError: false,
+    };
+  },
+  computed: {
+    context() {
+      return this.navigation ? this.navigation() : { items: [this.currentPin], hasNext: false };
+    },
+    currentIndex() {
+      return this.context.items.findIndex(item => item.id === this.currentPin.id);
+    },
+    hasPrevious() {
+      return this.currentIndex > 0;
+    },
+    hasNext() {
+      return this.currentIndex >= 0 && (
+        this.currentIndex < this.context.items.length - 1 || this.context.hasNext
+      );
+    },
+  },
+  mounted() {
+    this.disposed = false;
+    document.addEventListener('keydown', this.onKeydown);
+    this.$parent.$on('close', this.deactivate);
+  },
+  beforeDestroy() {
+    this.deactivate();
+    this.$parent.$off('close', this.deactivate);
+  },
   methods: {
+    deactivate() {
+      this.disposed = true;
+      document.removeEventListener('keydown', this.onKeydown);
+    },
+    async move(direction) {
+      if (this.disposed || this.busy || !this.navigation
+          || (direction < 0 ? !this.hasPrevious : !this.hasNext)) return;
+      this.pageError = false;
+      const index = this.currentIndex + direction;
+      if (index >= this.context.items.length && this.loadNext) {
+        this.busy = true;
+        try {
+          const loaded = await this.loadNext();
+          if (loaded === false) this.pageError = true;
+        } catch (_error) {
+          this.pageError = true;
+        } finally {
+          this.busy = false;
+        }
+      }
+      if (this.disposed || this.pageError) return;
+      const item = this.context.items[index];
+      if (item) {
+        this.imageReady = false;
+        this.imageError = false;
+        this.currentPin = item;
+        // 상세 영역만 처음으로 이동하고 뒤쪽 목록의 스크롤은 유지한다.
+        this.$nextTick(() => {
+          const content = this.$el.closest('.modal-content');
+          if (content) content.scrollTop = 0;
+        });
+      }
+    },
+    onKeydown(event) {
+      const { target } = event;
+      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey
+          || (target && target.closest && target.closest('input, textarea, select, [contenteditable]'))) return;
+      if (!this.navigation || !['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+      event.preventDefault();
+      this.move(event.key === 'ArrowLeft' ? -1 : 1);
+    },
+    onImageLoaded(event) {
+      if (event.target === this.$refs.previewImage) this.imageReady = true;
+    },
+    onImageError(event) {
+      if (event.target === this.$refs.previewImage) this.imageError = true;
+    },
     closeAndGoTo() {
       this.$parent.close();
       this.$router.push(
-        { name: 'pin', params: { pinId: this.pinItem.id } },
+        { name: 'pin', params: { pinId: this.currentPin.id } },
       );
     },
     niceLinks,
@@ -80,6 +186,40 @@ export default {
 <style lang="scss" scoped>
 @import './utils/fonts.scss';
 
+.preview-navigation {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 8px;
+  background: #172126;
+  color: #fff;
+  button {
+    min-height: 44px;
+    min-width: 80px;
+    padding: 4px 12px;
+    border: 1px solid #6b828d;
+    border-radius: 6px;
+    background: #24353d;
+    color: #fff;
+    cursor: pointer;
+    font: inherit;
+    &:disabled { opacity: 0.45; cursor: default; }
+    &:focus-visible { outline: 3px solid #5ad2c7; outline-offset: 2px; }
+    span { font-size: 24px; vertical-align: middle; }
+  }
+}
+.preview-position { white-space: nowrap; }
+.preview-message {
+  padding: 20px 12px;
+  background: #172126;
+  color: #fff;
+  text-align: center;
+}
+.card-image .image { min-height: 80px; }
 .meta-link {
   margin-left: 0.3rem;
 }

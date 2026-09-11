@@ -532,6 +532,46 @@ describe('Pins sorting', () => {
     expect(wrapper.vm.status.loading).toBe(false);
   });
 
+  it('원본 GIF만 배지를 표시하며 썸네일과 출처 확장자는 판별에 쓰지 않는다', async () => {
+    const gif = pin(3);
+    gif.image.image = 'https://example.test/original.GIF?token=1';
+    const jpg = pin(2);
+    jpg.url = 'https://example.test/source.gif';
+    jpg.image.thumbnail.image = 'https://example.test/thumb.gif';
+    const wrapper = mountPins({ fetchPinsImplementation: () => page([gif, jpg]) });
+    await settle();
+    expect(wrapper.find('[data-test="pin-card-3"] .pin-gif-badge').text()).toBe('GIF');
+    expect(wrapper.find('[data-test="pin-card-2"] .pin-gif-badge').exists()).toBe(false);
+  });
+
+  it('상세보기는 같은 목록과 페이지 요청을 사용하고 목록 변경 때 닫힌다', async () => {
+    const pending = deferred();
+    const wrapper = mountPins({
+      pinFilters: { tagFilter: 'cats' },
+      fetchPinsImplementation: jest.fn()
+        .mockImplementation(() => page())
+        .mockImplementationOnce(() => page([pin(30)], '/next'))
+        .mockImplementationOnce(() => pending.promise),
+    });
+    await settle();
+    const close = jest.fn();
+    wrapper.vm.$buefy.modal.open.mockReturnValue({ close, $once: jest.fn() });
+    wrapper.vm.openPreview(wrapper.vm.blocks[0]);
+    const config = wrapper.vm.$buefy.modal.open.mock.calls[0][0];
+    expect(config.scroll).toBe('keep');
+    expect(config.props.navigation().items.map(item => item.id)).toEqual([30]);
+    const existingRequest = wrapper.vm.fetchMore();
+    const previewRequest = config.props.loadNext();
+    expect(API.fetchPins).toHaveBeenCalledTimes(2);
+    expect(API.fetchPins.mock.calls[1][1]).toBe('cats');
+    pending.resolve({ data: { results: [pin(29)], next: null } });
+    await Promise.all([existingRequest, previewRequest]);
+    expect(config.props.navigation().items.map(item => item.id)).toEqual([30, 29]);
+    expect(config.props.navigation().hasNext).toBe(false);
+    wrapper.vm.reset();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   it('hides controls for a single Pin lookup', async () => {
     const wrapper = mountPins({ pinFilters: { idFilter: 7 } });
     await settle();
@@ -539,5 +579,22 @@ describe('Pins sorting', () => {
     expect(wrapper.find('[data-test="pin-sort-latest"]').exists()).toBe(false);
     expect(API.fetchPins).not.toHaveBeenCalled();
     expect(API.fetchPin).toHaveBeenCalledWith(7);
+    wrapper.vm.openPreview(wrapper.vm.blocks[0]);
+    expect(wrapper.vm.$buefy.modal.open.mock.calls[0][0].props.navigation).toBeNull();
+  });
+
+  it('사용자가 닫은 모달을 다음 열기에서 다시 닫지 않는다', async () => {
+    const wrapper = mountPins();
+    await settle();
+    const close = jest.fn();
+    let onClose;
+    wrapper.vm.$buefy.modal.open.mockReturnValue({
+      close,
+      $once(event, callback) { if (event === 'close') onClose = callback; },
+    });
+    wrapper.vm.openPreview(wrapper.vm.blocks[0]);
+    onClose();
+    wrapper.vm.openPreview(wrapper.vm.blocks[1]);
+    expect(close).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,11 @@
 {
+  "previewNavigation": "Pin navigation",
+  "previewPrevious": "Previous",
+  "previewNext": "Next",
+  "previewPageError": "Could not load more pins. Select Next to retry.",
+  "previewImageError": "Could not load this image. Try the original image link or another pin.",
+  "previewImageLoading": "Loading image…",
+  "previewImage": "Pin image",
     "NewPinTitle": "New Pin",
     "EditPinTitle": "Edit Pin",
     "BoardCreateTitle": "Create Board",

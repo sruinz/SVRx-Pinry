@@ -191,7 +191,7 @@
                 @click="onPinCardClick(item, $event)"
                 @keydown="onPinCardKeydown(item, $event)"
               >
-                <div @mouseenter="showEditButtons(item.id)"
+                <div class="pin-image-container" @mouseenter="showEditButtons(item.id)"
                      @mouseleave="hideEditButtons(item.id)"
                 >
                   <EditorUI
@@ -216,6 +216,7 @@
                     class="pin-selection-check"
                     aria-hidden="true"
                   >✓</span>
+                  <span v-if="item.is_gif" class="pin-gif-badge">GIF</span>
                   <img :src="item.url"
                      @load="onPinImageLoaded(item.id)"
                      @click.stop="onPinImageClick(item, $event)"
@@ -346,6 +347,7 @@ function createImageItem(pin) {
   image.author = pin.submitter.username;
   image.avatar = `//gravatar.com/avatar/${pin.submitter.gravatar}`;
   image.large_image_url = pinHandler.escapeUrl(pin.image.image);
+  image.is_gif = /\.gif$/i.test(image.large_image_url);
   image.original_image_url = pin.url;
   image.referer = pin.referer;
   image.orgianl_width = pin.image.width;
@@ -418,6 +420,8 @@ export default {
     this.selectionRequestToken = 0;
     this.bulkOperationToken = 0;
     this.bulkModalHandle = null;
+    this.previewModalHandle = null;
+    this.pinPageRequest = null;
     this.isDestroyed = false;
     this.seedFactory = generateRandomSeed;
   },
@@ -1240,17 +1244,34 @@ export default {
       return blocks;
     },
     openPreview(pinItem) {
-      this.$buefy.modal.open(
+      this.closePreview();
+      this.previewModalHandle = this.$buefy.modal.open(
         {
           parent: this,
           component: PinPreview,
           props: {
             pinItem,
+            navigation: this.pinFilters.idFilter ? null : () => ({
+              items: this.blocks,
+              hasNext: this.status.hasNext,
+            }),
+            loadNext: () => this.fetchMore(),
           },
           scroll: 'keep',
           customClass: 'pin-preview-at-home',
         },
       );
+      const modal = this.previewModalHandle;
+      if (modal) {
+        modal.$once('close', () => {
+          if (this.previewModalHandle === modal) this.previewModalHandle = null;
+        });
+      }
+    },
+    closePreview() {
+      const modal = this.previewModalHandle;
+      this.previewModalHandle = null;
+      if (modal && typeof modal.close === 'function') modal.close();
     },
     shouldFetchMore(created) {
       if (!created) {
@@ -1297,6 +1318,8 @@ export default {
       );
     },
     reset() {
+      this.closePreview();
+      this.pinPageRequest = null;
       this.invalidateSelectionRequest();
       this.invalidateBulkOperation();
       this.invalidateCoverSelection();
@@ -1346,9 +1369,10 @@ export default {
       generation = this.requestGeneration,
       filters = this.captureFilterSnapshot(),
     ) {
-      if (!this.isRequestCurrent(generation, filters)) return;
+      if (!this.isRequestCurrent(generation, filters)) return null;
+      if (this.status.loading) return this.pinPageRequest;
       if (!this.shouldFetchMore(created)) {
-        return;
+        return null;
       }
       this.status.loading = true;
       let promise;
@@ -1384,9 +1408,9 @@ export default {
       } else {
         promise = API.fetchPins(offset, null, null, null, this.sortRequestState());
       }
-      promise.then(
+      this.pinPageRequest = promise.then(
         (resp) => {
-          if (!resp || !this.isRequestCurrent(generation, filters)) return;
+          if (!resp || !this.isRequestCurrent(generation, filters)) return false;
           const { results, next } = resp.data;
           const consumed = results.length;
           const pageIds = new Set();
@@ -1403,9 +1427,10 @@ export default {
           this.status.offset += consumed;
           this.status.hasNext = next !== null;
           this.status.loading = false;
+          return true;
         },
         (error) => {
-          if (!this.isRequestCurrent(generation, filters)) return;
+          if (!this.isRequestCurrent(generation, filters)) return false;
           const status = error && error.response ? error.response.status : null;
           const code = error && error.response && error.response.data
             ? error.response.data.code : null;
@@ -1413,10 +1438,12 @@ export default {
             status === 400
             && code === 'pin_sort_invalid'
             && this.fallbackToLegacySort()
-          ) return;
+          ) return false;
           this.status.loading = false;
+          return false;
         },
       );
+      return this.pinPageRequest;
     },
     niceLinks,
   },
@@ -1428,6 +1455,7 @@ export default {
     this.initialize();
   },
   beforeDestroy() {
+    this.closePreview();
     this.invalidateSelectionRequest();
     this.invalidateBulkOperation();
     this.invalidateCoverSelection();
@@ -1455,6 +1483,24 @@ export default {
 }
 .gutter-sizer {
   width: 15px;
+}
+
+.pin-image-container {
+  position: relative;
+}
+.pin-gif-badge {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  z-index: 1;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 20px;
+  pointer-events: none;
 }
 
 /* pin-image transition */

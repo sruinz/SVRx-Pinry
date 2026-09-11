@@ -1,4 +1,11 @@
 {
+  "previewNavigation": "핀 감상 이동",
+  "previewPrevious": "이전 핀",
+  "previewNext": "다음 핀",
+  "previewPageError": "다음 핀을 불러오지 못했습니다. 다음 버튼으로 다시 시도하세요.",
+  "previewImageError": "이미지를 불러오지 못했습니다. 원본 이미지 링크를 확인하거나 다른 핀으로 이동하세요.",
+  "previewImageLoading": "이미지를 불러오는 중…",
+  "previewImage": "핀 이미지",
   "NewPinTitle": "새 Pin",
   "EditPinTitle": "Pin 편집",
   "BoardCreateTitle": "보드 만들기",

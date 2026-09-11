@@ -1,4 +1,11 @@
 {
+  "previewNavigation": "浏览图钉",
+  "previewPrevious": "上一张",
+  "previewNext": "下一张",
+  "previewPageError": "无法加载更多图钉，请点击下一张重试。",
+  "previewImageError": "无法加载图片，请查看原图链接或其他图钉。",
+  "previewImageLoading": "正在加载图片…",
+  "previewImage": "图钉图片",
   "NewPinTitle": "创建 Pin",
   "EditPinTitle": "编辑 Pin",
   "BoardCreateTitle": "创建画板",
