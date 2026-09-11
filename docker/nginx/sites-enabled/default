@@ -185,7 +185,8 @@ server {
         if (-f /run/svrx-pinry/maintenance) { return 419; }
         add_header Cache-Control "no-store" always;
         add_header Allow "GET, HEAD" always;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host "";
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_pass http://127.0.0.1:8000/api/v2/version/;
@@ -227,7 +228,8 @@ server {
         client_max_body_size 1m;
         proxy_read_timeout 65s;
         proxy_send_timeout 65s;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host "";
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_pass http://127.0.0.1:8000;
@@ -236,7 +238,8 @@ server {
 
     location /api {
         if (-f /run/svrx-pinry/maintenance) { return 419; }
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host "";
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_pass http://127.0.0.1:8000;
@@ -245,7 +248,8 @@ server {
 
     location /admin {
         if (-f /run/svrx-pinry/maintenance) { return 419; }
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host "";
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_pass http://127.0.0.1:8000;

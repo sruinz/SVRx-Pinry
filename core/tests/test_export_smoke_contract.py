@@ -1,3 +1,4 @@
+import importlib.util
 import re
 import subprocess
 import sys
@@ -17,6 +18,17 @@ RUNTIME_SMOKE = REPOSITORY_ROOT / "docker/tests/export_runtime_smoke.sh"
 
 
 class ExportSmokeContractTests(unittest.TestCase):
+    def test_fixture_preserves_utc_timestamp_on_supported_django(self):
+        spec = importlib.util.spec_from_file_location(
+            "export_fixture_timestamp", EXPORT_FIXTURE,
+        )
+        fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixture)
+        self.assertEqual(
+            fixture._published_at(1).isoformat(),
+            "2026-01-02T03:04:08.123456+00:00",
+        )
+
     @staticmethod
     def _shell_function(source, name):
         match = re.search(

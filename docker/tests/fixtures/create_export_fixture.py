@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 
@@ -109,9 +109,7 @@ def _create_image(owner, index, pin_count):
 
 
 def _published_at(index):
-    from django.utils import timezone
-
-    return timezone.datetime(
+    return datetime(
         2026,
         1,
         2,

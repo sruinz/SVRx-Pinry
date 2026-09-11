@@ -27,6 +27,13 @@ DATABASES = {
 
 USE_X_FORWARDED_HOST = True
 
+# HTTPS 종료 프록시의 공개 Origin은 운영자가 명시한 값만 허용한다.
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('PINRY_CSRF_TRUSTED_ORIGINS', '').split(',')
+    if origin.strip()
+]
+
 REST_FRAMEWORK['DEFAULT_RENDERER_CLASSES'] = [
     'rest_framework.renderers.JSONRenderer',
 ]

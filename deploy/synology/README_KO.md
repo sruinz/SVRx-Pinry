@@ -448,6 +448,32 @@ Pin은 안전하게 제외한다. 본인 Pin의 원본이 소실되었거나 바
 build context에는 데이터베이스, 업로드 미디어, export ZIP, 사용자 계정,
 비밀키가 포함되지 않는다.
 
+### HTTPS 역방향 프록시와 로그인 Origin
+
+Django 5.2 후보에서 DSM 등의 프록시가 HTTPS를 종료하고 컨테이너에는 HTTP로
+전달한다면, 실제 서비스의 공개 Origin을 명시한다. Compose 서비스에 다음처럼
+설정하되 예시 도메인은 본인의 주소로 바꾼다.
+
+```yaml
+    environment:
+      PINRY_CSRF_TRUSTED_ORIGINS: "https://pinry.example.com"
+```
+
+여러 주소는 쉼표로 구분하고, 비표준 포트를 사용하면
+`https://pinry.example.com:8443`처럼 포트까지 포함한다. 경로나 불필요한
+와일드카드는 넣지 않는다. 기본값은 빈 목록이며 요청 헤더에서 자동 추론하지
+않는다. 기존 `/data/local_settings.py`에 `CSRF_TRUSTED_ORIGINS`를 직접
+설정했다면 그 값이 환경변수보다 우선한다.
+
+외부 프록시는 원래 `Host`와 포트를 보존해야 한다. 컨테이너 Nginx도 이를
+앱에 전달하고, 클라이언트의 `X-Forwarded-Host`는 제거한다. 임의 전달 헤더를
+신뢰하거나 CSRF 검사를 끄는 방식으로 로그인 오류를 해결하지 않는다.
+Origin 허용은 CSRF 토큰 검증을 생략하지 않는다. `ALLOWED_HOSTS`도 실제
+사용 호스트로 제한하는 것을 권장한다.
+
+근거: [Django CSRF Origin 설정](https://docs.djangoproject.com/en/5.2/ref/settings/#csrf-trusted-origins),
+[Nginx 프록시 헤더 전달](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_set_header).
+
 ### 기존 설치의 데이터 경로 준비
 
 기존 컨테이너가 같은 2048 포트를 사용 중인 상태에서 새 컨테이너를
