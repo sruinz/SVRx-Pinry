@@ -96,6 +96,24 @@ class RecoveryDeploymentTests(SimpleTestCase):
             with self.subTest(change=change), patch.dict(os.environ, change):
                 self.assertIsNone(current_recovery_fingerprint())
 
+    def test_explicit_default_https_port_uses_browser_origin_and_host(self):
+        from pinry.recovery_config import deployment_configuration
+        with patch.dict(os.environ, PINRY_RECOVERY_ORIGIN='https://recovery.example:443'):
+            deployment = deployment_configuration()
+        self.assertEqual(deployment['origin'], 'https://recovery.example')
+        self.assertEqual(deployment['host'], 'recovery.example')
+        with patch.dict(os.environ, PINRY_RECOVERY_ORIGIN='https://recovery.example'):
+            self.assertEqual(current_recovery_fingerprint(), deployment['fingerprint'])
+        self.assertNotEqual(current_recovery_fingerprint(), deployment['fingerprint'])
+
+    def test_uppercase_hostname_uses_browser_origin_and_host(self):
+        from pinry.recovery_config import deployment_configuration
+        with patch.dict(os.environ, PINRY_RECOVERY_ORIGIN='https://RECOVERY.example:9443'):
+            deployment = deployment_configuration()
+        self.assertEqual(deployment['origin'], 'https://recovery.example:9443')
+        self.assertEqual(deployment['host'], 'recovery.example:9443')
+        self.assertEqual(current_recovery_fingerprint(), deployment['fingerprint'])
+
     def test_key_path_change_invalidates_proof_and_service_cannot_read_owner_only_key(self):
         from pinry.recovery_config import deployment_configuration
         original = current_recovery_fingerprint()

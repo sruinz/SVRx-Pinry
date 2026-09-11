@@ -29,6 +29,10 @@ def deployment_configuration(environ=None, service_identity=None):
                 or not re.fullmatch(r'https://[A-Za-z0-9.\-:\[\]]+', origin)
                 or parsed.port == 0):
             return None
+        host = '[{}]'.format(parsed.hostname) if ':' in parsed.hostname else parsed.hostname
+        if parsed.port not in (None, 443):
+            host += ':' + str(parsed.port)
+        origin = 'https://' + host
         cert = environ.get('PINRY_RECOVERY_CERT_FILE', '')
         key = environ.get('PINRY_RECOVERY_KEY_FILE', '')
         for path in (cert, key):
@@ -42,7 +46,7 @@ def deployment_configuration(environ=None, service_identity=None):
         context.load_cert_chain(cert, key, password=lambda: '')
         certificate = Path(cert).read_bytes()
         fingerprint = hashlib.sha256('\0'.join((origin, cert, key)).encode() + b'\0' + certificate).hexdigest()
-        return dict(origin=origin, host=parsed.netloc, hostname=parsed.hostname,
+        return dict(origin=origin, host=host, hostname=parsed.hostname,
                     cert=cert, key=key, fingerprint=fingerprint)
     except (ValueError, OSError, ssl.SSLError):
         return None
