@@ -256,16 +256,9 @@ const User = {
   },
   logOut() {
     const self = this;
-    return new Promise(
-      (resolve) => {
-        axios.get('/api-auth/logout/').then(
-          () => {
-            storage.set(self.storageKey, null, 1);
-            resolve();
-          },
-        );
-      },
-    );
+    return axios.post('/api-auth/logout/').then(() => {
+      storage.set(self.storageKey, null, 1);
+    });
   },
   fetchUserInfoByName(username) {
     /* returns null if user not logged in */

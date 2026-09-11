@@ -12,6 +12,7 @@ const options = { mocks: { $t: key => key }, stubs: ['b-field', 'b-input'] };
 describe('SSO policy screens', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    localStorage.clear();
     axios.get.mockResolvedValue({ data: { providers: [], password_login_enabled: false, api_tokens_enabled: false } });
   });
 
@@ -81,5 +82,26 @@ describe('SSO policy screens', () => {
     axios.get.mockResolvedValue({ data: [{ username: 'current', token: null }] });
     const user = await API.User.fetchUserInfo();
     expect(user).toEqual({ username: 'current', token: null });
+  });
+
+  it('logs out with POST and clears the cached user only after success', async () => {
+    localStorage.setItem('pinry.user', JSON.stringify({ value: { username: 'current' }, expires_at: Date.now() + 60000 }));
+    axios.post.mockResolvedValue({ status: 200 });
+
+    await API.User.logOut();
+
+    expect(axios.post).toHaveBeenCalledWith('/api-auth/logout/');
+    expect(JSON.parse(localStorage.getItem('pinry.user')).value).toBeNull();
+  });
+
+  it('rejects a failed logout without clearing the cached user', async () => {
+    const cached = { value: { username: 'current' }, expires_at: Date.now() + 60000 };
+    localStorage.setItem('pinry.user', JSON.stringify(cached));
+    const failure = new Error('logout failed');
+    axios.post.mockRejectedValue(failure);
+
+    await expect(API.User.logOut()).rejects.toBe(failure);
+
+    expect(JSON.parse(localStorage.getItem('pinry.user'))).toEqual(cached);
   });
 });
