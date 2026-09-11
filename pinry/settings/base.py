@@ -35,6 +35,7 @@ MIDDLEWARE = [
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'users.middleware.SSOSessionMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'pinry.middleware.ForceCSRFCookieMiddleware',
@@ -125,6 +126,7 @@ PUBLIC = True
 AUTHENTICATION_BACKENDS = [
     'users.auth.backends.CombinedAuthBackend',
     'django.contrib.auth.backends.ModelBackend',
+    'users.sso.authentication.SSOBackend',
 ]
 
 LOGIN_URL = '/login/'
