@@ -3,6 +3,7 @@ import errno
 import http.client
 import json
 import os
+from pathlib import Path
 import re
 import selectors
 import signal
@@ -21,6 +22,7 @@ from docker.scripts.startup_recovery import (
     RECOVERABLE_CODES, RecoveryPolicy, RecoveryServer,
 )
 from django_images.services.startup_lock import StartupLockError
+from pinry.recovery_config import deployment_configuration
 
 
 _MAX_FRAME_BYTES = 4096
@@ -53,6 +55,7 @@ EXPORT_WORKER_PATH = os.path.join(
 GUNICORN_PATH = os.path.join(
     PROJECT_ROOT, "docker", "scripts", "_start_gunicorn.sh"
 )
+AUTH_RECOVERY_PATH = os.path.join(PROJECT_ROOT, 'docker', 'scripts', '_start_recovery.sh')
 
 _WORKER_SHUTDOWN = -2
 _NGINX_EXITED = -3
@@ -322,6 +325,9 @@ class RuntimeSupervisor(object):
         self._export_stop_deadline = None
         self._export_spawn_in_progress = False
         self.gunicorn = None
+        self.auth_recovery = None
+        self.auth_recovery_config_path = Path('/etc/nginx/conf.d/pinry-auth-recovery.conf')
+        self.auth_recovery_socket_directory = Path('/run/pinry-auth-recovery')
         self.last_worker_error = "legacy_startup_failed"
         self._last_heartbeat = None
         self._shutdown_signal = None
@@ -1200,7 +1206,46 @@ class RuntimeSupervisor(object):
         if transitioned != 0 or self._shutdown_signal is not None:
             return transitioned
         self._maintain_export_worker()
+        self._start_auth_recovery()
         return self._serve_application()
+
+    def _remove_auth_recovery_listener(self, reload_nginx=False):
+        try:
+            existed = self.auth_recovery_config_path.exists()
+            self.auth_recovery_config_path.unlink(missing_ok=True)
+            if existed and reload_nginx and self.nginx is not None:
+                self._signal_record(self.nginx, signal.SIGHUP)
+        except OSError:
+            self._log('복구 리스너 설정을 제거하지 못했습니다. 배포 설정을 확인하세요.')
+
+    def _start_auth_recovery(self):
+        deployment = deployment_configuration(service_identity=(self.service_uid, self.service_gid))
+        if deployment is None:
+            if os.environ.get('PINRY_RECOVERY_ENABLED', '').lower() in ('true', '1'):
+                self._log('복구 설정이 유효하지 않아 복구만 비활성화했습니다. Origin·인증서·키 권한을 확인하세요.')
+            return
+        try:
+            self._raise_if_shutdown()
+            directory = self.auth_recovery_socket_directory
+            directory.mkdir(mode=0o750, parents=True, exist_ok=True)
+            os.chown(directory, os.geteuid(), self.service_gid)
+            os.chmod(directory, 0o750)
+            self.auth_recovery = self._spawn('auth_recovery', ['bash', AUTH_RECOVERY_PATH], cwd=PROJECT_ROOT)
+            self._raise_if_shutdown()
+            if not self._child_survived_start(self.auth_recovery):
+                raise SupervisorError('runtime_supervisor_failed')
+            template = Path(PROJECT_ROOT, 'docker/nginx/recovery.conf.template').read_text('utf-8')
+            for name in ('hostname', 'cert', 'key'):
+                template = template.replace('__' + name.upper() + '__', deployment[name])
+            self.auth_recovery_config_path.write_text(template, encoding='utf-8')
+            result = self.command_runner(['/usr/sbin/nginx', '-t'], capture_output=True, timeout=10)
+            if result.returncode != 0 or not self._signal_record(self.nginx, signal.SIGHUP):
+                raise SupervisorError('runtime_supervisor_failed')
+        except (OSError, subprocess.SubprocessError, SupervisorError):
+            self._remove_auth_recovery_listener()
+            self._terminate_record(self.auth_recovery)
+            self.auth_recovery = None
+            self._log('복구 리스너를 시작하지 못했습니다. 공개 서비스는 유지합니다.')
 
     def _serve_application(self):
         while self._shutdown_signal is None:
@@ -1208,7 +1253,7 @@ class RuntimeSupervisor(object):
             if self.nginx.process.poll() is not None:
                 self._reap_record(self.nginx)
                 self._terminate_records(
-                    (self.export_worker, self.gunicorn, self.nginx)
+                    (self.auth_recovery, self.export_worker, self.gunicorn, self.nginx)
                 )
                 return 1
             if self.gunicorn.process.poll() is not None:
@@ -1219,9 +1264,16 @@ class RuntimeSupervisor(object):
                     self._terminate_record(self.nginx)
                     return 1
                 self._terminate_record(self.export_worker)
+                self._terminate_record(self.auth_recovery)
+                self._remove_auth_recovery_listener(reload_nginx=True)
                 self._terminate_record(self.gunicorn)
                 return self._hold_failed("gunicorn_start_failed")
             self._maintain_export_worker()
+            if self.auth_recovery is not None and self.auth_recovery.process.poll() is not None:
+                self._terminate_record(self.auth_recovery)
+                self.auth_recovery = None
+                self._remove_auth_recovery_listener(reload_nginx=True)
+                self._log('복구 프로세스가 종료되어 복구 리스너를 비활성화했습니다.')
             sleep_seconds = _POLL_SECONDS
             if self.export_restart_at is not None:
                 sleep_seconds = min(
@@ -1265,6 +1317,9 @@ class RuntimeSupervisor(object):
         )
 
     def _hold_failed(self, code):
+        self._terminate_record(self.auth_recovery)
+        self.auth_recovery = None
+        self._remove_auth_recovery_listener(reload_nginx=True)
         self._failed_code = code
         self._failure_published = False
         server = None
@@ -1318,6 +1373,7 @@ class RuntimeSupervisor(object):
             os.close(self.progress_reader)
             self.progress_reader = None
         self.worker = self.gunicorn = self.export_worker = None
+        self.auth_recovery = None
         self.export_started_at = self.export_restart_at = None
         self.export_restart_delay = 1.0
         self._export_stop_deadline = None
@@ -1349,7 +1405,7 @@ class RuntimeSupervisor(object):
         if "migration" in self.children:
             order = ("migration", "nginx")
         else:
-            order = ("export", "gunicorn", "nginx")
+            order = ("auth_recovery", "export", "gunicorn", "nginx")
         for role in order:
             record = self.children.get(role)
             self._send_term_record(record)
@@ -1371,11 +1427,12 @@ class RuntimeSupervisor(object):
             [
                 self.children.get(role)
                 for role in (
-                    "migration", "export", "gunicorn", "nginx"
+                    "migration", "auth_recovery", "export", "gunicorn", "nginx"
                 )
             ],
             deadline=deadline,
         )
+        self._remove_auth_recovery_listener()
         if os.getpid() == 1:
             while True:
                 try:
@@ -1392,6 +1449,7 @@ class RuntimeSupervisor(object):
         try:
             self._raise_if_shutdown()
             self.status_store.prepare_runtime_gate()
+            self._remove_auth_recovery_listener()
             self._raise_if_shutdown()
             self.nginx = self._spawn_nginx()
             if not self._child_survived_start(self.nginx):

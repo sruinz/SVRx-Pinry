@@ -77,8 +77,9 @@ def validate_provider(provider):
 
 
 def current_recovery_fingerprint():
-    # 작업 5의 실제 배포 검증 전에는 복구 성공 증거를 수락하지 않는다.
-    return None
+    from pinry.recovery_config import deployment_configuration
+    deployment = deployment_configuration()
+    return deployment['fingerprint'] if deployment else None
 
 
 def _require_sso_only_proof(actor, policy):

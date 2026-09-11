@@ -1530,6 +1530,40 @@ class RuntimeConfigTests(unittest.TestCase):
         arguments = _read_recorded_argv(capture)
         self.assertEqual(_timeout_values(arguments), ["60"])
 
+    def test_recovery_script_uses_only_private_unix_socket_and_separate_wsgi(self):
+        environment, capture = self._capture_environment('gunicorn')
+        completed = subprocess.run(
+            ['bash', 'docker/scripts/_start_recovery.sh'], cwd=str(REPOSITORY_ROOT),
+            env=environment, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        arguments = _read_recorded_argv(capture)
+        self.assertIn('pinry.recovery_wsgi:application', arguments)
+        self.assertEqual(arguments[arguments.index('--bind') + 1],
+                         'unix:/run/pinry-auth-recovery/application.sock')
+        self.assertEqual(arguments[arguments.index('--umask') + 1], '007')
+        self.assertIn('DJANGO_SETTINGS_MODULE=pinry.settings.recovery', arguments)
+
+    def test_recovery_settings_override_public_security_and_url_configuration(self):
+        script = (
+            "import sys, types\n"
+            "local = types.ModuleType('pinry.settings.local_settings')\n"
+            "local.SECRET_KEY = 'synthetic-test-secret'\n"
+            "local.DEBUG = True\n"
+            "local.USE_X_FORWARDED_HOST = True\n"
+            "local.SESSION_COOKIE_DOMAIN = '.example.test'\n"
+            "sys.modules['pinry.settings.local_settings'] = local\n"
+            "from pinry.settings import recovery\n"
+            "assert recovery.DEBUG is False\n"
+            "assert recovery.ROOT_URLCONF == 'users.recovery_urls'\n"
+            "assert recovery.AUTHENTICATION_BACKENDS == ['users.recovery.RecoveryBackend']\n"
+            "assert recovery.SESSION_COOKIE_DOMAIN is None\n"
+            "assert recovery.USE_X_FORWARDED_HOST is False\n"
+            "assert recovery.SESSION_COOKIE_SECURE and recovery.SESSION_COOKIE_AGE == 900\n"
+        )
+        result = subprocess.run([sys.executable, '-c', script], cwd=str(REPOSITORY_ROOT), capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
     def test_gunicorn_start_script_replaces_shell_process(self):
         source = (
             REPOSITORY_ROOT / "docker/scripts/_start_gunicorn.sh"

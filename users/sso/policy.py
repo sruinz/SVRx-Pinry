@@ -33,6 +33,8 @@ def password_login_allowed(request=None):
 def api_token_allowed(request=None):
     if request is None:
         request = policy_request.get()
+    if request is not None and getattr(request, 'recovery_deployment', None):
+        return False
     if request is not None and getattr(request, 'session', {}).get('auth_method') == 'recovery':
         return False
     policy = request_policy(request)

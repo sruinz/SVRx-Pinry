@@ -1,5 +1,6 @@
 FROM python:3.14-bookworm
 ENV PYTHONUNBUFFERED 1
+ENV PINRY_RECOVERY_ENABLED=false
 WORKDIR /app
 COPY . /app
 

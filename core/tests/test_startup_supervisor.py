@@ -1123,6 +1123,10 @@ class _FakeProcesses(object):
             role = "gunicorn"
             running = True
             returncode = 0
+        elif "_start_recovery.sh" in rendered:
+            role = "auth_recovery"
+            running = True
+            returncode = 0
         elif "export_worker.py" in rendered:
             role = "export"
             self.export_attempt_times.append(self.clock())
@@ -1288,6 +1292,70 @@ class RuntimeSupervisorLifecycleTests(unittest.TestCase):
         del arguments
         self.events.append("startup_lock_acquired")
         return self.lock
+
+    def test_auth_recovery_starts_after_migration_and_cleans_up_on_shutdown(self):
+        supervisor, processes = self._supervisor(b'{"phase":"complete"}\n', 0)
+        with tempfile.TemporaryDirectory() as directory:
+            supervisor.auth_recovery_config_path = Path(directory) / 'recovery.conf'
+            supervisor.auth_recovery_socket_directory = Path(directory) / 'socket'
+            supervisor.command_runner = lambda *args, **kwargs: subprocess.CompletedProcess(args, 0)
+            original_spawn = supervisor._spawn
+
+            def spawn(role, *args, **kwargs):
+                if role == 'auth_recovery':
+                    self.assertTrue(self.status.ready)
+                    self.assertNotIn('migration', supervisor.children)
+                return original_spawn(role, *args, **kwargs)
+
+            def serve():
+                self.assertIn('auth_recovery', supervisor.children)
+                supervisor.handle_signal(signal.SIGTERM, None)
+                return 0
+
+            deployment = dict(hostname='recovery.example', cert='/cert.pem', key='/key.pem')
+            with mock.patch.object(supervisor, '_spawn', side_effect=spawn), \
+                    mock.patch.object(supervisor, '_serve_application', side_effect=serve), \
+                    mock.patch.object(self.supervisor_module, 'deployment_configuration', return_value=deployment, create=True), \
+                    mock.patch.object(self.supervisor_module.os, 'chown'):
+                self.assertEqual(supervisor.run(), 0)
+            self.assertFalse(supervisor.children)
+            self.assertIn(('auth_recovery', signal.SIGTERM), processes.signal_order)
+            self.assertFalse(supervisor.auth_recovery_config_path.exists())
+
+    def test_invalid_auth_recovery_config_keeps_public_service_and_removes_stale_listener(self):
+        supervisor, processes = self._supervisor(b'{"phase":"complete"}\n', 0)
+        with tempfile.TemporaryDirectory() as directory:
+            supervisor.auth_recovery_config_path = Path(directory) / 'recovery.conf'
+            supervisor.auth_recovery_config_path.write_text('stale invalid nginx configuration')
+
+            def serve():
+                self.assertEqual(set(supervisor.children), {'nginx', 'gunicorn', 'export'})
+                self.assertFalse(supervisor.auth_recovery_config_path.exists())
+                supervisor.handle_signal(signal.SIGTERM, None)
+                return 0
+
+            with mock.patch.object(supervisor, '_serve_application', side_effect=serve), \
+                    mock.patch.object(self.supervisor_module, 'deployment_configuration', return_value=None, create=True):
+                self.assertEqual(supervisor.run(), 0)
+            self.assertNotIn('auth_recovery', processes.processes)
+
+    def test_recovery_nginx_validation_failure_only_retires_recovery_child(self):
+        supervisor, processes = self._supervisor(b'{"phase":"complete"}\n', 0)
+        with tempfile.TemporaryDirectory() as directory:
+            supervisor.auth_recovery_config_path = Path(directory) / 'recovery.conf'
+            supervisor.auth_recovery_socket_directory = Path(directory) / 'socket'
+            supervisor.command_runner = lambda *args, **kwargs: subprocess.CompletedProcess(args, 1)
+            supervisor.nginx = supervisor._spawn_nginx()
+            with mock.patch.object(self.supervisor_module, 'deployment_configuration', return_value={
+                'hostname': 'recovery.example', 'cert': '/cert.pem', 'key': '/key.pem',
+            }, create=True), mock.patch.object(self.supervisor_module.os, 'chown'):
+                self.assertTrue(callable(getattr(supervisor, '_start_auth_recovery', None)))
+                supervisor._start_auth_recovery()
+            self.assertEqual(set(supervisor.children), {'nginx'})
+            self.assertIsNone(processes.processes['nginx'].poll())
+            self.assertFalse(supervisor.auth_recovery_config_path.exists())
+            self.assertIsNone(supervisor.auth_recovery)
+            supervisor._cleanup()
 
     @staticmethod
     def _wait_until(predicate):

@@ -1,0 +1,25 @@
+# supervisor가 migration 이후 유효한 명시 배포 설정에서만 생성한다.
+server {
+    listen 8443 ssl;
+    listen [::]:8443 ssl;
+    server_name __HOSTNAME__;
+    ssl_certificate __CERT__;
+    ssl_certificate_key __KEY__;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 16k;
+    access_log off;
+
+    location / { return 404; }
+    location ^~ /recovery/ {
+        proxy_pass http://unix:/run/pinry-auth-recovery/application.sock;
+        # 임의 전달 헤더·Authorization을 전달하지 않는다. 필요한 값만 다시 설정한다.
+        proxy_pass_request_headers off;
+        proxy_set_header Host $http_host;
+        proxy_set_header Origin $http_origin;
+        proxy_set_header Cookie $http_cookie;
+        proxy_set_header Content-Type $content_type;
+        proxy_set_header X-CSRFToken $http_x_csrftoken;
+        proxy_set_header X-Pinry-Recovery-Peer $realip_remote_addr;
+        proxy_set_header X-Pinry-Recovery-TLS $scheme;
+    }
+}

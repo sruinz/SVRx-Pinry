@@ -1,5 +1,5 @@
 from django.conf import settings
-from django.http import HttpResponseForbidden
+from django.http import HttpResponseForbidden, HttpResponseNotFound
 from django.urls import Resolver404, resolve
 from django.utils.deprecation import MiddlewareMixin
 from rest_framework.exceptions import AuthenticationFailed
@@ -18,6 +18,8 @@ class SSOSessionMiddleware(MiddlewareMixin):
             policy_request.reset(token)
 
     def process_request(self, request):
+        if request.path == '/recovery' or request.path.startswith('/recovery/'):
+            return HttpResponseNotFound()
         enforce_session_policy(request)
         if request.path == '/admin/login/':
             request.password_login_enabled = password_login_allowed(request)
