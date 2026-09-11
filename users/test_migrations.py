@@ -1,10 +1,12 @@
 import importlib
 from datetime import timedelta
 
+from django.contrib.auth.models import User
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
 from django.utils import timezone
+from rest_framework.authtoken.models import Token
 
 
 class AdminBootstrapMigrationTest(TransactionTestCase):
@@ -138,3 +140,48 @@ class AdminBootstrapMigrationTest(TransactionTestCase):
         self.assertFalse(demoted.is_staff)
         self.assertFalse(demoted.is_superuser)
         self.assertTrue(State.objects.get(pk=1).bootstrap_complete)
+
+
+class SSOModelsMigrationTest(TransactionTestCase):
+    migrate_from = [('users', '0002_admin_bootstrap')]
+    migrate_to = [('users', '0003_sso_models')]
+
+    def setUp(self):
+        super().setUp()
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.migrate_from)
+        self.user = User.objects.create_user(
+            username='existing',
+            password='test-password',
+        )
+        self.token = Token.objects.create(user=self.user)
+
+    def tearDown(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def migrate_forward(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.migrate_to)
+        return self.executor.loader.project_state(self.migrate_to).apps
+
+    def test_creates_safe_defaults_without_changing_existing_user_or_token(self):
+        user_id = self.user.pk
+        token_key = self.token.key
+
+        apps = self.migrate_forward()
+        Policy = apps.get_model('users', 'AuthPolicy')
+
+        policy = Policy.objects.get(pk=1)
+        self.assertTrue(policy.password_login_enabled)
+        self.assertTrue(policy.api_tokens_enabled)
+        self.assertEqual(policy.recovery_allowed_cidrs, [])
+        self.assertEqual(policy.recovery_denied_cidrs, [])
+        self.assertEqual(policy.revision, 1)
+        self.assertTrue(
+            User.objects.filter(pk=user_id, username='existing').exists(),
+        )
+        self.assertTrue(
+            Token.objects.filter(user_id=user_id, key=token_key).exists(),
+        )
