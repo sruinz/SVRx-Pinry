@@ -22,17 +22,18 @@ RUN pnpm build
 
 
 # Required for other database options
-FROM python:3.9-slim-bookworm as base
+FROM python:3.12-slim-bookworm as base
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && if [ $(dpkg --print-architecture) = "arm64" -o $(dpkg --print-architecture) = "armhf" ]; then apt-get -y install apt-utils; fi \
     && apt-get -y install pkg-config gcc default-libmysqlclient-dev
-RUN pip --no-cache-dir install --user mysqlclient cx-Oracle
+RUN python -m pip install --no-cache-dir --prefix=/install \
+    mysqlclient==2.2.8 oracledb==4.0.2
 
 
 # Final image
-FROM python:3.9-slim-bookworm
+FROM python:3.12-slim-bookworm
 ARG DEBIAN_FRONTEND=noninteractive
 ARG PINRY_SOURCE_COMMIT=development
 ENV PINRY_SOURCE_COMMIT=${PINRY_SOURCE_COMMIT}
@@ -51,6 +52,8 @@ RUN groupadd -g 2300 tmpgroup \
 RUN apt-get update \
     # Install nginx
     && apt-get -y  install nginx pwgen \
+    # MySQL/MariaDB 드라이버 런타임 라이브러리 설치
+    && apt-get -y install libmariadb3 \
     # Install Pillow dependencies
     && apt-get -y install libopenjp2-7 libjpeg-turbo-progs libjpeg62-turbo-dev libtiff-dev libxcb1 \
     # Needed to compile psycopg2 on arm (fallback for psycopg2-binary)
@@ -64,8 +67,15 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 
 # Copy from previous stages
 COPY --from=pnpm-build pinry-spa/dist /pinry/pinry-spa/dist
-COPY --from=base /root/.local /root/.local
-ENV PATH=/root/.local/bin:$PATH
+COPY --from=base /install /usr/local
+RUN python -c "import os, pwd; \
+    account = pwd.getpwnam('www-data'); \
+    os.setgroups([]); \
+    os.setgid(account.pw_gid); \
+    os.setuid(account.pw_uid); \
+    assert os.geteuid() == account.pw_uid != 0; \
+    assert os.getegid() == account.pw_gid != 0; \
+    import MySQLdb, oracledb"
 
 COPY manage.py ./
 COPY core ./core

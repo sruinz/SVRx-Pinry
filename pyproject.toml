@@ -6,31 +6,31 @@ authors = ["winkidney <winkidney@gmail.com>"]
 license = "BSD 2-Clause"
 
 [tool.poetry.dependencies]
-python = ">=3.9,<3.11"
+python = ">=3.12,<3.13"
 requests = "^2.27.1"
 urllib3 = "==1.26.20"
-django = "==4.2.30"
-pillow = ">=8.1.1"
+django = "==5.2.17"
+pillow = "==12.3.0"
 markdown = "*"
-django-filter = "==2.4.0"
+django-filter = "==26.1"
 coreapi = "^2.3.3"
 psycopg2-binary = "2.9.9"
-django-taggit = "4.0.0"
+django-taggit = "6.1.0"
 django-braces = "^1.15.0"
-django-compressor = "^4.0"
+django-compressor = "==4.6.0"
 mock = "^4.0.3"
 gunicorn = "^20.1.0"
-djangorestframework = "==3.15.2"
+djangorestframework = "==3.16.1"
 
 
 [tool.poetry.dev-dependencies]
-flake8 = "*"
+flake8 = "==7.3.0"
 qrcode = "*"
 django-extensions = "*"
 mkdocs = "*"
 mkdocs-material = "*"
 jinja2 = "==3.1.2"
-black = "==19.10b0"
+black = "==26.5.1"
 
 [tool.poetry.group.dev.dependencies]
 jinja2 = "3.1.2"

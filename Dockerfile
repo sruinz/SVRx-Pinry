@@ -1,4 +1,4 @@
-FROM python:3.9-bookworm
+FROM python:3.12-bookworm
 ENV PYTHONUNBUFFERED 1
 WORKDIR /app
 COPY . /app

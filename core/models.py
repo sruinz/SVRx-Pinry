@@ -84,10 +84,13 @@ class MediaAsset(models.Model):
 class Board(models.Model):
     class Meta:
         unique_together = ("submitter", "name")
-        index_together = (
-            ("submitter", "name"),
-            ("submitter", "display_order", "id"),
-        )
+        indexes = [
+            models.Index(fields=["submitter", "name"], name="board_owner_name_idx"),
+            models.Index(
+                fields=["submitter", "display_order", "id"],
+                name="board_owner_order_id_idx",
+            ),
+        ]
 
     submitter = models.ForeignKey(User, on_delete=models.CASCADE)
     name = models.CharField(max_length=128, blank=False, null=False)

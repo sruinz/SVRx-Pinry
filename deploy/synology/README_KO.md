@@ -656,10 +656,47 @@ curl -s http://NAS주소:2048/api/v2/version/
 값도 같은 SHA의 앞 12자와 일치해야 한다. 값이 다르면 이전 산출물을 다시
 빌드했거나 `latest` 이미지로 컨테이너를 교체하지 않은 것이다.
 
+## Python 3.12와 데이터베이스 호환 범위
+
+현재 산출물은 Python 3.12의 Debian Bookworm 이미지와 Django 5.2.17을
+사용한다. Django 5.2가 지원하는 SQLite, PostgreSQL, MariaDB, MySQL,
+Oracle 계열을 제거하지 않았지만, 서버가 아래 최소 버전보다 오래되었다면
+이미지를 적용하지 않는다.
+
+- SQLite 3.31.0 이상
+- PostgreSQL 14 이상
+- MariaDB 10.5 이상
+- MySQL 8.0.11 이상
+- Oracle Database 19c 이상
+
+SQLite는 Python 표준 라이브러리를 사용하고, PostgreSQL은 기존
+`psycopg2-binary==2.9.9`를 유지한다(Django 최소 요구 2.8.4).
+MySQL과 MariaDB는 Django 최소 요구 1.4.3보다 새롭고 Python 3.12를 지원하는
+`mysqlclient==2.2.8`을 사용한다. Oracle은 더 이상 `cx_Oracle`을 설치하지
+않고 Django 5.2가 요구하는 `oracledb>=2.3.0` 계열의
+`oracledb==4.0.2`를 사용한다. 두 추가 드라이버와 그 의존성은 최종 이미지의
+`/usr/local`에 복사하며, 이미지 빌드 중 `www-data` 권한으로 실제 import를
+확인한다. 버전 기준은
+[Django 5.2 데이터베이스 문서](https://docs.djangoproject.com/en/5.2/ref/databases/),
+[mysqlclient 2.2.8 PyPI](https://pypi.org/project/mysqlclient/2.2.8/),
+[oracledb 4.0.2 PyPI](https://pypi.org/project/oracledb/4.0.2/)를 따른다.
+
+기본 Oracle 경로는 별도 Oracle Client가 필요 없는 thin mode다. 기존 환경이
+Oracle Instant Client, `init_oracle_client()`, `lib_dir`, `TNS_ADMIN`, wallet
+등 thick mode 설정에 의존한다면 이를 자동으로 바꾸지 않는다. 현재 이미지에
+Instant Client도 포함하지 않는다. 기존 설정과 client library 마운트·환경
+변수를 확인하고 격리된 복제 환경에서 별도로 검증한 뒤에만 전환한다.
+
+이번 전환에서는 Docker CLI가 없는 로컬 환경 때문에 컨테이너 빌드를
+실행하지 않았고, Synology NAS와 외부 PostgreSQL·MariaDB·MySQL·Oracle
+서버에도 연결하지 않았다. SQLite를 포함해 실제 운영 데이터가 있는 모든
+DB는 배포 전에 백업하고, 운영 복제본으로 이관·기동·읽기·쓰기 회귀를
+확인해야 한다.
+
 ## 빌드 실패 참고
 
 `DEPRECATED: The legacy builder is deprecated`는 경고이며 빌드 실패 원인이
-아니다. 현재 산출물은 Python 3.9의 Debian Bookworm 이미지를 사용한다.
+아니다. 현재 산출물은 Python 3.12의 Debian Bookworm 이미지를 사용한다.
 
 컨테이너를 다시 만들기 전에 데이터 폴더를 별도 위치에 백업한다.
 `docker compose down`은 바인드 마운트 데이터 폴더를 삭제하지 않지만,

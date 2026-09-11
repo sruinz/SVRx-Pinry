@@ -2100,19 +2100,96 @@ class SynologyPackageTests(unittest.TestCase):
         )
 
     def test_synology_dockerfile_uses_supported_bookworm_inputs(self):
-        source = (
+        synology_source = (
             self.repository_root / "Dockerfile.autobuild"
+        ).read_text()
+        root_source = (REPOSITORY_ROOT / "Dockerfile").read_text()
+        workflow_source = (
+            REPOSITORY_ROOT / ".github/workflows/pythonpackage.yml"
         ).read_text()
 
         self.assertEqual(
-            re.findall(r"^FROM python:([^\s]+)", source, re.MULTILINE),
-            ["3.9-slim-bookworm", "3.9-slim-bookworm"],
+            re.findall(
+                r"^FROM python:([^\s]+)", synology_source, re.MULTILINE
+            ),
+            ["3.12-slim-bookworm", "3.12-slim-bookworm"],
         )
-        self.assertNotIn("buster", source)
-        self.assertIn("libtiff-dev", source)
-        self.assertNotIn("libtiff5-dev", source)
-        self.assertNotIn("--install-option", source)
-        self.assertNotIn("rcssmin==1.0.6", source)
+        self.assertEqual(
+            re.findall(r"^FROM python:([^\s]+)", root_source, re.MULTILINE),
+            ["3.12-bookworm"],
+        )
+        self.assertEqual(
+            re.findall(
+                r"python-version:\s*\['([^']+)'\]", workflow_source
+            ),
+            ["3.12"],
+        )
+        self.assertNotIn("buster", synology_source)
+        self.assertIn("libtiff-dev", synology_source)
+        self.assertNotIn("libtiff5-dev", synology_source)
+        self.assertNotIn("--install-option", synology_source)
+        self.assertNotIn("rcssmin==1.0.6", synology_source)
+
+    def test_synology_database_drivers_are_available_to_runtime_user(self):
+        source = (
+            self.repository_root / "Dockerfile.autobuild"
+        ).read_text()
+        stages = re.split(r"(?=^FROM\s+)", source, flags=re.MULTILINE)
+        stages = [stage for stage in stages if stage.startswith("FROM ")]
+        self.assertEqual(len(stages), 3)
+
+        database_builder = stages[1]
+        final_stage = stages[2]
+        normalized_builder = re.sub(
+            r"[ \t]*\\\n[ \t]*", " ", database_builder
+        )
+        normalized_final = re.sub(
+            r"[ \t]*\\\n[ \t]*", " ", final_stage
+        )
+        install_match = re.search(
+            r"RUN python -m pip install\s+([^\n]+)", normalized_builder
+        )
+        self.assertIsNotNone(install_match)
+        install_arguments = shlex.split(install_match.group(1))
+        self.assertIn("--prefix=/install", install_arguments)
+        self.assertEqual(
+            [
+                argument
+                for argument in install_arguments
+                if argument.startswith(("mysqlclient", "oracledb"))
+            ],
+            ["mysqlclient==2.2.8", "oracledb==4.0.2"],
+        )
+        runtime_apt_packages = {
+            package
+            for arguments in re.findall(
+                r"apt-get -y\s+install\s+([^;&\n]+)", normalized_final
+            )
+            for package in shlex.split(arguments)
+        }
+        self.assertIn("libmariadb3", runtime_apt_packages)
+
+        runtime_copy = "COPY --from=base /install /usr/local"
+        runtime_probe_steps = (
+            "account = pwd.getpwnam('www-data')",
+            "os.setgroups([])",
+            "os.setgid(account.pw_gid)",
+            "os.setuid(account.pw_uid)",
+            "assert os.geteuid() == account.pw_uid != 0",
+            "assert os.getegid() == account.pw_gid != 0",
+            "import MySQLdb, oracledb",
+        )
+        self.assertNotIn("/root/.local", source)
+        self.assertEqual(normalized_final.count(runtime_copy), 1)
+        for step in runtime_probe_steps:
+            self.assertEqual(normalized_final.count(step), 1)
+        probe_positions = [
+            normalized_final.index(step) for step in runtime_probe_steps
+        ]
+        self.assertEqual(probe_positions, sorted(probe_positions))
+        self.assertLess(
+            normalized_final.index(runtime_copy), probe_positions[0]
+        )
 
     def test_frontend_build_declares_async_runtime_and_pins_pnpm(self):
         package = json.loads(

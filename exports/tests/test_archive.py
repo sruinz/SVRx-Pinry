@@ -1,4 +1,5 @@
 import hashlib
+from datetime import timezone as datetime_timezone
 import json
 import os
 from types import SimpleNamespace
@@ -21,17 +22,17 @@ class ManifestTests(SimpleTestCase):
     def test_manifest_has_exact_schema_stable_order_and_no_private_user_data(self):
         exported_at = timezone.datetime(
             2026, 8, 30, 12, 1, 10, 123456,
-            tzinfo=timezone.utc,
+            tzinfo=datetime_timezone.utc,
         )
         published_at = timezone.datetime(
             2026, 8, 1, 2, 3, 4, 123456,
-            tzinfo=timezone.utc,
+            tzinfo=datetime_timezone.utc,
         )
         blob_id = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         job = SimpleNamespace(
             pk=uuid.UUID("6b269ff6-145e-44b9-a9c6-b17ddb6a67e5"),
             snapshot_at=timezone.datetime(
-                2026, 8, 30, 12, 0, 3, tzinfo=timezone.utc,
+                2026, 8, 30, 12, 0, 3, tzinfo=datetime_timezone.utc,
             ),
             scope="board",
             board_id_snapshot=12,
