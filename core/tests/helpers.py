@@ -5,13 +5,15 @@ from django_images.models import Thumbnail
 from taggit.models import Tag
 
 from core.models import Pin, Image
-from users.models import User
+from users.models import AuthPolicy, User
 
 
 TEST_IMAGE_PATH = 'docs/src/imgs/logo-dark.png'
 
 
 def create_user(username):
+    # TransactionTestCase의 flush로 사라진 기본 인증 fixture만 복원한다.
+    AuthPolicy.objects.get_or_create(pk=1)
     user, _ = User.objects.get_or_create(
         username='user_{}'.format(username),
         defaults={

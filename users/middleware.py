@@ -19,7 +19,8 @@ class SSOSessionMiddleware(MiddlewareMixin):
 
     def process_request(self, request):
         enforce_session_policy(request)
-        request.password_login_enabled = password_login_allowed(request)
+        if request.path == '/admin/login/':
+            request.password_login_enabled = password_login_allowed(request)
         if (request.method == 'POST' and request.path in ('/admin/login/', '/api-auth/login/')
                 and not password_login_allowed(request)):
             return HttpResponseForbidden('비밀번호 로그인이 비활성화되어 있습니다. SSO를 이용해 주세요.')

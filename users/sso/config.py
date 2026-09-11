@@ -67,7 +67,10 @@ def validate_provider(provider):
     for origin in provider.allowed_endpoint_origins:
         if not isinstance(origin, str):
             raise ValidationError('허용 endpoint origin은 HTTPS 문자열이어야 합니다.')
-        parsed = urlsplit(origin)
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            raise ValidationError('허용 endpoint origin을 확인해 주세요.') from None
         if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
                 or parsed.query or parsed.fragment or parsed.path not in ('', '/')):
             raise ValidationError('허용 endpoint origin을 확인해 주세요.')

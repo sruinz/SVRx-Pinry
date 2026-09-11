@@ -220,5 +220,19 @@ class SSOOnlyProofTests(TestCase):
 
     def test_invalid_origin_is_reported_as_validation_error(self):
         from users.sso.config import save_configuration
-        with self.assertRaises(ValidationError):
-            save_configuration(self.user, {}, {'id': self.provider.pk, 'allowed_endpoint_origins': [3]})
+        for origin in (3, 'https://['):
+            with self.subTest(origin=origin), self.assertRaises(ValidationError):
+                save_configuration(self.user, {}, {'id': self.provider.pk, 'allowed_endpoint_origins': [origin]})
+
+    def test_admin_reports_malformed_origin_without_server_error(self):
+        import json
+        self.client.force_login(self.user)
+        response = self.client.post(f'/admin/users/ssoprovider/{self.provider.pk}/change/', {
+            'name': 'Google', 'position': 0, 'enabled': 'on', 'public_base_url': 'https://pinry.example',
+            'client_id': 'client', 'allowed_endpoint_origins': json.dumps(['https://[']),
+            'internal_cidrs': '[]', 'expected_revision': 1, 'expected_policy_revision': 1,
+        }, follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, '허용 endpoint origin')
+        self.provider.refresh_from_db()
+        self.assertEqual(self.provider.allowed_endpoint_origins, ['https://accounts.google.com'])

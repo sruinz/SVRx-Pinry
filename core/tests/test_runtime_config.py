@@ -2449,11 +2449,11 @@ class RuntimeConfigTests(unittest.TestCase):
         source = (
             REPOSITORY_ROOT / "docker/nginx/sites-enabled/default"
         ).read_text()
-        mutant = source.replace(
-            "        break;\n    }\n\n    location /api {",
-            "        break;\n        break;\n    }\n\n    location /api {",
-            1,
-        )
+        start = source.index("    location = /api/v2/pins/batch/ {")
+        end = source.index("\n    }", start)
+        block = source[start:end]
+        mutated_block = block.replace("        break;", "        break;\n        break;", 1)
+        mutant = source[:start] + mutated_block + source[end:]
         self.assertNotEqual(mutant, source)
 
         with self.assertRaises(AssertionError):
