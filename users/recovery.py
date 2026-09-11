@@ -63,7 +63,7 @@ class RecoveryBoundaryMiddleware:
                 response = self.get_response(request)
             response['Cache-Control'] = 'no-store'
             response['X-Frame-Options'] = 'DENY'
-            response['Referrer-Policy'] = 'no-referrer'
+            response['Referrer-Policy'] = 'same-origin'
             return response
         finally:
             policy_request.reset(token)

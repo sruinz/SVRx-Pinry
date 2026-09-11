@@ -263,7 +263,8 @@ class RecoveryRequestTests(TestCase):
         self.assertFalse(Token.objects.exists())
 
     def test_post_requires_both_origin_and_csrf(self):
-        self.get()
+        response = self.get()
+        self.assertEqual(response['Referrer-Policy'], 'same-origin')
         for headers in [{'HTTP_ORIGIN': ''}, {'HTTP_ORIGIN': 'https://public.example'}, {'HTTP_X_CSRFTOKEN': ''}]:
             with self.subTest(headers=headers):
                 self.assertEqual(self.post(**headers).status_code, 403)
