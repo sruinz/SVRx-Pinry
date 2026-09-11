@@ -114,6 +114,40 @@ class SSOClientTests(SimpleTestCase):
                     self.exchange()
                 self.fixture.metadata[key] = original
 
+    def test_non_finite_and_non_numeric_token_dates_are_rejected(self):
+        original = dict(self.fixture.claims)
+        for claim in ('exp', 'iat', 'nbf', 'auth_time'):
+            for value in (float('nan'), float('inf'), float('-inf'), False, True, None, '123', [], {}):
+                with self.subTest(claim=claim, value=value):
+                    self.fixture.claims = dict(original, **{claim: value})
+                    with self.assertRaises(ValidationError):
+                        self.exchange()
+
+    def test_integer_and_finite_float_token_dates_are_accepted(self):
+        now = 2000000000
+        with patch('time.time', return_value=now):
+            for dates in (
+                {'exp': now + 1, 'iat': now, 'nbf': now, 'auth_time': now - 1},
+                {'exp': now + 0.5, 'iat': now - 0.5, 'nbf': now - 0.5, 'auth_time': now - 1.5},
+            ):
+                with self.subTest(dates=dates):
+                    self.fixture.claims.update(dates)
+                    self.assertEqual(self.exchange().subject, 'external-123')
+
+    def test_expired_and_future_token_date_boundaries_are_rejected(self):
+        now = 2000000000
+        original = dict(self.fixture.claims, exp=now + 1, iat=now, nbf=now)
+        with patch('time.time', return_value=now):
+            for claim, value in (
+                ('exp', now - 1), ('exp', now - 0.5),
+                ('iat', now + 1), ('iat', now + 0.5),
+                ('nbf', now + 1), ('nbf', now + 0.5),
+            ):
+                with self.subTest(claim=claim, value=value):
+                    self.fixture.claims = dict(original, **{claim: value})
+                    with self.assertRaises(ValidationError):
+                        self.exchange()
+
     def test_unsupported_pkce_is_not_retried(self):
         self.fixture.metadata['code_challenge_methods_supported'] = ['plain']
         with self.assertRaises(ValidationError):

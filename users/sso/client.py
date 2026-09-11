@@ -1,3 +1,4 @@
+import math
 import re
 import uuid
 from dataclasses import dataclass
@@ -131,6 +132,12 @@ def _oidc_identity(provider, metadata, token, nonce):
         },
         params={'nonce': nonce, 'client_id': provider.client_id, 'access_token': token.get('access_token')},
     )
+    for field in ('exp', 'iat', 'nbf', 'auth_time'):
+        if field not in claims:
+            continue
+        value = claims[field]
+        if type(value) not in (int, float) or (isinstance(value, float) and not math.isfinite(value)):
+            raise ValidationError('SSO 토큰의 시간 값은 유한한 숫자여야 합니다.')
     claims.validate(leeway=0)
     subject = claims.get('sub')
     if not isinstance(subject, str) or not 1 <= len(subject) <= 255:
