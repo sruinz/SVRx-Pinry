@@ -216,7 +216,9 @@
                     class="pin-selection-check"
                     aria-hidden="true"
                   >✓</span>
-                  <span v-if="item.is_gif" class="pin-gif-badge">GIF</span>
+                  <span v-if="item.animation_format" class="pin-animation-badge">
+                    {{ item.animation_format }} ▶
+                  </span>
                   <img :src="item.url"
                      @load="onPinImageLoaded(item.id)"
                      @click.stop="onPinImageClick(item, $event)"
@@ -347,7 +349,8 @@ function createImageItem(pin) {
   image.author = pin.submitter.username;
   image.avatar = `//gravatar.com/avatar/${pin.submitter.gravatar}`;
   image.large_image_url = pinHandler.escapeUrl(pin.image.image);
-  image.is_gif = /\.gif$/i.test(image.large_image_url);
+  image.animation_format = ['GIF', 'WEBP'].includes(pin.image.animation_format)
+    ? pin.image.animation_format : null;
   image.original_image_url = pin.url;
   image.referer = pin.referer;
   image.orgianl_width = pin.image.width;
@@ -1488,7 +1491,7 @@ export default {
 .pin-image-container {
   position: relative;
 }
-.pin-gif-badge {
+.pin-animation-badge {
   position: absolute;
   bottom: 8px;
   left: 8px;

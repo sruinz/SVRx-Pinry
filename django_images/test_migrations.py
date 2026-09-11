@@ -2,6 +2,7 @@ import os
 import shutil
 import tempfile
 import uuid
+from unittest.mock import patch
 
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
@@ -13,7 +14,7 @@ class AssetMetadataMigrationTests(TransactionTestCase):
     migrate_to = ("django_images", "0005_enforce_image_asset_metadata")
     migrate_latest = [
         ("core", "0016_board_display_order"),
-        ("django_images", "0007_startup_validation_state"),
+        ("django_images", "0008_image_animation_status"),
     ]
 
     def setUp(self):
@@ -223,3 +224,29 @@ class StartupValidationMigrationTests(TransactionTestCase):
         )
 
         self.assertEqual(State.objects.count(), 0)
+
+
+class AnimationMetadataMigrationTests(TransactionTestCase):
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super(AnimationMetadataMigrationTests, self).tearDown()
+
+    def test_adds_unchecked_metadata_without_reading_legacy_files(self):
+        previous = [("django_images", "0007_startup_validation_state")]
+        target = [("django_images", "0008_image_animation_status")]
+        executor = MigrationExecutor(connection)
+        executor.migrate(previous)
+        OldImage = executor.loader.project_state(previous).apps.get_model("django_images", "Image")
+        original = OldImage.objects.create(
+            image="missing/legacy.gif", width=16, height=16,
+            original_filename="legacy.gif",
+        )
+        with patch("django.core.files.storage.FileSystemStorage.open", side_effect=AssertionError("전체 검사")):
+            executor = MigrationExecutor(connection)
+            executor.migrate(target)
+        NewImage = executor.loader.project_state(target).apps.get_model("django_images", "Image")
+        image = NewImage.objects.get(pk=original.pk)
+        self.assertIsNone(image.animation_status)
+        self.assertEqual(image.image.name, "missing/legacy.gif")
+        self.assertEqual(image.asset_uuid, original.asset_uuid)

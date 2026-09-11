@@ -67,6 +67,7 @@ class ImageSerializer(serializers.ModelSerializer):
             "standard",
             "thumbnail",
             "square",
+            "animation_format",
         )
         extra_kwargs = {
             "width": {"read_only": True},
@@ -76,6 +77,7 @@ class ImageSerializer(serializers.ModelSerializer):
     standard = ThumbnailSerializer(read_only=True)
     thumbnail = ThumbnailSerializer(read_only=True)
     square = ThumbnailSerializer(read_only=True)
+    animation_format = serializers.ReadOnlyField()
 
     def create(self, validated_data):
         try:

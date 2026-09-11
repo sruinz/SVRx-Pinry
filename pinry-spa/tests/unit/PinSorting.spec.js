@@ -532,16 +532,30 @@ describe('Pins sorting', () => {
     expect(wrapper.vm.status.loading).toBe(false);
   });
 
-  it('원본 GIF만 배지를 표시하며 썸네일과 출처 확장자는 판별에 쓰지 않는다', async () => {
+  it('검증된 애니메이션 GIF·WebP만 배지를 표시한다', async () => {
     const gif = pin(3);
-    gif.image.image = 'https://example.test/original.GIF?token=1';
+    gif.image.animation_format = 'GIF';
+    const webp = pin(4);
+    webp.image.animation_format = 'WEBP';
+    const stillGif = pin(5);
+    stillGif.image.image = 'https://example.test/original.GIF?token=1';
+    stillGif.image.animation_format = null;
+    const stillWebp = pin(6);
+    stillWebp.image.image = 'https://example.test/original.webp';
+    stillWebp.image.animation_format = null;
     const jpg = pin(2);
     jpg.url = 'https://example.test/source.gif';
     jpg.image.thumbnail.image = 'https://example.test/thumb.gif';
-    const wrapper = mountPins({ fetchPinsImplementation: () => page([gif, jpg]) });
+    jpg.image.animation_format = 'unknown';
+    const wrapper = mountPins({
+      fetchPinsImplementation: () => page([gif, webp, stillGif, stillWebp, jpg]),
+    });
     await settle();
-    expect(wrapper.find('[data-test="pin-card-3"] .pin-gif-badge').text()).toBe('GIF');
-    expect(wrapper.find('[data-test="pin-card-2"] .pin-gif-badge').exists()).toBe(false);
+    expect(wrapper.find('[data-test="pin-card-3"] .pin-animation-badge').text()).toBe('GIF ▶');
+    expect(wrapper.find('[data-test="pin-card-4"] .pin-animation-badge').text()).toBe('WEBP ▶');
+    [2, 5, 6].forEach((id) => {
+      expect(wrapper.find(`[data-test="pin-card-${id}"] .pin-animation-badge`).exists()).toBe(false);
+    });
   });
 
   it('상세보기는 같은 목록과 페이지 요청을 사용하고 목록 변경 때 닫힌다', async () => {

@@ -11,6 +11,7 @@ from importlib import import_module
 from django.urls import reverse
 
 from . import utils
+from .animation import inspect_animation
 from .settings import IMAGE_SIZES, IMAGE_PATH, IMAGE_AUTO_DELETE
 from .startup_validation import STARTUP_VALIDATION_CONTRACT_VERSION
 
@@ -54,6 +55,49 @@ class Image(models.Model):
     original_filename = models.CharField(editable=False, max_length=255)
     height = models.PositiveIntegerField(default=0, editable=False)
     width = models.PositiveIntegerField(default=0, editable=False)
+    animation_status = models.CharField(max_length=16, null=True, editable=False)
+
+    def _read_animation_status(self):
+        if not self.image:
+            return "unreadable"
+        if not self.image._committed:
+            return inspect_animation(self.image.file)
+        if os.path.splitext(self.image.name)[1].lower() not in (".gif", ".webp"):
+            return "static"
+        try:
+            with self.image.storage.open(self.image.name, "rb") as source:
+                return inspect_animation(source)
+        except OSError:
+            return "unreadable"
+
+    def save(self, *args, **kwargs):
+        replacing_upload = self.image and not self.image._committed
+        update_fields = kwargs.get("update_fields")
+        writes_image = update_fields is None or "image" in update_fields
+        if writes_image and (replacing_upload or (
+            self._state.adding and self.animation_status is None
+        )):
+            self.animation_status = self._read_animation_status()
+            if update_fields is not None:
+                kwargs["update_fields"] = set(update_fields) | {"animation_status"}
+        return super(Image, self).save(*args, **kwargs)
+
+    @property
+    def animation_format(self):
+        if self.animation_status is None and self.pk and (
+            os.path.splitext(self.image.name)[1].lower() in (".gif", ".webp")
+        ):
+            rows = Image.objects.using(self._state.db).filter(
+                pk=self.pk, image=self.image.name
+            )
+            # 같은 원본을 참조하는 Pin이 이미 판별했다면 파일을 다시 열지 않는다.
+            current = rows.values_list("animation_status", flat=True).first()
+            if current is None:
+                current = self._read_animation_status()
+                # save()의 썸네일 삭제 신호를 발생시키지 않는 메타데이터 갱신이다.
+                rows.filter(animation_status__isnull=True).update(animation_status=current)
+            self.animation_status = current
+        return {"gif": "GIF", "webp": "WEBP"}.get(self.animation_status)
 
     def get_by_size(self, size):
         return self.thumbnail_set.get(size=size)
