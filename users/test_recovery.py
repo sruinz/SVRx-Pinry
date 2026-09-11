@@ -178,6 +178,19 @@ class RecoveryRequestTests(TestCase):
         self.assertEqual(self.get().status_code, 200)
         return self.post()
 
+    def test_recovery_pages_declare_mobile_viewport(self):
+        self.assertContains(
+            self.get(),
+            '<meta name="viewport" content="width=device-width, initial-scale=1">',
+            html=True,
+        )
+        self.assertEqual(self.login().status_code, 302)
+        self.assertContains(
+            self.get('/recovery/settings/'),
+            '<meta name="viewport" content="width=device-width, initial-scale=1">',
+            html=True,
+        )
+
     def test_recovery_origin_host_works_when_public_hosts_are_restricted(self):
         public_settings = types.ModuleType('pinry.settings.docker')
         public_settings.ALLOWED_HOSTS = ['public.example']

@@ -37,6 +37,127 @@ bash build-image.sh "svrx-pinry:gif-navigation-${feature_revision}"
 상세 좌우 이동, 목록 끝의 추가 로딩,
 빈 공간 클릭으로 닫은 뒤 위치 유지, 모바일 버튼을 확인한다.
 
+## SSO와 복구 배포
+
+이 작업선은 Authentik, Synology SSO Server, Google, Microsoft, GitHub,
+범용 OIDC의 복수 제공자와 일반 로그인 정책을 지원한다. 새 설치와
+업그레이드의 기본은 비밀번호 로그인·API 토큰 허용, 활성 SSO 제공자
+없음이다. 배포만으로 기존 계정이 잠기지 않는다.
+
+### SSO 제공자 설정
+
+슈퍼 관리자로 `/admin/`에 로그인한 뒤 `/admin/users/ssoprovider/`에서
+제공자를 생성한다. 제공자별로 표시 이름, 공개 서비스 기준 HTTPS URL,
+Client ID·Client Secret, 필요한 issuer·Discovery URL을 입력한다. 활성화 전
+관리자 화면에 표시된 **등록할 정확한 콜백 주소**를 IdP의 redirect URI로
+등록한다. 비표준 포트는 URL에 포함하고 프록시가 원래 Host를 보존하게 한다.
+
+제공자가 접속하는 모든 Discovery·authorization·token·JWKS·userinfo 주소의
+origin을 **허용 endpoint origin**에 HTTPS로 명시한다. Google·Microsoft·GitHub
+프리셋은 새 등록의 빈 목록에 안전한 기본 origin을 적용한다. Microsoft는
+`common`이나 `organizations`가 아닌 정확한 테넌트 UUID를 입력한다. 내부 IdP는
+해석된 IP가 속해야 하는 사설망 CIDR을 **내부 IdP 허용 CIDR**에 정확히
+지정한다. TLS 검증, PKCE S256, state·nonce, 서명·issuer·audience 검사는
+비활성화할 수 없다.
+
+내부 CA가 필요하면 CA bundle을 읽기 전용으로 `/data` 또는 별도
+마운트에 배치하고 `/data/local_settings.py`에 Django setting을 명시한다.
+이 값은 현재 Compose 환경변수로 자동 변환되지 않는다.
+
+```python
+SSO_CA_BUNDLE = "/data/idp-ca.pem"
+```
+
+Client Secret은 별도 Fernet 키로 암호화된다. 기본 키 경로는
+`/data/sso-secret.key`이며 서비스 소유자의 일반 파일·`0600`이어야 한다.
+다른 경로가 필요하면 `local_settings.py`에 `SSO_SECRET_KEY_FILE`을 지정한다.
+데이터베이스 백업과 별도로 이 키 파일을 백업한다. 암호문이 존재하는데
+키가 없거나 바뀌면 자동 재생성하지 않고 SSO 비밀 정보 사용을 거부한다.
+
+기존 사용자는 로그인한 뒤 프로필에서 **SSO 계정 연결**을 사용한다.
+동일한 이메일·이름을 자동으로 연결하지 않으며, 제공자의 **신규 SSO 사용자
+가입 허용**은 필요한 제공자에만 켠다. 연결·해제의 최근 재인증은
+연결된 외부 ID의 새 인증 왕복을 의미한다. IdP의 기존 세션 때문에
+비밀번호·MFA 재입력 없이 완료될 수 있으며, 모든 IdP의 MFA 재입력을
+강제하는 기능은 아니다.
+
+### 인증 정책과 SSO 전용 전환
+
+`/admin/users/authpolicy/`에서 비밀번호 로그인과 API 토큰을 별도로
+허용하거나 차단한다. API 토큰을 끄면 기존 토큰 행은 보존하지만
+새 발급, 프로필 노출, API 인증을 모두 차단한다. 다시 켜면 기존
+확장·자동화가 기존 토큰으로 회복된다.
+
+비밀번호 로그인을 끄기 전에 다음을 같은 설정 revision에서 확인한다.
+
+1. 최소 한 개의 현재 활성 SSO 제공자가 있다.
+2. 슈퍼 관리자에게 현재 issuer와 일치하는 SSO 연결이 있고 실제 로그인을 확인했다.
+3. 현재 복구 포트·인증서 지문과 일치하는 복구 로그인을 최근 10분 이내 확인했다.
+
+제공자 issuer·Client ID·비밀·복구 배포 설정이 바뀌면 기존 확인은
+무효가 되므로 로그인·복구 시험을 다시 수행한다. SSO 장애가 발생해도
+서버가 비밀번호 로그인을 자동으로 열지 않는다.
+
+### 복구 HTTPS 배포
+
+복구는 공개 서비스와 다른 컨테이너 `8443` HTTPS 리스너를 사용하며
+기본 Compose는 이 포트를 publish하지 않는다. 먼저 직접 LAN 요청의
+원본 IP가 NAS·Docker gateway가 아니라 클라이언트 IP로 유지되는지 확인한다.
+외부 역방향 프록시·라우터 포트 포워딩에 복구 포트를 연결하지 않는다.
+NAT로 NAS·게이트웨이만 보이면 해당 주소를 허용하지 말고 복구를 끈다.
+
+복구 전용 인증서·키를 운영 사이트 TLS 키와 분리한다. 키는 전용
+공유 그룹이 있다면 `root:<그룹> 0640`, 상위 디렉터리는 해당 그룹의 탐색
+권한을 갖게 하고 읽기 전용으로 마운트한다. 기본 이미지의 `www-data`는
+UID/GID `1000`이다. 실제 서비스 UID/GID와 Nginx·복구 앱의 읽기 가능 여부를
+확인한다. `root:root 0600`처럼 서비스가 읽을 수 없거나 세계 읽기 키면
+복구만 안전하게 비활성화되고 공개 서비스는 계속 시작한다.
+
+Compose의 주석을 실제 값으로 바꾸는 예시다. 호스트 IP·포트·경로는 자신의
+설치에 맞게 지정한다.
+
+```yaml
+    ports:
+      - "2048:80"
+      - "<NAS LAN IP>:<복구 포트>:8443"
+    environment:
+      PINRY_RECOVERY_ENABLED: "true"
+      PINRY_RECOVERY_ORIGIN: "https://<복구 호스트>:<복구 포트>"
+      PINRY_RECOVERY_CERT_FILE: "/run/pinry-recovery-tls/cert.pem"
+      PINRY_RECOVERY_KEY_FILE: "/run/pinry-recovery-tls/key.pem"
+    volumes:
+      - "/volume1/docker/svrx-pinry/data:/data"
+      - "/volume1/docker/svrx-pinry/recovery-tls:/run/pinry-recovery-tls:ro"
+```
+
+먼저 비밀번호 로그인이 켜진 상태에서 `/admin/users/authpolicy/`에 필요한 RFC1918
+또는 IPv6 ULA 허용 CIDR과 NAS·LAN gateway·Docker gateway·프록시의 차단
+IP/CIDR을 입력한다. 활성 슈퍼 관리자로
+`https://<복구 호스트>:<복구 포트>/recovery/login/`에 로그인하고 별도
+쿠키·15분 만료·정확한 Origin·CSRF·CIDR 검사가 적용되는지 확인한다.
+공개 포트의 `/recovery/`는 404여야 한다.
+
+복구 CIDR을 잘못 저장했거나 SSO 장애로 잠긴 경우 컨테이너 셀에서
+관리 명령을 사용한다. 실행 전 변경 요약을 확인하고 표준 입력에 정확히
+`YES`를 입력해야 반영된다. 명시하지 않은 정책은 보존된다.
+
+```sh
+docker exec -it svrx-pinry python manage.py auth_recover --allow-cidr 192.168.0.0/24
+docker exec -it svrx-pinry python manage.py auth_recover --enable-password-login
+```
+
+### 백업·검증 경계
+
+데이터베이스·미디어·`local_settings.py`와 별도로 `sso-secret.key`,
+내부 CA bundle, 복구 전용 인증서·키를 백업한다. 비밀키를 로그,
+문의 자료, 산출물에 포함하지 않는다. 제공자 설정 변경 후에는 로그인·연결,
+비밀번호/API 토큰 정책, 복구 진입, 컨테이너 재시작을 다시 검증한다.
+
+합성 TLS IdP 검증은 제품의 PKCE·nonce·서명·TLS 경계를 확인하지만
+Google·Microsoft·GitHub·Authentik·Synology 실계정 인증을 대신하지 않는다.
+외부 IdP 실계정·설정을 바꾸지 않았다면 해당 연동은 미검증으로 기록한다.
+NAS 전체 재부팅과 격리 컨테이너 재시작은 같은 검증이 아니므로 구분해 기록한다.
+
 ## 기동 복구 패치 이력
 
 ### 운영 배포 확인 — 2026-09-11

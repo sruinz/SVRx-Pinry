@@ -629,6 +629,7 @@ git archive --format=tar "${source_commit}" -- \
     ':(exclude)pinry_plugins/tests.py' \
     ':(exclude)users/test_*.py' \
     ':(exclude)users/tests.py' \
+    ':(exclude)users/sso_test_utils.py' \
     ':(exclude)pinry-spa/.editorconfig' \
     ':(exclude)pinry-spa/.gitignore' \
     ':(exclude)pinry-spa/README.md' \

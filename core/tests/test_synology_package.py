@@ -1425,8 +1425,21 @@ class SynologyPackageTests(unittest.TestCase):
                 "container_name: svrx-pinry",
                 "ports:",
                 '- "2048:80"',
+                "# 설치자가 직접 LAN 주소를 보존하는 경로를 검증한 뒤에만 추가:",
+                '# - "<NAS의 LAN IP>:<선택한 복구 포트>:8443"',
+                "environment:",
+                'PINRY_RECOVERY_ENABLED: "false"',
+                '# PINRY_RECOVERY_ORIGIN: "https://<복구 호스트>:<선택한 복구 포트>"',
+                '# PINRY_RECOVERY_CERT_FILE: "/run/pinry-recovery-tls/cert.pem"',
+                '# PINRY_RECOVERY_KEY_FILE: "/run/pinry-recovery-tls/key.pem"',
                 "volumes:",
                 '- "/volume1/docker/svrx-pinry/data:/data"',
+                "# 복구 전용 인증서·키를 사용하며 운영 웹사이트 TLS 키를 재사용하지 않는다.",
+                "# 키 root:www-data 0640, 상위 디렉터리 그룹 탐색 허용, 세계 읽기 금지.",
+                "# nginx·복구 앱만 읽을 수 있게 하고 읽기 전용으로 마운트:",
+                '# - "/volume1/docker/svrx-pinry/recovery-tls:/run/pinry-recovery-tls:ro"',
+                "# 허용 CIDR과 NAS·게이트웨이·프록시 차단 CIDR을 별도로 설정한다.",
+                "# NAT로 원본 주소를 구별할 수 없다면 게이트웨이를 허용하지 않는다.",
                 "restart: unless-stopped",
             ],
         )
@@ -1472,6 +1485,7 @@ class SynologyPackageTests(unittest.TestCase):
             "exports/tests.py",
             "pinry/settings/test_postgres.py",
             "pinry/settings/test_sqlite_file.py",
+            "users/sso_test_utils.py",
         ):
             with self.subTest(excluded_path=excluded_path):
                 self.assertFalse(
@@ -2083,6 +2097,7 @@ class SynologyPackageTests(unittest.TestCase):
                 "LICENSE.md",
                 "NOTICE.md",
                 "UPSTREAM.md",
+                "docker/nginx/recovery.conf.template",
             ],
         )
 
