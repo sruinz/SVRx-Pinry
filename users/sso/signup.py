@@ -43,8 +43,7 @@ class SignupForm(forms.Form):
     def __init__(self, *args, email='', **kwargs):
         super().__init__(*args, **kwargs)
         self.email = email
-        with translation.override('ko'):
-            self.fields['password1'].help_text = password_validation.password_validators_help_text_html()
+        self.fields['password1'].help_text = password_validation.password_validators_help_text_html()
         for field in self.fields.values():
             field.error_messages['required'] = '이 항목을 입력하세요.'
 
@@ -139,9 +138,11 @@ def signup(request):
                 mark_recent_auth(request, 'sso', provider)
                 response = HttpResponseRedirect(safe_next(next_path))
             else:
-                response = render(request, 'sso/signup.html', {'form': form, 'provider': attempt.provider,
-                                  'password_login_enabled': password_login_allowed(request)},
-                                  status=400 if form.is_bound else 200)
+                with translation.override('ko'):
+                    response = render(request, 'sso/signup.html', {
+                        'form': form, 'provider': attempt.provider,
+                        'password_login_enabled': password_login_allowed(request),
+                    }, status=400 if form.is_bound else 200)
         except (ValidationError, PermissionDenied) as error:
             response = render(request, 'sso/error.html', {
                 'reason': ' '.join(error.messages) if isinstance(error, ValidationError) else str(error),
