@@ -156,7 +156,7 @@
       data-test="admin-settings-link"
       href="/admin/">
       <div class="card-content admin-settings-content">
-        <i class="mdi mdi-shield-account-outline" aria-hidden="true"></i>
+        <i class="mdi mdi-shield-outline" aria-hidden="true"></i>
         <div class="admin-settings-description">
           <strong>{{ $t("adminSettingsLink") }}</strong>
           <p>{{ $t('profileAdminHelp') }}</p>
@@ -431,6 +431,7 @@ export default {
 .admin-settings-description p { color: var(--pinry-muted); margin-top: 4px; }
 .build-info-card .content { display: flex; flex-wrap: wrap; gap: 12px 28px; }
 .build-info-card code { background: none; color: var(--pinry-text); }
+.build-info-card strong { color: var(--pinry-text); }
 .dependency-group { display: flex; gap: 16px; align-items: flex-start; margin-top: 16px; }
 .dependency-group h3 { display: flex; align-items: center; gap: 12px; flex: 0 0 130px; margin: 0; min-height: 44px; font-size: 14px; }
 .dependency-group h3::before { content: ''; width: 28px; height: 6px; border-radius: 4px; background: var(--dependency-marker); }
