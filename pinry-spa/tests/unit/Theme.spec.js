@@ -53,6 +53,13 @@ describe('화면 테마 선택', () => {
     expect(localStorage.getItem('pinry-theme')).toBe('dark');
   });
 
+  it('테마 버튼을 접히는 메뉴 밖의 우측 도구로 배치한다', () => {
+    const button = mountHeader();
+    expect(button.element.parentElement.classList.contains('container')).toBe(true);
+    expect(button.element.previousElementSibling.id).toBe('PinryNav');
+    expect(wrapper.findAll('[data-test="theme-toggle"]')).toHaveLength(1);
+  });
+
   it('잘못된 저장값은 기존 다크 화면으로 처리한다', () => {
     localStorage.setItem('pinry-theme', 'invalid');
     mountHeader();

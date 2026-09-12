@@ -7,13 +7,6 @@
             <img src="../assets/svrx-pinry-dark-ui.png" alt="" height="32">
             <span class="brand-name" data-test="brand-name">SVRx Pinry</span>
           </a>
-          <button type="button" class="theme-toggle" data-test="theme-toggle"
-            :aria-label="$t(theme === 'dark' ? 'switchToLightTheme' : 'switchToDarkTheme')"
-            :title="$t(theme === 'dark' ? 'switchToLightTheme' : 'switchToDarkTheme')"
-            @click="toggleTheme">
-            <i aria-hidden="true" class="mdi"
-              :class="theme === 'dark' ? 'mdi-white-balance-sunny' : 'mdi-weather-night'"></i>
-          </button>
           <a role="button" class="navbar-burger burger"
              aria-label="menu" :aria-expanded="String(active)"
              v-on:click="toggleMenu"
@@ -184,6 +177,13 @@
             </div>
           </div>
         </div>
+        <button type="button" class="theme-toggle" data-test="theme-toggle"
+          :aria-label="$t(theme === 'dark' ? 'switchToLightTheme' : 'switchToDarkTheme')"
+          :title="$t(theme === 'dark' ? 'switchToLightTheme' : 'switchToDarkTheme')"
+          @click="toggleTheme">
+          <i aria-hidden="true" class="mdi"
+            :class="theme === 'dark' ? 'mdi-white-balance-sunny' : 'mdi-weather-night'"></i>
+        </button>
       </div>
     </nav>
   </div>
@@ -318,6 +318,9 @@ export default {
 }
 @media screen and (max-width: 1023px) {
   .navbar > .container { width: 100%; }
+  .theme-toggle { position: absolute; top: 4px; right: 56px; margin-left: 0; }
+  .navbar-brand { padding-right: 56px; }
+  .navbar-burger { position: absolute; right: 0; top: 0; }
   .brand-lockup { padding-left: 16px; }
   .navbar-burger { color: var(--pinry-text); }
   .navbar-menu { background: var(--pinry-surface); }
