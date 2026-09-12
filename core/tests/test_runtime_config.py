@@ -2030,6 +2030,22 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertNotIn(b"sentinel-existing-secret", rendered)
         self.assertNotIn(b"sentinel-db-credential", rendered)
 
+    def test_bootstrap_reports_settings_format_errors_without_disclosing_source(self):
+        for content, code in (
+            (b"SECRET_KEY='sentinel-private'\nif:\n", b'local_settings_syntax_invalid'),
+            ("SECRET_KEY='sentinel-private'\nNAME='한글'\n".encode('cp949'),
+             b'local_settings_encoding_invalid'),
+        ):
+            with self.subTest(code=code):
+                script, _root, data, _secret, environment = self._bootstrap_fixture(content)
+                completed = subprocess.run(
+                    ['/bin/bash', str(script)], env=environment, capture_output=True,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(completed.stderr.strip(), code)
+                self.assertNotIn(b'sentinel-private', completed.stdout + completed.stderr)
+                self.assertEqual((data / 'local_settings.py').read_bytes(), content)
+
     def test_bootstrap_key_generation_failure_is_not_overwritten_by_success(self):
         script, root, data, secret, environment = self._bootstrap_fixture()
         environment["PINRY_PWGEN_FAIL"] = "1"

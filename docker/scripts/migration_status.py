@@ -46,6 +46,8 @@ ERROR_CLASSES = frozenset((
 ))
 
 ERROR_CODE_CLASSES = {
+    "local_settings_encoding_invalid": "operator_action_required",
+    "local_settings_syntax_invalid": "operator_action_required",
     "archive_failed": "fatal",
     "archive_manifest_mismatch": "fatal",
     "archive_state_conflict": "fatal",

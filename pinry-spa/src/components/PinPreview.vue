@@ -10,14 +10,20 @@
     <section class="card">
       <p v-if="pageError" role="status" class="preview-message">{{ $t('previewPageError') }}</p>
       <div class="card-image">
-        <figure class="image" :aria-busy="!imageReady && !imageError ? 'true' : 'false'">
+        <figure ref="imageViewport" class="image preview-image-viewport"
+                :class="{ 'is-original-size': originalSize }"
+                :aria-busy="!imageReady && !imageError ? 'true' : 'false'">
           <p v-if="!imageReady" role="status" class="preview-message">
             {{ $t(imageError ? 'previewImageError' : 'previewImageLoading') }}
           </p>
-          <img :key="currentPin.id" ref="previewImage" data-test="preview-image"
+          <button v-show="imageReady" type="button" class="preview-image-toggle"
+                  data-test="preview-image-toggle" @click.stop="toggleOriginalSize"
+                  :aria-label="$t(originalSize ? 'previewFitScreen' : 'previewOriginalSize')">
+            <img :key="currentPin.id" ref="previewImage" data-test="preview-image"
                v-show="imageReady" :src="currentPin.large_image_url"
                :alt="currentPin.description || $t('previewImage')"
                @load="onImageLoaded" @error="onImageError">
+          </button>
         </figure>
         <nav v-if="navigation" class="preview-navigation" data-test="preview-navigation"
              :aria-label="$t('previewNavigation')">
@@ -46,6 +52,13 @@
             <span v-for="tag in currentPin.tags" :key="tag" class="tag pin-preview-tag">{{ tag }}</span>
           </div>
           <div class="preview-links">
+            <button type="button" class="meta-link" data-test="preview-zoom"
+                    :disabled="!imageReady || imageError"
+                    :aria-pressed="originalSize ? 'true' : 'false'" @click.stop="toggleOriginalSize">
+              {{ $t(originalSize ? 'previewFitScreen' : 'previewOriginalSize') }}
+            </button>
+            <a :href="currentPin.large_image_url" target="_blank" rel="noopener noreferrer"
+               class="meta-link" data-test="preview-stored-original">{{ $t('previewOpenOriginal') }}</a>
             <a v-if="currentPin.referer !== null" :href="currentPin.referer"
                target="_blank" rel="noopener noreferrer" class="meta-link">
               {{ $t('sourceButton') }}
@@ -83,6 +96,7 @@ export default {
       pageError: false,
       imageReady: false,
       imageError: false,
+      originalSize: false,
     };
   },
   computed: {
@@ -109,6 +123,20 @@ export default {
     this.deactivate();
   },
   methods: {
+    toggleOriginalSize() {
+      if (!this.imageReady || this.imageError) return;
+      this.originalSize = !this.originalSize;
+      this.resetImageScroll();
+    },
+    resetImageScroll() {
+      this.$nextTick(() => {
+        const viewport = this.$refs.imageViewport;
+        if (viewport) {
+          viewport.scrollTop = 0;
+          viewport.scrollLeft = 0;
+        }
+      });
+    },
     deactivate() {
       this.disposed = true;
       document.removeEventListener('keydown', this.onKeydown);
@@ -132,6 +160,8 @@ export default {
       if (this.disposed || !this.isModalActive() || this.pageError) return;
       const item = this.context.items[index];
       if (item) {
+        this.originalSize = false;
+        this.resetImageScroll();
         this.imageReady = false;
         this.imageError = false;
         this.currentPin = item;
@@ -210,6 +240,14 @@ export default {
   object-fit: contain;
   border-radius: 5px;
 }
+.meta-link:disabled { opacity: .45; cursor: default; }
+.meta-link[aria-pressed="true"] { color: var(--pinry-accent); }
+.preview-image-toggle { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
+.preview-image-viewport.is-original-size { display: block; overflow: auto; max-height: calc(100dvh - 220px); }
+.is-original-size .preview-image-toggle { width: max-content; max-width: none; cursor: zoom-out; }
+.is-original-size .preview-image-toggle img { width: auto; max-width: none; max-height: none; }
+.meta-link:focus-visible,
+.preview-image-toggle:focus-visible { outline: 2px solid var(--pinry-accent); outline-offset: -2px; }
 .preview-step {
   position: absolute;
   top: 50%;

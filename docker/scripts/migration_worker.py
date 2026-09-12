@@ -28,6 +28,8 @@ _DEFAULT_SERVICE_UID = 33
 _DEFAULT_SERVICE_GID = 33
 _MAX_FRAME_BYTES = 4096
 _BOOTSTRAP_ERROR_CODES = frozenset((
+    "local_settings_encoding_invalid",
+    "local_settings_syntax_invalid",
     "bootstrap_environment_invalid",
     "bootstrap_persistent_settings_invalid",
     "bootstrap_project_settings_invalid",

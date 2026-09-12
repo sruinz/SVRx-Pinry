@@ -16,6 +16,19 @@ const ui = require(SCRIPT_PATH);
 const html = readFileSync(HTML_PATH, "utf8");
 const css = readFileSync(CSS_PATH, "utf8");
 
+test("설정 인코딩과 구문 오류는 미디어 오류와 구별해 안내한다", () => {
+  for (const [code, explanation] of [
+    ["local_settings_encoding_invalid", /UTF-8/],
+    ["local_settings_syntax_invalid", /구문/],
+  ]) {
+    const view = ui.deriveViewModel(status({
+      state: "failed", error_class: "operator_action_required", error_code: code,
+    }), Date.now());
+    assert.match(view.operatorHint, /local_settings\.py/);
+    assert.match(view.operatorHint, explanation);
+  }
+});
+
 
 function status(overrides = {}) {
   return {

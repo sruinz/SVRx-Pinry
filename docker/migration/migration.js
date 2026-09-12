@@ -263,7 +263,13 @@
     return String(Math.floor(ageSeconds / 3600)) + "시간 전";
   }
 
-  function errorNotice(errorClass) {
+  function errorNotice(errorClass, errorCode) {
+    if (errorCode === "local_settings_encoding_invalid") {
+      return "local_settings.py의 인코딩을 안전하게 자동 복구할 수 없습니다. 원본을 백업하고 설정값을 확인한 뒤 UTF-8로 저장하세요.";
+    }
+    if (errorCode === "local_settings_syntax_invalid") {
+      return "local_settings.py에 Python 구문 오류가 있습니다. 원본을 백업하고 설정 파일의 구문을 확인하세요. 데이터 이전은 시작하지 않았습니다.";
+    }
     if (errorClass === "retryable") {
       return "컨테이너를 다시 시작하면 마지막 확정 배치부터 재개합니다.";
     }
@@ -290,7 +296,7 @@
       && payload.backfill_total === null;
     var notice = "중지해야 한다면 DSM Container Manager의 정상 중지를 사용하세요. 재시작하면 마지막 확정 배치부터 이어집니다.";
     if (failed) {
-      notice = errorNotice(payload.error_class);
+      notice = errorNotice(payload.error_class, payload.error_code);
     } else {
       var heartbeatAge = now - Date.parse(payload.heartbeat_at);
       var progressAge = payload.progress_at === null ? 0 : now - Date.parse(payload.progress_at);
@@ -348,7 +354,7 @@
         fatal: "안전 상태 확인 필요",
       })[payload.error_class] || "없음",
       errorCodeText: payload.error_code || "없음",
-      operatorHint: failed ? errorNotice(payload.error_class) : "",
+      operatorHint: failed ? errorNotice(payload.error_class, payload.error_code) : "",
     };
   }
 

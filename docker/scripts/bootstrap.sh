@@ -143,9 +143,14 @@ esac
 
 bootstrap_failure_code="bootstrap_persistent_settings_invalid"
 if [ -e "${data_settings}" ] || [ -L "${data_settings}" ]; then
-    python3 "${normalize_script}" \
-        "${data_root}" "${data_settings}" settings \
-        >/dev/null 2>/dev/null || abort_current_stage
+    if ! settings_error="$(python3 "${normalize_script}" \
+        "${data_root}" "${data_settings}" settings 2>&1 >/dev/null)"; then
+        case "${settings_error}" in
+            local_settings_encoding_invalid|local_settings_syntax_invalid)
+                bootstrap_failure_code="${settings_error}" ;;
+        esac
+        abort_current_stage
+    fi
     if [ -e "${key_file}" ] || [ -L "${key_file}" ]; then
         python3 "${normalize_script}" \
             "${data_root}" "${key_file}" key \

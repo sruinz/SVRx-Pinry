@@ -59,6 +59,33 @@ describe('핀 상세 연속 감상', () => {
     expect(wrapper.find('[data-test="preview-navigation"]').exists()).toBe(false);
   });
 
+  it('로드 후 원본 크기를 켜고 끄며 저장된 원본을 새 탭에서 연다', async () => {
+    open();
+    const toggle = wrapper.find('.preview-links [data-test="preview-zoom"]');
+    expect(toggle.exists()).toBe(true);
+    expect(toggle.attributes('disabled')).toBeDefined();
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await toggle.trigger('click');
+    expect(toggle.attributes('aria-pressed')).toBe('true');
+    expect(wrapper.find('.preview-image-viewport').classes()).toContain('is-original-size');
+    await wrapper.find('[data-test="preview-image-toggle"]').trigger('click');
+    expect(toggle.attributes('aria-pressed')).toBe('false');
+    const original = wrapper.find('[data-test="preview-stored-original"]');
+    expect(original.attributes('href')).toBe('/image-3.gif');
+    expect(original.attributes('target')).toBe('_blank');
+  });
+
+  it('확대 중 다음 핀으로 이동하면 화면 맞춤으로 돌아온다', async () => {
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    expect(wrapper.find('[data-test="preview-zoom"]').exists()).toBe(true);
+    await wrapper.find('[data-test="preview-zoom"]').trigger('click');
+    await wrapper.find('[data-test="preview-next"]').trigger('click');
+    expect(wrapper.find('[data-test="preview-zoom"]').attributes('aria-pressed')).toBe('false');
+    expect(wrapper.find('[data-test="preview-stored-original"]').attributes('href')).toBe('/image-8.gif');
+    expect(wrapper.emitted('close')).toBeUndefined();
+  });
+
   it('이전다음 클릭은 바깥 닫기에 전파되지 않고 순번만 이동한다', async () => {
     open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
     const outsideClick = jest.fn();
