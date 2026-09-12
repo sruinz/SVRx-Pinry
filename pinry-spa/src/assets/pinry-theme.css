@@ -11,6 +11,9 @@
   --pinry-selection: #253d3a;
   --pinry-link-hover: #6de1cf;
   --pinry-link: #00c4a7;
+  --pinry-dependency-backend: #193d6f;
+  --pinry-dependency-frontend: #164b48;
+  --pinry-dependency-tools: #303d48;
 }
 
 :root[data-theme="light"] {
@@ -26,6 +29,9 @@
   --pinry-selection: #c6eee6;
   --pinry-link-hover: #006c5c;
   --pinry-link: #007d6b;
+  --pinry-dependency-backend: #dce9fa;
+  --pinry-dependency-frontend: #d4eeea;
+  --pinry-dependency-tools: #e3e9ef;
 }
 
 html, body, #app { min-height: 100%; background: var(--pinry-background); }

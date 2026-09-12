@@ -1,16 +1,29 @@
 <template>
   <div class="profile-container">
-    <div class="card">
+    <div class="card token-card">
       <header class="card-header">
         <p class="card-header-title">
-          {{ $t("tokenUserProfileCardTitle") }}
+          {{ $t("profileTokenTitle") }}
         </p>
       </header>
       <div class="card-content">
         <div class="content">
-          <p>{{ $t("tokenUserProfileCardContent") }}</p>
-          <pre v-if="policy && policy.api_tokens_enabled">{{ token }}</pre>
+          <p>{{ $t("profileTokenDescription") }}</p>
+          <div v-if="policy && policy.api_tokens_enabled && token" class="token-controls">
+            <div class="token-field">
+              <code data-test="token-value">{{ tokenVisible ? token : '•••• •••• •••• ••••' }}</code>
+              <button class="button token-toggle" type="button" data-test="token-toggle"
+                :aria-pressed="String(tokenVisible)" @click="tokenVisible = !tokenVisible">
+                <i class="mdi" :class="tokenVisible ? 'mdi-eye-off-outline' : 'mdi-eye-outline'" aria-hidden="true"></i>
+                {{ $t(tokenVisible ? 'profileTokenHide' : 'profileTokenShow') }}
+              </button>
+            </div>
+            <button class="button token-copy" type="button" data-test="token-copy" @click="copyToken">
+              <i class="mdi mdi-content-copy" aria-hidden="true"></i>{{ $t('profileTokenCopy') }}
+            </button>
+          </div>
           <p v-else>{{ $t('ssoTokensDisabled') }}</p>
+          <p v-if="tokenStatus" role="status" data-test="token-status">{{ $t(tokenStatus) }}</p>
           {{ $t("pleaseReadTokenUserProfileCardContent") }}<a target="_blank" href="https://www.django-rest-framework.org/api-guide/authentication/#tokenauthentication">{{ $t("drfApiDocumentationLink") }}</a>{{ $t("forMoreDetailsParagraph") }}
           <br>
         </div>
@@ -50,12 +63,13 @@
               data-test="password-reauth-form"
               class="sso-password-reauth"
               @submit.prevent="passwordReauth">
-              <label for="sso-password">{{ $t('passwordLabel') }}</label>
+              <label for="sso-password">{{ $t('profilePinryPassword') }}</label>
               <div class="sso-password-reauth__row">
                 <input
                   id="sso-password"
                   v-model="password"
                   type="password"
+                  :placeholder="$t('profileCurrentPassword')"
                   autocomplete="current-password"
                   required>
                 <button class="button" type="submit">{{ $t('ssoReauth') }}</button>
@@ -74,6 +88,7 @@
                     :src="providerIcon(identity.provider_id, identity.provider_kind)"
                     alt="">
                   <span>{{ identity.provider_name }}</span>
+                  <span v-if="identity.enabled" class="sso-connected-status">{{ $t('profileConnected') }}</span>
                   <span v-if="!identity.enabled" class="sso-provider-status">
                     {{ $t('ssoUnavailable') }}
                   </span>
@@ -113,7 +128,7 @@
             </div>
             <div v-if="policy && !identityError" class="sso-provider-list sso-link-list">
               <form
-                v-for="provider in policy.providers"
+                v-for="provider in availableProviders"
                 :key="provider.id"
                 data-test="provider-link-row"
                 class="sso-provider-row"
@@ -140,10 +155,15 @@
       class="card admin-settings-card"
       data-test="admin-settings-link"
       href="/admin/">
-      <div class="card-content">
-        <div class="content">
-          {{ $t("adminSettingsLink") }}
+      <div class="card-content admin-settings-content">
+        <i class="mdi mdi-shield-account-outline" aria-hidden="true"></i>
+        <div class="admin-settings-description">
+          <strong>{{ $t("adminSettingsLink") }}</strong>
+          <p>{{ $t('profileAdminHelp') }}</p>
         </div>
+        <span class="button admin-settings-action">{{ $t('profileAdminOpen') }}
+          <i class="mdi mdi-arrow-top-right" aria-hidden="true"></i>
+        </span>
       </div>
     </a>
     <div class="card build-info-card">
@@ -177,13 +197,18 @@
       </header>
       <div class="card-content">
         <div class="content">
-          <div
-            v-for="dependency in dependencies"
-            :key="dependency.key">
-            <span>{{ dependency.label }}:</span>
-            <code v-if="dependency.version">{{ dependency.version }}</code>
-            <span v-else>—</span>
-          </div>
+          <section v-for="group in dependencyGroups" :key="group.key"
+            class="dependency-group" :class="`dependency-group--${group.key}`"
+            :data-test="`dependencies-${group.key}`">
+            <h3>{{ $t(group.title) }}</h3>
+            <ul class="dependency-bubbles">
+              <li v-for="dependency in group.items" :key="dependency.key" class="dependency-bubble">
+                <span>{{ dependency.label }}</span>{{ ' ' }}<code v-if="dependency.version">{{ dependency.version }}</code>
+                <span v-else>—</span>
+              </li>
+            </ul>
+          </section>
+          <p class="dependency-build-help">{{ $t('profileBuildToolsHelp') }}</p>
         </div>
       </div>
     </div>
@@ -207,6 +232,7 @@
 
 <script>
 import API from '../api';
+import buildDependencies from '../utils/build-dependencies';
 
 const providerKinds = ['authentik', 'google', 'microsoft', 'github', 'synology', 'oidc'];
 const unlinkErrorKeys = {
@@ -227,6 +253,9 @@ export default {
   data() {
     return {
       componentAlive: true,
+      tokenVisible: false,
+      tokenStatus: '',
+      buildDependencies: buildDependencies(),
       policy: null,
       policyError: false,
       identities: [],
@@ -246,6 +275,23 @@ export default {
       versionRequestSequence: 0,
     };
   },
+  computed: {
+    availableProviders() {
+      const connected = new Set(this.identities.map(identity => identity.provider_id));
+      return ((this.policy && this.policy.providers) || [])
+        .filter(provider => !connected.has(provider.id));
+    },
+    dependencyGroups() {
+      return [
+        { key: 'backend', title: 'profileBackend', items: this.dependencies },
+        { key: 'frontend', title: 'profileFrontend', items: this.buildDependencies.frontend },
+        { key: 'buildTools', title: 'profileBuildTools', items: this.buildDependencies.buildTools },
+      ];
+    },
+  },
+  watch: {
+    token() { this.tokenVisible = false; this.tokenStatus = ''; },
+  },
   created() {
     this.fetchBuildVersion();
     API.SSO.policy().then((policy) => { if (this.componentAlive) this.policy = policy; })
@@ -257,6 +303,34 @@ export default {
     this.versionRequestSequence += 1;
   },
   methods: {
+    async copyToken() {
+      if (!this.policy || !this.policy.api_tokens_enabled || !this.token) return;
+      this.tokenStatus = '';
+      try {
+        if (navigator.clipboard) {
+          await navigator.clipboard.writeText(this.token);
+        } else {
+          // 내부망 HTTP에서는 Clipboard API를 사용할 수 없다.
+          const previousFocus = document.activeElement;
+          const selection = document.createElement('textarea');
+          selection.value = this.token;
+          selection.readOnly = true;
+          selection.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
+          document.body.appendChild(selection);
+          try {
+            selection.focus();
+            selection.select();
+            if (!document.execCommand('copy')) throw new Error('copy failed');
+          } finally {
+            selection.remove();
+            if (previousFocus) previousFocus.focus();
+          }
+        }
+        if (this.componentAlive) this.tokenStatus = 'profileTokenCopied';
+      } catch (_) {
+        if (this.componentAlive) this.tokenStatus = 'profileTokenCopyFailed';
+      }
+    },
     providerKind(providerId, kind = null) {
       if (providerKinds.includes(kind)) return kind;
       const providers = this.policy && this.policy.providers;
@@ -318,17 +392,59 @@ export default {
 
 <style scoped lang="scss">
 .profile-container {
-  margin-top: 2rem;
-  margin-left: auto;
-  margin-right: auto;
-  box-shadow: 5px 5px 2px 1px rgba(0, 0, 255, .1);
+  display: grid;
+  gap: 24px;
+  width: calc(100% - 96px);
+  max-width: 1280px;
+  margin: 24px auto 40px;
 }
 
-.admin-settings-card,
-.build-info-card,
-.dependency-info-card,
-.open-source-card {
-  margin-top: 1rem;
+.card {
+  margin: 0;
+  border: 1px solid var(--pinry-border);
+  border-radius: 16px;
+  box-shadow: none;
+  overflow: hidden;
+}
+.card-header { box-shadow: none; padding: 28px 32px 0; }
+.card-header-title { padding: 0; font-size: 22px; }
+.card-content { padding: 20px 32px 28px; }
+.content { color: var(--pinry-muted); }
+.button { min-height: 44px; border-radius: 10px; gap: 8px; }
+.token-controls { display: flex; gap: 12px; margin: 16px 0; }
+.token-field {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  flex: 1;
+  border: 1px solid var(--pinry-border);
+  border-radius: 10px;
+  background: var(--pinry-background);
+}
+.token-field code { min-width: 0; flex: 1; padding: 12px 16px; overflow-wrap: anywhere; background: none; color: var(--pinry-text); }
+.token-toggle { flex-shrink: 0; border: 0; background: transparent; }
+.token-copy, .admin-settings-action { color: var(--pinry-link); border-color: var(--pinry-accent); background: transparent; }
+.admin-settings-content { display: flex; align-items: center; gap: 20px; padding: 24px 32px; }
+.admin-settings-content > .mdi { color: var(--pinry-accent); font-size: 32px; }
+.admin-settings-description { flex: 1; }
+.admin-settings-description strong { color: var(--pinry-text); font-size: 18px; }
+.admin-settings-description p { color: var(--pinry-muted); margin-top: 4px; }
+.build-info-card .content { display: flex; flex-wrap: wrap; gap: 12px 28px; }
+.build-info-card code { background: none; color: var(--pinry-text); }
+.dependency-group { display: flex; gap: 16px; align-items: flex-start; margin-top: 16px; }
+.dependency-group h3 { display: flex; align-items: center; gap: 12px; flex: 0 0 130px; margin: 0; min-height: 44px; font-size: 14px; }
+.dependency-group h3::before { content: ''; width: 28px; height: 6px; border-radius: 4px; background: var(--dependency-marker); }
+.dependency-group--backend { --dependency-marker: #347bd1; --dependency-bubble: var(--pinry-dependency-backend); }
+.dependency-group--frontend { --dependency-marker: #00c4a7; --dependency-bubble: var(--pinry-dependency-frontend); }
+.dependency-group--buildTools { --dependency-marker: #8fa1b8; --dependency-bubble: var(--pinry-dependency-tools); }
+.content ul.dependency-bubbles { display: flex; flex: 1; flex-wrap: wrap; gap: 12px; margin: 0; list-style: none; }
+.content li.dependency-bubble { display: flex; align-items: center; gap: 18px; max-width: 100%; min-height: 44px; padding: 10px 20px; margin: 0; border-radius: 999px; background: var(--dependency-bubble); color: var(--pinry-text); }
+.dependency-bubble span { overflow-wrap: anywhere; }
+.dependency-bubble code { color: inherit; font: inherit; white-space: nowrap; padding: 0; background: none; }
+.dependency-build-help { margin-top: 20px; font-size: 14px; }
+.sso-connected-status { padding: 4px 12px; border-radius: 999px; background: var(--pinry-selection); color: var(--pinry-link); font-size: 12px; }
+.sso-card .card-header {
+  background: var(--pinry-surface);
 }
 
 .admin-settings-card {
@@ -336,25 +452,17 @@ export default {
 }
 
 .sso-card {
-  color: #eef0f1;
-  background: #1b1f21;
-  border: 1px solid #3b4246;
-}
-
-.sso-card .card-header {
-  background: #1b1f21;
-  border-bottom: 1px solid #3b4246;
-  box-shadow: none;
+  color: var(--pinry-text);
 }
 
 .sso-card .card-header-title {
-  color: #f7f8f8;
+  color: var(--pinry-text);
 }
 
 .sso-auto-link-help,
 .sso-manual-help,
 .sso-provider-help {
-  color: #b8bec1;
+  color: var(--pinry-muted);
   overflow-wrap: anywhere;
   word-break: keep-all;
 }
@@ -376,12 +484,12 @@ export default {
 
 .sso-manual-controls {
   margin-top: 1.25rem;
-  border-top: 1px solid #3b4246;
+  border-top: 1px solid var(--pinry-border);
 }
 
 .sso-manual-controls summary {
   padding: 1rem 0;
-  color: #f4f5f5;
+  color: var(--pinry-text);
   font-weight: 600;
   cursor: pointer;
 }
@@ -397,7 +505,7 @@ export default {
 .sso-password-reauth label {
   display: block;
   margin-bottom: .5rem;
-  color: #d9dcde;
+  color: var(--pinry-text);
   font-weight: 600;
 }
 
@@ -420,10 +528,10 @@ export default {
   min-height: 44px;
   flex: 1;
   padding: .625rem .75rem;
-  color: #f5f6f6;
-  background: #121516;
-  border: 1px solid #4b5357;
-  border-radius: 4px;
+  color: var(--pinry-text);
+  background: var(--pinry-background);
+  border: 1px solid var(--pinry-border);
+  border-radius: 10px;
 }
 
 .sso-password-reauth input:focus {
@@ -440,9 +548,9 @@ export default {
 .sso-password-reauth .button,
 .sso-link-action {
   min-height: 44px;
-  color: #10211e;
-  background: #00d1b2;
-  border-color: #00d1b2;
+  color: var(--pinry-link);
+  background: transparent;
+  border-color: var(--pinry-accent);
   font-weight: 600;
 }
 
@@ -454,19 +562,17 @@ export default {
 
 .sso-link-list {
   padding-top: 1rem;
-  border-top: 1px solid #3b4246;
+  border-top: 1px solid var(--pinry-border);
 }
 
 .sso-provider-row {
   display: flex;
   min-height: 58px;
-  padding: .75rem;
+  padding: .75rem 0;
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  background: #171a1c;
-  border: 1px solid #3b4246;
-  border-radius: 8px;
+  background: transparent;
 }
 
 .sso-provider-row__identity,
@@ -519,7 +625,7 @@ export default {
 }
 
 .sso-secondary-action {
-  color: #eef0f1;
+  color: var(--pinry-text);
   background: transparent;
   border-color: #697176;
 }
@@ -573,17 +679,24 @@ export default {
 }
 
 [data-test="build-version"],
-.dependency-info-card code {
+.build-info-card code {
   margin-left: .5rem;
   user-select: text;
 }
 
-@import '../utils/grid-layout';
-@include screen-grid-layout(".profile-container");
-
-@media (max-width: 542px) {
-  .profile-container {
-    max-width: calc(100% - 2rem);
-  }
+@media (max-width: 700px) {
+  .profile-container { width: calc(100% - 32px); gap: 16px; margin-top: 16px; }
+  .card-header { padding: 20px 20px 0; }
+  .card-content { padding: 16px 20px 20px; }
+  .card-header-title { font-size: 20px; }
+  .token-controls { flex-wrap: wrap; }
+  .token-field { flex-basis: 100%; }
+  .token-field code { font-size: 12px; }
+  .admin-settings-content { flex-wrap: wrap; }
+  .admin-settings-action { margin-left: auto; }
+  .dependency-group { flex-direction: column; gap: 8px; }
+  .dependency-group h3 { flex-basis: auto; min-height: 24px; }
+  .content ul.dependency-bubbles { gap: 8px; }
+  .content li.dependency-bubble { padding: 8px 14px; gap: 12px; font-size: 14px; }
 }
 </style>

@@ -88,7 +88,7 @@ describe('Profile administrator link', () => {
 
     expect(link.exists()).toBe(true);
     expect(link.attributes('href')).toBe('/admin/');
-    expect(link.text()).toBe('관리자 설정');
+    expect(link.text()).toContain('관리자 설정');
   });
 
   it.each([

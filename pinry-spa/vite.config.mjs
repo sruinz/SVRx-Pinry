@@ -2,8 +2,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
+import buildDependencies from './scripts/build-dependencies.cjs';
 
 export default defineConfig({
+  define: { __PINRY_BUILD_DEPENDENCIES__: JSON.stringify(buildDependencies()) },
   plugins: [vue({ template: { transformAssetUrls: { includeAbsolute: false } } }), {
     name: 'pinry-network-only-worker',
     generateBundle() {

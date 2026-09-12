@@ -1,5 +1,5 @@
 <template>
-    <div class="user-profile-card">
+    <div class="user-profile-card" :class="{ 'user-profile-card--settings': inProfile }">
       <div id="user-home-container">
         <div class="card">
           <div class="card-content">
@@ -158,4 +158,24 @@ export default {
 }
 @import '../components/utils/grid-layout';
 @include screen-grid-layout("#user-home-container");
+.user-profile-card--settings #user-home-container {
+  width: calc(100% - 96px);
+  max-width: 1280px;
+  box-shadow: none;
+}
+.user-profile-card--settings .card {
+  border: 1px solid var(--pinry-border);
+  border-radius: 16px;
+  box-shadow: none;
+}
+.user-profile-card--settings .card-content { padding: 32px; }
+.user-profile-card--settings .media { margin-bottom: 16px; }
+.user-profile-card--settings .content { color: var(--pinry-muted); margin-bottom: 20px; }
+.user-profile-card--settings .tabs { margin-bottom: 0; }
+.user-profile-card--settings .tabs a { min-height: 44px; gap: 8px; }
+@media (max-width: 700px) {
+  .user-profile-card--settings #user-home-container { width: calc(100% - 32px); }
+  .user-profile-card--settings .card-content { padding: 20px; }
+  .user-profile-card--settings .tabs a { padding: 8px 12px; }
+}
 </style>
