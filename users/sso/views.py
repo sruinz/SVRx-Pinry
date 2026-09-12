@@ -1,5 +1,6 @@
 import json
 import logging
+from urllib.parse import urlencode, urlsplit
 
 from django.contrib import messages
 from django.core.exceptions import PermissionDenied, ValidationError
@@ -10,7 +11,8 @@ from django.views.decorators.http import require_GET, require_POST
 
 from users.models import ExternalIdentity, SSOProvider
 from users.sso.policy import api_token_allowed, identity_is_usable, password_login_allowed
-from users.sso.flows import begin_attempt, finish_attempt, mark_recent_auth, require_user, unlink_identity
+from users.sso.flows import (begin_attempt, callback_url, finish_attempt, mark_recent_auth,
+                            require_user, safe_next, unlink_identity)
 from users.sso.lan_recovery import direct_lan_allowed
 
 
@@ -31,14 +33,41 @@ def _data(request):
 
 def _begin(request, provider_id, purpose):
     provider = get_object_or_404(SSOProvider, pk=provider_id, enabled=True)
+    public_home = None
     try:
         data = request.GET if request.method == 'GET' else _data(request)
-        response = HttpResponseRedirect(begin_attempt(request, provider, purpose, data.get('next', '/')))
+        next_path = safe_next(data.get('next', '/'))
+        try:
+            public = urlsplit(callback_url(provider))
+            current = urlsplit('https://' + request.get_host())
+            # TLS 종료 프록시 뒤에서도 동작하도록 호스트·포트만 비교한다.
+            # HTTPS 강제는 공개 프록시 정책이며 전달 헤더를 새로 신뢰하지 않는다.
+            same_authority = ((current.hostname, current.port or 443)
+                              == (public.hostname, public.port or 443))
+        except ValueError:
+            raise ValidationError('SSO 공개 주소와 접속 주소의 포트를 확인해 주세요.') from None
+        if purpose == 'login' and request.user.is_authenticated:
+            require_user(request)
+            response = HttpResponseRedirect(next_path)
+        elif not same_authority:
+            public_home = provider.public_base_url.rstrip('/') + '/'
+            if purpose != 'login':
+                raise ValidationError('계정 연결·재인증은 공개 주소에서 같은 Pinry 계정으로 '
+                                      '로그인한 뒤 프로필에서 다시 진행해 주세요.')
+            # 내부 주소의 세션을 만들거나 옮기지 않고 공개 주소에서 인증을 시작한다.
+            destination = (provider.public_base_url.rstrip('/')
+                           + reverse('sso:login', args=[provider.pk])
+                           + '?' + urlencode({'next': next_path}))
+            response = HttpResponseRedirect(destination)
+        else:
+            response = HttpResponseRedirect(begin_attempt(request, provider, purpose, next_path))
     except (ValidationError, PermissionDenied) as error:
         response = render(request, 'sso/error.html', {
             'reason': ' '.join(error.messages) if isinstance(error, ValidationError) else str(error),
+            'public_home': public_home,
         }, status=403 if isinstance(error, PermissionDenied) else 400)
     response['Cache-Control'] = 'no-store'
+    response['Referrer-Policy'] = 'no-referrer'
     return response
 
 
@@ -51,7 +80,7 @@ def providers(request):
     ], 'password_login_enabled': password_login_allowed(request),
         'api_tokens_enabled': api_token_allowed(request)})
     response['Cache-Control'] = 'no-store'
-    if direct_lan_allowed(request):
+    if not request.user.is_authenticated and direct_lan_allowed(request):
         data = json.loads(response.content)
         data['recovery_login_url'] = reverse('sso:lan-recovery')
         response = JsonResponse(data)
@@ -61,11 +90,14 @@ def providers(request):
 
 @require_GET
 def login_page(request):
-    response = render(request, 'sso/login.html', {
-        'providers': SSOProvider.objects.filter(enabled=True),
-        'password_login_enabled': password_login_allowed(request),
-        'recovery_login_allowed': direct_lan_allowed(request),
-    })
+    if request.user.is_authenticated:
+        response = HttpResponseRedirect('/')
+    else:
+        response = render(request, 'sso/login.html', {
+            'providers': SSOProvider.objects.filter(enabled=True),
+            'password_login_enabled': password_login_allowed(request),
+            'recovery_login_allowed': direct_lan_allowed(request),
+        })
     response['Cache-Control'] = 'no-store'
     response['Referrer-Policy'] = 'no-referrer'
     return response

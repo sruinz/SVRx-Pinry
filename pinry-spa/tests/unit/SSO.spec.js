@@ -228,6 +228,77 @@ describe('SSO policy screens', () => {
     expect(wrapper.text()).toContain('ssoTokensDisabled');
   });
 
+  it('renders an accessible Pinry password reauthentication row', async () => {
+    axios.get.mockImplementation(url => Promise.resolve({
+      data: url.endsWith('/identities/')
+        ? []
+        : { providers: [], password_login_enabled: true, api_tokens_enabled: false },
+    }));
+    const wrapper = shallowMount(Profile, options);
+    await flushPromises();
+
+    const form = wrapper.find('[data-test="password-reauth-form"]');
+    expect(form.find('label[for="sso-password"]').exists()).toBe(true);
+    expect(form.find('#sso-password').attributes('autocomplete')).toBe('current-password');
+    expect(form.find('button[type="submit"]').text()).toBe('ssoReauth');
+  });
+
+  it('shows provider presentation and keeps destructive unlink visually distinct', async () => {
+    axios.get.mockImplementation(url => Promise.resolve({
+      data: url.endsWith('/identities/')
+        ? [
+          {
+            id: 4, provider_id: 'google-work', provider_name: 'Custom Workspace', enabled: true,
+          },
+          {
+            id: 5, provider_id: 'retired', provider_name: 'Retired SSO', enabled: false,
+          },
+        ]
+        : {
+          providers: [{
+            id: 'google-work', kind: 'google', name: 'Custom Workspace', login_url: '/login',
+          }],
+          password_login_enabled: true,
+          api_tokens_enabled: false,
+        },
+    }));
+    const wrapper = shallowMount(Profile, options);
+    await flushPromises();
+
+    const rows = wrapper.findAll('[data-test="identity-row"]');
+    expect(rows.at(0).find('[data-test="provider-icon"]').attributes('src'))
+      .toBe('/static/auth/providers/google.svg');
+    expect(rows.at(0).text()).toContain('Custom Workspace');
+    expect(rows.at(0).find('form[action="/api/v2/sso/google-work/reauth/"]').exists()).toBe(true);
+    expect(rows.at(0).find('[data-test="unlink-button"]').classes()).toEqual(
+      expect.arrayContaining(['is-danger', 'is-outlined']),
+    );
+    expect(rows.at(1).find('[data-test="provider-icon"]').attributes('src'))
+      .toBe('/static/auth/providers/oidc.svg');
+    expect(rows.at(1).text()).toContain('ssoUnavailable');
+  });
+
+  it('explains SSO reauthentication when Pinry password login is unavailable', async () => {
+    axios.get.mockImplementation(url => Promise.resolve({
+      data: url.endsWith('/identities/')
+        ? [{
+          id: 4, provider_id: 'one', provider_name: 'SSO', enabled: true,
+        }]
+        : {
+          providers: [{
+            id: 'one', kind: 'oidc', name: 'SSO', login_url: '/login',
+          }],
+          password_login_enabled: false,
+          api_tokens_enabled: false,
+        },
+    }));
+    const wrapper = shallowMount(Profile, options);
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="password-reauth-form"]').exists()).toBe(false);
+    expect(wrapper.text()).toContain('ssoManualSsoOnlyHelp');
+  });
+
   it('renders a native CSRF form for provider reauthentication', async () => {
     document.cookie = 'csrftoken=csrf-value';
     axios.get.mockImplementation(url => Promise.resolve({

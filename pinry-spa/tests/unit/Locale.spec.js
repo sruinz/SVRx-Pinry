@@ -32,6 +32,7 @@ const EXPECTED_LOCALE_KEYS = [
   'ssoLoading',
   'ssoLoginWithProvider',
   'ssoManualControls',
+  'ssoManualSsoOnlyHelp',
   'ssoPasswordDisabled',
   'ssoReauth',
   'ssoReauthHelp',
@@ -287,6 +288,10 @@ const EXPECTED_LOCALE_KEYS = [
 ];
 
 const REQUIRED_KOREAN_TEXT = {
+  ssoAutoLinkHelp: 'SSO에서 확인된 이메일이 기존 Pinry 계정과 같으면 자동으로 연결되므로 수동 연결은 필요하지 않습니다. Pinry 비밀번호와 SSO 제공자 비밀번호는 같을 필요가 없습니다.',
+  ssoManualSsoOnlyHelp: 'SSO 전용 계정은 연결된 SSO의 다시 인증을 선택해 제공자에서 확인한 뒤, 5분 안에 원하는 제공자의 계정 연결을 선택하고 다시 제공자에서 확인하세요.',
+  ssoRecentAuthHelp: '수동 연결: 현재 Pinry 비밀번호를 입력해 다시 인증한 뒤, 5분 안에 원하는 제공자의 계정 연결을 선택하고 SSO 제공자에서 확인하세요.',
+  ssoReauthHelp: '연결된 SSO는 제공자에서 다시 확인합니다. 제공자의 기존 로그인 상태에 따라 비밀번호 입력 없이 완료될 수 있습니다.',
   pinBoardAlreadyIncluded: '이미 포함됨',
   pinBoardMembershipLoadError: '보드 포함 상태를 불러오지 못했습니다.',
   NewPinTitle: '새 Pin',

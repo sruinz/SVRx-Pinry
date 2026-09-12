@@ -22,6 +22,7 @@ from users.sso.client import VerifiedIdentity
 @override_settings(PUBLIC=False)
 class SSOFlowTests(TestCase):
     def setUp(self):
+        self.client.defaults['HTTP_HOST'] = 'pinry.example'
         directory = self.enterContext(tempfile.TemporaryDirectory())
         self.enterContext(override_settings(SSO_SECRET_KEY_FILE=str(Path(directory) / 'key')))
         self.provider = SSOProvider.objects.create(
@@ -78,8 +79,81 @@ class SSOFlowTests(TestCase):
         response = self.client.get('/api/v2/sso/providers/')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {'providers': [{'id': str(self.provider.pk), 'name': '시험',
+                                           'kind': 'oidc',
                                            'login_url': f'/api/v2/sso/{self.provider.pk}/login/'}],
                                            'password_login_enabled': True, 'api_tokens_enabled': True})
+
+    def test_lan_login_moves_to_public_host_before_creating_attempt(self):
+        self.connect()
+        lan = Client(HTTP_HOST='192.168.0.45:2048')
+        path = f'/api/v2/sso/{self.provider.pk}/login/'
+        response = lan.get(path, {'next': '/profile/'})
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response['Location'], f'https://pinry.example{path}?next=%2Fprofile%2F')
+        self.assertEqual(response['Cache-Control'], 'no-store')
+        self.assertEqual(response['Referrer-Policy'], 'no-referrer')
+        self.assertFalse(SSOAttempt.objects.exists())
+        self.assertNotIn('sso_browser', lan.session)
+
+        public = Client(HTTP_HOST='pinry.example')
+        start = public.get(response['Location'], secure=True)
+        state = parse_qs(urlsplit(start['Location']).query)['state'][0]
+        result = self.callback(state, client=public)
+        self.assertEqual(result['Location'], '/profile/')
+        self.assertEqual(public.session[SESSION_KEY], str(self.user.pk))
+        self.assertNotIn(SESSION_KEY, lan.session)
+        self.assertEqual(self.exchange_count, 1)
+
+    def test_public_redirect_uses_configured_host_and_safe_next_only(self):
+        path = f'/api/v2/sso/{self.provider.pk}/login/'
+        for host in ('10.12.0.5:8080', '[fd00::5]:8080', 'evil.example', 'pinry.example:8080'):
+            with self.subTest(host=host):
+                response = Client(HTTP_HOST=host).get(path, {
+                    'next': '//evil.example/', 'state': 'do-not-forward', 'code': 'do-not-forward',
+                })
+                self.assertEqual(response['Location'], f'https://pinry.example{path}?next=%2F')
+        self.assertFalse(SSOAttempt.objects.exists())
+
+    def test_public_host_behind_http_upstream_does_not_redirect_loop(self):
+        for host in ('pinry.example', 'PINRY.EXAMPLE:443'):
+            with self.subTest(host=host):
+                response = Client(HTTP_HOST=host).get(f'/api/v2/sso/{self.provider.pk}/login/')
+                self.assertTrue(response['Location'].startswith('https://idp.example/authorize?'))
+        self.assertEqual(SSOAttempt.objects.count(), 2)
+
+    def test_lan_manual_actions_require_restarting_on_public_profile(self):
+        self.reauthenticate()
+        self.connect()
+        for purpose in ('link', 'reauth'):
+            with self.subTest(purpose=purpose):
+                response = self.client.post(f'/api/v2/sso/{self.provider.pk}/{purpose}/',
+                                            {'next': '/profile/'}, HTTP_HOST='192.168.0.45:2048')
+                self.assertEqual(response.status_code, 400)
+                self.assertContains(response, '공개 주소', status_code=400)
+                self.assertContains(response, 'href="https://pinry.example/"', status_code=400)
+                self.assertNotIn('Location', response)
+        self.assertFalse(SSOAttempt.objects.exists())
+        self.assertNotIn('sso_browser', self.client.session)
+
+    def test_invalid_public_base_never_redirects_or_starts_attempt(self):
+        for base in ('http://pinry.example', 'https://evil.example/redirect', 'https://user@evil.example'):
+            with self.subTest(base=base):
+                SSOProvider.objects.filter(pk=self.provider.pk).update(public_base_url=base)
+                response = Client(HTTP_HOST='192.168.0.45:2048').get(
+                    f'/api/v2/sso/{self.provider.pk}/login/')
+                self.assertEqual(response.status_code, 400)
+                self.assertNotIn('Location', response)
+        self.assertFalse(SSOAttempt.objects.exists())
+
+    def test_logged_in_user_does_not_see_login_page_or_recovery_link(self):
+        self.client.force_login(self.user)
+        response = self.client.get('/login/')
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response['Location'], '/')
+        response = self.client.get('/api/v2/sso/providers/', HTTP_HOST='192.168.0.45:2048',
+                                   REMOTE_ADDR='127.0.0.1', HTTP_X_PINRY_DIRECT_PEER='192.168.0.20',
+                                   HTTP_X_PINRY_PROXIED='0')
+        self.assertNotIn('recovery_login_url', response.json())
 
     def test_login_uses_existing_exact_identity_and_session_backend(self):
         self.connect()
@@ -393,8 +467,14 @@ class SSOFlowTests(TestCase):
 
     def test_authenticated_login_start_does_not_switch_account(self):
         self.client.force_login(self.user)
-        response = self.client.get(f'/api/v2/sso/{self.provider.pk}/login/')
-        self.assertEqual(response.status_code, 403)
+        for host in ('pinry.example', '192.168.0.45:2048'):
+            for next_path, expected in (('/profile/', '/profile/'), ('//evil.example', '/')):
+                with self.subTest(host=host, next_path=next_path):
+                    response = self.client.get(f'/api/v2/sso/{self.provider.pk}/login/',
+                                                {'next': next_path}, HTTP_HOST=host)
+                    self.assertEqual(response.status_code, 302)
+                    self.assertEqual(response['Location'], expected)
+                    self.assertEqual(self.client.session[SESSION_KEY], str(self.user.pk))
         self.assertFalse(SSOAttempt.objects.exists())
 
     def test_expired_attempt_cleanup_is_bounded(self):
