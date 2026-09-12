@@ -6,7 +6,7 @@ COPY . /app
 
 # config nodejs
 RUN curl -L https://raw.githubusercontent.com/tj/n/master/bin/n -o n
-RUN bash n 18
+RUN bash n 24.21.0
 RUN npm -g install pnpm@9.15.9
 
 WORKDIR /app

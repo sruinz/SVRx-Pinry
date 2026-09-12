@@ -27,6 +27,7 @@ module.exports = {
     appleMobileWebAppCapable: 'yes',
     appleMobileWebAppStatusBarStyle: 'black',
     iconPaths: {
+      faviconSVG: null,
       favicon32: 'favicon.png',
       favicon16: 'favicon.png',
       appleTouchIcon: 'img/icons/android-chrome-192x192.png',
@@ -51,10 +52,11 @@ module.exports = {
   chainWebpack: (config) => {
     config.plugins.delete('workbox');
     config.plugin('copy').tap((args) => {
-      args[0].push({
+      args[0].patterns.push({
         from: path.resolve(__dirname, 'src/service-worker.js'),
         to: path.resolve(__dirname, 'dist/service-worker.js'),
-        toType: 'file',
+        // 기동 호환용 서비스워커는 원본 그대로 배포한다.
+        info: { minimized: true },
       });
       return args;
     });
