@@ -1,10 +1,14 @@
 /* eslint-env jest */
 import axios from 'axios';
+import Buefy from 'buefy';
 import flushPromises from 'flush-promises';
-import { shallowMount } from '@vue/test-utils';
+import VueI18n from 'vue-i18n';
+import { createLocalVue, mount, shallowMount } from '@vue/test-utils';
 import LoginForm from '@/components/LoginForm.vue';
 import Profile from '@/components/user/profile.vue';
 import API from '@/components/api';
+import modals from '@/components/modals';
+import ko from '@/components/utils/i18n/locales/ko.json';
 
 jest.mock('axios');
 const options = {
@@ -21,12 +25,41 @@ describe('SSO policy screens', () => {
     axios.get.mockResolvedValue({ data: { providers: [], password_login_enabled: false, api_tokens_enabled: false } });
   });
 
+  it('keeps Escape and outside cancellation without rendering Buefy close X', () => {
+    const open = jest.fn();
+    const vm = { $buefy: { modal: { open } } };
+
+    modals.openLogin(vm, jest.fn());
+
+    expect(open.mock.calls[0][0].canCancel).toEqual(['escape', 'outside']);
+  });
+
   it('renders the square brand icon beside the SVRx Pinry name', () => {
     const wrapper = shallowMount(LoginForm, options);
     const brand = wrapper.find('[data-test="login-brand"]');
 
     expect(brand.text()).toBe('SVRx Pinry');
     expect(brand.find('img').attributes('alt')).toBe('');
+  });
+
+  it('associates visible password login labels with the real inputs', async () => {
+    axios.get.mockResolvedValue({
+      data: { providers: [], password_login_enabled: true, api_tokens_enabled: false },
+    });
+    const localVue = createLocalVue();
+    localVue.use(Buefy);
+    localVue.use(VueI18n);
+    const wrapper = mount(LoginForm, {
+      localVue,
+      i18n: new VueI18n({ locale: 'ko', messages: { ko } }),
+    });
+    await flushPromises();
+
+    expect(wrapper.find('label[for="login-username"]').exists()).toBe(true);
+    expect(wrapper.find('#login-username').exists()).toBe(true);
+    expect(wrapper.find('label[for="login-password"]').exists()).toBe(true);
+    expect(wrapper.find('#login-password').exists()).toBe(true);
+    wrapper.destroy();
   });
 
   it('keeps manual account linking in collapsed advanced controls', async () => {

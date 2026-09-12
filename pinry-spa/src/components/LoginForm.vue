@@ -66,9 +66,11 @@
           @submit.prevent="doLogin">
           <b-field
             v-bind:label="$t('usernameLabel')"
+            label-for="login-username"
             :type="form.username.type"
             :message="form.username.error">
             <b-input
+              id="login-username"
               name="username"
               type="text"
               v-model="form.username.value"
@@ -82,9 +84,11 @@
 
           <b-field
             v-bind:label="$t('passwordLabel')"
+            label-for="login-password"
             :type="form.password.type"
             :message="form.password.error">
             <b-input
+              id="login-password"
               name="password"
               type="password"
               v-model="form.password.value"
@@ -369,9 +373,15 @@ export default {
 }
 
 .password-form ::v-deep .input {
+  min-height: 48px;
   color: #f5f6f6;
   background: #121516;
   border-color: #4b5357;
+}
+
+.password-form ::v-deep .input::placeholder {
+  color: #aeb4b7;
+  opacity: 1;
 }
 
 .password-form ::v-deep .input:focus {
@@ -381,6 +391,7 @@ export default {
 
 .login-submit {
   width: 100%;
+  min-height: 48px;
   margin-top: 8px;
   color: #10211e;
   background: #00d1b2;

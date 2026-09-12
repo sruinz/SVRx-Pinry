@@ -71,6 +71,7 @@ function openLogin(vm, onSucceed) {
     parent: vm,
     component: LoginForm,
     hasModalCard: true,
+    canCancel: ['escape', 'outside'],
     events: {
       'login.succeed': onSucceed,
     },
