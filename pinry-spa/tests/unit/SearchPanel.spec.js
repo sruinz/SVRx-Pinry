@@ -1,8 +1,8 @@
 /* eslint-env jest */
 import axios from 'axios';
 import flushPromises from 'flush-promises';
-import VueI18n from 'vue-i18n';
-import { createLocalVue, shallowMount } from '@vue/test-utils';
+import { createI18n } from 'vue-i18n';
+import { shallowMount } from '@vue/test-utils';
 
 import SearchPanel from '@/components/search/SearchPanel.vue';
 import en from '@/components/utils/i18n/locales/en.json';
@@ -20,12 +20,12 @@ function deferred() {
 
 
 function mountPanel() {
-  const localVue = createLocalVue();
-  localVue.use(VueI18n);
   return shallowMount(SearchPanel, {
-    localVue,
-    i18n: new VueI18n({ locale: 'en', messages: { en } }),
-    stubs: ['b-field', 'b-select', 'b-taginput', 'b-input', 'b-button'],
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      stubs: ['FormField', 'TagInput'],
+      plugins: [createI18n({ legacy: true, locale: 'en', messages: { en } })],
+    },
   });
 }
 

@@ -149,7 +149,7 @@ export default {
     });
     this.poller.start();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.isDestroyed = true;
     this.clearExpiryTimer();
     if (this.poller) this.poller.stop();

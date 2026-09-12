@@ -127,20 +127,14 @@
             <router-link
               :to="{ name: 'search' }"
               class="navbar-item">
-              <b-icon
-                type="is-dark"
-                icon="magnify"
-                custom-size="mdi-24px">
-              </b-icon>
+              <i aria-hidden="true" class="mdi mdi-magnify"
+                ></i>
             </router-link>
             <div
               class="navbar-item has-dropdown is-hoverable">
               <a class="navbar-link">
-                <b-icon
-                  type="is-dark"
-                  icon="translate"
-                  custom-size="mdi-24px">
-                </b-icon>
+                <i aria-hidden="true" class="mdi mdi-translate"
+                  ></i>
               </a>
               <div class="navbar-dropdown">
                 <a

@@ -8,54 +8,47 @@
         <p v-if="policyError" role="alert">{{ $t('ssoSettingsFailed') }}</p>
         <p v-else-if="!passwordAllowed">{{ $t('ssoPasswordDisabled') }}</p>
         <section v-if="passwordAllowed" class="modal-card-body">
-          <b-field v-bind:label="$t('usernameLabel')"
+          <FormField v-bind:label="$t('usernameLabel')"
                    :type="form.username.type"
                    :message="form.username.error">
-            <b-input
-              type="string"
+            <input class="input" :aria-label="$t('usernameLabel')"
+              type="text"
               v-model="form.username.value"
               v-bind:placeholder="$t('usernamePlaceholder')"
               maxlength="30"
               required>
-            </b-input>
-          </b-field>
+          </FormField>
 
-          <b-field v-bind:label="$t('emailLabel')"
+          <FormField v-bind:label="$t('emailLabel')"
                    :type="form.email.type"
                    :message="form.email.error">
-            <b-input
+            <input class="input" :aria-label="$t('emailLabel')"
               type="email"
               v-model="form.email.value"
-              password-reveal
               v-bind:placeholder="$t('emailPlaceholder')"
               required>
-            </b-input>
-          </b-field>
-          <b-field v-bind:label="$t('passwordLabel')"
+          </FormField>
+          <FormField v-bind:label="$t('passwordLabel')"
                    :type="form.password.type"
                    :message="form.password.error">
-            <b-input
+            <PasswordInput
               type="password"
               v-model="form.password.value"
-              password-reveal
               v-bind:placeholder="$t('passwordSignUpPlaceholder')"
-              required>
-            </b-input>
-          </b-field>
-          <b-field v-bind:label="$t('repeatPasswordLabel')"
+              required />
+          </FormField>
+          <FormField v-bind:label="$t('repeatPasswordLabel')"
                    :type="form.password_repeat.type"
                    :message="form.password_repeat.error">
-            <b-input
+            <PasswordInput
               type="password"
               v-model="form.password_repeat.value"
-              password-reveal
               v-bind:placeholder="$t('repeatPasswordInputPlaceholder')"
-              required>
-            </b-input>
-          </b-field>
+              required />
+          </FormField>
         </section>
         <footer class="modal-card-foot">
-          <button class="button" type="button" @click="$parent.close()">{{ $t("closeButton") }}</button>
+          <button class="button" type="button" @click="$emit('close')">{{ $t("closeButton") }}</button>
           <button
             v-if="passwordAllowed"
             @click="doRegister"
@@ -67,6 +60,9 @@
 </template>
 
 <script>
+import FormField from './ui/FormField.vue';
+import PasswordInput from './ui/PasswordInput.vue';
+import overlays from './utils/overlays';
 import api from './api';
 import ModelForm from './utils/ModelForm';
 
@@ -78,6 +74,7 @@ const fields = [
 ];
 
 export default {
+  components: { FormField, PasswordInput },
   name: 'SignUpForm',
   data() {
     const model = ModelForm.fromFields(fields);
@@ -106,11 +103,11 @@ export default {
       promise.then(
         (user) => {
           self.$emit('signup.succeed', user);
-          self.$parent.close();
+          self.$emit('close');
         },
         (resp) => {
           if (resp.status === 401) {
-            this.$buefy.toast.open(
+            overlays.toast(
               { type: 'is-danger', message: 'sign up of this site closed by owner' },
             );
           } else {

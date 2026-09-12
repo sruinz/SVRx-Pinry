@@ -1,5 +1,7 @@
-function open(vm) {
-  return vm.$buefy.loading.open({ container: null });
+import overlays from './overlays';
+
+function open() {
+  return overlays.openLoading();
 }
 
 export default {

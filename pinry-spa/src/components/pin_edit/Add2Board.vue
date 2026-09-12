@@ -28,7 +28,7 @@
           </div>
         </section>
         <footer class="modal-card-foot">
-          <button class="button" type="button" @click="$parent.close()">{{ $t("closeButton") }}</button>
+          <button class="button" type="button" @click="$emit('close')">{{ $t("closeButton") }}</button>
           <button
             type="button"
             :disabled="!canSubmit"
@@ -42,6 +42,7 @@
 </template>
 
 <script>
+import overlays from '../utils/overlays';
 import API from '../api';
 import FileUpload from './FileUpload.vue';
 import FilterSelect from './FilterSelect.vue';
@@ -82,7 +83,7 @@ export default {
   created() {
     this.fetchBoardList();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.componentAlive = false;
   },
   methods: {
@@ -129,10 +130,10 @@ export default {
         this.boardIds = failedBoardIds;
         this.submitInFlight = false;
         if (failedBoardIds.length === 0) {
-          this.$buefy.toast.open('Succeed to add pin to boards');
-          this.$parent.close();
+          overlays.toast('Succeed to add pin to boards');
+          this.$emit('close');
         } else {
-          this.$buefy.toast.open(
+          overlays.toast(
             {
               message: 'Failed to add pin to boards',
               type: 'is-danger',

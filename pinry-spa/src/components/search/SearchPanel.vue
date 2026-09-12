@@ -2,12 +2,13 @@
   <div class="search-panel">
     <div class="filter-selector">
       <div class="card-content">
-        <b-field>
-          <b-select v-bind:placeholder="$t('chooseFilterPlaceholder')" v-model="filterType">
+        <FormField>
+          <select :aria-label="$t('chooseFilterPlaceholder')" v-model="filterType">
+            <option :value="null" disabled>{{ $t('chooseFilterPlaceholder') }}</option>
             <option value="Tag">{{ $t("SearchPanelTagOption") }}</option>
             <option value="Board">{{ $t("SearchPanelBoardOption") }}</option>
-          </b-select>
-          <b-taginput
+          </select>
+          <TagInput
             v-show="filterType === 'Tag'"
             class="search-input"
             v-model="selectedTags"
@@ -19,31 +20,31 @@
             v-bind:placeholder="$t('selectFilterPlaceholder')"
             icon="magnify"
             @typing="updateTagSearch">
-            <template slot="empty">{{ $t("noResultsFound") }}</template>
-          </b-taginput>
+            <template #empty>{{ $t("noResultsFound") }}</template>
+          </TagInput>
           <template v-if="filterType === 'Board'">
-            <b-input
-              class="search-input"
+            <input class="input search-input" :aria-label="$t('searchBoardPlaceholder')"
               type="search"
               v-model="boardText"
               v-bind:placeholder="$t('searchBoardPlaceholder')"
-              icon="magnify"
             >
-            </b-input>
             <p class="control">
-              <b-button @click="searchBoard" class="button is-primary">{{ $t("searchButton") }}</b-button>
+              <button type="button" @click="searchBoard" class="button is-primary">{{ $t("searchButton") }}</button>
             </p>
           </template>
-        </b-field>
+        </FormField>
       </div>
     </div>
   </div>
 </template>
 
 <script>
+import FormField from '../ui/FormField.vue';
+import TagInput from '../ui/TagInput.vue';
 import api from '../api';
 
 export default {
+  components: { FormField, TagInput },
   name: 'FilterSelector',
   data() {
     return {

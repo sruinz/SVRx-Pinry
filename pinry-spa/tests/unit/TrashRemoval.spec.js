@@ -1,7 +1,6 @@
 /* eslint-env jest */
-import VueI18n from 'vue-i18n';
-import VueRouter from 'vue-router';
-import { createLocalVue, shallowMount } from '@vue/test-utils';
+import { createI18n } from 'vue-i18n';
+import { shallowMount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import PHeader from '@/components/PHeader.vue';
@@ -29,20 +28,18 @@ const directDeleteTranslations = {
 
 describe('Trash removal', () => {
   it('leaves /trash to the PageNotFound route', () => {
-    expect(router.match('/trash').name).toBe('PageNotFound');
+    expect(router.resolve('/trash').name).toBe('PageNotFound');
   });
 
   it('does not show a trash link to logged-in users', async () => {
-    const localVue = createLocalVue();
-    localVue.use(VueI18n);
-    localVue.use(VueRouter);
     const initializeUser = jest.spyOn(PHeader.methods, 'initializeUser')
       .mockImplementation(() => {});
     const wrapper = shallowMount(PHeader, {
-      localVue,
-      router,
-      i18n: new VueI18n({ locale: 'en', messages: { en } }),
-      stubs: ['b-icon'],
+      global: {
+        directives: { masonry: {}, 'masonry-tile': {} },
+        stubs: [],
+        plugins: [router, createI18n({ legacy: true, locale: 'en', messages: { en } })],
+      },
     });
 
     await wrapper.setData({

@@ -1,21 +1,36 @@
 /* eslint-env jest */
 import axios from 'axios';
-import Buefy from 'buefy';
 import flushPromises from 'flush-promises';
-import VueI18n from 'vue-i18n';
-import { createLocalVue, mount, shallowMount } from '@vue/test-utils';
+import { createI18n } from 'vue-i18n';
+import { mount, shallowMount } from '@vue/test-utils';
 import LoginForm from '@/components/LoginForm.vue';
 import Profile from '@/components/user/profile.vue';
 import API from '@/components/api';
 import modals from '@/components/modals';
 import ko from '@/components/utils/i18n/locales/ko.json';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 jest.mock('axios');
 const options = {
-  mocks: {
-    $t: (key, params) => (params && params.provider ? `${key} ${params.provider}` : key),
+  global: {
+    mocks: {
+      $t: (key, params) => (params && params.provider ? `${key} ${params.provider}` : key),
+    },
+    stubs: ['FormField'],
   },
-  stubs: ['b-field', 'b-input'],
 };
 
 describe('SSO policy screens', () => {
@@ -26,12 +41,12 @@ describe('SSO policy screens', () => {
   });
 
   it('keeps Escape and outside cancellation without rendering Buefy close X', () => {
-    const open = jest.fn();
-    const vm = { $buefy: { modal: { open } } };
+    const open = overlays.openModal;
+    const vm = { };
 
     modals.openLogin(vm, jest.fn());
 
-    expect(open.mock.calls[0][0].canCancel).toEqual(['escape', 'outside']);
+    expect(open.mock.calls[0][1].canCancel).toEqual(['escape', 'outside']);
   });
 
   it('renders the square brand icon beside the SVRx Pinry name', () => {
@@ -46,12 +61,13 @@ describe('SSO policy screens', () => {
     axios.get.mockResolvedValue({
       data: { providers: [], password_login_enabled: true, api_tokens_enabled: false },
     });
-    const localVue = createLocalVue();
-    localVue.use(Buefy);
-    localVue.use(VueI18n);
+
+
     const wrapper = mount(LoginForm, {
-      localVue,
-      i18n: new VueI18n({ locale: 'ko', messages: { ko } }),
+      global: {
+        directives: { masonry: {}, 'masonry-tile': {} },
+        plugins: [createI18n({ legacy: true, locale: 'ko', messages: { ko } })],
+      },
     });
     await flushPromises();
 
@@ -59,7 +75,7 @@ describe('SSO policy screens', () => {
     expect(wrapper.find('#login-username').exists()).toBe(true);
     expect(wrapper.find('label[for="login-password"]').exists()).toBe(true);
     expect(wrapper.find('#login-password').exists()).toBe(true);
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('keeps manual account linking in collapsed advanced controls', async () => {
@@ -124,7 +140,7 @@ describe('SSO policy screens', () => {
     const wrapper = shallowMount(LoginForm, options);
     await flushPromises();
 
-    expect(wrapper.findAll('[data-test="provider-icon"]').wrappers.map(icon => icon.attributes('src')))
+    expect(wrapper.findAll('[data-test="provider-icon"]').map(icon => icon.attributes('src')))
       .toEqual([
         '/static/auth/providers/authentik.svg',
         '/static/auth/providers/google.svg',
@@ -199,13 +215,8 @@ describe('SSO policy screens', () => {
     axios.post.mockRejectedValue({ response: { data: { username: ['invalid'] } } });
     const wrapper = shallowMount(LoginForm, options);
     await flushPromises();
-    await wrapper.setData({
-      form: {
-        ...wrapper.vm.form,
-        username: { ...wrapper.vm.form.username, value: 'alice' },
-        password: { ...wrapper.vm.form.password, value: 'secret' },
-      },
-    });
+    wrapper.vm.form.username.value = 'alice';
+    wrapper.vm.form.password.value = 'secret';
 
     await wrapper.find('[data-test="password-form"]').trigger('submit');
     await flushPromises();
@@ -221,7 +232,7 @@ describe('SSO policy screens', () => {
     axios.get.mockImplementation(url => (url.endsWith('/identities/')
       ? Promise.reject(new Error('offline'))
       : Promise.resolve({ data: { providers: [], password_login_enabled: false, api_tokens_enabled: false } })));
-    const wrapper = shallowMount(Profile, { ...options, propsData: { token: 'stale-secret' } });
+    const wrapper = shallowMount(Profile, { ...options, props: { token: 'stale-secret' } });
     await flushPromises();
     expect(wrapper.text()).not.toContain('stale-secret');
     expect(wrapper.text()).toContain('ssoIdentitiesFailed');
@@ -295,7 +306,7 @@ describe('SSO policy screens', () => {
     await flushPromises();
 
     const button = wrapper.find('[data-test="unlink-button"]');
-    expect(button.attributes('disabled')).toBe('disabled');
+    expect(button.attributes('disabled')).toBeDefined();
     expect(button.attributes('aria-describedby')).toBe('sso-unlink-reason-4');
     expect(wrapper.find('[data-test="unlink-reason"]').text())
       .toBe('ssoUnlinkBlockedLastLoginMethod');

@@ -1,8 +1,7 @@
 /* eslint-env jest */
 
-import Buefy from 'buefy';
 import flushPromises from 'flush-promises';
-import { createLocalVue, mount } from '@vue/test-utils';
+import { mount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import BoardEdit from '@/components/BoardEdit.vue';
@@ -11,14 +10,26 @@ import BoardEditUI from '@/components/editors/BoardEditUI.vue';
 import ko from '@/components/utils/i18n/locales/ko.json';
 import bus from '@/components/utils/bus';
 import scroll from '@/components/utils/scroll';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 function mountBoardEdit(board) {
-  const localVue = createLocalVue();
-  localVue.use(Buefy);
   return mount(BoardEdit, {
-    localVue,
-    propsData: { isEdit: true, board },
-    mocks: { $t: key => ko[key] || key },
+    global: { directives: { masonry: {}, 'masonry-tile': {} }, mocks: { $t: key => ko[key] || key } },
+
+    props: { isEdit: true, board },
   });
 }
 
@@ -38,11 +49,11 @@ describe('Board cover publication warning', () => {
     expect(wrapper.find('[data-test="board-cover-publish-warning"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="board-private-checkbox"]').exists()).toBe(true);
 
-    await wrapper.find('.b-checkbox input').setChecked(false);
+    await wrapper.find('input[type="checkbox"]').setChecked(false);
 
     expect(wrapper.find('[data-test="board-cover-publish-warning"]').text())
       .toContain('자동 대표 이미지');
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it.each([
@@ -57,10 +68,10 @@ describe('Board cover publication warning', () => {
       cover,
     });
 
-    await wrapper.find('.b-checkbox input').setChecked(false);
+    await wrapper.find('input[type="checkbox"]').setChecked(false);
 
     expect(wrapper.find('[data-test="board-cover-publish-warning"]').exists()).toBe(false);
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('preserves cover metadata through Boards and opens an editor that can warn', async () => {
@@ -88,33 +99,33 @@ describe('Board cover publication warning', () => {
     API.fetchBoardForUser = jest.fn().mockResolvedValue({
       data: { results: [board], next: null },
     });
-    const modal = { open: jest.fn() };
-    const localVue = createLocalVue();
-    localVue.directive('masonry', {});
-    localVue.directive('masonry-tile', {});
+    const modal = { open: overlays.openModal };
+
+
     const boardsWrapper = mount(Boards, {
-      localVue,
-      propsData: { filters: { boardUsername: 'owner' } },
-      mocks: {
-        $buefy: { modal },
-        $t: key => ko[key] || key,
-      },
-      stubs: {
-        'b-icon': true,
-        loadingSpinner: true,
-        noMore: true,
-        'router-link': {
-          props: ['to'],
-          template: '<a href="#"><slot /></a>',
+      global: {
+        directives: { masonry: {}, 'masonry-tile': {} },
+        mocks: {
+          $t: key => ko[key] || key,
+        },
+        stubs: {
+          loadingSpinner: true,
+          noMore: true,
+          'router-link': {
+            props: ['to'],
+            template: '<a href="#"><slot /></a>',
+          },
         },
       },
+
+      props: { filters: { boardUsername: 'owner' } },
     });
     await flushPromises();
 
     const editor = boardsWrapper.findComponent(BoardEditUI);
     editor.vm.editBoard();
 
-    const modalConfig = modal.open.mock.calls[0][0];
+    const modalConfig = modal.open.mock.calls[0][1];
     expect(modalConfig.component).toBe(BoardEdit);
     expect(modalConfig.props.board).toMatchObject({
       id: 7,
@@ -123,13 +134,13 @@ describe('Board cover publication warning', () => {
       cover: { id: 31, private: true },
     });
     const boardEditWrapper = mountBoardEdit(modalConfig.props.board);
-    await boardEditWrapper.find('.b-checkbox input').setChecked(false);
+    await boardEditWrapper.find('input[type="checkbox"]').setChecked(false);
     expect(boardEditWrapper.find('[data-test="board-cover-publish-warning"]').exists())
       .toBe(true);
 
-    bus.bus.$off(bus.events.refreshBoards, boardsWrapper.vm.reset);
-    boardEditWrapper.destroy();
-    boardsWrapper.destroy();
+    bus.bus.off(bus.events.refreshBoards, boardsWrapper.vm.reset);
+    boardEditWrapper.unmount();
+    boardsWrapper.unmount();
     scroll.bindScroll2Bottom.mockRestore();
   });
 });

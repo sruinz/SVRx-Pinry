@@ -2,7 +2,7 @@
 
 import axios from 'axios';
 import flushPromises from 'flush-promises';
-import { createLocalVue, mount } from '@vue/test-utils';
+import { mount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import Boards from '@/components/Boards.vue';
@@ -55,28 +55,28 @@ const wrappers = [];
 let scrollDisposer;
 
 function mountBoards(filters = { boardUsername: 'alice' }) {
-  const localVue = createLocalVue();
-  localVue.directive('masonry', {});
-  localVue.directive('masonry-tile', {});
   const wrapper = mount(Boards, {
-    localVue,
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: {
+        $redrawVueMasonry: jest.fn(),
+        $t: translate,
+      },
+      stubs: {
+        BoardEditorUI: {
+          template: '<div data-test="board-editor-stub"></div>',
+        },
+        loadingSpinner: true,
+        noMore: true,
+        'router-link': {
+          props: ['to'],
+          template: '<a data-test="board-link"><slot /></a>',
+        },
+      },
+    },
+
     attachTo: document.body,
-    propsData: { filters },
-    mocks: {
-      $redrawVueMasonry: jest.fn(),
-      $t: translate,
-    },
-    stubs: {
-      BoardEditorUI: {
-        template: '<div data-test="board-editor-stub"></div>',
-      },
-      loadingSpinner: true,
-      noMore: true,
-      'router-link': {
-        props: ['to'],
-        template: '<a data-test="board-link"><slot /></a>',
-      },
-    },
+    props: { filters },
   });
   wrappers.push(wrapper);
   return wrapper;
@@ -126,8 +126,8 @@ describe('accessible Board custom ordering', () => {
 
   afterEach(() => {
     wrappers.splice(0).forEach((wrapper) => {
-      bus.bus.$off(bus.events.refreshBoards, wrapper.vm.reset);
-      wrapper.destroy();
+      bus.bus.off(bus.events.refreshBoards, wrapper.vm.reset);
+      wrapper.unmount();
     });
   });
 
@@ -295,7 +295,7 @@ describe('accessible Board custom ordering', () => {
     expect(wrapper.find('[data-test="board-link"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="board-editor-stub"]').isVisible()).toBe(false);
     expect(wrapper.find('[data-test="board-sort-custom"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(API.fetchBoardForUser).not.toHaveBeenCalled();
   });
 
@@ -333,9 +333,9 @@ describe('accessible Board custom ordering', () => {
     expect(API.Board.saveOrder).toHaveBeenCalledTimes(1);
     expect(API.Board.saveOrder).toHaveBeenCalledWith(7, [2, 1, 3]);
     expect(wrapper.find('[data-test="board-order-save"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(wrapper.find('[data-test="board-order-cancel"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
 
     save.resolve({ data: { version: 8, board_ids: [2, 1, 3] } });
     await settle();
@@ -421,7 +421,7 @@ describe('accessible Board custom ordering', () => {
     await settle();
     const blocksBeforeDestroy = wrapper.vm.blocks.map(item => item.id);
     const orderingBeforeDestroy = JSON.parse(JSON.stringify(wrapper.vm.ordering));
-    wrapper.destroy();
+    wrapper.unmount();
 
     latePage.resolve({ data: { results: [board(3)], next: null } });
     await settle();
@@ -441,7 +441,7 @@ describe('accessible Board custom ordering', () => {
     await wrapper.find('[data-test="board-order-save"]').trigger('click');
     const blocksBeforeDestroy = wrapper.vm.blocks.map(item => item.id);
     const orderingBeforeDestroy = JSON.parse(JSON.stringify(wrapper.vm.ordering));
-    wrapper.destroy();
+    wrapper.unmount();
 
     save.resolve({ data: { version: 8, board_ids: [2, 1, 3] } });
     await settle();
@@ -453,11 +453,11 @@ describe('accessible Board custom ordering', () => {
   it('removes the bus and scroll listeners when destroyed', async () => {
     const wrapper = mountBoards();
     await settle();
-    wrapper.destroy();
+    wrapper.unmount();
     API.User.fetchUserInfo.mockClear();
     API.fetchBoardForUser.mockClear();
 
-    bus.bus.$emit(bus.events.refreshBoards);
+    bus.bus.emit(bus.events.refreshBoards);
     await settle();
 
     expect(scrollDisposer).toHaveBeenCalledTimes(1);

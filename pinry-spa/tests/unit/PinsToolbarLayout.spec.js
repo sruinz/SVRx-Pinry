@@ -1,10 +1,24 @@
 /* eslint-env jest */
 
 import flushPromises from 'flush-promises';
-import { createLocalVue, mount } from '@vue/test-utils';
+import { mount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import Pins from '@/components/Pins.vue';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 let authenticatedUsername = 'owner';
 let wrappers = [];
@@ -55,30 +69,26 @@ function mountPins({
     },
   });
 
-  const localVue = createLocalVue();
-  localVue.directive('masonry', {});
-  localVue.directive('masonry-tile', {});
+
   const wrapper = mount(Pins, {
-    localVue,
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: {
+        $t: (key, values) => (values ? `${key}:${values.count}` : key),
+      },
+      stubs: {
+        EditorUI: true,
+        loadingSpinner: true,
+        noMore: true,
+        'router-link': {
+          props: ['to'],
+          template: '<a href="#"><slot /></a>',
+        },
+      },
+    },
+
     attachTo: document.body,
-    propsData: { pinFilters },
-    mocks: {
-      $buefy: {
-        dialog: { confirm: jest.fn() },
-        modal: { open: jest.fn() },
-        toast: { open: jest.fn() },
-      },
-      $t: (key, values) => (values ? `${key}:${values.count}` : key),
-    },
-    stubs: {
-      EditorUI: true,
-      loadingSpinner: true,
-      noMore: true,
-      'router-link': {
-        props: ['to'],
-        template: '<a href="#"><slot /></a>',
-      },
-    },
+    props: { pinFilters },
   });
   wrappers.push(wrapper);
   return wrapper;
@@ -120,7 +130,7 @@ describe('Pins responsive tool area', () => {
   });
 
   afterEach(() => {
-    wrappers.forEach(wrapper => wrapper.destroy());
+    wrappers.forEach(wrapper => wrapper.unmount());
     if (Pins.methods.initializeMeta.mockRestore) Pins.methods.initializeMeta.mockRestore();
     localStorage.clear();
   });
@@ -160,22 +170,22 @@ describe('Pins responsive tool area', () => {
     expect(wrapper.vm.selection.active).toBe(true);
     expect(primary.find('[data-test="pin-selection-enter"]').exists()).toBe(true);
     expect(primary.find('[data-test="pin-selection-enter"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(primary.find('[data-test="board-cover-enter"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     const active = wrapper.find('[data-test="pin-tools-active"]');
     const bulkToolbar = active.find('.pin-bulk-toolbar');
     expect(bulkToolbar.classes()).toContain('is-active');
     expect(bulkToolbar.find('[data-test="pin-selection-summary"]').exists()).toBe(true);
     expect(active.find('[data-test="pin-selection-select-loaded"]').exists()).toBe(true);
-    const actionNames = active.findAll('.pin-bulk-toolbar__buttons > button').wrappers
+    const actionNames = active.findAll('.pin-bulk-toolbar__buttons > button')
       .map(button => button.attributes('data-test'));
     expect(actionNames.indexOf('pin-selection-edit'))
       .toBeLessThan(actionNames.indexOf('pin-selection-export'));
     expect(actionNames.indexOf('pin-selection-export'))
       .toBeLessThan(actionNames.indexOf('pin-selection-delete'));
     expect(active.find('[data-test="pin-selection-select-all"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
 
     await active.find('[data-test="pin-selection-exit"]').trigger('click');
 
@@ -194,9 +204,9 @@ describe('Pins responsive tool area', () => {
 
     await button.trigger('click');
 
-    const config = wrapper.vm.$buefy.modal.open.mock.calls[0][0];
+    const config = overlays.openModal.mock.calls[0][1];
     expect(config.props).toEqual({ boardId: 7 });
-    expect(config.trapFocus).toBe(true);
+    expect(config.canCancel).toBe(true);
   });
 
   it('keeps cover entry controls in the first row and status and actions in the second row', async () => {
@@ -208,9 +218,9 @@ describe('Pins responsive tool area', () => {
 
     expect(wrapper.vm.interactionMode).toBe('cover-selection');
     expect(primary.find('[data-test="pin-selection-enter"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(primary.find('[data-test="board-cover-enter"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     const active = wrapper.find('[data-test="pin-tools-active"]');
     expect(active.find('[data-test="board-cover-status"]').text())
       .toContain('bulkPinSelectedCount:1');

@@ -1,8 +1,8 @@
 /* eslint-env jest */
 import axios from 'axios';
 import flushPromises from 'flush-promises';
-import VueI18n from 'vue-i18n';
-import { createLocalVue, shallowMount } from '@vue/test-utils';
+import { createI18n } from 'vue-i18n';
+import { shallowMount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import Profile from '@/components/user/profile.vue';
@@ -24,12 +24,13 @@ function deferred() {
 
 
 function mountProfile() {
-  const localVue = createLocalVue();
-  localVue.use(VueI18n);
   return shallowMount(Profile, {
-    localVue,
-    i18n: new VueI18n({ locale: 'ko', messages: { ko } }),
-    propsData: { token: 'secret-token' },
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      plugins: [createI18n({ legacy: true, locale: 'ko', messages: { ko } })],
+    },
+
+    props: { token: 'secret-token' },
   });
 }
 
@@ -169,7 +170,7 @@ describe('Profile build version', () => {
     axios.get.mockReturnValue(request.promise);
     const wrapper = mountProfile();
 
-    wrapper.destroy();
+    wrapper.unmount();
     request.resolve({ data: { display_version: 'stale1234567' } });
     await flushPromises();
 
@@ -181,7 +182,7 @@ describe('Profile build version', () => {
     axios.get.mockReturnValue(request.promise);
     const wrapper = mountProfile();
 
-    wrapper.destroy();
+    wrapper.unmount();
     request.reject(new Error('/private/build/path'));
     await request.promise.catch(() => {});
     await flushPromises();
@@ -194,8 +195,8 @@ describe('Profile build version', () => {
     const second = mountProfile();
 
     expect(axios.get.mock.calls.filter(([url]) => url === '/api/v2/version/')).toHaveLength(2);
-    first.destroy();
-    second.destroy();
+    first.unmount();
+    second.unmount();
   });
 
   it('exposes the read-only version request through the API module', async () => {

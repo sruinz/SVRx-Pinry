@@ -1,5 +1,4 @@
-import Vue from 'vue';
-import VueRouter from 'vue-router';
+import { createRouter, createWebHistory } from 'vue-router';
 import Home from '../views/Home.vue';
 import Pins4Tag from '../views/Pins4Tag.vue';
 import Pins4User from '../views/Pins4User.vue';
@@ -11,8 +10,6 @@ import PinCreate from '../views/PinCreate.vue';
 import Search from '../views/Search.vue';
 import PageNotFound from '../views/PageNotFound.vue';
 import Exports from '../views/Exports.vue';
-
-Vue.use(VueRouter);
 
 const routes = [
   {
@@ -66,14 +63,14 @@ const routes = [
     component: Exports,
   },
   {
-    path: '*',
+    path: '/:pathMatch(.*)*',
     name: 'PageNotFound',
     component: PageNotFound,
   },
 ];
 
-const router = new VueRouter({
-  mode: 'history',
+const router = createRouter({
+  history: createWebHistory(),
   routes,
 });
 

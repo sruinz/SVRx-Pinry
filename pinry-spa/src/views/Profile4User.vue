@@ -38,7 +38,7 @@ export default {
     this.initializeUser(to.params.username);
     next();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.userRequestSequence += 1;
   },
   methods: {

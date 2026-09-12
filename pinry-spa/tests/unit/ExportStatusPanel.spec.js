@@ -49,8 +49,8 @@ function translate(key, values) {
 
 function mountPanel(latestAttempt, downloadableJob = null) {
   return mount(ExportStatusPanel, {
-    propsData: { latestAttempt, downloadableJob },
-    mocks: { $t: translate },
+    global: { mocks: { $t: translate } },
+    props: { latestAttempt, downloadableJob },
   });
 }
 

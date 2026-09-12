@@ -243,7 +243,7 @@ export default {
   created() {
     this.loadPreview();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.disposed = true;
     this.requestToken += 1;
   },
@@ -290,7 +290,7 @@ export default {
       if (this.closeConsumed) return;
       this.closeConsumed = true;
       this.$emit('closed');
-      if (this.$parent && typeof this.$parent.close === 'function') this.$parent.close();
+      this.$emit('close');
     },
     deleteBoardOnly() {
       if (this.phase !== 'ready') return null;

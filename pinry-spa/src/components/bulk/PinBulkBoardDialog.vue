@@ -208,7 +208,7 @@ export default {
   created() {
     this.loadBoards();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.disposed = true;
     this.boardRequestToken += 1;
     this.boardCreateToken += 1;
@@ -219,7 +219,7 @@ export default {
       if (this.boardCreateInFlight || this.operationInFlight || this.closeConsumed) return;
       this.closeConsumed = true;
       this.$emit('closed');
-      if (this.$parent && typeof this.$parent.close === 'function') this.$parent.close();
+      this.$emit('close');
     },
     loadBoards() {
       const token = this.boardRequestToken + 1;
@@ -275,7 +275,7 @@ export default {
         this.newBoardName = '';
         this.newBoardPrivate = false;
         this.boardCreateAnnouncement = 'bulkPinBoardCreated';
-        bus.bus.$emit(bus.events.refreshBoards);
+        bus.bus.emit(bus.events.refreshBoards);
         this.$nextTick(() => {
           if (!this.disposed && this.boardCreateToken === token
             && this.$refs.targetBoard && typeof this.$refs.targetBoard.focus === 'function') {

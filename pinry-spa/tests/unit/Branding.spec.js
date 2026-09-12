@@ -2,8 +2,8 @@
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
-import VueI18n from 'vue-i18n';
-import { createLocalVue, shallowMount } from '@vue/test-utils';
+import { createI18n } from 'vue-i18n';
+import { shallowMount } from '@vue/test-utils';
 
 import PHeader from '@/components/PHeader.vue';
 import ko from '@/components/utils/i18n/locales/ko.json';
@@ -122,12 +122,12 @@ describe('SVRx Pinry branding', () => {
   });
 
   it('renders the graphite artwork for the light navbar in the home link', () => {
-    const localVue = createLocalVue();
-    localVue.use(VueI18n);
     const wrapper = shallowMount(PHeader, {
-      localVue,
-      i18n: new VueI18n({ locale: 'ko', messages: { ko } }),
-      stubs: ['b-icon', 'router-link'],
+      global: {
+        directives: { masonry: {}, 'masonry-tile': {} },
+        stubs: ['router-link'],
+        plugins: [createI18n({ legacy: true, locale: 'ko', messages: { ko } })],
+      },
     });
 
     const lockup = wrapper.find('[data-test="brand-lockup"]');

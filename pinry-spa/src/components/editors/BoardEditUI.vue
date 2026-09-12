@@ -2,18 +2,10 @@
   <div class="editor">
     <div class="editor-buttons">
       <span class="icon-container" data-test="delete-board" @click="deleteBoard">
-         <b-icon
-           type="is-light"
-           icon="delete"
-           custom-size="mdi-24px">
-         </b-icon>
+         <i aria-hidden="true" class="mdi mdi-delete"></i>
       </span>
       <span class="icon-container" @click="editBoard">
-       <b-icon
-         type="is-light"
-         icon="pencil"
-         custom-size="mdi-24px">
-       </b-icon>
+       <i aria-hidden="true" class="mdi mdi-pencil"></i>
       </span>
     </div>
   </div>
@@ -40,7 +32,7 @@ export default {
       deleteDialogToken: 0,
     };
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.disposed = true;
     this.deleteDialogToken += 1;
   },

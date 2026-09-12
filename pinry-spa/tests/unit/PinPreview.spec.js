@@ -1,6 +1,6 @@
 /* eslint-env jest */
 import { mount } from '@vue/test-utils';
-import Vue from 'vue';
+import { nextTick, reactive } from 'vue';
 import flushPromises from 'flush-promises';
 import PinPreview from '@/components/PinPreview.vue';
 
@@ -34,13 +34,12 @@ describe('핀 상세 연속 감상', () => {
   let wrapper;
   function open(props = {}) {
     wrapper = mount(PinPreview, {
-      propsData: { pinItem: pin(3), ...props },
-      mocks: { $t: key => key, $router: { push: jest.fn() } },
-      stubs: { 'b-tag': true, 'b-button': true },
+      global: { mocks: { $t: key => key, $router: { push: jest.fn() } }, stubs: {} },
+      props: { pinItem: pin(3), ...props },
     });
     return wrapper;
   }
-  afterEach(() => { if (wrapper) wrapper.destroy(); });
+  afterEach(() => { if (wrapper) wrapper.unmount(); });
 
   it('목록의 순서로 이미지·설명·링크를 바꾸고 끝에서는 순환하지 않는다', async () => {
     open({ navigation: () => ({ items: [pin(3), pin(8), pin(1)], hasNext: false }) });
@@ -63,14 +62,14 @@ describe('핀 상세 연속 감상', () => {
   it('닫기 애니메이션 중에는 방향키로 추가 요청을 하지 않는다', async () => {
     const loadNext = jest.fn();
     open({ navigation: () => ({ items: [pin(3)], hasNext: true }), loadNext });
-    wrapper.vm.$parent.$emit('close');
+    await wrapper.find('[data-test="preview-close"]').trigger('click');
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
-    await Vue.nextTick();
+    await nextTick();
     expect(loadNext).not.toHaveBeenCalled();
   });
 
   it('추가 로딩 중 연속 요청을 막고 다음 페이지의 첫 핀으로 이동한다', async () => {
-    const state = Vue.observable({ items: [pin(3)], hasNext: true });
+    const state = reactive({ items: [pin(3)], hasNext: true });
     let complete;
     const loadNext = jest.fn(() => new Promise((resolve) => { complete = resolve; }));
     open({ navigation: () => state, loadNext });
@@ -87,7 +86,7 @@ describe('핀 상세 연속 감상', () => {
   });
 
   it('페이지 요청 실패는 현재 핀을 유지하고 재시도할 수 있다', async () => {
-    const state = Vue.observable({ items: [pin(3)], hasNext: true });
+    const state = reactive({ items: [pin(3)], hasNext: true });
     const loadNext = jest.fn()
       .mockRejectedValueOnce(new Error('offline'))
       .mockImplementationOnce(() => { state.items.push(pin(8)); state.hasNext = false; });
@@ -109,10 +108,10 @@ describe('핀 상세 연속 감상', () => {
     document.body.appendChild(input);
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
     input.remove();
-    await Vue.nextTick();
+    await nextTick();
     expect(wrapper.text()).toContain('Pin 3');
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
-    await Vue.nextTick();
+    await nextTick();
     expect(wrapper.text()).toContain('Pin 8');
   });
 
@@ -121,7 +120,7 @@ describe('핀 상세 연속 감상', () => {
     const oldImage = wrapper.find('[data-test="preview-image"]').element;
     await wrapper.find('[data-test="preview-next"]').trigger('click');
     oldImage.dispatchEvent(new Event('load'));
-    await Vue.nextTick();
+    await nextTick();
     expect(wrapper.find('[data-test="preview-image"]').isVisible()).toBe(false);
     await wrapper.find('[data-test="preview-image"]').trigger('load');
     expect(wrapper.find('[data-test="preview-image"]').isVisible()).toBe(true);

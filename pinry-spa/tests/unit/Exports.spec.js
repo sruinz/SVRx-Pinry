@@ -6,6 +6,20 @@ import { mount } from '@vue/test-utils';
 import API from '@/components/api';
 import modals from '@/components/modals';
 import Exports from '@/views/Exports.vue';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 const JOB_ID = '123e4567-e89b-42d3-a456-426614174000';
 const UTC = '2026-08-30T12:34:56Z';
@@ -64,9 +78,10 @@ function latest(latestAttempt = job(), downloadableJob = null) {
 
 function mountView() {
   const wrapper = mount(Exports, {
-    mocks: {
-      $buefy: { modal: { open: jest.fn() } },
-      $t: (key, values) => (values ? `${key}:${JSON.stringify(values)}` : key),
+    global: {
+      mocks: {
+        $t: (key, values) => (values ? `${key}:${JSON.stringify(values)}` : key),
+      },
     },
   });
   wrappers.push(wrapper);
@@ -86,7 +101,7 @@ describe('Exports view', () => {
   });
 
   afterEach(() => {
-    wrappers.forEach(wrapper => wrapper.destroy());
+    wrappers.forEach(wrapper => wrapper.unmount());
     jest.useRealTimers();
     jest.restoreAllMocks();
   });
@@ -182,7 +197,7 @@ describe('Exports view', () => {
     const request = deferred();
     API.Export.fetchLatest.mockReturnValue(request.promise);
     const wrapper = mountView();
-    wrapper.destroy();
+    wrapper.unmount();
     request.resolve(latest());
     await settle();
 
@@ -194,7 +209,7 @@ describe('Exports view', () => {
     API.Export.fetchLatest.mockResolvedValue(latest());
     const wrapper = mountView();
     await settle();
-    wrapper.destroy();
+    wrapper.unmount();
 
     jest.advanceTimersByTime(30000);
     expect(API.Export.fetchLatest).toHaveBeenCalledTimes(1);
@@ -208,7 +223,7 @@ describe('Exports view', () => {
     API.Export.fetchLatest.mockResolvedValue(latest(complete, complete));
     const wrapper = mountView();
     await settle();
-    wrapper.destroy();
+    wrapper.unmount();
 
     jest.advanceTimersByTime(30000);
     expect(API.Export.fetchLatest).toHaveBeenCalledTimes(1);

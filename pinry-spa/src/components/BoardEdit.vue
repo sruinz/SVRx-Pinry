@@ -7,47 +7,45 @@
         </header>
         <section class="modal-card-body">
           <div v-if="!isEdit">
-            <b-field v-bind:label="$t('nameLabel')"
+            <FormField v-bind:label="$t('nameLabel')"
                        :type="createModel.form.name.type"
                        :message="createModel.form.name.error">
-                <b-input
+                <input class="input" :aria-label="$t('nameLabel')"
                   type="text"
                   v-model="createModel.form.name.value"
                   v-bind:placeholder="$t('boardNamePlaceholder')"
                   maxlength="128"
                   >
-                </b-input>
-            </b-field>
-            <b-field v-bind:label="$t('privacyOptionLabel')"
+            </FormField>
+            <FormField v-bind:label="$t('privacyOptionLabel')"
                        :type="createModel.form.private.type"
                        :message="createModel.form.private.error">
-                <b-checkbox v-model="createModel.form.private.value">
+                <label class="checkbox"><input type="checkbox" v-model="createModel.form.private.value">
                     {{ $t("isPrivateCheckbox") }}
-                </b-checkbox>
-              </b-field>
+                </label>
+              </FormField>
           </div>
           <div v-if="isEdit">
-            <b-field v-bind:label="$t('nameLabel')"
+            <FormField v-bind:label="$t('nameLabel')"
                        :type="editModel.form.name.type"
                        :message="editModel.form.name.error">
-                <b-input
+                <input class="input" :aria-label="$t('nameLabel')"
                   type="text"
                   v-model="editModel.form.name.value"
                   v-bind:placeholder="$t('boardNamePlaceholder')"
                   maxlength="128"
                   >
-                </b-input>
-            </b-field>
-            <b-field v-bind:label="$t('privacyOptionLabel')"
+            </FormField>
+            <FormField v-bind:label="$t('privacyOptionLabel')"
                        :type="editModel.form.private.type"
                        :message="editModel.form.private.error">
-                <b-checkbox
+                <label class="checkbox"><input type="checkbox"
                   v-model="editModel.form.private.value"
                   data-test="board-private-checkbox"
                 >
                     {{ $t("isPrivateCheckbox") }}
-                </b-checkbox>
-              </b-field>
+                </label>
+              </FormField>
             <p
               v-if="willResetPrivateCover"
               class="notification is-info"
@@ -59,7 +57,7 @@
           </div>
         </section>
         <footer class="modal-card-foot">
-          <button class="button" type="button" @click="$parent.close()">{{ $t("closeButton") }}</button>
+          <button class="button" type="button" @click="$emit('close')">{{ $t("closeButton") }}</button>
           <button
             v-if="!isEdit"
             @click="createBoard"
@@ -77,6 +75,7 @@
 </template>
 
 <script>
+import FormField from './ui/FormField.vue';
 import API from './api';
 import ModelForm from './utils/ModelForm';
 import bus from './utils/bus';
@@ -84,6 +83,7 @@ import bus from './utils/bus';
 const fields = ['name', 'private'];
 
 export default {
+  components: { FormField },
   name: 'BoardEditModal',
   data() {
     const createModel = ModelForm.fromFields(fields);
@@ -138,7 +138,7 @@ export default {
       promise.then(
         (resp) => {
           self.$emit('boardSaved', resp);
-          self.$parent.close();
+          self.$emit('close');
         },
         (error) => {
           self.editModel.markFieldsAsDanger(error.response.data);
@@ -153,9 +153,9 @@ export default {
       );
       promise.then(
         (resp) => {
-          bus.bus.$emit(bus.events.refreshBoards);
+          bus.bus.emit(bus.events.refreshBoards);
           self.$emit('boardCreated', resp);
-          self.$parent.close();
+          self.$emit('close');
         },
         (resp) => {
           self.createModel.markFieldsAsDanger(resp.data);

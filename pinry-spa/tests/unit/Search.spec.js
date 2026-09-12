@@ -6,7 +6,7 @@ import Search from '@/views/Search.vue';
 
 function mountSearch() {
   return shallowMount(Search, {
-    stubs: ['PHeader', 'SearchPanel', 'Pins', 'Boards'],
+    global: { stubs: ['PHeader', 'SearchPanel', 'Pins', 'Boards'] },
   });
 }
 

@@ -165,8 +165,8 @@
           column-width=".grid-sizer"
           gutter=".gutter-sizer"
         >
-          <template v-for="item in blocks">
-            <div v-bind:key="item.id"
+          <template v-for="item in blocks" :key="item.id">
+            <div
                  v-masonry-tile
                  :class="item.class"
                  class="grid pin-masonry">
@@ -243,8 +243,8 @@
                         </span>
                         <template v-if="item.tags.length > 0">
                           &nbsp;in&nbsp;
-                          <template v-for="tag in item.tags">
-                            <span v-bind:key="tag" class="pin-tag">
+                          <template v-for="tag in item.tags" :key="tag">
+                            <span class="pin-tag">
                               <router-link :to="{ name: 'tag', params: {tag: tag} }"
                                            params="{tag: tag}">{{ tag }}</router-link>
                             </span>
@@ -268,6 +268,7 @@
 </template>
 
 <script>
+import overlays from './utils/overlays';
 import API from './api';
 import pinHandler from './utils/PinHandler';
 import PinPreview from './PinPreview.vue';
@@ -750,7 +751,7 @@ export default {
         this.editorMeta.currentBoard = response.data;
         this.interactionMode = 'browse';
         this.coverSelection.candidateId = null;
-        this.$buefy.toast.open({
+        overlays.toast({
           message: this.$t('boardCoverSaved'),
           type: 'is-success',
         });
@@ -781,7 +782,7 @@ export default {
 
       if ((status === 400 || status === 409) && invalidCodes.has(code)) {
         this.coverSelection.candidateId = null;
-        this.$buefy.toast.open({
+        overlays.toast({
           message: this.$t('boardCoverRefreshRequired'),
           type: 'is-warning',
         });
@@ -791,7 +792,7 @@ export default {
 
       if (status === 403 || status === 404) {
         this.coverSelection.candidateId = null;
-        this.$buefy.toast.open({
+        overlays.toast({
           message: this.$t('boardCoverSaveFailed'),
           type: 'is-danger',
         });
@@ -807,7 +808,7 @@ export default {
         || this.interactionMode !== 'cover-selection'
         || this.currentBoardCoverId === null
       ) return;
-      this.$buefy.dialog.confirm({
+      overlays.confirm(this, {
         message: this.$t('boardCoverResetConfirm'),
         onConfirm: () => this.applyCoverPin(null),
       });
@@ -1000,7 +1001,7 @@ export default {
       let active = true;
       this.bulkOperationToken = token;
       this.bulkDeleteDialogOpen = true;
-      this.$buefy.dialog.confirm({
+      overlays.confirm(this, {
         message: this.$t('bulkPinDeleteConfirm', { count: selectedIds.length }),
         onConfirm: () => {
           if (
@@ -1248,9 +1249,9 @@ export default {
     },
     openPreview(pinItem) {
       this.closePreview();
-      this.previewModalHandle = this.$buefy.modal.open(
+      const modal = overlays.openModal(
+        this,
         {
-          parent: this,
           component: PinPreview,
           props: {
             pinItem,
@@ -1260,16 +1261,13 @@ export default {
             }),
             loadNext: () => this.fetchMore(),
           },
-          scroll: 'keep',
           customClass: 'pin-preview-at-home',
+          onClose: () => {
+            if (this.previewModalHandle === modal) this.previewModalHandle = null;
+          },
         },
       );
-      const modal = this.previewModalHandle;
-      if (modal) {
-        modal.$once('close', () => {
-          if (this.previewModalHandle === modal) this.previewModalHandle = null;
-        });
-      }
+      this.previewModalHandle = modal;
     },
     closePreview() {
       const modal = this.previewModalHandle;
@@ -1451,13 +1449,13 @@ export default {
     niceLinks,
   },
   created() {
-    bus.bus.$on(bus.events.refreshPin, this.reset);
+    bus.bus.on(bus.events.refreshPin, this.reset);
     this.registerScrollEvent();
     document.addEventListener('keydown', this.onDocumentKeydown);
     this.activateSortContext();
     this.initialize();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.closePreview();
     this.invalidateSelectionRequest();
     this.invalidateBulkOperation();

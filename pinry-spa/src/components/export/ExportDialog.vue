@@ -64,6 +64,7 @@
 </template>
 
 <script>
+import overlays from '../utils/overlays';
 import API from '../api';
 import {
   validateExportCreate,
@@ -129,7 +130,7 @@ export default {
   mounted() {
     if (this.requestPayload !== null) this.loadPreview();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.isDestroyed = true;
     this.requestSequence += 1;
   },
@@ -142,7 +143,7 @@ export default {
       this.errorKey = status === 401 ? 'exportLoginRequired' : 'exportErrorGeneric';
     },
     closeDialog() {
-      if (this.$parent && typeof this.$parent.close === 'function') this.$parent.close();
+      this.$emit('close');
     },
     navigateAndClose() {
       this.$router.push({ name: 'exports' });
@@ -184,7 +185,7 @@ export default {
             const latest = await API.Export.fetchLatest();
             if (!this.isCurrent(sequence)) return;
             if (!latest.latest_attempt) throw new Error('invalid_export_contract');
-            this.$buefy.toast.open({
+            overlays.toast({
               message: this.$t('exportActiveExists'),
               type: 'is-info',
             });

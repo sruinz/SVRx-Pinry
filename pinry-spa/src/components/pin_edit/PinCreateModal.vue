@@ -15,38 +15,36 @@
               <div class="description" v-show="pinModel.form.description.value" v-html="niceLinks(pinModel.form.description.value)"></div>
             </div>
             <div class="column">
-              <b-field v-bind:label="$t('imageUrlLabel')"
+              <FormField v-bind:label="$t('imageUrlLabel')"
                        v-show="!disableUrlField && !isEdit"
                        :type="pinModel.form.url.type"
                        :message="pinModel.form.url.error">
-                <b-input
+                <input class="input" :aria-label="$t('imageUrlLabel')"
                   type="text"
                   v-model="pinModel.form.url.value"
                   v-bind:placeholder="$t('pinCreateModalImageURLPlaceholder')"
                   maxlength="2048"
                 >
-                </b-input>
-              </b-field>
-              <b-field v-bind:label="$t('privacyOptionLabel')"
+              </FormField>
+              <FormField v-bind:label="$t('privacyOptionLabel')"
                        :type="pinModel.form.private.type"
                        :message="pinModel.form.private.error">
-                <b-checkbox v-model="pinModel.form.private.value">
+                <label class="checkbox"><input type="checkbox" v-model="pinModel.form.private.value">
                     {{ $t("isPrivateCheckbox") }}
-                </b-checkbox>
-              </b-field>
-              <b-field v-bind:label="$t('imageSourceLabel')"
+                </label>
+              </FormField>
+              <FormField v-bind:label="$t('imageSourceLabel')"
                        :type="pinModel.form.referer.type"
                        :message="pinModel.form.referer.error">
-                <b-input
+                <input class="input" :aria-label="$t('imageSourceLabel')"
                   type="text"
                   v-model="pinModel.form.referer.value"
                   v-bind:placeholder="$t('pinCreateModalImageSourcePlaceholder')"
                   maxlength="2048"
                 >
-                </b-input>
-              </b-field>
-              <b-field v-bind:label="$t('tagsLabel')">
-                <b-taginput
+              </FormField>
+              <FormField v-bind:label="$t('tagsLabel')">
+                <TagInput
                     v-model="pinModel.form.tags.value"
                     :data="editorMeta.filteredTagOptions"
                     autocomplete
@@ -55,25 +53,23 @@
                     :allow-new="true"
                     v-bind:placeholder="$t('pinCreateModalImageTagsPlaceholder')"
                     @typing="getFilteredTags">
-                  <template slot-scope="props">
+                  <template #default="props">
                     <strong>{{ props.option }}</strong>
                   </template>
-                  <template slot="empty">
+                  <template #empty>
                     {{ $t("pinCreateModalEmptySlot") }}
                   </template>
-                </b-taginput>
-              </b-field>
-              <b-field v-bind:label="$t('descriptionLabel')"
+                </TagInput>
+              </FormField>
+              <FormField v-bind:label="$t('descriptionLabel')"
                        :type="pinModel.form.description.type"
                        :message="pinModel.form.description.error">
-                <b-input
-                  type="textarea"
+                <textarea class="textarea" :aria-label="$t('descriptionLabel')"
                   v-model="pinModel.form.description.value"
                   v-bind:placeholder="$t('pinCreateModalImageDescriptionPlaceholder')"
                   maxlength="1024"
-                >
-                </b-input>
-              </b-field>
+                ></textarea>
+              </FormField>
             </div>
             <div class="column" v-if="!isEdit">
               <FilterSelect
@@ -113,6 +109,8 @@
 <script>
 import axios from 'axios';
 
+import FormField from '../ui/FormField.vue';
+import TagInput from '../ui/TagInput.vue';
 import API from '../api';
 import FileUpload from './FileUpload.vue';
 import FilterSelect from './FilterSelect.vue';
@@ -173,6 +171,8 @@ export default {
     },
   },
   components: {
+    FormField,
+    TagInput,
     FileUpload,
     FilterSelect,
   },
@@ -215,7 +215,7 @@ export default {
       this.pinModel.form.description.value = this.fromUrl.description;
     }
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.componentAlive = false;
     this.closeLoading();
   },
@@ -229,7 +229,7 @@ export default {
     },
     closeModal() {
       if (!this.createInFlight) {
-        this.$parent.close();
+        this.$emit('close');
       }
     },
     fetchTagList() {
@@ -283,9 +283,9 @@ export default {
       const promise = API.Pin.updateById(this.existedPin.id, data);
       promise.then(
         (resp) => {
-          bus.bus.$emit(bus.events.refreshPin);
+          bus.bus.emit(bus.events.refreshPin);
           self.$emit('pinUpdated', resp);
-          self.$parent.close();
+          self.$emit('close');
         },
       );
     },
@@ -334,10 +334,10 @@ export default {
             }
             self.createInFlight = false;
             self.$emit('pinCreated', resp);
-            self.$parent.close();
+            self.$emit('close');
             self.closeLoading();
           }
-          bus.bus.$emit(bus.events.refreshPin);
+          bus.bus.emit(bus.events.refreshPin);
           if (self.selectedFile === null && self.boardIds) {
             // FIXME(winkidney): Should handle error for add-to board
             self.boardIds.forEach(

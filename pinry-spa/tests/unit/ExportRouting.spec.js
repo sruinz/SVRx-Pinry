@@ -1,6 +1,6 @@
 /* eslint-env jest */
 
-import { createLocalVue, shallowMount } from '@vue/test-utils';
+import { shallowMount } from '@vue/test-utils';
 
 import PHeader from '@/components/PHeader.vue';
 import router from '@/router';
@@ -8,16 +8,17 @@ import router from '@/router';
 function mountHeader() {
   const initializeUser = jest.spyOn(PHeader.methods, 'initializeUser')
     .mockImplementation(() => {});
-  const localVue = createLocalVue();
+
   const wrapper = shallowMount(PHeader, {
-    localVue,
-    mocks: { $t: key => key },
-    stubs: {
-      'b-icon': true,
-      'router-link': {
-        name: 'RouterLinkStub',
-        props: ['to'],
-        template: '<a><slot /></a>',
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: { $t: key => key },
+      stubs: {
+        'router-link': {
+          name: 'RouterLinkStub',
+          props: ['to'],
+          template: '<a><slot /></a>',
+        },
       },
     },
   });
@@ -32,8 +33,8 @@ describe('export route and header entry point', () => {
     expect(routes.filter(route => route.name === 'exports')).toHaveLength(1);
     expect(routes.find(route => route.name === 'exports').path).toBe('/exports');
     expect(routes.findIndex(route => route.name === 'exports'))
-      .toBeLessThan(routes.findIndex(route => route.path === '*'));
-    expect(router.resolve({ name: 'exports' }).route.path).toBe('/exports');
+      .toBeLessThan(routes.findIndex(route => route.path === '/:pathMatch(.*)*'));
+    expect(router.resolve({ name: 'exports' }).path).toBe('/exports');
   });
 
   it('orders the authenticated My menu as Pins, boards, exports, then profile', async () => {
@@ -49,7 +50,7 @@ describe('export route and header entry point', () => {
       'my-exports-link',
       'my-profile-link',
     ]);
-    const link = wrapper.find('[data-test="my-exports-link"]');
+    const link = wrapper.findComponent('[data-test="my-exports-link"]');
     expect(link.props('to')).toEqual({ name: 'exports' });
     expect(link.element.tagName).toBe('A');
     expect(link.attributes('tabindex')).toBeUndefined();

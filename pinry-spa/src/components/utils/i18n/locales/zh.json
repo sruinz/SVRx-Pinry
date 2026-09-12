@@ -1,4 +1,6 @@
 {
+  "confirmButton": "确认",
+  "loading": "加载中…",
   "loginSubtitle": "选择要使用的账号。",
   "ssoLoginWithProvider": "使用 {provider} 登录",
   "passwordLoginTitle": "使用账号和密码登录",

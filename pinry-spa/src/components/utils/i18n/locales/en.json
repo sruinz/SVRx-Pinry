@@ -1,4 +1,6 @@
 {
+  "confirmButton": "Confirm",
+  "loading": "Loading…",
   "loginSubtitle": "Choose an account to continue.",
   "ssoLoginWithProvider": "Log in with {provider}",
   "passwordLoginTitle": "Log in with username and password",

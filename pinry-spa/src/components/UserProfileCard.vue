@@ -6,7 +6,7 @@
             <div class="media">
               <div class="media-left">
                 <figure class="image is-48x48">
-                  <b-skeleton width="48px" height="48px" :active="avatarLoading"></b-skeleton>
+                  <span v-if="avatarLoading" class="app-skeleton" />
                   <img
                     @load="onAvatarLoaded"
                     v-show="!avatarLoading"
@@ -29,31 +29,19 @@
               <ul>
                 <li :class="trueFalse2Class(inPins)">
                   <a @click="go2UserPins">
-                    <b-icon
-                      type="is-dark"
-                      icon="image"
-                      custom-size="mdi-24px">
-                    </b-icon>
+                    <i aria-hidden="true" class="mdi mdi-image"></i>
                     <span>{{ $t("pinsUserProfileCardLink") }}</span>
                   </a>
                 </li>
                 <li :class="trueFalse2Class(inBoard)">
                   <a @click="go2UserBoard">
-                    <b-icon
-                      type="is-dark"
-                      icon="folder-multiple-image"
-                      custom-size="mdi-24px">
-                    </b-icon>
+                    <i aria-hidden="true" class="mdi mdi-folder-multiple-image"></i>
                     <span>{{ $t("boardsUserProfileCardLink") }}</span>
                   </a>
                 </li>
                 <li :class="trueFalse2Class(inProfile)">
                   <a @click="go2UserProfile">
-                    <b-icon
-                      type="is-dark"
-                      icon="account"
-                      custom-size="mdi-24px">
-                    </b-icon>
+                    <i aria-hidden="true" class="mdi mdi-account"></i>
                     <span>{{ $t("profileUserProfileCardLink") }}</span>
                   </a>
                 </li>
@@ -100,7 +88,7 @@ export default {
   beforeMount() {
     this.initializeUser(this.username);
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.userRequestSequence += 1;
   },
   watch: {

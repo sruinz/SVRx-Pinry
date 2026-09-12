@@ -1,5 +1,7 @@
 <template>
   <div class="pin-preview-modal">
+    <button type="button" class="preview-close" data-test="preview-close"
+      :aria-label="$t('closeButton')" @click="closePreview">×</button>
     <section>
         <nav v-if="navigation" class="preview-navigation" data-test="preview-navigation"
              :aria-label="$t('previewNavigation')">
@@ -43,34 +45,34 @@
                   <p class="title is-4 pin-meta-info"><span class="dim">{{ $t("pinnedByTitle") }}</span><span class="author">{{ currentPin.author }}</span></p>
                   <p class="subtitle is-6" v-show="currentPin.tags.length > 0">
                     <span class="subtitle dim">in&nbsp;</span>
-                    <template v-for="tag in currentPin.tags">
-                      <b-tag v-bind:key="tag" type="is-info" class="pin-preview-tag">{{ tag }}</b-tag>
+                    <template v-for="tag in currentPin.tags" :key="tag">
+                      <span class="tag pin-preview-tag is-info">{{ tag }}</span>
                     </template>
                   </p>
                 </div>
                 <div class="is-pulled-right">
                   <a :href="currentPin.referer" target="_blank">
-                    <b-button
+                    <button type="button"
                         v-show="currentPin.referer !== null"
                         class="meta-link"
-                        type="is-warning">
+                        >
                       {{ $t("sourceButton") }}
-                    </b-button>
+                    </button>
                   </a>
                   <a :href="currentPin.original_image_url" target="_blank">
-                    <b-button
+                    <button type="button"
                         v-show="currentPin.original_image_url !== null"
                         class="meta-link"
-                        type="is-link">
+                        >
                         {{ $t("originalImageButton") }}
-                    </b-button>
+                    </button>
                   </a>
-                  <b-button
+                  <button type="button"
                       @click="closeAndGoTo"
                       class="meta-link"
-                      type="is-success">
+                      >
                       {{ $t("permalinkButton") }}
-                  </b-button>
+                  </button>
                 </div>
               </div>
             </div>
@@ -85,6 +87,8 @@ import niceLinks from './utils/niceLinks';
 
 export default {
   name: 'PinPreview',
+  emits: ['close'],
+  inject: { isModalActive: { default: () => () => true } },
   props: {
     pinItem: { type: Object, required: true },
     navigation: { type: Function, default: null },
@@ -118,11 +122,9 @@ export default {
   mounted() {
     this.disposed = false;
     document.addEventListener('keydown', this.onKeydown);
-    this.$parent.$on('close', this.deactivate);
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.deactivate();
-    this.$parent.$off('close', this.deactivate);
   },
   methods: {
     deactivate() {
@@ -130,7 +132,7 @@ export default {
       document.removeEventListener('keydown', this.onKeydown);
     },
     async move(direction) {
-      if (this.disposed || this.busy || !this.navigation
+      if (this.disposed || !this.isModalActive() || this.busy || !this.navigation
           || (direction < 0 ? !this.hasPrevious : !this.hasNext)) return;
       this.pageError = false;
       const index = this.currentIndex + direction;
@@ -145,7 +147,7 @@ export default {
           this.busy = false;
         }
       }
-      if (this.disposed || this.pageError) return;
+      if (this.disposed || !this.isModalActive() || this.pageError) return;
       const item = this.context.items[index];
       if (item) {
         this.imageReady = false;
@@ -173,10 +175,14 @@ export default {
       if (event.target === this.$refs.previewImage) this.imageError = true;
     },
     closeAndGoTo() {
-      this.$parent.close();
+      this.closePreview();
       this.$router.push(
         { name: 'pin', params: { pinId: this.currentPin.id } },
       );
+    },
+    closePreview() {
+      this.deactivate();
+      this.$emit('close');
     },
     niceLinks,
   },
@@ -185,6 +191,8 @@ export default {
 
 <style lang="scss" scoped>
 @import './utils/fonts.scss';
+.preview-close { position: absolute; top: 8px; right: 8px; z-index: 3; width: 44px; height: 44px; border: 0; border-radius: 50%; background: #172126; color: white; font-size: 28px; cursor: pointer; }
+.pin-preview-modal { position: relative; padding-top: 56px; }
 
 .preview-navigation {
   display: flex;

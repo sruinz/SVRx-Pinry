@@ -1,6 +1,6 @@
 /* eslint-env jest */
 import axios from 'axios';
-import { createLocalVue, mount } from '@vue/test-utils';
+import { mount } from '@vue/test-utils';
 import flushPromises from 'flush-promises';
 
 import API from '@/components/api';
@@ -39,19 +39,19 @@ function deferred() {
 }
 
 function mountBoards(filters = {}) {
-  const localVue = createLocalVue();
-  localVue.directive('masonry', {});
-  localVue.directive('masonry-tile', {});
   return mount(Boards, {
-    localVue,
-    propsData: { filters },
-    mocks: { $t: key => key },
-    stubs: {
-      BoardEditorUI: true,
-      loadingSpinner: true,
-      noMore: true,
-      'router-link': true,
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: { $t: key => key },
+      stubs: {
+        BoardEditorUI: true,
+        loadingSpinner: true,
+        noMore: true,
+        'router-link': true,
+      },
     },
+
+    props: { filters },
   });
 }
 
@@ -154,15 +154,15 @@ describe('Board sorting query and controls', () => {
 
   it('renders four modes with the active aria-pressed state', async () => {
     const wrapper = mount(BoardSortControls, {
-      propsData: { mode: 'oldest' },
-      mocks: { $t: key => key },
+      global: { mocks: { $t: key => key } },
+      props: { mode: 'oldest' },
     });
 
     expect(wrapper.find('[data-test="board-sort-custom"]').attributes('aria-pressed')).toBe('false');
     expect(wrapper.find('[data-test="board-sort-latest"]').attributes('aria-pressed')).toBe('false');
     expect(wrapper.find('[data-test="board-sort-oldest"]').attributes('aria-pressed')).toBe('true');
     expect(wrapper.find('[data-test="board-sort-random"]').attributes('aria-pressed')).toBe('false');
-    expect(wrapper.findAll('button').wrappers.map(button => button.text())).toEqual([
+    expect(wrapper.findAll('button').map(button => button.text())).toEqual([
       'boardSortCustom', 'boardSortLatest', 'boardSortOldest', 'boardSortRandom',
     ]);
     expect(wrapper.find('[data-test="board-sort-oldest"]').classes()).toContain('is-primary');
@@ -177,7 +177,7 @@ describe('Board sorting query and controls', () => {
 
     expect(wrapper.find('[data-test="board-sort-custom"]').exists()).toBe(false);
     expect(API.Board.fetchListWhichContains).toHaveBeenCalledWith('travel', 0);
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('keeps the user Board screen working when the localStorage getter throws', async () => {
@@ -204,7 +204,7 @@ describe('Board sorting query and controls', () => {
       });
       expect(API.fetchBoardForUser.mock.calls[1][3]).toEqual(wrapper.vm.sortState);
     } finally {
-      if (wrapper) wrapper.destroy();
+      if (wrapper) wrapper.unmount();
       Object.defineProperty(window, 'localStorage', descriptor);
     }
   });
@@ -233,7 +233,7 @@ describe('Board sorting query and controls', () => {
       expect(API.fetchBoardForUser.mock.calls[2][3]).toEqual(wrapper.vm.sortState);
     } finally {
       setItem.mockRestore();
-      wrapper.destroy();
+      wrapper.unmount();
     }
   });
 
@@ -255,7 +255,7 @@ describe('Board sorting query and controls', () => {
       [0, { version: 1, mode: 'random', randomSeed: 23 }],
       [1, { version: 1, mode: 'random', randomSeed: 23 }],
     ]);
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('deduplicates Board pages while advancing offset by consumed rows', async () => {
@@ -278,7 +278,7 @@ describe('Board sorting query and controls', () => {
     expect(wrapper.vm.blocks.map(item => item.id)).toEqual([1, 2, 3]);
     expect(Object.keys(wrapper.vm.blocksMap).map(Number).sort()).toEqual([1, 2, 3]);
     expect(wrapper.vm.status.offset).toBe(6);
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('keeps sort state for pagination and discards late responses after a mode change', async () => {
@@ -304,6 +304,6 @@ describe('Board sorting query and controls', () => {
       [0, { version: 1, mode: 'latest', randomSeed: expect.any(Number) }],
     ]);
     expect(wrapper.vm.blocks.map(item => item.id)).toEqual([3]);
-    wrapper.destroy();
+    wrapper.unmount();
   });
 });

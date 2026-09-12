@@ -1,11 +1,25 @@
 /* eslint-env jest */
 
 import flushPromises from 'flush-promises';
-import { createLocalVue, mount } from '@vue/test-utils';
+import { mount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import Pins from '@/components/Pins.vue';
 import PinSortControls from '@/components/sorting/PinSortControls.vue';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 const HOME_KEY = 'svrx.pinSort.v1:home';
 let mountedPinWrappers = [];
@@ -76,25 +90,25 @@ function mountPins({
     })),
   );
 
-  const localVue = createLocalVue();
-  localVue.directive('masonry', {});
-  localVue.directive('masonry-tile', {});
+
   const wrapper = mount(Pins, {
-    localVue,
-    propsData: { pinFilters },
-    mocks: {
-      $buefy: { modal: { open: jest.fn() } },
-      $t: (key, values) => (values ? `${key}:${values.count}` : key),
-    },
-    stubs: {
-      EditorUI: true,
-      loadingSpinner: true,
-      noMore: true,
-      'router-link': {
-        props: ['to'],
-        template: '<a href="#"><slot /></a>',
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: {
+        $t: (key, values) => (values ? `${key}:${values.count}` : key),
+      },
+      stubs: {
+        EditorUI: true,
+        loadingSpinner: true,
+        noMore: true,
+        'router-link': {
+          props: ['to'],
+          template: '<a href="#"><slot /></a>',
+        },
       },
     },
+
+    props: { pinFilters },
   });
   mountedPinWrappers.push(wrapper);
   return wrapper;
@@ -108,8 +122,8 @@ async function settle() {
 describe('PinSortControls', () => {
   it('presents all modes and emits the selected mode', async () => {
     const wrapper = mount(PinSortControls, {
-      propsData: { mode: 'oldest' },
-      mocks: { $t: key => key },
+      global: { mocks: { $t: key => key } },
+      props: { mode: 'oldest' },
     });
 
     expect(wrapper.find('[data-test="pin-sort-latest"]').attributes('aria-pressed'))
@@ -129,13 +143,13 @@ describe('PinSortControls', () => {
     ['loading state', { disabled: false, busy: true }],
   ])('disables every mode during %s', async (_name, props) => {
     const wrapper = mount(PinSortControls, {
-      propsData: { mode: 'latest', ...props },
-      mocks: { $t: key => key },
+      global: { mocks: { $t: key => key } },
+      props: { mode: 'latest', ...props },
     });
 
     ['latest', 'oldest', 'random'].forEach((mode) => {
       expect(wrapper.find(`[data-test="pin-sort-${mode}"]`).attributes('disabled'))
-        .toBe('disabled');
+        .toBeDefined();
     });
   });
 });
@@ -170,7 +184,7 @@ describe('Pins sorting', () => {
   });
 
   afterEach(() => {
-    mountedPinWrappers.forEach(wrapper => wrapper.destroy());
+    mountedPinWrappers.forEach(wrapper => wrapper.unmount());
     if (Pins.methods.initializeMeta.mockRestore) {
       Pins.methods.initializeMeta.mockRestore();
     }
@@ -333,7 +347,7 @@ describe('Pins sorting', () => {
     await wrapper.vm.$nextTick();
     ['latest', 'oldest', 'random'].forEach((mode) => {
       expect(wrapper.find(`[data-test="pin-sort-${mode}"]`).attributes('disabled'))
-        .toBe('disabled');
+        .toBeDefined();
     });
 
     wrapper.vm.selection.active = false;
@@ -341,7 +355,7 @@ describe('Pins sorting', () => {
     await wrapper.vm.$nextTick();
     ['latest', 'oldest', 'random'].forEach((mode) => {
       expect(wrapper.find(`[data-test="pin-sort-${mode}"]`).attributes('disabled'))
-        .toBe('disabled');
+        .toBeDefined();
     });
   });
 
@@ -361,6 +375,7 @@ describe('Pins sorting', () => {
     wrapper.vm.fetchMore();
 
     await wrapper.setProps({ pinFilters: { userFilter: 'other' } });
+    await wrapper.vm.$nextTick();
     expect(wrapper.vm.blocks).toEqual([]);
     expect(wrapper.vm.blocksMap).toEqual({});
     expect(wrapper.vm.status.offset).toBe(0);
@@ -569,10 +584,10 @@ describe('Pins sorting', () => {
     });
     await settle();
     const close = jest.fn();
-    wrapper.vm.$buefy.modal.open.mockReturnValue({ close, $once: jest.fn() });
+    overlays.openModal.mockReturnValue({ close });
     wrapper.vm.openPreview(wrapper.vm.blocks[0]);
-    const config = wrapper.vm.$buefy.modal.open.mock.calls[0][0];
-    expect(config.scroll).toBe('keep');
+    const config = overlays.openModal.mock.calls[0][1];
+    expect(typeof config.onClose).toBe('function');
     expect(config.props.navigation().items.map(item => item.id)).toEqual([30]);
     const existingRequest = wrapper.vm.fetchMore();
     const previewRequest = config.props.loadNext();
@@ -594,20 +609,16 @@ describe('Pins sorting', () => {
     expect(API.fetchPins).not.toHaveBeenCalled();
     expect(API.fetchPin).toHaveBeenCalledWith(7);
     wrapper.vm.openPreview(wrapper.vm.blocks[0]);
-    expect(wrapper.vm.$buefy.modal.open.mock.calls[0][0].props.navigation).toBeNull();
+    expect(overlays.openModal.mock.calls[0][1].props.navigation).toBeNull();
   });
 
   it('사용자가 닫은 모달을 다음 열기에서 다시 닫지 않는다', async () => {
     const wrapper = mountPins();
     await settle();
     const close = jest.fn();
-    let onClose;
-    wrapper.vm.$buefy.modal.open.mockReturnValue({
-      close,
-      $once(event, callback) { if (event === 'close') onClose = callback; },
-    });
+    overlays.openModal.mockReturnValue({ close });
     wrapper.vm.openPreview(wrapper.vm.blocks[0]);
-    onClose();
+    overlays.openModal.mock.calls[0][1].onClose();
     wrapper.vm.openPreview(wrapper.vm.blocks[1]);
     expect(close).not.toHaveBeenCalled();
   });

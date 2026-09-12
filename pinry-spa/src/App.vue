@@ -1,21 +1,22 @@
 <template>
   <div id="app">
     <router-view/>
+    <AppOverlays />
   </div>
 </template>
 
 <script>
+import AppOverlays from './components/ui/AppOverlays.vue';
+
 export default {
   name: 'app',
+  components: { AppOverlays },
 };
 </script>
 
 <style lang="scss">
-  // Import Bulma's core
-  @import "~bulma/sass/utilities/_all";
-  // Import Bulma and Buefy styles
-  @import "~bulma";
-  @import "~buefy/src/scss/buefy";
+  @import "bulma/sass/utilities/_all";
+  @import "bulma/bulma.sass";
   html {
     background-color: #F5F5EB;
   }

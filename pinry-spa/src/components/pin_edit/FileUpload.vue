@@ -6,29 +6,28 @@
       <img :src="previewImage">
     </div>
     <div v-show="previewImage === null">
-      <b-field>
-        <b-upload v-model="dropFile"
-                  accept="image/*"
-                  drag-drop>
+      <FormField>
+        <label class="file-drop" data-test="file-drop" @dragover.prevent @drop.prevent="selectFiles($event.dataTransfer.files)">
+          <input type="file" accept="image/*" @change="selectFiles($event.target.files)">
           <section class="section">
             <div class="content has-text-centered">
               <p>
-                <b-icon
-                  icon="upload"
-                  size="is-medium">
-                </b-icon>
+                <i aria-hidden="true" class="mdi mdi-upload"></i>
               </p>
               <p>{{ $t("FileUploadDescription") }}</p>
             </div>
           </section>
-        </b-upload>
-      </b-field>
+        </label>
+      </FormField>
     </div>
   </div>
 </template>
 
 <script>
+import FormField from '../ui/FormField.vue';
+
 export default {
+  components: { FormField },
   name: 'FileUpload',
   data() {
     return {
@@ -51,7 +50,7 @@ export default {
       this.$emit('imageSelected', newFile);
     },
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.releaseObjectUrl();
   },
   computed: {
@@ -66,6 +65,11 @@ export default {
     },
   },
   methods: {
+    selectFiles(files) {
+      const file = files && files[0];
+      if (file && !file.type.startsWith('image/')) return;
+      this.dropFile = file || null;
+    },
     releaseObjectUrl() {
       if (this.objectUrl !== null) {
         URL.revokeObjectURL(this.objectUrl);
@@ -88,5 +92,7 @@ export default {
   height: auto;
   @include loader('../../assets/loader.gif');
 }
+.file-drop { display: block; border: 2px dashed #b5b5b5; border-radius: 6px; cursor: pointer; }
+.file-drop input { max-width: 100%; }
 
 </style>

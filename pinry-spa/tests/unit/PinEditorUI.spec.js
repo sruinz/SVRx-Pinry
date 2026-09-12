@@ -1,14 +1,28 @@
 /* eslint-env jest */
 import axios from 'axios';
 import flushPromises from 'flush-promises';
-import VueI18n from 'vue-i18n';
-import { createLocalVue, shallowMount } from '@vue/test-utils';
+import { createI18n } from 'vue-i18n';
+import { shallowMount } from '@vue/test-utils';
 
 import BoardDeleteDialog from '@/components/bulk/BoardDeleteDialog.vue';
 import BoardEditUI from '@/components/editors/BoardEditUI.vue';
 import PinEditorUI from '@/components/editors/PinEditorUI.vue';
 import { openBoardDelete } from '@/components/modals';
 import en from '@/components/utils/i18n/locales/en.json';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 jest.mock('axios');
 
@@ -48,24 +62,23 @@ describe('PinEditorUI delete behavior', () => {
   });
 
   function mountEditor() {
-    const localVue = createLocalVue();
-    localVue.use(VueI18n);
-    const dialog = { confirm: jest.fn() };
-    const toast = { open: jest.fn() };
+    const dialog = { confirm: overlays.confirm };
+    const toast = { open: overlays.toast };
     return {
       dialog,
       toast,
       wrapper: shallowMount(PinEditorUI, {
-        localVue,
-        i18n: new VueI18n({ locale: 'en', messages: { en } }),
-        propsData: {
+        global: {
+          directives: { masonry: {}, 'masonry-tile': {} },
+          mocks: {},
+          stubs: [],
+          plugins: [createI18n({ legacy: true, locale: 'en', messages: { en } })],
+        },
+
+        props: {
           currentUsername: 'owner',
           pin: { id: 41, author: 'owner' },
         },
-        mocks: {
-          $buefy: { dialog, toast },
-        },
-        stubs: ['b-icon'],
       }),
     };
   }
@@ -74,11 +87,11 @@ describe('PinEditorUI delete behavior', () => {
     const { dialog, toast, wrapper } = mountEditor();
     await wrapper.find('[data-test="delete-pin"]').trigger('click');
     expect(dialog.confirm).toHaveBeenCalledTimes(1);
-    expect(dialog.confirm.mock.calls[0][0].message).toBe('Delete this Pin?');
+    expect(dialog.confirm.mock.calls[0][1].message).toBe('Delete this Pin?');
     expect(axios.delete).not.toHaveBeenCalled();
 
-    dialog.confirm.mock.calls[0][0].onConfirm();
-    dialog.confirm.mock.calls[0][0].onConfirm();
+    dialog.confirm.mock.calls[0][1].onConfirm();
+    dialog.confirm.mock.calls[0][1].onConfirm();
     await flushPromises();
 
     expect(axios.delete).toHaveBeenCalledTimes(1);
@@ -92,7 +105,7 @@ describe('PinEditorUI delete behavior', () => {
     const { dialog, toast, wrapper } = mountEditor();
 
     await wrapper.find('[data-test="delete-pin"]').trigger('click');
-    dialog.confirm.mock.calls[0][0].onConfirm();
+    dialog.confirm.mock.calls[0][1].onConfirm();
     await flushPromises();
 
     expect(toast.open).toHaveBeenCalledWith({
@@ -117,7 +130,7 @@ describe('PinEditorUI delete behavior', () => {
     const { dialog, wrapper } = mountEditor();
 
     await wrapper.find('[data-test="delete-pin"]').trigger('click');
-    const firstDialog = dialog.confirm.mock.calls[0][0];
+    const firstDialog = dialog.confirm.mock.calls[0][1];
     firstDialog.onCancel();
     firstDialog.onCancel();
 
@@ -135,10 +148,10 @@ describe('PinEditorUI delete behavior', () => {
     const { dialog, wrapper } = mountEditor();
 
     await wrapper.find('[data-test="delete-pin"]').trigger('click');
-    const firstDialog = dialog.confirm.mock.calls[0][0];
+    const firstDialog = dialog.confirm.mock.calls[0][1];
     firstDialog.onCancel();
     await wrapper.find('[data-test="delete-pin"]').trigger('click');
-    const currentDialog = dialog.confirm.mock.calls[1][0];
+    const currentDialog = dialog.confirm.mock.calls[1][1];
 
     firstDialog.onConfirm();
     expect(axios.delete).not.toHaveBeenCalled();
@@ -161,7 +174,7 @@ describe('PinEditorUI delete behavior', () => {
     const { dialog, toast, wrapper } = mountEditor();
 
     await wrapper.find('[data-test="delete-pin"]').trigger('click');
-    const { onConfirm } = dialog.confirm.mock.calls[0][0];
+    const { onConfirm } = dialog.confirm.mock.calls[0][1];
     onConfirm();
     onConfirm();
 
@@ -185,7 +198,7 @@ describe('PinEditorUI delete behavior', () => {
     const { dialog, wrapper } = mountEditor();
 
     await wrapper.find('[data-test="delete-pin"]').trigger('click');
-    const firstConfirm = dialog.confirm.mock.calls[0][0].onConfirm;
+    const firstConfirm = dialog.confirm.mock.calls[0][1].onConfirm;
     firstConfirm();
     await rejectRequest(firstRequest);
     firstConfirm();
@@ -193,7 +206,7 @@ describe('PinEditorUI delete behavior', () => {
     expect(axios.delete).toHaveBeenCalledTimes(1);
     await wrapper.find('[data-test="delete-pin"]').trigger('click');
     expect(dialog.confirm).toHaveBeenCalledTimes(2);
-    dialog.confirm.mock.calls[1][0].onConfirm();
+    dialog.confirm.mock.calls[1][1].onConfirm();
 
     expect(axios.delete).toHaveBeenCalledTimes(2);
     await rejectRequest(secondRequest);
@@ -205,9 +218,9 @@ describe('PinEditorUI delete behavior', () => {
     const { dialog, toast, wrapper } = mountEditor();
 
     await wrapper.find('[data-test="delete-pin"]').trigger('click');
-    dialog.confirm.mock.calls[0][0].onConfirm();
+    dialog.confirm.mock.calls[0][1].onConfirm();
     expect(wrapper.vm.deleteInFlight).toBe(true);
-    wrapper.destroy();
+    wrapper.unmount();
     await resolveRequest(request);
 
     expect(wrapper.vm.deleteInFlight).toBe(true);
@@ -221,9 +234,9 @@ describe('PinEditorUI delete behavior', () => {
     const { dialog, toast, wrapper } = mountEditor();
 
     await wrapper.find('[data-test="delete-pin"]').trigger('click');
-    dialog.confirm.mock.calls[0][0].onConfirm();
+    dialog.confirm.mock.calls[0][1].onConfirm();
     expect(wrapper.vm.deleteInFlight).toBe(true);
-    wrapper.destroy();
+    wrapper.unmount();
     await rejectRequest(request);
 
     expect(wrapper.vm.deleteInFlight).toBe(true);
@@ -234,7 +247,7 @@ describe('PinEditorUI delete behavior', () => {
 
 describe('board delete modal helper', () => {
   it('opens the board delete component and forwards completed and closed events', () => {
-    const vm = { $buefy: { modal: { open: jest.fn() } } };
+    const vm = { };
     const board = { id: 7, name: 'Reference' };
     const completed = jest.fn();
     const closed = jest.fn();
@@ -242,12 +255,10 @@ describe('board delete modal helper', () => {
     openBoardDelete(vm, { board }, completed, closed);
     board.name = 'Changed later';
 
-    const config = vm.$buefy.modal.open.mock.calls[0][0];
+    const config = overlays.openModal.mock.calls[0][1];
     expect(config).toMatchObject({
-      parent: vm,
       component: BoardDeleteDialog,
       props: { board: { id: 7, name: 'Reference' } },
-      hasModalCard: true,
       canCancel: false,
       events: { completed, closed },
     });
@@ -260,15 +271,14 @@ describe('BoardEditUI delete behavior', () => {
   });
 
   function mountBoardEditor() {
-    const modal = { open: jest.fn() };
-    const dialog = { confirm: jest.fn() };
+    const modal = { open: overlays.openModal };
+    const dialog = { confirm: overlays.confirm };
     return {
       dialog,
       modal,
       wrapper: shallowMount(BoardEditUI, {
-        propsData: { board: { id: 7, name: 'Reference' } },
-        mocks: { $buefy: { dialog, modal } },
-        stubs: ['b-icon'],
+        global: { mocks: {}, stubs: [] },
+        props: { board: { id: 7, name: 'Reference' } },
       }),
     };
   }
@@ -281,7 +291,7 @@ describe('BoardEditUI delete behavior', () => {
     expect(dialog.confirm).not.toHaveBeenCalled();
     expect(axios.delete).not.toHaveBeenCalled();
     expect(wrapper.emitted('board-delete-succeed')).toBeUndefined();
-    const config = modal.open.mock.calls[0][0];
+    const config = modal.open.mock.calls[0][1];
     expect(config.component).toBe(BoardDeleteDialog);
     expect(config.props.board).toEqual({ id: 7, name: 'Reference' });
 
@@ -298,7 +308,7 @@ describe('BoardEditUI delete behavior', () => {
 
     expect(modal.open).toHaveBeenCalledTimes(1);
     expect(wrapper.vm.deleteDialogOpen).toBe(true);
-    modal.open.mock.calls[0][0].events.closed();
+    modal.open.mock.calls[0][1].events.closed();
     expect(wrapper.vm.deleteDialogOpen).toBe(false);
 
     await wrapper.find('[data-test="delete-board"]').trigger('click');
@@ -310,7 +320,7 @@ describe('BoardEditUI delete behavior', () => {
     const { modal, wrapper } = mountBoardEditor();
 
     await wrapper.find('[data-test="delete-board"]').trigger('click');
-    const { closed, completed } = modal.open.mock.calls[0][0].events;
+    const { closed, completed } = modal.open.mock.calls[0][1].events;
     closed();
     completed(7);
 
@@ -322,7 +332,7 @@ describe('BoardEditUI delete behavior', () => {
     const { modal, wrapper } = mountBoardEditor();
 
     await wrapper.find('[data-test="delete-board"]').trigger('click');
-    const { completed } = modal.open.mock.calls[0][0].events;
+    const { completed } = modal.open.mock.calls[0][1].events;
     completed(7);
     completed(7);
 
@@ -346,7 +356,7 @@ describe('BoardEditUI delete behavior', () => {
   it('ignores callbacks captured before modal opening throws', async () => {
     const { modal, wrapper } = mountBoardEditor();
     let capturedEvents;
-    modal.open.mockImplementationOnce((config) => {
+    modal.open.mockImplementationOnce((_vm, config) => {
       capturedEvents = config.events;
       throw new Error('open failed');
     });
@@ -362,9 +372,9 @@ describe('BoardEditUI delete behavior', () => {
   it('ignores a late completed event after the board editor is destroyed', async () => {
     const { modal, wrapper } = mountBoardEditor();
     await wrapper.find('[data-test="delete-board"]').trigger('click');
-    const { completed } = modal.open.mock.calls[0][0].events;
+    const { completed } = modal.open.mock.calls[0][1].events;
 
-    wrapper.destroy();
+    wrapper.unmount();
     completed(7);
 
     expect(wrapper.emitted('board-delete-succeed')).toBeUndefined();

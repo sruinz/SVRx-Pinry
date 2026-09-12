@@ -2,11 +2,25 @@
 
 import axios from 'axios';
 import flushPromises from 'flush-promises';
-import { createLocalVue, mount } from '@vue/test-utils';
+import { mount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import BoardCoverToolbar from '@/components/board_cover/BoardCoverToolbar.vue';
 import Pins from '@/components/Pins.vue';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 jest.mock('axios');
 
@@ -81,27 +95,23 @@ function mountPins({
   API.fetchPins.mockImplementation(() => page(pins));
   API.Board.get.mockResolvedValue({ data: board });
 
-  const localVue = createLocalVue();
-  localVue.directive('masonry', {});
-  localVue.directive('masonry-tile', {});
+
   const wrapper = mount(Pins, {
-    localVue,
-    attachTo: document.body,
-    propsData: { pinFilters },
-    mocks: {
-      $buefy: {
-        dialog: { confirm: jest.fn() },
-        modal: { open: jest.fn() },
-        toast: { open: jest.fn() },
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: {
+        $t: key => key,
       },
-      $t: key => key,
+      stubs: {
+        EditorUI: true,
+        loadingSpinner: true,
+        noMore: true,
+        'router-link': routerLink,
+      },
     },
-    stubs: {
-      EditorUI: true,
-      loadingSpinner: true,
-      noMore: true,
-      'router-link': routerLink,
-    },
+
+    attachTo: document.body,
+    props: { pinFilters },
   });
   wrapper.vm.editorMeta.user = authenticatedUsername === null
     ? { loggedIn: false, meta: {} }
@@ -144,14 +154,15 @@ describe('Board cover API', () => {
 describe('BoardCoverToolbar', () => {
   it('emits presentation events and exposes enter-button focus', async () => {
     const wrapper = mount(BoardCoverToolbar, {
-      propsData: {
+      global: { mocks: { $t: key => key } },
+      props: {
         active: false,
         selectedId: null,
         currentCoverId: 41,
         busy: false,
         canReset: true,
       },
-      mocks: { $t: key => key },
+
       attachTo: document.body,
     });
 
@@ -171,7 +182,7 @@ describe('BoardCoverToolbar', () => {
     events.forEach((event) => {
       expect(wrapper.emitted(event)).toHaveLength(1);
     });
-    wrapper.destroy();
+    wrapper.unmount();
   });
 });
 
@@ -201,7 +212,7 @@ describe('Pins board-cover selection mode', () => {
   });
 
   afterEach(() => {
-    mountedPinWrappers.forEach(wrapper => wrapper.destroy());
+    mountedPinWrappers.forEach(wrapper => wrapper.unmount());
     if (Pins.methods.initializeMeta.mockRestore) Pins.methods.initializeMeta.mockRestore();
     localStorage.clear();
   });
@@ -229,7 +240,7 @@ describe('Pins board-cover selection mode', () => {
     await wrapper.find('[data-test="board-cover-enter"]').trigger('click');
     expect(wrapper.vm.interactionMode).toBe('cover-selection');
     expect(wrapper.find('[data-test="pin-selection-enter"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     wrapper.vm.enterSelection();
     expect(wrapper.vm.interactionMode).toBe('cover-selection');
     expect(wrapper.vm.selection.active).toBe(false);
@@ -239,7 +250,7 @@ describe('Pins board-cover selection mode', () => {
     await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
     expect(wrapper.vm.interactionMode).toBe('bulk-selection');
     expect(wrapper.find('[data-test="board-cover-enter"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     wrapper.vm.enterCoverSelection();
     expect(wrapper.vm.interactionMode).toBe('bulk-selection');
     expect(wrapper.vm.coverSelection.candidateId).toBeNull();
@@ -265,7 +276,7 @@ describe('Pins board-cover selection mode', () => {
     expect(wrapper.vm.coverSelection.candidateId).toBe(40);
     await wrapper.find('[data-test="pin-image-41"]').trigger('click');
     expect(wrapper.vm.coverSelection.candidateId).toBe(41);
-    expect(wrapper.vm.$buefy.modal.open).not.toHaveBeenCalled();
+    expect(overlays.openModal).not.toHaveBeenCalled();
   });
 
   it('prevents inner router-link navigation before selecting the card', async () => {
@@ -434,7 +445,7 @@ describe('Pins board-cover selection mode', () => {
     expect(wrapper.vm.editorMeta.currentBoard.cover_pin_id).toBe(40);
     expect(wrapper.vm.interactionMode).toBe('browse');
     expect(wrapper.vm.coverSelection.candidateId).toBeNull();
-    expect(wrapper.vm.$buefy.toast.open).toHaveBeenCalledWith({
+    expect(overlays.toast).toHaveBeenCalledWith({
       message: 'boardCoverSaved',
       type: 'is-success',
     });
@@ -576,7 +587,7 @@ describe('Pins board-cover selection mode', () => {
       const originalBoard = wrapper.vm.editorMeta.currentBoard;
       const applyPromise = wrapper.vm.applyCoverPin(40);
 
-      wrapper.destroy();
+      wrapper.unmount();
       if (outcome === 'resolve') {
         request.resolve({
           data: {
@@ -599,7 +610,7 @@ describe('Pins board-cover selection mode', () => {
         inFlight: false,
         error: null,
       });
-      expect(wrapper.vm.$buefy.toast.open).not.toHaveBeenCalled();
+      expect(overlays.toast).not.toHaveBeenCalled();
     },
   );
 
@@ -623,12 +634,12 @@ describe('Pins board-cover selection mode', () => {
     expect(wrapper.vm.interactionMode).toBe('browse');
     expect(wrapper.vm.coverSelection.candidateId).toBeNull();
     expect(API.Board.get.mock.calls.length).toBeGreaterThan(boardFetches);
-    expect(wrapper.vm.$buefy.toast.open).toHaveBeenCalledWith({
+    expect(overlays.toast).toHaveBeenCalledWith({
       message: 'boardCoverRefreshRequired',
       type: 'is-warning',
     });
     expect(wrapper.text()).not.toContain(code);
-    expect(JSON.stringify(wrapper.vm.$buefy.toast.open.mock.calls)).not.toContain(code);
+    expect(JSON.stringify(overlays.toast.mock.calls)).not.toContain(code);
   });
 
   it.each([403, 404])('exits and refreshes after an unavailable board response %i', async (status) => {
@@ -647,12 +658,12 @@ describe('Pins board-cover selection mode', () => {
     expect(wrapper.vm.interactionMode).toBe('browse');
     expect(wrapper.vm.coverSelection.candidateId).toBeNull();
     expect(API.Board.get.mock.calls.length).toBeGreaterThan(boardFetches);
-    expect(wrapper.vm.$buefy.toast.open).toHaveBeenCalledWith({
+    expect(overlays.toast).toHaveBeenCalledWith({
       message: 'boardCoverSaveFailed',
       type: 'is-danger',
     });
     expect(wrapper.text()).not.toContain('board_cover_internal_code');
-    expect(JSON.stringify(wrapper.vm.$buefy.toast.open.mock.calls))
+    expect(JSON.stringify(overlays.toast.mock.calls))
       .not.toContain('board_cover_internal_code');
   });
 
@@ -665,9 +676,9 @@ describe('Pins board-cover selection mode', () => {
 
     await wrapper.find('[data-test="board-cover-reset"]').trigger('click');
 
-    expect(wrapper.vm.$buefy.dialog.confirm).toHaveBeenCalledTimes(1);
+    expect(overlays.confirm).toHaveBeenCalledTimes(1);
     expect(API.Board.setCover).not.toHaveBeenCalled();
-    const { onConfirm } = wrapper.vm.$buefy.dialog.confirm.mock.calls[0][0];
+    const { onConfirm } = overlays.confirm.mock.calls[0][1];
     onConfirm();
     onConfirm();
     expect(API.Board.setCover).toHaveBeenCalledTimes(1);

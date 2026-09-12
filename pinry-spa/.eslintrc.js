@@ -4,10 +4,22 @@ module.exports = {
     node: true,
   },
   extends: [
-    'plugin:vue/essential',
-    '@vue/airbnb',
+    'plugin:vue/vue3-essential',
+    'airbnb-base',
+    'plugin:vuejs-accessibility/recommended',
   ],
+  settings: {
+    'import/resolver': {
+      alias: { map: [['@', './src']], extensions: ['.js', '.vue', '.json', '.mjs'] },
+    },
+  },
   rules: {
+    'import/extensions': ['error', 'always', { js: 'never', mjs: 'never' }],
+    'no-param-reassign': ['error', {
+      props: true,
+      ignorePropertyModificationsFor: ['state', 'acc', 'e'],
+    }],
+    'vuejs-accessibility/no-onchange': 'off',
     // 'no-console': process.env.NODE_ENV === 'production' ? 'error' : 'off',
     'no-debugger': process.env.NODE_ENV === 'production' ? 'error' : 'off',
     'max-len': 'off',

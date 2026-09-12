@@ -30,15 +30,16 @@ function publicUser(username) {
 function mountCard(username = 'owner') {
   const router = { push: jest.fn() };
   const wrapper = shallowMount(UserProfileCard, {
-    propsData: { username },
-    mocks: {
-      $router: router,
-      $t: key => key,
+    global: {
+      mocks: {
+        $router: router,
+        $t: key => key,
+      },
+      stubs: {
+        'b-skeleton': true,
+      },
     },
-    stubs: {
-      'b-icon': true,
-      'b-skeleton': true,
-    },
+    props: { username },
   });
   return { router, wrapper };
 }
@@ -59,7 +60,7 @@ describe('UserProfileCard request lifecycle', () => {
     API.User.fetchUserInfoByName.mockReturnValue(request.promise);
     const { router, wrapper } = mountCard('missing');
 
-    wrapper.destroy();
+    wrapper.unmount();
     request.resolve(null);
     await flushPromises();
 

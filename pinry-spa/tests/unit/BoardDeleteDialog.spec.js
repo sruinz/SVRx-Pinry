@@ -1,8 +1,8 @@
 /* eslint-env jest */
 
 import flushPromises from 'flush-promises';
-import VueI18n from 'vue-i18n';
-import { createLocalVue, shallowMount } from '@vue/test-utils';
+import { createI18n } from 'vue-i18n';
+import { shallowMount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import BoardDeleteDialog from '@/components/bulk/BoardDeleteDialog.vue';
@@ -61,17 +61,16 @@ async function settle() {
 }
 
 function mountDialog() {
-  const localVue = createLocalVue();
-  localVue.use(VueI18n);
-  const i18n = new VueI18n({
+  const i18n = createI18n({
+    legacy: true,
     locale: 'ko',
     fallbackLocale: 'ko',
     messages: localeUtils.messages,
   });
   const wrapper = shallowMount(BoardDeleteDialog, {
-    localVue,
-    i18n,
-    propsData: { board: { id: 7, name: 'Reference' } },
+    global: { directives: { masonry: {}, 'masonry-tile': {} }, plugins: [i18n] },
+
+    props: { board: { id: 7, name: 'Reference' } },
   });
   mountedWrappers.push(wrapper);
   return wrapper;
@@ -94,7 +93,7 @@ describe('BoardDeleteDialog', () => {
   });
 
   afterEach(() => {
-    mountedWrappers.forEach(wrapper => wrapper.destroy());
+    mountedWrappers.forEach(wrapper => wrapper.unmount());
     mountedWrappers = [];
   });
 
@@ -181,13 +180,12 @@ describe('BoardDeleteDialog', () => {
   it('emits closed before asking the modal parent to close on cancel', async () => {
     const order = [];
     const wrapper = mountDialog();
-    wrapper.vm.$on('closed', () => order.push('closed'));
-    wrapper.vm.$parent.close = jest.fn(() => order.push('parent-close'));
+    await wrapper.setProps({ onClosed: () => order.push('closed'), onClose: () => order.push('close') });
     await settle();
 
     await wrapper.find('[data-test="board-delete-cancel"]').trigger('click');
 
-    expect(order).toEqual(['closed', 'parent-close']);
+    expect(order).toEqual(['closed', 'close']);
   });
 
   it('deletes only the board without fetching or mutating pins', async () => {
@@ -281,7 +279,7 @@ describe('BoardDeleteDialog', () => {
     expect(error.text())
       .toBe('전체 범위가 너무 커 현재 화면의 Pin만 선택할 수 있습니다.');
     expect(wrapper.find('[data-test="board-delete-with-pins"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(wrapper.find('[data-test="board-delete-only"]').attributes('disabled'))
       .toBeUndefined();
     await wrapper.find('[data-test="board-delete-with-pins"]').trigger('click');
@@ -335,7 +333,7 @@ describe('BoardDeleteDialog', () => {
 
     expect(wrapper.vm.phase).toBe('ready');
     expect(wrapper.find('[data-test="board-delete-with-pins"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(wrapper.find('[data-test="board-delete-only"]').attributes('disabled'))
       .toBeUndefined();
     expect(API.Pin.bulk).not.toHaveBeenCalled();
@@ -352,7 +350,7 @@ describe('BoardDeleteDialog', () => {
 
     expect(wrapper.vm.phase).toBe('ready');
     expect(wrapper.find('[data-test="board-delete-with-pins"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(wrapper.find('[data-test="board-delete-only"]').attributes('disabled'))
       .toBeUndefined();
     expect(API.Pin.bulk).not.toHaveBeenCalled();
@@ -555,15 +553,14 @@ describe('BoardDeleteDialog', () => {
     const order = [];
     API.Board.delete.mockRejectedValueOnce(new Error('delete failed'));
     const wrapper = mountDialog();
-    wrapper.vm.$on('closed', () => order.push('closed'));
-    wrapper.vm.$parent.close = jest.fn(() => order.push('parent-close'));
+    await wrapper.setProps({ onClosed: () => order.push('closed'), onClose: () => order.push('close') });
     await settle();
     await wrapper.find('[data-test="board-delete-only"]').trigger('click');
     await settle();
 
     await wrapper.find('[data-test="board-delete-close"]').trigger('click');
 
-    expect(order).toEqual(['closed', 'parent-close']);
+    expect(order).toEqual(['closed', 'close']);
   });
 
   it('retries only the board call after exclusive pins were deleted', async () => {
@@ -596,7 +593,7 @@ describe('BoardDeleteDialog', () => {
     const preview = deferred();
     API.Board.deletePreview.mockReturnValueOnce(preview.promise);
     const loading = mountDialog();
-    loading.destroy();
+    loading.unmount();
     preview.resolve({
       data: {
         exclusive_owned_count: 2,
@@ -619,7 +616,7 @@ describe('BoardDeleteDialog', () => {
     const deleting = mountDialog();
     await settle();
     deleting.vm.deleteBoardOnly();
-    deleting.destroy();
+    deleting.unmount();
     deletion.resolve({ status: 204 });
     await settle();
 

@@ -1,12 +1,25 @@
 /* eslint-env jest */
 
 import flushPromises from 'flush-promises';
-import { createLocalVue, mount } from '@vue/test-utils';
-import VueRouter from 'vue-router';
+import { mount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import ExportDialog from '@/components/export/ExportDialog.vue';
 import router from '@/router';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 const routerPush = jest.spyOn(router, 'push').mockImplementation(() => Promise.resolve());
 
@@ -93,21 +106,22 @@ function latest() {
   };
 }
 
-function mountDialog(propsData = { pinIds: [9, 4] }) {
+function mountDialog(props = { pinIds: [9, 4] }) {
   const close = jest.fn();
-  const toast = { open: jest.fn() };
-  const localVue = createLocalVue();
-  localVue.use(VueRouter);
+  const toast = { open: overlays.toast };
+
   const wrapper = mount(ExportDialog, {
-    localVue,
-    router,
-    propsData,
-    mocks: {
-      $buefy: { toast },
-      $t: (key, values) => (values ? `${key}:${JSON.stringify(values)}` : key),
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: {
+        $t: (key, values) => (values ? `${key}:${JSON.stringify(values)}` : key),
+      },
+      plugins: [router],
     },
+
+    props,
   });
-  wrapper.vm.$parent.close = close;
+  wrapper.setProps({ onClose: close });
   wrapper.push = routerPush;
   wrapper.close = close;
   wrapper.toast = toast;
@@ -158,8 +172,8 @@ describe('ExportDialog', () => {
     const { routes } = router.options;
     expect(routes.filter(route => route.name === 'exports')).toHaveLength(1);
     expect(routes.findIndex(route => route.name === 'exports'))
-      .toBeLessThan(routes.findIndex(route => route.path === '*'));
-    expect(router.resolve({ name: 'exports' }).route.path).toBe('/exports');
+      .toBeLessThan(routes.findIndex(route => route.path === '/:pathMatch(.*)*'));
+    expect(router.resolve({ name: 'exports' }).path).toBe('/exports');
   });
 
   it.each([
@@ -169,15 +183,15 @@ describe('ExportDialog', () => {
     ['unsafe board', { boardId: Number.MAX_SAFE_INTEGER + 1 }],
     ['empty Pins', { pinIds: [] }],
     ['invalid Pin', { pinIds: [9, 0] }],
-  ])('fails closed without an API call for %s', async (_name, propsData) => {
-    const wrapper = mountDialog(propsData);
+  ])('fails closed without an API call for %s', async (_name, props) => {
+    const wrapper = mountDialog(props);
     await settle();
 
     expect(API.Export.preview).not.toHaveBeenCalled();
     expect(API.Export.create).not.toHaveBeenCalled();
     expect(wrapper.find('[data-test="export-error"]').text()).toBe('exportErrorGeneric');
     expect(wrapper.find('[data-test="export-confirm"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
   });
 
   it('submits once, validates the create response, then navigates and closes immediately', async () => {
@@ -247,7 +261,7 @@ describe('ExportDialog', () => {
     expect(wrapper.find('[data-test="export-error"]').text()).toBe('exportErrorGeneric');
     expect(wrapper.html()).not.toContain('/data/exports/private');
     expect(wrapper.find('[data-test="export-confirm"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(API.Export.create).not.toHaveBeenCalled();
   });
 
@@ -261,7 +275,7 @@ describe('ExportDialog', () => {
     expect(wrapper.find('[data-test="export-error"]').text()).toBe('exportLoginRequired');
     expect(wrapper.html()).not.toContain('/private/session');
     expect(wrapper.find('[data-test="export-confirm"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
   });
 
   it('recovers only an exact active-export conflict through the validated latest envelope', async () => {
@@ -405,7 +419,7 @@ describe('ExportDialog', () => {
       previewLoading: wrapper.vm.previewLoading,
       submitting: wrapper.vm.submitting,
     };
-    wrapper.destroy();
+    wrapper.unmount();
 
     if (outcome === 'resolve') {
       let value = latest();

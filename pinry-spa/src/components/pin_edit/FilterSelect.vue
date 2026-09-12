@@ -1,42 +1,42 @@
 <template>
   <div class="filter-select">
-    <b-field v-bind:label="$t('selectBoardLabel')"
+    <FormField v-bind:label="$t('selectBoardLabel')"
              :type="form.name.type"
              :message="form.name.error">
-      <b-input
+      <input class="input" :aria-label="$t('nameLabel')"
         type="text"
         v-model="form.name.value"
         v-bind:placeholder="$t('filterSelectSelectBoardPlaceholder')"
         maxlength="128"
       >
-      </b-input>
-    </b-field>
-    <b-field>
+    </FormField>
+    <FormField>
       <button
         @click="createNewBoard"
         class="button is-primary">
         {{ $t("filterSelectCreateNewBoardButton") }}
       </button>
-    </b-field>
-    <b-field>
-      <b-select
+    </FormField>
+    <FormField>
+      <select
+        :aria-label="$t('selectBoardLabel')"
         class="select-list"
         multiple
         expanded
-        native-size="8"
+        size="8"
         v-model="selectedOptions">
-        <template v-for="option in availableOptions">
+        <template v-for="option in availableOptions" :key="option.value">
           <option
-            v-bind:key="option.value"
             :disabled="option.disabled === true"
             :value="option.value">{{ option.displayName || option.name }}</option>
         </template>
-      </b-select>
-    </b-field>
+      </select>
+    </FormField>
   </div>
 </template>
 
 <script>
+import FormField from '../ui/FormField.vue';
 import API from '../api';
 import ModelForm from '../utils/ModelForm';
 import AutoComplete from '../utils/AutoComplete';
@@ -67,6 +67,7 @@ function getAvailableOptions(vm, filter) {
 
 
 export default {
+  components: { FormField },
   name: 'FilterSelect',
   props: {
     allOptions: {

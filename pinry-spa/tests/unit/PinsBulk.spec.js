@@ -1,11 +1,25 @@
 /* eslint-env jest */
 
 import flushPromises from 'flush-promises';
-import { createLocalVue, mount } from '@vue/test-utils';
+import { mount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import PinBulkToolbar from '@/components/bulk/PinBulkToolbar.vue';
 import Pins from '@/components/Pins.vue';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 let mockAuthenticatedUsername = 'owner';
 let mountedPinWrappers = [];
@@ -68,25 +82,25 @@ function mountPins({
     )),
   );
 
-  const localVue = createLocalVue();
-  localVue.directive('masonry', {});
-  localVue.directive('masonry-tile', {});
+
   const wrapper = mount(Pins, {
-    localVue,
-    propsData: { pinFilters },
-    mocks: {
-      $buefy: { modal: { open: jest.fn() } },
-      $t: (key, values) => (values ? `${key}:${values.count}` : key),
-    },
-    stubs: {
-      EditorUI: true,
-      loadingSpinner: true,
-      noMore: true,
-      'router-link': {
-        props: ['to'],
-        template: '<a href="#"><slot /></a>',
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: {
+        $t: (key, values) => (values ? `${key}:${values.count}` : key),
+      },
+      stubs: {
+        EditorUI: true,
+        loadingSpinner: true,
+        noMore: true,
+        'router-link': {
+          props: ['to'],
+          template: '<a href="#"><slot /></a>',
+        },
       },
     },
+
+    props: { pinFilters },
   });
   mountedPinWrappers.push(wrapper);
   return wrapper;
@@ -114,7 +128,8 @@ function dispatchKey(target, key, options = {}) {
 describe('PinBulkToolbar', () => {
   it('emits only presentation-level management events', async () => {
     const wrapper = mount(PinBulkToolbar, {
-      propsData: {
+      global: { mocks: { $t: key => key } },
+      props: {
         active: true,
         selectedCount: 2,
         loadedCount: 3,
@@ -134,7 +149,6 @@ describe('PinBulkToolbar', () => {
         operationInFlight: false,
         announcement: '2 selected',
       },
-      mocks: { $t: key => key },
     });
 
     const events = [
@@ -187,7 +201,7 @@ describe('Pins selection mode', () => {
 
   afterEach(() => {
     mountedPinWrappers.forEach((wrapper) => {
-      wrapper.destroy();
+      wrapper.unmount();
     });
     if (Pins.methods.initializeMeta.mockRestore) {
       Pins.methods.initializeMeta.mockRestore();
@@ -391,8 +405,8 @@ describe('Pins selection mode', () => {
 
     await wrapper.find('[data-test="pin-image-41"]').trigger('click');
 
-    expect(wrapper.vm.$buefy.modal.open).toHaveBeenCalledTimes(1);
-    expect(wrapper.vm.$buefy.modal.open.mock.calls[0][0].props.pinItem.id).toBe(41);
+    expect(overlays.openModal).toHaveBeenCalledTimes(1);
+    expect(overlays.openModal.mock.calls[0][1].props.pinItem.id).toBe(41);
   });
 
   it('selects instead of opening preview while selection mode is active', async () => {
@@ -402,7 +416,7 @@ describe('Pins selection mode', () => {
     await wrapper.find('[data-test="pin-card-41"]').trigger('click');
 
     expect(wrapper.vm.selection.selectedIds).toEqual([41]);
-    expect(wrapper.vm.$buefy.modal.open).not.toHaveBeenCalled();
+    expect(overlays.openModal).not.toHaveBeenCalled();
   });
 
   it('supports Shift ranges and Ctrl or Command toggles in loaded order', async () => {
@@ -501,7 +515,7 @@ describe('Pins selection mode', () => {
     await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
 
     const selectAll = wrapper.find('[data-test="pin-selection-select-all"]');
-    expect(selectAll.attributes('disabled')).toBe('disabled');
+    expect(selectAll.attributes('disabled')).toBeDefined();
     await selectAll.trigger('click');
     await settle();
     expect(API.Pin.fetchSelectionIds).not.toHaveBeenCalled();
@@ -540,7 +554,7 @@ describe('Pins selection mode', () => {
     expect(wrapper.find('[data-test="pin-selection-move"]').exists()).toBe(false);
     ['add-to-board', 'edit', 'delete'].forEach((action) => {
       expect(wrapper.find(`[data-test="pin-selection-${action}"]`).attributes('disabled'))
-        .toBe('disabled');
+        .toBeDefined();
     });
     expect(wrapper.find('[data-test="pin-selection-export"]').attributes('disabled'))
       .toBeUndefined();
@@ -561,7 +575,7 @@ describe('Pins selection mode', () => {
       .toBeUndefined();
     ['edit', 'delete'].forEach((action) => {
       expect(wrapper.find(`[data-test="pin-selection-${action}"]`).attributes('disabled'))
-        .toBe('disabled');
+        .toBeDefined();
     });
     expect(wrapper.find('[data-test="pin-selection-export"]').attributes('disabled'))
       .toBeUndefined();
@@ -572,12 +586,12 @@ describe('Pins selection mode', () => {
     await settle();
     await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
     await wrapper.find('[data-test="pin-card-41"]').trigger('click');
-    wrapper.vm.$delete(wrapper.vm.selection.ownershipById, 41);
+    delete wrapper.vm.selection.ownershipById[41];
     await wrapper.vm.$nextTick();
 
     ['add-to-board', 'edit', 'delete'].forEach((action) => {
       expect(wrapper.find(`[data-test="pin-selection-${action}"]`).attributes('disabled'))
-        .toBe('disabled');
+        .toBeDefined();
     });
   });
 
@@ -605,7 +619,7 @@ describe('Pins selection mode', () => {
     const addCalls = addSpy.mock.calls.filter(call => call[0] === 'keydown');
 
     expect(addCalls).toHaveLength(1);
-    wrapper.destroy();
+    wrapper.unmount();
     const removeCalls = removeSpy.mock.calls.filter(call => call[0] === 'keydown');
     expect(removeCalls).toHaveLength(1);
     expect(removeCalls[0][1]).toBe(addCalls[0][1]);

@@ -10,7 +10,7 @@
           class="login-card__close"
           type="button"
           :aria-label="$t('closeButton')"
-          @click="$parent.close()">
+          @click="$emit('close')">
           <img src="/static/auth/icons/x.svg" alt="">
         </button>
       </header>
@@ -64,12 +64,12 @@
           data-test="password-form"
           class="password-form"
           @submit.prevent="doLogin">
-          <b-field
+          <FormField
             v-bind:label="$t('usernameLabel')"
             label-for="login-username"
             :type="form.username.type"
             :message="form.username.error">
-            <b-input
+            <input class="input" :aria-label="$t('usernameLabel')"
               id="login-username"
               name="username"
               type="text"
@@ -79,25 +79,22 @@
               maxlength="30"
               autofocus
               required>
-            </b-input>
-          </b-field>
+          </FormField>
 
-          <b-field
+          <FormField
             v-bind:label="$t('passwordLabel')"
             label-for="login-password"
             :type="form.password.type"
             :message="form.password.error">
-            <b-input
+            <PasswordInput
               id="login-password"
               name="password"
               type="password"
               v-model="form.password.value"
-              password-reveal
               autocomplete="current-password"
               v-bind:placeholder="$t('passwordLoginPlaceholder')"
-              required>
-            </b-input>
-          </b-field>
+              required />
+          </FormField>
 
           <button
             class="button login-submit"
@@ -120,6 +117,8 @@
 </template>
 
 <script>
+import FormField from './ui/FormField.vue';
+import PasswordInput from './ui/PasswordInput.vue';
 import brandLogo from '@/assets/svrx-pinry-dark-ui.png';
 import api from './api';
 import ModelForm from './utils/ModelForm';
@@ -128,6 +127,7 @@ const fields = ['username', 'password'];
 const providerKinds = ['authentik', 'google', 'microsoft', 'github', 'synology', 'oidc'];
 
 export default {
+  components: { FormField, PasswordInput },
   name: 'LoginForm',
   data() {
     const model = ModelForm.fromFields(fields);
@@ -171,7 +171,7 @@ export default {
       promise.then(
         (user) => {
           this.$emit('login.succeed', user);
-          this.$parent.close();
+          this.$emit('close');
           window.location.reload();
         },
         (resp) => {

@@ -1,14 +1,27 @@
 /* eslint-env jest */
 import axios from 'axios';
-import Buefy from 'buefy';
 import flushPromises from 'flush-promises';
-import VueI18n from 'vue-i18n';
-import { createLocalVue, mount } from '@vue/test-utils';
+import { createI18n } from 'vue-i18n';
+import { mount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import Add2Board from '@/components/pin_edit/Add2Board.vue';
 import FilterSelect from '@/components/pin_edit/FilterSelect.vue';
 import ko from '@/components/utils/i18n/locales/ko.json';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 jest.mock('axios');
 
@@ -51,30 +64,30 @@ function installMembershipDouble(response = membershipResponse()) {
 }
 
 function mountDialog() {
-  const localVue = createLocalVue();
-  localVue.use(Buefy);
-  localVue.use(VueI18n);
   const wrapper = mount(Add2Board, {
-    localVue,
-    i18n: new VueI18n({ locale: 'ko', messages }),
-    propsData: {
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      plugins: [createI18n({ legacy: true, locale: 'ko', messages })],
+    },
+
+    props: {
       pin: { id: 41, url: '/media/pin-41.jpg' },
       username: 'owner',
     },
   });
   const close = jest.fn();
-  wrapper.vm.$parent.close = close;
+  wrapper.setProps({ onClose: close });
   return { close, wrapper };
 }
 
 function mountFilterSelect() {
-  const localVue = createLocalVue();
-  localVue.use(Buefy);
-  localVue.use(VueI18n);
   return mount(FilterSelect, {
-    localVue,
-    i18n: new VueI18n({ locale: 'ko', messages }),
-    propsData: { allOptions: [] },
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      plugins: [createI18n({ legacy: true, locale: 'ko', messages })],
+    },
+
+    props: { allOptions: [] },
   });
 }
 
@@ -90,7 +103,7 @@ describe('FilterSelect 옵션 메타데이터', () =>
     expect(option.exists()).toBe(true);
     expect(option.attributes('disabled')).toBeUndefined();
     expect(option.text()).toBe('원본 이름');
-    wrapper.destroy();
+    wrapper.unmount();
   });
 });
 
@@ -140,7 +153,7 @@ describe('Add2Board 포함 상태', () => {
 
     expect(API.Pin.fetchBoardMemberships).toHaveBeenCalledWith(41);
     expect(API.Board.fetchFullList).not.toHaveBeenCalled();
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('이미 Pin이 포함된 보드라면 선태가 비활성하고 포함 문구라로 표시한다', async () => {
@@ -148,12 +161,12 @@ describe('Add2Board 포함 상태', () => {
     await settle();
 
     const options = wrapper.findComponent(FilterSelect).findAll('option');
-    const included = options.wrappers.find(option => option.attributes('value') === '3');
+    const included = options.find(option => option.attributes('value') === '3');
 
     expect(included).toBeDefined();
-    expect(included.attributes('disabled')).toBe('disabled');
+    expect(included.attributes('disabled')).toBeDefined();
     expect(included.text()).toContain('이미 포함됨');
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('포함된 ID가 포함되지 않은 ID와 섞여되어도 PATCH에서 제외한다', async () => {
@@ -167,7 +180,7 @@ describe('Add2Board 포함 상태', () => {
 
     expect(API.Board.addToBoard).toHaveBeenCalledTimes(1);
     expect(API.Board.addToBoard).toHaveBeenCalledWith(7, [41]);
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('새로 만든 보드는 현재 Pin이 포함되지 않으므로 선태하고 PATCH한다', async () => {
@@ -189,7 +202,7 @@ describe('Add2Board 포함 상태', () => {
 
     expect(API.Board.addToBoard).toHaveBeenCalledTimes(1);
     expect(API.Board.addToBoard).toHaveBeenCalledWith(11, [41]);
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('제출을 연다라 눌러도 하나의 PATCH만 보낸다', async () => {
@@ -207,7 +220,7 @@ describe('Add2Board 포함 상태', () => {
     expect(API.Board.addToBoard).toHaveBeenCalledTimes(1);
     request.resolve({ status: 200 });
     await settle();
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('제출 중 모달이 파괴되면 늦은 응답으로 다시 닫거나 알림을 표시하지 않는다', async () => {
@@ -217,10 +230,10 @@ describe('Add2Board 포함 상태', () => {
     await settle();
     wrapper.findComponent(FilterSelect).vm.$emit('selected', [7]);
     await wrapper.vm.$nextTick();
-    const toast = jest.spyOn(wrapper.vm.$buefy.toast, 'open');
+    const toast = jest.spyOn(overlays, 'toast');
 
     await wrapper.find('.modal-card-foot .button.is-primary').trigger('click');
-    wrapper.destroy();
+    wrapper.unmount();
     request.resolve({ status: 200 });
     await settle();
 
@@ -271,11 +284,11 @@ describe('Add2Board 포함 상태', () => {
       callCountWhilePending,
       calledBoardIds: API.Board.addToBoard.mock.calls.map(call => call[0]),
     }).toEqual({
-      disabledWhilePending: 'disabled',
+      disabledWhilePending: '',
       callCountWhilePending: 2,
       calledBoardIds: [7, 9, 7],
     });
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('새 보드 추가만 성공하면 모달에서 즉시 이미 포함됨으로 비활성화한다', async () => {
@@ -298,10 +311,10 @@ describe('Add2Board 포함 상태', () => {
 
     const createdOption = filterSelect.find('option[value="11"]');
     expect(createdOption.exists()).toBe(true);
-    expect(createdOption.attributes('disabled')).toBe('disabled');
+    expect(createdOption.attributes('disabled')).toBeDefined();
     expect(createdOption.text()).toContain('이미 포함됨');
     expect(wrapper.vm.boardIds).toEqual([7]);
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('느린 포함 상태 응답이 나중에 도착해도 새 보드 옵션과 선택을 유지한다', async () => {
@@ -322,7 +335,7 @@ describe('Add2Board 포함 상태', () => {
     expect(createdOption.attributes('disabled')).toBeUndefined();
     expect(filterSelect.vm.selectedOptions).toEqual([11]);
     expect(wrapper.vm.boardIds).toEqual([11]);
-    wrapper.destroy();
+    wrapper.unmount();
   });
 
   it('포함 상태 조회가 실패하면 빈 목록과 구분되는 실패로 표시한다', async () => {
@@ -335,7 +348,7 @@ describe('Add2Board 포함 상태', () => {
     expect(error.attributes('role')).toBe('alert');
     expect(error.text()).toBe('보드 포함 상태를 불러오지 못했습니다.');
     expect(wrapper.find('.modal-card-foot .button.is-primary').attributes('disabled'))
-      .toBe('disabled');
-    wrapper.destroy();
+      .toBeDefined();
+    wrapper.unmount();
   });
 });

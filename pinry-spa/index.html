@@ -5,9 +5,13 @@
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="viewport" content="width=device-width,initial-scale=1.0">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@mdi/font@2.5.94/css/materialdesignicons.min.css">
-    <link rel="icon" href="<%= BASE_URL %>favicon.png">
-    <link rel="icon" href="<%= BASE_URL %>favicon-light.png" media="(prefers-color-scheme: light)">
-    <link rel="icon" href="<%= BASE_URL %>favicon-dark.png" media="(prefers-color-scheme: dark)">
+    <link rel="icon" href="/favicon.png">
+    <link rel="icon" href="/favicon-light.png" media="(prefers-color-scheme: light)">
+    <link rel="icon" href="/favicon-dark.png" media="(prefers-color-scheme: dark)">
+    <link rel="apple-touch-icon" href="/img/icons/android-chrome-192x192.png">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
     <title>SVRx Pinry</title>
   </head>
   <body>
@@ -15,6 +19,6 @@
       <strong>SVRx Pinry를 사용하려면 JavaScript를 활성화해 주세요.</strong>
     </noscript>
     <div id="app"></div>
-    <!-- built files will be auto injected -->
+    <script type="module" src="/src/main.js"></script>
   </body>
 </html>

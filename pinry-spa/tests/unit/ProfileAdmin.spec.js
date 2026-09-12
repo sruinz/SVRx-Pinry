@@ -41,12 +41,12 @@ function currentUser(username, canAccessAdmin = false) {
 }
 
 
-function mountProfile(propsData = {}) {
+function mountProfile(props = {}) {
   jest.spyOn(API.SSO, 'policy').mockReturnValue(new Promise(() => {}));
   jest.spyOn(API.SSO, 'identities').mockReturnValue(new Promise(() => {}));
   return shallowMount(Profile, {
-    propsData: { token: 'owner-token', ...propsData },
-    mocks: { $t: key => ko[key] || key },
+    global: { mocks: { $t: key => ko[key] || key } },
+    props: { token: 'owner-token', ...props },
   });
 }
 
@@ -54,13 +54,15 @@ function mountProfile(propsData = {}) {
 function mountProfilePage(username = 'owner') {
   const router = { push: jest.fn() };
   const wrapper = shallowMount(Profile4User, {
-    mocks: {
-      $route: { params: { username } },
-      $router: router,
-    },
-    stubs: {
-      PHeader: true,
-      UserProfileCard: true,
+    global: {
+      mocks: {
+        $route: { params: { username } },
+        $router: router,
+      },
+      stubs: {
+        PHeader: true,
+        UserProfileCard: true,
+      },
     },
   });
   return { router, wrapper };
@@ -92,8 +94,8 @@ describe('Profile administrator link', () => {
   it.each([
     ['the default value', {}],
     ['an explicit false value', { canAccessAdmin: false }],
-  ])('hides the administrator link for %s', (_name, propsData) => {
-    const wrapper = mountProfile(propsData);
+  ])('hides the administrator link for %s', (_name, props) => {
+    const wrapper = mountProfile(props);
 
     expect(wrapper.find('[data-test="admin-settings-link"]').exists()).toBe(false);
   });
@@ -188,7 +190,7 @@ describe('Profile page ownership boundary', () => {
     API.User.fetchUserInfoByName.mockReturnValue(publicRequest.promise);
     const { router, wrapper } = mountProfilePage('missing');
 
-    wrapper.destroy();
+    wrapper.unmount();
     publicRequest.resolve(null);
     await flushPromises();
 
@@ -203,7 +205,7 @@ describe('Profile page ownership boundary', () => {
     await flushPromises();
     expect(API.User.fetchUserInfo).toHaveBeenCalledWith(true);
 
-    wrapper.destroy();
+    wrapper.unmount();
     currentUserRequest.resolve(currentUser('owner', true));
     await flushPromises();
 

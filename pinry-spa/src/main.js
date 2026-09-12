@@ -1,7 +1,7 @@
-import Buefy from 'buefy';
-import Vue from 'vue';
+import { createApp } from 'vue';
+import PrimeVue from 'primevue/config';
 import { VueMasonryPlugin } from 'vue-masonry';
-import VueI18n from 'vue-i18n';
+import { createI18n } from 'vue-i18n';
 import localeUtils, {
   DEFAULT_LOCALE,
   loadAndSyncStoredLocale,
@@ -12,20 +12,18 @@ import setUpAxiosCsrfConfig from './components/utils/csrf';
 import './registerServiceWorker';
 
 
-Vue.config.productionTip = false;
-Vue.use(Buefy);
-Vue.use(VueMasonryPlugin);
-Vue.use(VueI18n);
 setUpAxiosCsrfConfig();
 
-const i18n = new VueI18n({
+const i18n = createI18n({
+  legacy: true,
   locale: loadAndSyncStoredLocale(localStorage, document),
   fallbackLocale: DEFAULT_LOCALE,
   messages: localeUtils.messages,
 });
 
-new Vue({
-  router,
-  i18n,
-  render: h => h(App),
-}).$mount('#app');
+createApp(App)
+  .use(router)
+  .use(i18n)
+  .use(PrimeVue, { unstyled: true })
+  .use(VueMasonryPlugin)
+  .mount('#app');

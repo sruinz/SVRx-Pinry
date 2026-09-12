@@ -1,7 +1,7 @@
 /* eslint-env jest */
 
 import flushPromises from 'flush-promises';
-import { createLocalVue, mount, shallowMount } from '@vue/test-utils';
+import { mount, shallowMount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import bus from '@/components/utils/bus';
@@ -10,6 +10,20 @@ import PinBulkEdit, { buildChanges } from '@/components/bulk/PinBulkEdit.vue';
 import ExportDialog from '@/components/export/ExportDialog.vue';
 import { openExport, openPinBulkBoard, openPinBulkEdit } from '@/components/modals';
 import Pins from '@/components/Pins.vue';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 let mountedWrappers = [];
 
@@ -85,26 +99,28 @@ function pin(id, author = 'owner') {
   };
 }
 
-function mountBoardDialog(propsData) {
+function mountBoardDialog(props) {
   const wrapper = shallowMount(PinBulkBoardDialog, {
-    propsData: {
+    global: { mocks: { $t: (key, values) => (values ? `${key}:${values.count}` : key) } },
+    props: {
       mode: 'add',
       sourceBoardId: null,
       selectedIds: [41, 42],
       username: 'owner',
-      ...propsData,
+      ...props,
     },
-    mocks: { $t: (key, values) => (values ? `${key}:${values.count}` : key) },
   });
   mountedWrappers.push(wrapper);
   return wrapper;
 }
 
-function mountBulkEdit(propsData = {}) {
+function mountBulkEdit(props = {}) {
   const wrapper = shallowMount(PinBulkEdit, {
-    propsData: { selectedIds: [41, 42], ...propsData },
-    mocks: { $t: (key, values) => (values ? `${key}:${values.count}` : key) },
-    stubs: ['b-taginput'],
+    global: {
+      mocks: { $t: (key, values) => (values ? `${key}:${values.count}` : key) },
+      stubs: ['TagInput'],
+    },
+    props: { selectedIds: [41, 42], ...props },
   });
   mountedWrappers.push(wrapper);
   return wrapper;
@@ -112,12 +128,19 @@ function mountBulkEdit(propsData = {}) {
 
 function mountConfiguredBulkDialog(config) {
   const wrapper = shallowMount(config.component, {
-    propsData: config.props,
-    mocks: { $t: (key, values) => (values ? `${key}:${values.count}` : key) },
-    stubs: ['b-taginput'],
-  });
-  Object.entries(config.events || {}).forEach(([event, handler]) => {
-    wrapper.vm.$on(event, handler);
+    global: {
+      mocks: { $t: (key, values) => (values ? `${key}:${values.count}` : key) },
+      stubs: ['TagInput'],
+    },
+    props: {
+      ...config.props,
+      ...Object.fromEntries(
+        Object.entries(config.events || {}).map(([event, handler]) => [
+          `on${event.charAt(0).toUpperCase()}${event.slice(1)}`,
+          handler,
+        ]),
+      ),
+    },
   });
   mountedWrappers.push(wrapper);
   return wrapper;
@@ -131,28 +154,29 @@ function mountPins({
   API.Board.get.mockResolvedValue({
     data: { id: Number(pinFilters.boardFilter), submitter: { username: 'owner' } },
   });
-  const localVue = createLocalVue();
-  localVue.directive('masonry', {});
-  localVue.directive('masonry-tile', {});
-  const dialog = { confirm: jest.fn() };
-  const modal = { open: jest.fn() };
+
+
+  const dialog = { confirm: overlays.confirm };
+  const modal = { open: overlays.openModal };
   const wrapper = mount(Pins, {
-    localVue,
-    propsData: { pinFilters },
-    mocks: {
-      $buefy: { dialog, modal },
-      $t: (key, values) => {
-        if (!values) return key;
-        if (values.completed !== undefined) return `${values.completed}/${values.total}`;
-        return `${key}:${values.count}`;
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: {
+        $t: (key, values) => {
+          if (!values) return key;
+          if (values.completed !== undefined) return `${values.completed}/${values.total}`;
+          return `${key}:${values.count}`;
+        },
+      },
+      stubs: {
+        EditorUI: true,
+        loadingSpinner: true,
+        noMore: true,
+        'router-link': { template: '<a href="#"><slot /></a>' },
       },
     },
-    stubs: {
-      EditorUI: true,
-      loadingSpinner: true,
-      noMore: true,
-      'router-link': { template: '<a href="#"><slot /></a>' },
-    },
+
+    props: { pinFilters },
   });
   wrapper.dialog = dialog;
   wrapper.modal = modal;
@@ -227,7 +251,7 @@ describe('bulk operation dialogs', () => {
   });
 
   afterEach(() => {
-    mountedWrappers.forEach(wrapper => wrapper.destroy());
+    mountedWrappers.forEach(wrapper => wrapper.unmount());
     mountedWrappers = [];
   });
 
@@ -276,7 +300,7 @@ describe('bulk operation dialogs', () => {
   it('creates a private board once, selects it, then applies the existing bulk add', async () => {
     const creation = deferred();
     API.Board.create.mockReturnValueOnce(creation.promise);
-    const refreshBoards = jest.spyOn(bus.bus, '$emit');
+    const refreshBoards = jest.spyOn(bus.bus, 'emit');
     const wrapper = mountBoardDialog({ mode: 'add' });
     await settle();
     const target = wrapper.find('[data-test="bulk-board-target"]');
@@ -290,11 +314,11 @@ describe('bulk operation dialogs', () => {
     expect(API.Board.create).toHaveBeenCalledTimes(1);
     expect(API.Board.create).toHaveBeenCalledWith('New Board', true);
     expect(wrapper.find('[data-test="bulk-board-target"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(wrapper.find('[data-test="bulk-board-submit"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(wrapper.find('[data-test="bulk-board-close"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
 
     creation.resolve({ id: 11, name: 'New Board', private: true });
     await settle();
@@ -362,7 +386,7 @@ describe('bulk operation dialogs', () => {
     await settle();
     await wrapper.find('[data-test="bulk-board-new-name"]').setValue('Late Board');
     const request = wrapper.vm.createBoard();
-    wrapper.destroy();
+    wrapper.unmount();
     creation.resolve({ id: 13, name: 'Late Board', private: false });
     await request;
 
@@ -377,7 +401,7 @@ describe('bulk operation dialogs', () => {
     API.Board.fetchFullList.mockReturnValueOnce(boards.promise);
     const loading = mountBoardDialog({ mode: 'add' });
     expect(loading.find('[data-test="bulk-board-create"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     await expect(loading.vm.createBoard()).resolves.toBeNull();
 
     boards.resolve({ data: [{ id: 7, name: 'Target' }] });
@@ -389,7 +413,7 @@ describe('bulk operation dialogs', () => {
 
     expect(loading.vm.result.retryable).toBe(true);
     expect(loading.find('[data-test="bulk-board-create"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     await expect(loading.vm.createBoard()).resolves.toBeNull();
     expect(API.Board.create).not.toHaveBeenCalled();
   });
@@ -398,7 +422,7 @@ describe('bulk operation dialogs', () => {
     const boards = deferred();
     API.Board.fetchFullList.mockReturnValueOnce(boards.promise);
     const wrapper = mountBoardDialog();
-    wrapper.destroy();
+    wrapper.unmount();
     boards.resolve({ data: [{ id: 7, name: 'Target' }] });
     await settle();
     expect(wrapper.vm.boardOptions).toEqual([]);
@@ -411,7 +435,7 @@ describe('bulk operation dialogs', () => {
     running.vm.targetBoardId = 7;
     const submission = running.vm.submit();
     expect(running.vm.operationInFlight).toBe(true);
-    running.destroy();
+    running.unmount();
     operation.resolve(bulkAxiosResponse([41, 42], {}, 'add_to_board'));
     await submission;
 
@@ -461,7 +485,7 @@ describe('bulk operation dialogs', () => {
 
       expect(wrapper.vm.canSubmit).toBe(false);
       expect(wrapper.find('[data-test="bulk-edit-submit"]').attributes('disabled'))
-        .toBe('disabled');
+        .toBeDefined();
       expect(wrapper.vm.submit()).toBeNull();
       expect(API.Pin.bulk).not.toHaveBeenCalled();
     },
@@ -524,17 +548,16 @@ describe('bulk operation dialogs', () => {
     const wrapper = mountDialog();
     await settle();
     const order = [];
-    wrapper.vm.$on('closed', () => order.push('closed'));
-    wrapper.vm.$parent.close = jest.fn(() => order.push('parent-close'));
+    await wrapper.setProps({ onClosed: () => order.push('closed'), onClose: () => order.push('close') });
 
     wrapper.vm.close();
     wrapper.vm.close();
 
-    expect(order).toEqual(['closed', 'parent-close']);
+    expect(order).toEqual(['closed', 'close']);
   });
 
   it('opens board and edit modal helpers with copied props and lifecycle events', () => {
-    const vm = { $buefy: { modal: { open: jest.fn() } } };
+    const vm = { };
     const selectedIds = [41, 42];
     const boardCompleted = jest.fn();
     const boardStarted = jest.fn();
@@ -553,11 +576,9 @@ describe('bulk operation dialogs', () => {
     );
     selectedIds.push(43);
 
-    const boardConfig = vm.$buefy.modal.open.mock.calls[0][0];
+    const boardConfig = overlays.openModal.mock.calls[0][1];
     expect(boardConfig).toMatchObject({
-      parent: vm,
       component: PinBulkBoardDialog,
-      hasModalCard: true,
       props: {
         mode: 'move', sourceBoardId: 3, selectedIds: [41, 42], username: 'owner',
       },
@@ -567,10 +588,8 @@ describe('bulk operation dialogs', () => {
         closed: boardClosed,
       },
     });
-    expect(vm.$buefy.modal.open.mock.calls[1][0]).toMatchObject({
-      parent: vm,
+    expect(overlays.openModal.mock.calls[1][1]).toMatchObject({
       component: PinBulkEdit,
-      hasModalCard: true,
       props: { selectedIds: [41, 42] },
       events: {
         started: editStarted,
@@ -587,19 +606,17 @@ describe('bulk operation dialogs', () => {
     _name, props, expectedProps,
   ) => {
     const handle = { close: jest.fn() };
-    const vm = { $buefy: { modal: { open: jest.fn(() => handle) } } };
+    overlays.openModal.mockReturnValueOnce(handle);
+    const vm = {};
     const source = props.pinIds || null;
 
     expect(openExport(vm, props)).toBe(handle);
     if (source) source.push(99);
 
-    expect(vm.$buefy.modal.open).toHaveBeenCalledWith({
-      parent: vm,
+    expect(overlays.openModal).toHaveBeenCalledWith(vm, {
       component: ExportDialog,
       props: expectedProps,
-      hasModalCard: true,
       canCancel: true,
-      trapFocus: true,
     });
   });
 
@@ -609,10 +626,10 @@ describe('bulk operation dialogs', () => {
     ['invalid board', { boardId: 0 }],
     ['empty Pins', { pinIds: [] }],
   ])('rejects an export modal helper with %s', (_name, props) => {
-    const vm = { $buefy: { modal: { open: jest.fn() } } };
+    const vm = { };
 
     expect(() => openExport(vm, props)).toThrow('invalid_export_target');
-    expect(vm.$buefy.modal.open).not.toHaveBeenCalled();
+    expect(overlays.openModal).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -800,7 +817,7 @@ describe('bulk operation dialogs', () => {
     await wrapper.vm.$nextTick();
 
     expect(wrapper.find('[data-test="bulk-board-target"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
   });
 
   it('disables every edit control while an edit retry is available', async () => {
@@ -814,9 +831,9 @@ describe('bulk operation dialogs', () => {
     await wrapper.vm.$nextTick();
 
     expect(wrapper.find('[data-test="bulk-edit-privacy"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(wrapper.find('[data-test="bulk-edit-tag-mode"]').attributes('disabled'))
-      .toBe('disabled');
+      .toBeDefined();
     expect(wrapper.find('[data-test="bulk-edit-tags"]').attributes('disabled'))
       .toBe('true');
   });
@@ -853,7 +870,7 @@ describe('Pins bulk operation orchestration', () => {
   });
 
   afterEach(() => {
-    mountedWrappers.forEach(wrapper => wrapper.destroy());
+    mountedWrappers.forEach(wrapper => wrapper.unmount());
     mountedWrappers = [];
     Pins.methods.initializeMeta.mockRestore();
   });
@@ -864,19 +881,19 @@ describe('Pins bulk operation orchestration', () => {
     selectScope(mine, [41, 40]);
     await mine.vm.$nextTick();
     await mine.find('[data-test="pin-selection-add-to-board"]').trigger('click');
-    const addConfig = mine.modal.open.mock.calls[0][0];
+    const addConfig = mine.modal.open.mock.calls[0][1];
     addConfig.events.closed();
     await mine.vm.$nextTick();
     await mine.find('[data-test="pin-selection-edit"]').trigger('click');
 
-    expect(mine.modal.open.mock.calls[0][0].props).toMatchObject({
+    expect(mine.modal.open.mock.calls[0][1].props).toMatchObject({
       mode: 'add', sourceBoardId: null, selectedIds: [41, 40], username: 'owner',
     });
-    expect(mine.modal.open.mock.calls[0][0].props.canStartOperation).toEqual(
+    expect(mine.modal.open.mock.calls[0][1].props.canStartOperation).toEqual(
       expect.any(Function),
     );
-    expect(mine.modal.open.mock.calls[1][0].props).toMatchObject({ selectedIds: [41, 40] });
-    expect(mine.modal.open.mock.calls[1][0].props.canStartOperation).toEqual(
+    expect(mine.modal.open.mock.calls[1][1].props).toMatchObject({ selectedIds: [41, 40] });
+    expect(mine.modal.open.mock.calls[1][1].props.canStartOperation).toEqual(
       expect.any(Function),
     );
 
@@ -885,7 +902,7 @@ describe('Pins bulk operation orchestration', () => {
     selectScope(board, [41], false);
     await board.vm.$nextTick();
     await board.find('[data-test="pin-selection-move"]').trigger('click');
-    expect(board.modal.open.mock.calls[0][0].props).toMatchObject({
+    expect(board.modal.open.mock.calls.at(-1)[1].props).toMatchObject({
       mode: 'move', sourceBoardId: 3, selectedIds: [41], username: 'owner',
     });
   });
@@ -904,12 +921,10 @@ describe('Pins bulk operation orchestration', () => {
     wrapper.vm.selection.selectedIds.push(39);
 
     expect(wrapper.modal.open).toHaveBeenCalledTimes(1);
-    expect(wrapper.modal.open.mock.calls[0][0]).toMatchObject({
+    expect(wrapper.modal.open.mock.calls[0][1]).toMatchObject({
       component: ExportDialog,
       props: { pinIds: [41, 40] },
-      hasModalCard: true,
       canCancel: true,
-      trapFocus: true,
     });
   });
 
@@ -921,7 +936,7 @@ describe('Pins bulk operation orchestration', () => {
 
     wrapper.vm.openBulkEdit();
     wrapper.vm.openBulkBoard('add');
-    wrapper.modal.open.mock.calls[0][0].events.started();
+    wrapper.modal.open.mock.calls[0][1].events.started();
     dispatchKey(document, 'Escape');
     dispatchKey(document, 'a', { ctrlKey: true });
     await wrapper.find('[data-test="pin-card-40"]').trigger('click');
@@ -957,13 +972,13 @@ describe('Pins bulk operation orchestration', () => {
     selectScope(wrapper, [41]);
 
     wrapper.vm.openBulkEdit();
-    const staleEvents = wrapper.modal.open.mock.calls[0][0].events;
+    const staleEvents = wrapper.modal.open.mock.calls[0][1].events;
     staleEvents.closed();
     staleEvents.closed();
     expect(wrapper.vm.selection.operationInFlight).toBe(false);
 
     wrapper.vm.openBulkBoard('add');
-    const currentEvents = wrapper.modal.open.mock.calls[1][0].events;
+    const currentEvents = wrapper.modal.open.mock.calls[1][1].events;
     staleEvents.started();
     staleEvents.completed({
       total: 1, completed: 1, succeeded: 1, preserved: 0, failed: 0,
@@ -980,7 +995,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41]);
     wrapper.vm.openBulkEdit();
-    const [{ events }] = wrapper.modal.open.mock.calls[0];
+    const [, { events }] = wrapper.modal.open.mock.calls[0];
     const result = {
       total: 1, completed: 1, succeeded: 1, preserved: 0, failed: 0,
     };
@@ -1005,7 +1020,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41]);
     wrapper.vm.openBulkEdit();
-    const [{ events }] = wrapper.modal.open.mock.calls[0];
+    const [, { events }] = wrapper.modal.open.mock.calls[0];
     const result = {
       total: 1, completed: 1, succeeded: 1, preserved: 0, failed: 0,
     };
@@ -1027,9 +1042,9 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41]);
     wrapper.vm.openBulkEdit();
-    const [{ events }] = wrapper.modal.open.mock.calls[0];
+    const [, { events }] = wrapper.modal.open.mock.calls[0];
 
-    wrapper.destroy();
+    wrapper.unmount();
     events.started();
     events.completed({
       total: 1, completed: 1, succeeded: 1, preserved: 0, failed: 0,
@@ -1048,7 +1063,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41]);
     wrapper.vm.openBulkBoard('add');
-    const [config] = wrapper.modal.open.mock.calls[0];
+    const [, config] = wrapper.modal.open.mock.calls[0];
     const dialog = mountConfiguredBulkDialog(config);
     await settle();
     dialog.vm.targetBoardId = 7;
@@ -1069,7 +1084,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41]);
     wrapper.vm.openBulkEdit();
-    const [config] = wrapper.modal.open.mock.calls[0];
+    const [, config] = wrapper.modal.open.mock.calls[0];
     const dialog = mountConfiguredBulkDialog(config);
     await dialog.setData({ privacyMode: 'private' });
 
@@ -1088,7 +1103,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41]);
     wrapper.vm.openBulkEdit();
-    const [config] = wrapper.modal.open.mock.calls[0];
+    const [, config] = wrapper.modal.open.mock.calls[0];
     const dialog = mountConfiguredBulkDialog(config);
     await dialog.setData({ privacyMode: 'private' });
 
@@ -1112,7 +1127,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41]);
     wrapper.vm.openBulkEdit();
-    const [config] = wrapper.modal.open.mock.calls[0];
+    const [, config] = wrapper.modal.open.mock.calls[0];
     const dialog = mountConfiguredBulkDialog(config);
     await dialog.setData({ privacyMode: 'private' });
 
@@ -1153,7 +1168,7 @@ describe('Pins bulk operation orchestration', () => {
     await wrapper.find('[data-test="pin-selection-delete"]').trigger('click');
     await wrapper.find('[data-test="pin-selection-delete"]').trigger('click');
     expect(wrapper.dialog.confirm).toHaveBeenCalledTimes(1);
-    const config = wrapper.dialog.confirm.mock.calls[0][0];
+    const config = wrapper.dialog.confirm.mock.calls[0][1];
     expect(config.message).toBe('bulkPinDeleteConfirm:2');
     config.onConfirm();
     config.onConfirm();
@@ -1176,7 +1191,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, ids);
     wrapper.vm.confirmBulkDelete();
-    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+    wrapper.dialog.confirm.mock.calls[0][1].onConfirm();
     first.resolve(bulkAxiosResponse(ids.slice(0, 50), {}, 'delete'));
     await settle();
     second.resolve(bulkAxiosResponse(ids.slice(50, 100), {}, 'delete'));
@@ -1206,7 +1221,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41]);
     wrapper.vm.confirmBulkDelete();
-    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+    wrapper.dialog.confirm.mock.calls[0][1].onConfirm();
 
     dispatchKey(document, 'Escape');
     wrapper.vm.exitSelection();
@@ -1214,7 +1229,7 @@ describe('Pins bulk operation orchestration', () => {
     await wrapper.find('[data-test="pin-card-41"]').trigger('click');
     wrapper.vm.confirmBulkDelete();
     if (wrapper.dialog.confirm.mock.calls[1]) {
-      wrapper.dialog.confirm.mock.calls[1][0].onConfirm();
+      wrapper.dialog.confirm.mock.calls[1][1].onConfirm();
     }
 
     expect(wrapper.vm.selection.active).toBe(true);
@@ -1247,7 +1262,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41, 40, 39]);
     wrapper.vm.confirmBulkDelete();
-    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+    wrapper.dialog.confirm.mock.calls[0][1].onConfirm();
     await settle();
 
     expect(API.Pin.fetchSelectionIds).toHaveBeenCalledWith({ boardId: null });
@@ -1275,7 +1290,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41, 40, 39]);
     wrapper.vm.confirmBulkDelete();
-    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+    wrapper.dialog.confirm.mock.calls[0][1].onConfirm();
     await settle();
 
     expect(API.Pin.bulk).toHaveBeenCalledTimes(1);
@@ -1317,7 +1332,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41, 40]);
     wrapper.vm.confirmBulkDelete();
-    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+    wrapper.dialog.confirm.mock.calls[0][1].onConfirm();
     await settle();
 
     expect(wrapper.vm.selection.result).toMatchObject({ retryIds: [] });
@@ -1337,7 +1352,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41, 40]);
     wrapper.vm.confirmBulkDelete();
-    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+    wrapper.dialog.confirm.mock.calls[0][1].onConfirm();
     await settle();
 
     expect(wrapper.vm.selection.result).toMatchObject({ retryIds: [40] });
@@ -1351,7 +1366,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41, 40]);
     wrapper.vm.confirmBulkDelete();
-    wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+    wrapper.dialog.confirm.mock.calls[0][1].onConfirm();
     await settle();
 
     expect(wrapper.vm.selection.result).toMatchObject({ retryIds: [] });
@@ -1364,7 +1379,7 @@ describe('Pins bulk operation orchestration', () => {
     await settle();
     selectScope(wrapper, [41]);
     wrapper.vm.openBulkEdit();
-    const { completed } = wrapper.modal.open.mock.calls[0][0].events;
+    const { completed } = wrapper.modal.open.mock.calls[0][1].events;
 
     await wrapper.setProps({ pinFilters: { userFilter: 'other' } });
     await settle();
@@ -1386,9 +1401,9 @@ describe('Pins bulk operation orchestration', () => {
       await settle();
       selectScope(wrapper, [41]);
       wrapper.vm.confirmBulkDelete();
-      wrapper.dialog.confirm.mock.calls[0][0].onConfirm();
+      wrapper.dialog.confirm.mock.calls[0][1].onConfirm();
       expect(wrapper.vm.selection.operationInFlight).toBe(true);
-      wrapper.destroy();
+      wrapper.unmount();
 
       if (outcome === 'resolve') {
         operation.resolve(bulkAxiosResponse([41], {}, 'delete'));

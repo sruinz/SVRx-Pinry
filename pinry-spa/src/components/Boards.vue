@@ -31,8 +31,8 @@
           column-width=".grid-sizer"
           gutter=".gutter-sizer"
         >
-          <template v-for="(item, index) in blocks">
-            <div v-bind:key="item.id"
+          <template v-for="(item, index) in blocks" :key="item.id">
+            <div
                  v-masonry-tile
                  :class="item.class"
                  class="grid"
@@ -113,7 +113,8 @@
                         data-order-control="previous"
                         :data-board-order-id="item.id"
                         :data-test="`board-order-previous-${item.id}`"
-                        :disabled="ordering.loading || index === 0"
+                        :disabled="ordering.loading"
+                        :aria-disabled="index === 0"
                         @click="moveBoard(item.id, -1)"
                       >
                         {{ $t('boardOrderMoveForward') }}
@@ -124,7 +125,8 @@
                         data-order-control="next"
                         :data-board-order-id="item.id"
                         :data-test="`board-order-next-${item.id}`"
-                        :disabled="ordering.loading || index === blocks.length - 1"
+                        :disabled="ordering.loading"
+                        :aria-disabled="index === blocks.length - 1"
                         @click="moveBoard(item.id, 1)"
                       >
                         {{ $t('boardOrderMoveBackward') }}
@@ -729,15 +731,15 @@ export default {
     },
   },
   created() {
-    bus.bus.$on(bus.events.refreshBoards, this.reset);
+    bus.bus.on(bus.events.refreshBoards, this.reset);
     this.registerScrollEvent();
     this.activateSortContext();
     this.initialize();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.requestGeneration += 1;
     this.orderRequestToken += 1;
-    bus.bus.$off(bus.events.refreshBoards, this.reset);
+    bus.bus.off(bus.events.refreshBoards, this.reset);
     if (typeof this.scrollDisposer === 'function') this.scrollDisposer();
     this.scrollDisposer = null;
   },

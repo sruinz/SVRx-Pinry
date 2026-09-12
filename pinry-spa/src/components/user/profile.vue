@@ -252,7 +252,7 @@ export default {
       .catch(() => { if (this.componentAlive) this.policyError = true; });
     this.fetchIdentities();
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.componentAlive = false;
     this.versionRequestSequence += 1;
   },

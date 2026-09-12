@@ -2,42 +2,27 @@
   <div class="editor">
     <div class="editor-buttons">
       <span class="icon-container" v-if="inOwnedBoard" @click="removeFromBoard">
-          <b-icon
-            type="is-light"
-            icon="minus-box"
-            custom-size="mdi-24px">
-         </b-icon>
+          <i aria-hidden="true" class="mdi mdi-minus-box"></i>
       </span>
       <span class="icon-container" @click="addToBoard">
-          <b-icon
-            type="is-light"
-            icon="plus-box"
-            custom-size="mdi-24px">
-         </b-icon>
+          <i aria-hidden="true" class="mdi mdi-plus-box"></i>
       </span>
       <span
         class="icon-container"
         data-test="delete-pin"
         @click="deletePin"
         v-if="isOwner">
-         <b-icon
-           type="is-light"
-           icon="delete"
-           custom-size="mdi-24px">
-         </b-icon>
+         <i aria-hidden="true" class="mdi mdi-delete"></i>
       </span>
       <span class="icon-container" v-if="isOwner" @click="editPin">
-       <b-icon
-         type="is-light"
-         icon="pencil"
-         custom-size="mdi-24px">
-       </b-icon>
+       <i aria-hidden="true" class="mdi mdi-pencil"></i>
       </span>
     </div>
   </div>
 </template>
 
 <script>
+import overlays from '../utils/overlays';
 import API from '../api';
 import modals from '../modals';
 
@@ -81,7 +66,7 @@ export default {
       disposed: false,
     };
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.disposed = true;
   },
   methods: {
@@ -89,16 +74,16 @@ export default {
       modals.openAdd2Board(this, this.pin, this.currentUsername);
     },
     removeFromBoard() {
-      this.$buefy.dialog.confirm({
+      overlays.confirm(this, {
         message: 'Remove Pin from Board?',
         onConfirm: () => {
           API.Board.removeFromBoard(this.currentBoard.id, [this.pin.id]).then(
             () => {
-              this.$buefy.toast.open('Pin removed');
+              overlays.toast('Pin removed');
               this.$emit('pin-remove-from-board-succeed', this.pin.id);
             },
             () => {
-              this.$buefy.toast.open(
+              overlays.toast(
                 { type: 'is-danger', message: 'Failed to Remove Pin' },
               );
             },
@@ -126,7 +111,7 @@ export default {
       ) return;
       this.deleteDialogOpen = true;
       let active = true;
-      this.$buefy.dialog.confirm({
+      overlays.confirm(this, {
         message: this.$t('pinDeleteConfirm'),
         onConfirm: () => {
           if (!active || this.disposed || this.deleteConsumed) return;
@@ -138,13 +123,13 @@ export default {
               if (this.disposed) return;
               this.deleteInFlight = false;
               this.deleteConsumed = true;
-              this.$buefy.toast.open(this.$t('pinDeleted'));
+              overlays.toast(this.$t('pinDeleted'));
               this.$emit('pin-delete-succeed', this.pin.id);
             },
             () => {
               if (this.disposed) return;
               this.deleteInFlight = false;
-              this.$buefy.toast.open(
+              overlays.toast(
                 { type: 'is-danger', message: this.$t('pinDeleteError') },
               );
             },

@@ -1,3 +1,4 @@
+import overlays from './utils/overlays';
 import PinCreateModal from './pin_edit/PinCreateModal.vue';
 import LoginForm from './LoginForm.vue';
 import SignUpForm from './SignUpForm.vue';
@@ -8,69 +9,50 @@ import PinBulkEdit from './bulk/PinBulkEdit.vue';
 import BoardDeleteDialog from './bulk/BoardDeleteDialog.vue';
 import ExportDialog from './export/ExportDialog.vue';
 
-
 function openPinEdit(vm, props = null, onCreated = null) {
-  vm.$buefy.modal.open(
-    {
-      parent: vm,
-      component: PinCreateModal,
-      props,
-      hasModalCard: true,
-      canCancel: false,
-      events: {
-        pinCreated() {
-          if (onCreated !== null) {
-            onCreated();
-          }
-        },
+  return overlays.openModal(vm, {
+    component: PinCreateModal,
+    props,
+    canCancel: false,
+    events: {
+      pinCreated() {
+        if (onCreated !== null) {
+          onCreated();
+        }
       },
     },
-  );
+  });
 }
 
 function openAdd2Board(vm, pin, username) {
-  vm.$buefy.modal.open(
-    {
-      parent: vm,
-      component: Add2Board,
-      props: { pin, username },
-      hasModalCard: true,
-    },
-  );
+  return overlays.openModal(vm, {
+    component: Add2Board,
+    props: { pin, username },
+  });
 }
 
 function openBoardCreate(vm) {
-  vm.$buefy.modal.open(
-    {
-      parent: vm,
-      component: BoardEdit,
-      hasModalCard: true,
-    },
-  );
+  return overlays.openModal(vm, {
+    component: BoardEdit,
+  });
 }
 
 function openBoardEdit(vm, board, onSaved) {
-  vm.$buefy.modal.open(
-    {
-      parent: vm,
-      component: BoardEdit,
-      props: {
-        board,
-        isEdit: true,
-      },
-      events: {
-        boardSaved: onSaved,
-      },
-      hasModalCard: true,
+  return overlays.openModal(vm, {
+    component: BoardEdit,
+    props: {
+      board,
+      isEdit: true,
     },
-  );
+    events: {
+      boardSaved: onSaved,
+    },
+  });
 }
 
 function openLogin(vm, onSucceed) {
-  vm.$buefy.modal.open({
-    parent: vm,
+  return overlays.openModal(vm, {
     component: LoginForm,
-    hasModalCard: true,
     canCancel: ['escape', 'outside'],
     events: {
       'login.succeed': onSucceed,
@@ -79,10 +61,8 @@ function openLogin(vm, onSucceed) {
 }
 
 function openSignUp(vm, onSignUpSucceed) {
-  vm.$buefy.modal.open({
-    parent: vm,
+  return overlays.openModal(vm, {
     component: SignUpForm,
-    hasModalCard: true,
     events: {
       'signup.succeed': onSignUpSucceed,
     },
@@ -106,52 +86,46 @@ function bulkModalEvents(onCompleted, lifecycle) {
 
 export function openPinBulkBoard(vm, props, onCompleted = null, lifecycle = null) {
   const config = {
-    parent: vm,
     component: PinBulkBoardDialog,
     props: {
       ...props,
       selectedIds: [...props.selectedIds],
     },
-    hasModalCard: true,
     canCancel: false,
   };
   const events = bulkModalEvents(onCompleted, lifecycle);
   if (Object.keys(events).length > 0) config.events = events;
-  return vm.$buefy.modal.open(config);
+  return overlays.openModal(vm, config);
 }
 
 export function openPinBulkEdit(vm, props, onCompleted = null, lifecycle = null) {
   const config = {
-    parent: vm,
     component: PinBulkEdit,
     props: {
       ...props,
       selectedIds: [...props.selectedIds],
     },
-    hasModalCard: true,
     canCancel: false,
   };
   const events = bulkModalEvents(onCompleted, lifecycle);
   if (Object.keys(events).length > 0) config.events = events;
-  return vm.$buefy.modal.open(config);
+  return overlays.openModal(vm, config);
 }
 
 export function openBoardDelete(vm, props, onCompleted = null, onClosed = null) {
   const config = {
-    parent: vm,
     component: BoardDeleteDialog,
     props: {
       ...props,
       board: { ...props.board },
     },
-    hasModalCard: true,
     canCancel: false,
   };
   const events = {};
   if (onCompleted !== null) events.completed = onCompleted;
   if (onClosed !== null) events.closed = onClosed;
   if (Object.keys(events).length > 0) config.events = events;
-  return vm.$buefy.modal.open(config);
+  return overlays.openModal(vm, config);
 }
 
 function isPositiveSafeInteger(value) {
@@ -169,13 +143,10 @@ export function openExport(vm, props) {
   if (hasBoard === hasPins || (hasBoard && !validBoard) || (hasPins && !validPins)) {
     throw new Error('invalid_export_target');
   }
-  return vm.$buefy.modal.open({
-    parent: vm,
+  return overlays.openModal(vm, {
     component: ExportDialog,
     props: hasBoard ? { boardId: props.boardId } : { pinIds: props.pinIds.slice() },
-    hasModalCard: true,
     canCancel: true,
-    trapFocus: true,
   });
 }
 

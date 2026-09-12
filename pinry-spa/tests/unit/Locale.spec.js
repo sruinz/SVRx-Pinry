@@ -1,6 +1,6 @@
 /* eslint-env jest */
-import VueI18n from 'vue-i18n';
-import { createLocalVue, shallowMount } from '@vue/test-utils';
+import { createI18n } from 'vue-i18n';
+import { shallowMount } from '@vue/test-utils';
 
 import PHeader from '@/components/PHeader.vue';
 import localeUtils, {
@@ -24,6 +24,8 @@ const LEGACY_CHROME_URL = 'https://chrome.google.com/webstore/detail/jmhdcnmfkgl
 const FIREFOX_URL = 'https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/';
 
 const EXPECTED_LOCALE_KEYS = [
+  'confirmButton',
+  'loading',
   'ssoAccounts',
   'ssoActionFailed',
   'ssoAutoLinkHelp',
@@ -477,26 +479,29 @@ describe('Header locale and extension menus', () => {
   });
 
   function mountHeader() {
-    const localVue = createLocalVue();
-    localVue.use(VueI18n);
-    const i18n = new VueI18n({
+    const i18n = createI18n({
+      legacy: true,
       locale: 'ko',
       fallbackLocale: 'ko',
       messages: localeUtils.messages,
     });
     const wrapper = shallowMount(PHeader, {
-      localVue,
-      i18n,
-      stubs: {
-        'b-icon': true,
-        'router-link': {
-          name: 'RouterLinkStub',
-          props: ['to'],
-          template: '<a><slot /></a>',
+      global: {
+        directives: { masonry: {}, 'masonry-tile': {} },
+        stubs: {
+          'router-link': {
+            name: 'RouterLinkStub',
+            props: ['to'],
+            template: '<a><slot /></a>',
+          },
         },
+        plugins: [i18n],
       },
     });
-    return { i18n, wrapper };
+    return {
+      i18n,
+      wrapper,
+    };
   }
 
   it('renders My menu as Pin, boards, exports, and profile with exact route params', async () => {
@@ -512,16 +517,16 @@ describe('Header locale and extension menus', () => {
       'my-exports-link',
       'my-profile-link',
     ]);
-    expect(wrapper.find('[data-test="my-pins-link"]').props('to')).toEqual({
+    expect(wrapper.findComponent('[data-test="my-pins-link"]').props('to')).toEqual({
       name: 'user', params: { user: 'owner' },
     });
-    expect(wrapper.find('[data-test="my-boards-link"]').props('to')).toEqual({
+    expect(wrapper.findComponent('[data-test="my-boards-link"]').props('to')).toEqual({
       name: 'boards4user', params: { username: 'owner' },
     });
-    expect(wrapper.find('[data-test="my-exports-link"]').props('to')).toEqual({
+    expect(wrapper.findComponent('[data-test="my-exports-link"]').props('to')).toEqual({
       name: 'exports',
     });
-    expect(wrapper.find('[data-test="my-profile-link"]').props('to')).toEqual({
+    expect(wrapper.findComponent('[data-test="my-profile-link"]').props('to')).toEqual({
       name: 'profile4user', params: { username: 'owner' },
     });
   });
@@ -530,10 +535,10 @@ describe('Header locale and extension menus', () => {
     const { i18n, wrapper } = mountHeader();
     const options = wrapper.findAll('[data-test="locale-option"]');
 
-    expect(options.wrappers.map(option => option.text()))
+    expect(options.map(option => option.text()))
       .toEqual(['한국어', 'English', '简体中文', 'Français']);
     await options.at(1).trigger('click');
-    expect(i18n.locale).toBe('en');
+    expect(i18n.global.locale).toBe('en');
     expect(localStorage.getItem('localeCode')).toBe('en');
     expect(document.documentElement.lang).toBe('en');
   });
@@ -547,7 +552,7 @@ describe('Header locale and extension menus', () => {
 
     await wrapper.findAll('[data-test="locale-option"]').at(1).trigger('click');
 
-    expect(i18n.locale).toBe('en');
+    expect(i18n.global.locale).toBe('en');
     setItem.mockRestore();
   });
 
@@ -570,7 +575,7 @@ describe('Header locale and extension menus', () => {
     const items = wrapper.findAll(
       '[data-test="browser-extension-menu"] > [data-test]',
     );
-    expect(items.wrappers.map(item => item.attributes('href'))).toEqual([
+    expect(items.map(item => item.attributes('href'))).toEqual([
       'https://github.com/sruinz/SVRx-Pinry-Extention',
       CUSTOM_CHROME_URL,
       CUSTOM_EDGE_URL,

@@ -32,7 +32,7 @@
             <option value="replace">{{ $t('bulkPinTagReplace') }}</option>
           </select>
         </div>
-        <b-taginput
+        <TagInput
           v-if="tagMode !== null"
           v-model="tagValues"
           data-test="bulk-edit-tags"
@@ -75,6 +75,7 @@
 </template>
 
 <script>
+import TagInput from '../ui/TagInput.vue';
 import API from '../api';
 import { executeBulk } from './bulkExecutor';
 
@@ -92,6 +93,7 @@ export function buildChanges({ privacyMode, tagMode, tagValues }) {
 }
 
 export default {
+  components: { TagInput },
   name: 'PinBulkEdit',
   beforeCreate() {
     this.disposed = false;
@@ -145,7 +147,7 @@ export default {
         && this.result.retryable === true;
     },
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.disposed = true;
     this.operationToken += 1;
   },
@@ -154,7 +156,7 @@ export default {
       if (this.operationInFlight || this.closeConsumed) return;
       this.closeConsumed = true;
       this.$emit('closed');
-      if (this.$parent && typeof this.$parent.close === 'function') this.$parent.close();
+      this.$emit('close');
     },
     submit() {
       if (!this.canSubmit || this.canStartOperation() !== true) return null;

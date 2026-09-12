@@ -1,9 +1,8 @@
 /* eslint-env jest */
 import axios from 'axios';
 import flushPromises from 'flush-promises';
-import VueI18n from 'vue-i18n';
-import { createLocalVue, mount, shallowMount } from '@vue/test-utils';
-import { ConfigProgrammatic } from 'buefy';
+import { createI18n } from 'vue-i18n';
+import { mount, shallowMount } from '@vue/test-utils';
 
 import API from '@/components/api';
 import FileUpload from '@/components/pin_edit/FileUpload.vue';
@@ -11,6 +10,20 @@ import modals from '@/components/modals';
 import PinCreateModal from '@/components/pin_edit/PinCreateModal.vue';
 import bus from '@/components/utils/bus';
 import en from '@/components/utils/i18n/locales/en.json';
+import overlays from '@/components/utils/overlays';
+
+jest.mock('@/components/utils/overlays', () => ({
+  __esModule: true,
+  default: {
+    openModal: jest.fn(), confirm: jest.fn(), toast: jest.fn(), openLoading: jest.fn(),
+  },
+}));
+beforeEach(() => {
+  overlays.openModal.mockReset();
+  overlays.confirm.mockReset();
+  overlays.toast.mockReset();
+  overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
 
 jest.mock('axios');
 
@@ -27,31 +40,31 @@ function deferred() {
 
 
 function mountFileUpload() {
-  const localVue = createLocalVue();
-  localVue.use(VueI18n);
   return shallowMount(FileUpload, {
-    localVue,
-    i18n: new VueI18n({ locale: 'en', messages: { en } }),
-    stubs: ['b-field', 'b-upload', 'b-icon'],
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      stubs: ['FormField'],
+      plugins: [createI18n({ legacy: true, locale: 'en', messages: { en } })],
+    },
   });
 }
 
 
 function mountCreateModal() {
-  const localVue = createLocalVue();
-  localVue.use(VueI18n);
   const loading = { close: jest.fn() };
+  overlays.openLoading.mockReturnValueOnce(loading);
   const wrapper = shallowMount(PinCreateModal, {
-    localVue,
-    i18n: new VueI18n({ locale: 'en', messages: { en } }),
-    propsData: { username: 'owner' },
-    mocks: {
-      $buefy: { loading: { open: jest.fn(() => loading) } },
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: {},
+      stubs: ['FormField', 'TagInput'],
+      plugins: [createI18n({ legacy: true, locale: 'en', messages: { en } })],
     },
-    stubs: ['b-field', 'b-input', 'b-checkbox', 'b-taginput'],
+
+    props: { username: 'owner' },
   });
   const close = jest.fn();
-  wrapper.vm.$parent.close = close;
+  wrapper.setProps({ onClose: close });
   return {
     close,
     loading,
@@ -61,29 +74,22 @@ function mountCreateModal() {
 
 
 function mountCreateModalWithFileUpload() {
-  const localVue = createLocalVue();
-  localVue.use(VueI18n);
   const wrapper = mount(PinCreateModal, {
-    localVue,
-    i18n: new VueI18n({ locale: 'en', messages: { en } }),
-    propsData: { username: 'owner' },
-    mocks: {
-      $buefy: {
-        loading: { open: jest.fn(() => ({ close: jest.fn() })) },
+    global: {
+      directives: { masonry: {}, 'masonry-tile': {} },
+      mocks: {},
+      stubs: {
+        FilterSelect: true,
+        FormField: true,
+        TagInput: true,
       },
+      plugins: [createI18n({ legacy: true, locale: 'en', messages: { en } })],
     },
-    stubs: {
-      FilterSelect: true,
-      'b-field': true,
-      'b-input': true,
-      'b-checkbox': true,
-      'b-taginput': true,
-      'b-upload': true,
-      'b-icon': true,
-    },
+
+    props: { username: 'owner' },
   });
-  const close = jest.fn(() => wrapper.destroy());
-  wrapper.vm.$parent.close = close;
+  const close = jest.fn(() => wrapper.unmount());
+  wrapper.setProps({ onClose: close });
   return { close, wrapper };
 }
 
@@ -100,7 +106,8 @@ describe('local pin file selection', () => {
     const file = new File(['image-bytes'], 'photo.png', { type: 'image/png' });
     const wrapper = mountFileUpload();
 
-    await wrapper.setData({ dropFile: file });
+    wrapper.vm.dropFile = file;
+    await wrapper.vm.$nextTick();
 
     expect(global.URL.createObjectURL).toHaveBeenCalledWith(file);
     expect(wrapper.find('img').attributes('src')).toBe('blob:local-preview');
@@ -117,8 +124,10 @@ describe('local pin file selection', () => {
     const second = new File(['second'], 'second.png', { type: 'image/png' });
     const wrapper = mountFileUpload();
 
-    await wrapper.setData({ dropFile: first });
-    await wrapper.setData({ dropFile: second });
+    wrapper.vm.dropFile = first;
+    await wrapper.vm.$nextTick();
+    wrapper.vm.dropFile = second;
+    await wrapper.vm.$nextTick();
 
     expect(global.URL.revokeObjectURL).toHaveBeenCalledTimes(1);
     expect(global.URL.revokeObjectURL).toHaveBeenCalledWith('blob:first-preview');
@@ -130,9 +139,10 @@ describe('local pin file selection', () => {
   it('revokes its current preview when the component is destroyed', async () => {
     const file = new File(['image'], 'photo.png', { type: 'image/png' });
     const wrapper = mountFileUpload();
-    await wrapper.setData({ dropFile: file });
+    wrapper.vm.dropFile = file;
+    await wrapper.vm.$nextTick();
 
-    wrapper.destroy();
+    wrapper.unmount();
 
     expect(global.URL.revokeObjectURL).toHaveBeenCalledTimes(1);
     expect(global.URL.revokeObjectURL).toHaveBeenCalledWith('blob:local-preview');
@@ -141,9 +151,11 @@ describe('local pin file selection', () => {
   it('clears the preview and emits null when the file selection is cleared', async () => {
     const file = new File(['image'], 'photo.png', { type: 'image/png' });
     const wrapper = mountFileUpload();
-    await wrapper.setData({ dropFile: file });
+    wrapper.vm.dropFile = file;
+    await wrapper.vm.$nextTick();
 
-    await wrapper.setData({ dropFile: null });
+    wrapper.vm.dropFile = null;
+    await wrapper.vm.$nextTick();
 
     expect(global.URL.createObjectURL).toHaveBeenCalledTimes(1);
     expect(global.URL.revokeObjectURL).toHaveBeenCalledWith('blob:local-preview');
@@ -192,7 +204,7 @@ describe('local pin creation', () => {
   it('submits one multipart pin request with exact scalar and repeated fields', async () => {
     const response = { data: { id: 41 }, status: 201 };
     axios.post.mockResolvedValue(response);
-    const refresh = jest.spyOn(bus.bus, '$emit');
+    const refresh = jest.spyOn(bus.bus, 'emit');
     const { close, loading, wrapper } = mountCreateModal();
     await flushPromises();
     jest.clearAllMocks();
@@ -325,8 +337,8 @@ describe('local pin creation', () => {
     await wrapper.vm.$nextTick();
     const buttons = wrapper.findAll('.modal-card-foot > button');
 
-    expect(buttons.at(0).attributes('disabled')).toBe('disabled');
-    expect(buttons.at(1).attributes('disabled')).toBe('disabled');
+    expect(buttons.at(0).attributes('disabled')).toBeDefined();
+    expect(buttons.at(1).attributes('disabled')).toBeDefined();
     await buttons.at(0).trigger('click');
 
     expect(close).not.toHaveBeenCalled();
@@ -334,16 +346,13 @@ describe('local pin creation', () => {
   });
 
   it('opens the pin modal with implicit cancellation disabled', () => {
-    const config = ConfigProgrammatic.getOptions();
-    const defaultCancelOptions = config.defaultModalCanCancel.slice();
-    const open = jest.fn();
-    const vm = { $buefy: { modal: { open } } };
+    const open = overlays.openModal;
+    const vm = { };
 
     modals.openPinEdit(vm);
 
     expect(open).toHaveBeenCalledTimes(1);
-    expect(open.mock.calls[0][0].canCancel).toBe(false);
-    expect(config.defaultModalCanCancel).toEqual(defaultCancelOptions);
+    expect(open.mock.calls[0][1].canCancel).toBe(false);
   });
 
   it('keeps the modal open and exposes the server error after upload failure', async () => {
@@ -393,7 +402,7 @@ describe('local pin creation', () => {
   it('has no success UI side effects after destruction', async () => {
     const request = deferred();
     axios.post.mockImplementation(() => request.promise);
-    const refresh = jest.spyOn(bus.bus, '$emit');
+    const refresh = jest.spyOn(bus.bus, 'emit');
     const { close, loading, wrapper } = mountCreateModal();
     await flushPromises();
     jest.clearAllMocks();
@@ -401,7 +410,7 @@ describe('local pin creation', () => {
     wrapper.findComponent(FileUpload).vm.$emit('imageSelected', file);
     wrapper.vm.createPin();
 
-    wrapper.destroy();
+    wrapper.unmount();
     expect(loading.close).toHaveBeenCalledTimes(1);
     request.resolve({ data: { id: 41 }, status: 201 });
     await request.promise;
@@ -424,7 +433,7 @@ describe('local pin creation', () => {
     wrapper.findComponent(FileUpload).vm.$emit('imageSelected', file);
     wrapper.vm.createPin();
 
-    wrapper.destroy();
+    wrapper.unmount();
     expect(loading.close).toHaveBeenCalledTimes(1);
     request.reject(new Error('network'));
     await request.promise.catch(() => {});
