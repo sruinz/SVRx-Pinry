@@ -373,6 +373,14 @@ export default {
   font-weight: 600;
 }
 
+.sso-card .button,
+.sso-password-reauth input {
+  box-sizing: border-box;
+  height: 44px;
+  min-height: 44px;
+  font: inherit;
+}
+
 .sso-password-reauth__row {
   display: flex;
   align-items: stretch;
@@ -511,4 +519,10 @@ export default {
 
 @import '../utils/grid-layout';
 @include screen-grid-layout(".profile-container");
+
+@media (max-width: 542px) {
+  .profile-container {
+    max-width: calc(100% - 2rem);
+  }
+}
 </style>
