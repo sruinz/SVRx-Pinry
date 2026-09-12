@@ -16,6 +16,14 @@ describe('SSO policy screens', () => {
     axios.get.mockResolvedValue({ data: { providers: [], password_login_enabled: false, api_tokens_enabled: false } });
   });
 
+  it('keeps manual account linking in collapsed advanced controls', async () => {
+    const wrapper = shallowMount(Profile, options);
+    await flushPromises();
+    expect(wrapper.text()).toContain('ssoAutoLinkHelp');
+    expect(wrapper.find('details').exists()).toBe(true);
+    expect(wrapper.find('details').attributes('open')).toBeUndefined();
+  });
+
   it('shows enabled provider login buttons and hides the password form', async () => {
     axios.get.mockResolvedValue({
       data: {

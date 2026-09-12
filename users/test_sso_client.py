@@ -10,7 +10,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase, TestCase
-from joserfc.jwk import RSAKey
+from joserfc import jwt
+from joserfc.jwk import OctKey, RSAKey
 
 from users.models import SSOAttempt, SSOProvider
 from users.sso_test_utils import SyntheticProvider, tls_server
@@ -47,6 +48,26 @@ class SSOClientTests(SimpleTestCase):
         token_request = next(body for path, body in self.fixture.requests if path == '/token')
         self.assertEqual(token_request['code_verifier'], ['a' * 64])
         self.assertEqual(token_request['redirect_uri'], ['https://pinry.example/callback'])
+
+    def test_email_verification_requires_signed_boolean_true(self):
+        self.fixture.claims['email'] = 'member@example.com'
+        for value in (True, False, 'true', 1, None):
+            with self.subTest(value=value):
+                self.fixture.claims['email_verified'] = value
+                self.assertEqual(self.exchange().email_verified, value is True)
+
+    def test_authentik_hs256_uses_client_secret_and_rejects_wrong_signature(self):
+        self.fixture.metadata['id_token_signing_alg_values_supported'] = ['HS256']
+        self.provider.encrypted_client_secret = 'encrypted-placeholder'
+        secret = 'synthetic-client-secret-at-least-32-bytes'
+        token = {'id_token': jwt.encode({'alg': 'HS256'}, self.fixture.claims, OctKey.import_key(secret.encode()))}
+        with patch('users.sso.client.decrypt_secret', return_value=secret):
+            identity = self.client_module._oidc_identity(self.provider, self.fixture.metadata, token, 'one-use-nonce')
+            self.assertEqual(identity.subject, 'external-123')
+        with patch('users.sso.client.decrypt_secret', return_value='different-client-secret-at-least-32-bytes'):
+            from joserfc.errors import JoseError
+            with self.assertRaises(JoseError):
+                self.client_module._oidc_identity(self.provider, self.fixture.metadata, token, 'one-use-nonce')
 
     def test_all_oidc_presets_verify_their_fixed_or_configured_issuer(self):
         for kind, issuer in (
@@ -210,6 +231,17 @@ class EndpointTests(SimpleTestCase):
                 self.transport.validate_endpoint(self.provider, 'https://idp.example:8443/token'),
                 'https://idp.example:8443/token',
             )
+
+    def test_configured_self_hosted_discovery_allows_its_private_host_without_cidr(self):
+        self.provider.kind = 'authentik'
+        self.provider.discovery_url = 'https://idp.example/.well-known/openid-configuration'
+        resolved = [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.0.45', 443))]
+        with patch('socket.getaddrinfo', return_value=resolved):
+            self.assertEqual(self.transport.validate_endpoint(self.provider, 'https://idp.example/token'),
+                             'https://idp.example/token')
+            self.provider.allowed_endpoint_origins.append('https://other.example')
+            with self.assertRaises(ValidationError):
+                self.transport.validate_endpoint(self.provider, 'https://other.example/token')
 
     def test_mixed_public_and_private_dns_answer_is_rejected(self):
         private = (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.0.0.1', 443))

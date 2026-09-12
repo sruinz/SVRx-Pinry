@@ -55,6 +55,10 @@ def _resolve_endpoint(provider, url):
         ipaddress.ip_network(cidr)
         for cidr in normalize_cidrs(provider.internal_cidrs, private_only=True)
     ]
+    # 슈퍼 관리자가 지정한 자체 호스팅 IdP의 동일 출처만 내부 DNS를 허용한다.
+    configured = provider.discovery_url or provider.issuer
+    private_host = bool(provider.kind in ('authentik', 'synology', 'oidc') and configured
+                        and _origin(_parse_url(configured)) == _origin(parsed))
     try:
         addresses = socket.getaddrinfo(
             parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM,
@@ -64,7 +68,7 @@ def _resolve_endpoint(provider, url):
         for family, socktype, proto, canonname, sockaddr in addresses:
             address = ipaddress.ip_address(sockaddr[0])
             private = any(address in network for network in PRIVATE_NETWORKS)
-            permitted_private = private and any(address in network for network in networks)
+            permitted_private = private and (private_host or any(address in network for network in networks))
             if (
                 address.is_loopback or address.is_link_local
                 or address.is_multicast or address.is_unspecified

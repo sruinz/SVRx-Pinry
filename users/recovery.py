@@ -83,7 +83,7 @@ class RecoveryBackend(ModelBackend):
         return None
 
 
-def _limited_authenticate(request, username, password):
+def _limited_authenticate(request, username, password, authenticator=authenticate):
     keys = sorted(hashlib.sha256(('recovery:' + kind + ':' + value).encode()).hexdigest()
                   for kind, value in [('peer', request.recovery_peer), ('account', username.casefold())])
     now = timezone.now()
@@ -98,7 +98,7 @@ def _limited_authenticate(request, username, password):
             rows.append(row)
         if any(row.failure_count >= 5 for row in rows):
             return None, True
-        user = authenticate(request, username=username, password=password)
+        user = authenticator(request, username=username, password=password)
         if user is None:
             for row in rows:
                 row.failure_count += 1

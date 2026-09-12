@@ -1,4 +1,5 @@
 import tempfile
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
@@ -103,6 +104,26 @@ class SSOFlowTests(TestCase):
         self.assertFalse(ExternalIdentity.objects.exists())
         self.assertEqual(User.objects.count(), 1)
 
+    def test_verified_email_connects_existing_account_without_password(self):
+        self.identity = SimpleNamespace(**dict(vars(self.identity), email_verified=True))
+        response = self.callback(self.start())
+        self.assertEqual(response['Location'], '/')
+        self.assertEqual(self.client.session[SESSION_KEY], str(self.user.pk))
+        self.assertEqual(ExternalIdentity.objects.get().user_id, self.user.pk)
+        self.assertEqual(User.objects.count(), 1)
+
+    def test_verified_email_duplicate_or_existing_provider_link_rejected(self):
+        self.identity = SimpleNamespace(**dict(vars(self.identity), email_verified=True))
+        other = User.objects.create_user('duplicate', 'same@example.com', 'password')
+        self.callback(self.start())
+        self.assertNotIn(SESSION_KEY, self.client.session)
+        self.assertFalse(ExternalIdentity.objects.exists())
+        other.delete()
+        self.connect(subject='different-subject')
+        self.callback(self.start())
+        self.assertNotIn(SESSION_KEY, self.client.session)
+        self.assertEqual(ExternalIdentity.objects.count(), 1)
+
     def test_signup_creates_unprivileged_user_without_password(self):
         self.provider.allow_signup = True
         self.provider.save()
@@ -186,6 +207,7 @@ class SSOFlowTests(TestCase):
         self.client.force_login(self.user)
         response = self.client.post(f'/api/v2/sso/{self.provider.pk}/link/')
         self.assertEqual(response.status_code, 403)
+        self.assertContains(response, '재인증', status_code=403)
         self.assertFalse(SSOAttempt.objects.exists())
 
     def test_link_requires_same_authenticated_user_at_callback(self):

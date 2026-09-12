@@ -4,6 +4,8 @@
   "ssoPasswordDisabled": "密码登录和注册已停用，请使用 SSO。",
   "ssoTokensDisabled": "API 令牌不可用。",
   "ssoAccounts": "已关联的 SSO 账号",
+  "ssoAutoLinkHelp": "经 SSO 验证的邮箱与现有账号一致时，将在下次 SSO 登录时自动关联，无需匹配密码或提前关联。",
+  "ssoManualControls": "高级：手动关联和解除关联",
   "ssoIdentitiesFailed": "无法加载关联账号，请刷新后重试。",
   "ssoActionFailed": "无法完成操作，请在最近 5 分钟内重新验证后重试。",
   "ssoReauthenticated": "验证完成，现在可以关联或解除账号。",

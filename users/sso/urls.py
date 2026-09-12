@@ -1,10 +1,12 @@
 from django.urls import path
 
 from users.sso import views
+from users.sso.lan_recovery import recovery_login
 
 
 app_name = 'sso'
 urlpatterns = [
+    path('recovery/', recovery_login, name='lan-recovery'),
     path('providers/', views.providers, name='providers'),
     path('password/reauth/', views.password_reauth, name='password-reauth'),
     path('identities/', views.identities, name='identities'),

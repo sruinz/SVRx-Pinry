@@ -1,10 +1,8 @@
 import uuid
-from datetime import timedelta
 from urllib.parse import urlsplit
 
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.db import transaction
-from django.utils import timezone
 
 from users.models import AuthPolicy, AuthVerification, ExternalIdentity, SSOProvider
 
@@ -89,15 +87,8 @@ def _require_sso_only_proof(actor, policy):
         user=actor, kind='sso', provider=identity.provider,
         provider_revision=identity.provider.revision, policy_revision=policy.revision,
     ).exists() for identity in identities)
-    fingerprint = current_recovery_fingerprint()
-    recovered = bool(fingerprint and AuthVerification.objects.filter(
-        user=actor, kind='recovery', policy_revision=policy.revision,
-        deployment_fingerprint=fingerprint,
-        verified_at__gte=timezone.now() - timedelta(minutes=10),
-        verified_at__lte=timezone.now(),
-    ).exists())
-    if not verified or not recovered:
-        raise ValidationError('현재 설정의 관리자 SSO 연결·로그인과 최근 10분 이내 복구 로그인 확인이 필요합니다.')
+    if not verified:
+        raise ValidationError('비밀번호 로그인을 끄기 전에 현재 설정으로 관리자 SSO 로그인을 확인하세요.')
 
 
 def read_policy():

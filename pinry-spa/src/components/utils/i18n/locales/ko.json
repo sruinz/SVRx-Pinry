@@ -4,6 +4,8 @@
   "ssoPasswordDisabled": "비밀번호 로그인과 가입이 비활성화되어 있습니다. SSO를 이용해 주세요.",
   "ssoTokensDisabled": "API 토큰을 사용할 수 없습니다.",
   "ssoAccounts": "연결된 SSO 계정",
+  "ssoAutoLinkHelp": "SSO에서 확인된 이메일이 기존 계정과 일치하면 다음 SSO 로그인 때 자동 연결됩니다. 비밀번호를 같게 맞추거나 미리 연결할 필요가 없습니다.",
+  "ssoManualControls": "고급: 수동 연결·연결 해제",
   "ssoIdentitiesFailed": "연결 계정을 불러오지 못했습니다. 새로고침 후 다시 시도해 주세요.",
   "ssoActionFailed": "작업을 완료하지 못했습니다. 최근 5분 이내에 다시 인증한 후 시도해 주세요.",
   "ssoReauthenticated": "다시 인증했습니다. 계정을 연결하거나 해제할 수 있습니다.",

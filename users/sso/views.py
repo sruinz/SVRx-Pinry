@@ -11,6 +11,7 @@ from django.views.decorators.http import require_GET, require_POST
 from users.models import ExternalIdentity, SSOProvider
 from users.sso.policy import api_token_allowed, identity_is_usable, password_login_allowed
 from users.sso.flows import begin_attempt, finish_attempt, mark_recent_auth, require_user, unlink_identity
+from users.sso.lan_recovery import direct_lan_allowed
 
 
 logger = logging.getLogger(__name__)
@@ -33,8 +34,10 @@ def _begin(request, provider_id, purpose):
     try:
         data = request.GET if request.method == 'GET' else _data(request)
         response = HttpResponseRedirect(begin_attempt(request, provider, purpose, data.get('next', '/')))
-    except ValidationError as error:
-        response = JsonResponse({'detail': error.messages}, status=400)
+    except (ValidationError, PermissionDenied) as error:
+        response = render(request, 'sso/error.html', {
+            'reason': ' '.join(error.messages) if isinstance(error, ValidationError) else str(error),
+        }, status=403 if isinstance(error, PermissionDenied) else 400)
     response['Cache-Control'] = 'no-store'
     return response
 
@@ -48,6 +51,11 @@ def providers(request):
     ], 'password_login_enabled': password_login_allowed(request),
         'api_tokens_enabled': api_token_allowed(request)})
     response['Cache-Control'] = 'no-store'
+    if direct_lan_allowed(request):
+        data = json.loads(response.content)
+        data['recovery_login_url'] = reverse('sso:lan-recovery')
+        response = JsonResponse(data)
+        response['Cache-Control'] = 'no-store'
     return response
 
 
@@ -56,6 +64,7 @@ def login_page(request):
     response = render(request, 'sso/login.html', {
         'providers': SSOProvider.objects.filter(enabled=True),
         'password_login_enabled': password_login_allowed(request),
+        'recovery_login_allowed': direct_lan_allowed(request),
     })
     response['Cache-Control'] = 'no-store'
     response['Referrer-Policy'] = 'no-referrer'
@@ -85,9 +94,12 @@ def callback(request, provider_id):
         provider = SSOProvider.objects.get(pk=provider_id)
         finish_attempt(request, provider, request.GET.get('state', ''), request.GET.get('code', ''))
         destination = request.sso_next_path
-    except (ValidationError, PermissionDenied, SSOProvider.DoesNotExist):
-        logger.warning('SSO 인증 실패 provider=%s', provider_id)
-        messages.error(request, 'SSO 인증을 완료하지 못했습니다. 설정과 연결 계정을 확인하고 다시 시도해 주세요.')
+    except (ValidationError, PermissionDenied, SSOProvider.DoesNotExist) as error:
+        reason = (' '.join(error.messages) if isinstance(error, ValidationError) else str(error))
+        if isinstance(error, SSOProvider.DoesNotExist):
+            reason = 'SSO 제공자 설정을 찾을 수 없습니다.'
+        logger.warning('SSO 인증 실패 provider=%s category=%s', provider_id, type(error).__name__)
+        messages.error(request, 'SSO 인증을 완료하지 못했습니다. ' + reason)
         destination = '/login/'
     response = HttpResponseRedirect(destination)
     response['Cache-Control'] = 'no-store'

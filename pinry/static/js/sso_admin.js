@@ -9,6 +9,7 @@
     const kindSelect = document.getElementById('id_kind');
     const base = document.getElementById('id_public_base_url');
     if (base) {
+      if (!base.value && window.location.protocol === 'https:') base.value = window.location.origin;
       function updateForm() {
         const kind = kindSelect ? kindSelect.value : base.dataset.providerKind;
         const guide = guides[kind];

@@ -4,4 +4,5 @@
 {% for message in messages %}<p role="alert">{{ message }}</p>{% endfor %}
 {% for provider in providers %}<p><a href="{% url 'sso:login' provider.pk %}">{{ provider.name }} 로그인</a></p>{% endfor %}
 {% if password_login_enabled %}<p><a href="/">홈에서 비밀번호 로그인</a></p>{% else %}<p>비밀번호 로그인이 비활성화되어 있습니다. SSO를 이용해 주세요.</p>{% endif %}
+{% if recovery_login_allowed %}<p><a href="{% url 'sso:lan-recovery' %}">관리자 복구 로그인</a></p>{% endif %}
 </main></body></html>

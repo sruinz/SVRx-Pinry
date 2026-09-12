@@ -4,6 +4,8 @@
   "ssoPasswordDisabled": "Password login and signup are disabled. Use SSO.",
   "ssoTokensDisabled": "API tokens are unavailable.",
   "ssoAccounts": "Connected SSO accounts",
+  "ssoAutoLinkHelp": "A verified SSO email matching your existing account links automatically at your next SSO login. Matching passwords or linking beforehand is not required.",
+  "ssoManualControls": "Advanced: manual linking and unlinking",
   "ssoIdentitiesFailed": "Unable to load connected accounts. Refresh to retry.",
   "ssoActionFailed": "Unable to complete the action. Reauthenticate within 5 minutes and retry.",
   "ssoReauthenticated": "Reauthentication completed. You can now connect or unlink an account.",

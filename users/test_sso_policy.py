@@ -1,12 +1,10 @@
 import base64
 from unittest.mock import patch
-from datetime import timedelta
 
 from django.test import TestCase, RequestFactory, override_settings
 from django.db import DatabaseError, connection
 from django.test.utils import CaptureQueriesContext
 from django.core.exceptions import ValidationError
-from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
 from users.models import AuthPolicy, AuthVerification, ExternalIdentity, SSOProvider, User, create_token_if_necessary
@@ -182,28 +180,19 @@ class SSOOnlyProofTests(TestCase):
         from users.sso.config import save_configuration
         return save_configuration(self.user, {'password_login_enabled': False}, **kwargs)
 
-    def test_unimplemented_recovery_never_accepts_a_manually_inserted_proof(self):
-        with self.assertRaises(ValidationError):
-            self.switch()
+    def test_verified_admin_sso_does_not_require_separate_recovery_setup(self):
+        self.recovery.delete()
+        self.assertFalse(self.switch().password_login_enabled)
 
     def test_current_sso_and_recent_current_deployment_proof_allow_transition(self):
         with patch('users.sso.config.current_recovery_fingerprint', return_value='deployment-a'):
             self.assertFalse(self.switch().password_login_enabled)
 
-    def test_stale_provider_or_recovery_evidence_is_rejected(self):
-        changes = [{'policy_revision': 2}, {'deployment_fingerprint': 'deployment-old'},
-                   {'verified_at': timezone.now() - timedelta(minutes=11)}]
-        with patch('users.sso.config.current_recovery_fingerprint', return_value='deployment-a'):
-            for fields in changes:
-                with self.subTest(fields=fields):
-                    AuthVerification.objects.filter(pk=self.recovery.pk).update(**fields)
-                    with self.assertRaises(ValidationError):
-                        self.switch()
-                    self.recovery.save()
-            self.provider.revision = 2
-            self.provider.save()
-            with self.assertRaises(ValidationError):
-                self.switch()
+    def test_stale_provider_evidence_is_rejected(self):
+        self.provider.revision = 2
+        self.provider.save()
+        with self.assertRaises(ValidationError):
+            self.switch()
 
     def test_changing_provider_and_disabling_password_cannot_reuse_old_proof(self):
         with patch('users.sso.config.current_recovery_fingerprint', return_value='deployment-a'):

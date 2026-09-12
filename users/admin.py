@@ -1,5 +1,7 @@
 import json
 import uuid
+from copy import copy
+from urllib.parse import urlsplit
 
 from django import forms
 from django.contrib import admin
@@ -15,7 +17,7 @@ from .sso.flows import callback_url
 from .sso.policy import request_policy
 from .sso.admin_guide import PROVIDER_GUIDES, SELF_HOSTED, guide_context
 from .sso.config import PRESET_ORIGINS
-from .sso.transport import _parse_url
+from .sso.transport import _origin, _parse_url
 
 
 POLICY_FIELDS = (
@@ -82,7 +84,7 @@ class AuthPolicyAdminForm(forms.ModelForm):
 
         labels = {'password_login_enabled': '비밀번호 로그인 허용', 'api_tokens_enabled': 'API 토큰 인증 허용',
                   'recovery_allowed_cidrs': '복구 허용 CIDR', 'recovery_denied_cidrs': '복구 차단 CIDR'}
-        help_texts = {'password_login_enabled': '끄기 전에 현재 관리자 SSO 로그인과 복구 로그인 확인이 필요합니다.',
+        help_texts = {'password_login_enabled': '끄기 전에 관리자 SSO 로그인을 확인하세요. 내부망 IP 직접 접속에서는 관리자 복구 로그인을 사용할 수 있습니다.',
                       'api_tokens_enabled': '끄면 기존 토큰을 보존하면서 인증·노출·발급을 모두 차단합니다.'}
 
     def __init__(self, *args, **kwargs):
@@ -132,8 +134,8 @@ class SSOProviderAdminForm(forms.ModelForm):
         self.fields['name'].widget.attrs['placeholder'] = '회사 계정'
         self.fields['position'].help_text = '필수 · 작은 숫자가 먼저 표시됩니다. 예: 0, 10, 20'
         self.fields['enabled'].help_text = '처음에는 끈 상태로 저장해 확정 콜백 URI를 발급받고, 제공자 등록을 마친 후 활성화하세요.'
-        self.fields['issuer'].help_text = '활성화 시 필수 · IdP Discovery 문서의 issuer 값을 그대로 입력하세요. 마지막 슬래시도 일치해야 합니다.'
-        self.fields['discovery_url'].help_text = '선택 · IdP에서 제공한 Well-known URL입니다. 비우면 발급자 주소 뒤에 /.well-known/openid-configuration을 붙입니다.'
+        self.fields['issuer'].help_text = 'Discovery에서 자동 확인합니다. 수동 설정 시 문서의 issuer 값과 마지막 슬래시까지 일치해야 합니다.'
+        self.fields['discovery_url'].help_text = '제공자의 OpenID 구성 URL을 붙여넣으세요. 발급자와 서버 주소는 자동 확인합니다.'
         self.fields['tenant_id'].help_text = '활성화 시 필수 · Entra의 디렉터리(테넌트) ID입니다. UUID만 허용하며 common은 사용할 수 없습니다.'
         self.fields['tenant_id'].widget.attrs['placeholder'] = '11111111-2222-4333-8444-555555555555'
         self.fields['client_id'].help_text = '활성화 시 필수 · 제공자의 앱 등록 화면에서 발급받은 클라이언트 ID입니다.'
@@ -158,6 +160,15 @@ class SSOProviderAdminForm(forms.ModelForm):
         data = super().clean()
         kind = self.instance.kind if not self.instance._state.adding else data.get('kind')
         enabled = data.get('enabled')
+        if kind in SELF_HOSTED and data.get('discovery_url') and (
+                not data.get('issuer') or data['discovery_url'] != self.instance.discovery_url):
+            self._discover(data, kind)
+        if not data.get('allowed_endpoint_origins') and (self.instance._state.adding or enabled or data.get('discovery_url')):
+            address = data.get('discovery_url') or data.get('issuer')
+            data['allowed_endpoint_origins'] = PRESET_ORIGINS.get(kind, [])[:]
+            if kind in SELF_HOSTED and address:
+                parsed = urlsplit(address)
+                data['allowed_endpoint_origins'] = [f'{parsed.scheme}://{parsed.netloc}']
         self._validate_addresses(data, kind, enabled)
         if kind == 'microsoft' and (enabled or data.get('tenant_id')):
             try:
@@ -173,12 +184,45 @@ class SSOProviderAdminForm(forms.ModelForm):
                 self.add_error('allowed_endpoint_origins', '활성화하려면 허용 서버 주소가 필요합니다.')
         return data
 
+    def _discover(self, data, kind):
+        from .sso.transport import request_json
+        try:
+            parsed = _parse_url(data['discovery_url'])
+            candidate = copy(self.instance)
+            candidate.kind = kind
+            candidate.discovery_url = data['discovery_url']
+            origin = f'{parsed.scheme}://{parsed.netloc}'
+            old = urlsplit(self.instance.discovery_url or self.instance.issuer)
+            origins = data.get('allowed_endpoint_origins', [])
+            if not origins or (old.netloc and len(origins) == 1 and _origin(_parse_url(origins[0])) == _origin(old)):
+                origins = [origin]
+            origin_keys = [_origin(_parse_url(value)) for value in origins]
+            if _origin(parsed) not in origin_keys:
+                raise ValidationError('Discovery 서버가 고급 설정의 허용 주소에 없습니다. 허용 주소를 비워 자동 설정하거나 수정하세요.')
+            candidate.allowed_endpoint_origins = origins
+            candidate.internal_cidrs = data.get('internal_cidrs', [])
+            metadata = request_json(candidate, candidate.discovery_url)
+            issuer = _parse_url(metadata.get('issuer'))
+            explicit_issuer = data.get('issuer') and (self.instance._state.adding or data['issuer'] != self.instance.issuer)
+            if explicit_issuer and data['issuer'] != metadata['issuer']:
+                raise ValidationError('입력한 발급자가 Discovery 문서와 다릅니다. 발급자를 비워 자동 확인하세요.')
+            if _origin(issuer) not in origin_keys:
+                raise ValidationError('Discovery 발급자 서버가 허용 주소에 없습니다.')
+            for name in ('authorization_endpoint', 'token_endpoint', 'jwks_uri'):
+                endpoint = _parse_url(metadata.get(name))
+                if _origin(endpoint) not in origin_keys:
+                    raise ValidationError('다른 서버의 인증 주소는 고급 설정에서 발급자와 허용 서버 주소를 확인하세요.')
+            data['issuer'] = metadata['issuer']
+            data['allowed_endpoint_origins'] = origins
+        except ValidationError as error:
+            self.add_error('discovery_url', error)
+
     def _validate_addresses(self, data, kind, enabled):
         for name in ('public_base_url', 'issuer', 'discovery_url'):
             if name != 'public_base_url' and kind not in SELF_HOSTED:
                 continue
             value = data.get(name)
-            required = enabled and name != 'discovery_url'
+            required = enabled and name != 'discovery_url' and not (name == 'issuer' and data.get('discovery_url'))
             if not value:
                 if required and name not in self.errors:
                     self.add_error(name, '활성화하려면 HTTPS 기준 URL을 입력하세요.')
@@ -233,7 +277,11 @@ class ActiveSuperuserAdminMixin:
 @admin.register(AuthPolicy)
 class AuthPolicyAdmin(ActiveSuperuserAdminMixin, admin.ModelAdmin):
     form = AuthPolicyAdminForm
-    fields = POLICY_FIELDS + ('expected_revision', 'revision',)
+    fieldsets = (
+        (None, {'fields': ('password_login_enabled', 'api_tokens_enabled', 'expected_revision')}),
+        ('기존 전용 복구 포트 고급 설정 (내부망 직접 복구에는 불필요)', {
+            'classes': ('collapse',), 'fields': ('recovery_allowed_cidrs', 'recovery_denied_cidrs', 'revision')}),
+    )
     readonly_fields = ('revision',)
 
     def has_add_permission(self, request):
@@ -257,11 +305,31 @@ class SSOProviderAdmin(ActiveSuperuserAdminMixin, admin.ModelAdmin):
     form = SSOProviderAdminForm
     change_form_template = 'admin/users/ssoprovider/change_form.html'
     change_list_template = 'admin/users/ssoprovider/change_list.html'
-    fields = PROVIDER_FIELDS + ('client_secret', 'callback_address', 'expected_revision',
-                                'expected_policy_revision', 'revision',)
+    fieldsets = (
+        (None, {'fields': ('kind', 'client_id', 'client_secret', 'discovery_url', 'tenant_id',
+                           'enabled', 'callback_address', 'expected_revision', 'expected_policy_revision')}),
+        ('고급 설정 (일반적으로 변경할 필요 없음)', {'classes': ('collapse',), 'fields': (
+            'name', 'position', 'allow_signup', 'public_base_url', 'issuer',
+            'allowed_endpoint_origins', 'internal_cidrs', 'revision')}),
+    )
     readonly_fields = ('revision', 'callback_address')
     list_display = ('name', 'kind', 'position', 'enabled', 'revision')
     ordering = ('position', 'name')
+
+    def get_form(self, request, obj=None, **kwargs):
+        base_form = super().get_form(request, obj, **kwargs)
+
+        class ProviderForm(base_form):
+            def __init__(self, *args, **form_kwargs):
+                super().__init__(*args, **form_kwargs)
+                if not obj and request.is_secure():
+                    self.fields['public_base_url'].initial = request.build_absolute_uri('/').rstrip('/')
+                self.fields['name'].required = False
+
+            def clean_name(self):
+                return self.cleaned_data.get('name') or (obj.kind if obj else self.data.get('kind', 'authentik'))
+
+        return ProviderForm
 
     def get_urls(self):
         return [path('setup-guide/', self.admin_site.admin_view(self.setup_guide),

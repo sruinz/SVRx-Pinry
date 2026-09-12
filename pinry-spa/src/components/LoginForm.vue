@@ -11,6 +11,7 @@
           <a v-for="provider in providers" :key="provider.id"
              class="button is-link" :href="provider.login_url">{{ provider.name }}</a>
           <p v-if="policy && !policy.password_login_enabled">{{ $t('ssoPasswordDisabled') }}</p>
+          <a v-if="policy && policy.recovery_login_url" :href="policy.recovery_login_url">관리자 복구 로그인</a>
           <div v-if="passwordAllowed" data-test="password-form">
           <b-field v-bind:label="$t('usernameLabel')"
                    :type="form.username.type"

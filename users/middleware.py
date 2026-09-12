@@ -53,7 +53,7 @@ class Public(MiddlewareMixin):
         if settings.PUBLIC is False and not request.user.is_authenticated:
             try:
                 public_sso = resolve(request.path_info).view_name in {
-                    'sso:providers', 'sso:login', 'sso:callback', 'login-page',
+                    'sso:providers', 'sso:login', 'sso:callback', 'sso:lan-recovery', 'login-page',
                 }
             except Resolver404:
                 public_sso = False

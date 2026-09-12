@@ -35,7 +35,7 @@ def api_token_allowed(request=None):
         request = policy_request.get()
     if request is not None and getattr(request, 'recovery_deployment', None):
         return False
-    if request is not None and getattr(request, 'session', {}).get('auth_method') == 'recovery':
+    if request is not None and getattr(request, 'session', {}).get('auth_method') in ('recovery', 'lan-recovery'):
         return False
     policy = request_policy(request)
     return bool(policy and policy.api_tokens_enabled)
@@ -63,7 +63,12 @@ def sso_session_usable(user, provider_id, revision):
 
 def enforce_session_policy(request):
     method = request.session.get('auth_method', 'password')
-    if method == 'recovery':
+    if method == 'lan-recovery':
+        from users.sso.lan_recovery import direct_lan_allowed
+        if not (direct_lan_allowed(request) and request.user.is_authenticated
+                and request.user.is_active and request.user.is_superuser):
+            logout(request)
+    elif method == 'recovery':
         logout(request)
     elif request.user.is_authenticated:
         if method == 'sso':

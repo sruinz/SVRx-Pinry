@@ -23,6 +23,9 @@
         <p v-if="identityError" role="alert">{{ $t('ssoIdentitiesFailed') }}</p>
         <p v-if="actionError" role="alert">{{ $t('ssoActionFailed') }}</p>
         <p v-if="reauthenticated" role="status">{{ $t('ssoReauthenticated') }}</p>
+        <p>{{ $t('ssoAutoLinkHelp') }}</p>
+        <details>
+        <summary>{{ $t('ssoManualControls') }}</summary>
         <p>{{ $t('ssoRecentAuthHelp') }}</p>
         <form v-if="policy && policy.password_login_enabled" @submit.prevent="passwordReauth">
           <label>{{ $t('passwordLabel') }}
@@ -50,6 +53,7 @@
             <button class="button" type="submit">{{ provider.name }} — {{ $t('ssoLink') }}</button>
           </form>
         </div>
+        </details>
       </div>
     </div>
     <a

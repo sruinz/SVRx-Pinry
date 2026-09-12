@@ -1,4 +1,5 @@
 import uuid
+from unittest.mock import patch
 
 from django.test import TestCase
 from django.contrib import admin
@@ -17,6 +18,41 @@ class SSOAdminGuideTest(TestCase):
                     expected_policy_revision=1)
         data.update(changes)
         return data
+
+    def test_authentik_discovery_supplies_issuer_and_origin(self):
+        with patch('users.sso.transport.request_json', return_value={
+            'issuer': 'https://auth.example.com/application/o/pins/',
+            'authorization_endpoint': 'https://auth.example.com/application/o/authorize/',
+            'token_endpoint': 'https://auth.example.com/application/o/token/',
+            'jwks_uri': 'https://auth.example.com/application/o/pins/jwks/',
+        }):
+            form = SSOProviderAdminForm(data=self.provider_data(
+                kind='authentik', enabled=True, client_secret='example-secret',
+                discovery_url='https://auth.example.com/application/o/pins/.well-known/openid-configuration'))
+            self.assertTrue(form.is_valid(), form.errors)
+            self.assertEqual(form.cleaned_data['issuer'], 'https://auth.example.com/application/o/pins/')
+            self.assertEqual(form.cleaned_data['allowed_endpoint_origins'], ['https://auth.example.com'])
+
+    def test_changed_discovery_updates_automatic_origin_but_rejects_custom_conflict(self):
+        provider = SSOProvider.objects.create(
+            kind='authentik', name='test', issuer='https://old.example.com/',
+            discovery_url='https://old.example.com/.well-known/openid-configuration',
+            allowed_endpoint_origins=['https://old.example.com'])
+        metadata = {'issuer': 'https://new.example.com/',
+                    'authorization_endpoint': 'https://new.example.com/authorize',
+                    'token_endpoint': 'https://new.example.com/token', 'jwks_uri': 'https://new.example.com/jwks'}
+        data = self.provider_data(kind='authentik', issuer=provider.issuer,
+                                  discovery_url='https://new.example.com/.well-known/openid-configuration',
+                                  allowed_endpoint_origins='https://old.example.com')
+        with patch('users.sso.transport.request_json', return_value=metadata):
+            form = SSOProviderAdminForm(data=data, instance=provider)
+            self.assertTrue(form.is_valid(), form.errors)
+            self.assertEqual(form.cleaned_data['allowed_endpoint_origins'], ['https://new.example.com'])
+            provider.refresh_from_db()
+            data['allowed_endpoint_origins'] = 'https://custom.example.com'
+            form = SSOProviderAdminForm(data=data, instance=provider)
+            self.assertFalse(form.is_valid())
+            self.assertIn('discovery_url', form.errors)
 
     def test_policy_accepts_lines_and_renders_existing_lists_as_lines(self):
         form = AuthPolicyAdminForm(data=dict(

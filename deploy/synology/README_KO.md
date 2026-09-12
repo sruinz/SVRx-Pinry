@@ -47,8 +47,10 @@ bash build-image.sh "svrx-pinry:gif-navigation-${feature_revision}"
 ### SSO 제공자 설정
 
 슈퍼 관리자로 `/admin/`에 로그인한 뒤 `/admin/users/ssoprovider/`에서
-제공자를 생성한다. 제공자별로 표시 이름, 공개 서비스 기준 HTTPS URL,
-Client ID·Client Secret, 필요한 issuer·Discovery URL을 입력한다. 활성화 전
+제공자를 생성한다. Authentik은 Client ID·Client Secret·Discovery URL을 입력한다.
+발급자와 동일 출처 서버 주소는 자동 확인하며 현재 HTTPS 접속 주소가 공개 URL의
+기본값이다. 내부 IP 접속에서 새 제공자를 만들 때는 고급 설정에 실제 공개 HTTPS
+주소를 입력한다. 표시 이름·순서·발급자·추가 서버 주소는 고급 설정에 있다. 활성화 전
 관리자 화면에 표시된 **등록할 정확한 콜백 주소**를 IdP의 redirect URI로
 등록한다. 비표준 포트는 URL에 포함하고 프록시가 원래 Host를 보존하게 한다.
 
@@ -68,12 +70,11 @@ Authentik·Synology·범용 OIDC에만 표시된다. Google·Microsoft의 Discov
 기존 JSON 배열 저장 형식은 유지하며 이전 JSON 입력도 호환한다. 잘못된 형식은
 입력한 내용을 유지한 채 해당 칸에 오류로 표시한다.
 
-제공자가 접속하는 모든 Discovery·authorization·token·JWKS·userinfo 주소의
-origin을 **허용 서버 주소 (origin)**에 HTTPS로 명시한다. Google·Microsoft·GitHub
-프리셋은 새 등록의 빈 목록에 안전한 기본 origin을 적용한다. Microsoft는
-`common`이나 `organizations`가 아닌 정확한 테넌트 UUID를 입력한다. 내부 IdP는
-해석된 IP가 속해야 하는 사설망 CIDR을 **내부 IdP 허용 CIDR**에 정확히
-지정한다. TLS 검증, PKCE S256, state·nonce, 서명·issuer·audience 검사는
+자체 호스팅 IdP의 Discovery와 동일 출처는 사설 DNS 주소도 CIDR 입력 없이 허용한다.
+다른 출처의 endpoint가 필요한 경우에만 고급 설정의 허용 서버 주소를 사용한다.
+Google·Microsoft·GitHub 프리셋은 기본 origin을 적용한다. Microsoft는
+`common`이나 `organizations`가 아닌 정확한 테넌트 UUID를 입력한다.
+루프백·링크 로컬·메타데이터 주소 차단과 TLS 검증, PKCE S256, state·nonce, 서명·issuer·audience 검사는
 비활성화할 수 없다.
 
 내부 CA가 필요하면 CA bundle을 읽기 전용으로 `/data` 또는 별도
@@ -90,9 +91,12 @@ Client Secret은 별도 Fernet 키로 암호화된다. 기본 키 경로는
 데이터베이스 백업과 별도로 이 키 파일을 백업한다. 암호문이 존재하는데
 키가 없거나 바뀌면 자동 재생성하지 않고 SSO 비밀 정보 사용을 거부한다.
 
-기존 사용자는 로그인한 뒤 프로필에서 **SSO 계정 연결**을 사용한다.
-동일한 이메일·이름을 자동으로 연결하지 않으며, 제공자의 **신규 SSO 사용자
-가입 허용**은 필요한 제공자에만 켠다. 연결·해제의 최근 재인증은
+기존 사용자는 SSO 로그인을 하면 서명된 `email_verified=true` 이메일과 일치하는
+계정 하나에 자동 연결된다. 기존 비밀번호를 다시 입력하거나 같게 맞출 필요는 없다.
+중복 이메일·미검증 이메일·다른 외부 ID와의 기존 연결 충돌은 자동 연결하지 않는다.
+Authentik의 HS256 전용 토큰은 32바이트 이상 Client Secret으로 검증한다.
+신규 계정 생성은 별도의 **신규 SSO 사용자 가입 허용**을 따른다.
+프로필 고급 항목의 수동 연결·해제에는 최근 재인증을 유지한다. 재인증은
 연결된 외부 ID의 새 인증 왕복을 의미한다. IdP의 기존 세션 때문에
 비밀번호·MFA 재입력 없이 완료될 수 있으며, 모든 IdP의 MFA 재입력을
 강제하는 기능은 아니다.
@@ -108,11 +112,24 @@ Client Secret은 별도 Fernet 키로 암호화된다. 기본 키 경로는
 
 1. 최소 한 개의 현재 활성 SSO 제공자가 있다.
 2. 슈퍼 관리자에게 현재 issuer와 일치하는 SSO 연결이 있고 실제 로그인을 확인했다.
-3. 현재 복구 포트·인증서 지문과 일치하는 복구 로그인을 최근 10분 이내 확인했다.
 
-제공자 issuer·Client ID·비밀·복구 배포 설정이 바뀌면 기존 확인은
-무효가 되므로 로그인·복구 시험을 다시 수행한다. SSO 장애가 발생해도
+제공자 issuer·Client ID·비밀이 바뀌면 관리자 SSO 로그인을 다시 확인한다.
+최근 복구 로그인 확인을 전환 조건으로 강제하지 않지만 직접 복구 시험은 권장한다. SSO 장애가 발생해도
 서버가 비밀번호 로그인을 자동으로 열지 않는다.
+
+### 내부망 직접 관리자 복구
+
+`http://NAS의-내부-IP:서비스포트`로 접속하면 로그인 화면에 **관리자 복구 로그인**이
+표시된다. IPv4 사설망과 IPv6 ULA를 지원하며 CIDR 설정은 필요 없다.
+`/api/v2/sso/recovery/`는 활성 슈퍼 관리자만 로그인할 수 있고 세션은 15분이다.
+외부 주소·프록시 경유 요청은 화면과 API 모두 차단한다. 기존 일반 비밀번호 로그인
+API는 내부망에서도 SSO 전용 정책을 우회하지 않는다.
+
+컨테이너 nginx가 원본 접속 주소와 프록시 흔적을 덮어써 전달하고 앱은 매 요청 검사한다.
+외부 프록시는 원래 Host 및 `X-Forwarded-Proto` 또는 `X-Forwarded-For`를 전달해야 한다.
+직접 서비스 포트를 인터넷에 포트 포워딩하거나 외부 요청을 내부 주소로 위장하는
+프록시를 구성하지 않는다. 직접 HTTP 복구는 신뢰하는 내부망에서만 사용한다.
+별도 TLS 복구가 필요한 기존 설치는 아래 고급 배포 방식을 계속 사용할 수 있다.
 
 ### 복구 HTTPS 배포
 

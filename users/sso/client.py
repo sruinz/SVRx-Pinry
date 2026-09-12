@@ -10,7 +10,7 @@ from authlib.oidc.core import CodeIDToken
 from django.core.exceptions import ValidationError
 from joserfc import jwt
 from joserfc.errors import JoseError
-from joserfc.jwk import KeySet
+from joserfc.jwk import KeySet, OctKey
 
 from users.models import SSOProvider
 from users.sso.secrets import decrypt_secret
@@ -23,6 +23,7 @@ class VerifiedIdentity:
     subject: str
     email: str | None
     display_name: str
+    email_verified: bool = False
 
 
 def _metadata(provider):
@@ -117,12 +118,20 @@ def authorization_url(provider, redirect_uri, state, nonce, verifier):
 
 
 def _oidc_identity(provider, metadata, token, nonce):
-    keys = request_json(provider, metadata['jwks_uri'])
     supported = metadata.get('id_token_signing_alg_values_supported', ['RS256'])
     algorithms = [alg for alg in ('RS256', 'RS384', 'RS512', 'PS256', 'PS384', 'PS512', 'ES256', 'ES384', 'ES512', 'EdDSA') if alg in supported]
-    if not algorithms:
+    if supported == ['HS256']:
+        # 대칭 서명에는 이 클라이언트의 비밀만 사용한다. 공개 JWK를 HMAC 키로 쓰지 않는다.
+        secret = decrypt_secret(provider.encrypted_client_secret)
+        if len(secret.encode()) < 32:
+            raise ValidationError('HS256에는 32바이트 이상의 Client Secret이 필요합니다.')
+        key = OctKey.import_key(secret.encode())
+        algorithms = ['HS256']
+    elif algorithms:
+        key = KeySet.import_key_set(request_json(provider, metadata['jwks_uri']))
+    else:
         raise ValidationError('지원하지 않는 ID 토큰 서명 방식입니다.')
-    decoded = jwt.decode(token['id_token'], KeySet.import_key_set(keys), algorithms=algorithms)
+    decoded = jwt.decode(token['id_token'], key, algorithms=algorithms)
     claims = CodeIDToken(
         decoded.claims, decoded.header,
         options={
@@ -146,6 +155,7 @@ def _oidc_identity(provider, metadata, token, nonce):
         issuer=metadata['issuer'], subject=subject,
         email=claims.get('email') if isinstance(claims.get('email'), str) else None,
         display_name=claims.get('name') if isinstance(claims.get('name'), str) else '',
+        email_verified=claims.get('email_verified') is True,
     )
 
 

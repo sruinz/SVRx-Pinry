@@ -4,6 +4,8 @@
   "ssoPasswordDisabled": "La connexion et l’inscription par mot de passe sont désactivées. Utilisez le SSO.",
   "ssoTokensDisabled": "Les jetons API ne sont pas disponibles.",
   "ssoAccounts": "Comptes SSO associés",
+  "ssoAutoLinkHelp": "Une adresse SSO vérifiée correspondant au compte existant permet une association automatique à la prochaine connexion SSO, sans saisir le mot de passe local.",
+  "ssoManualControls": "Avancé : association et dissociation manuelles",
   "ssoIdentitiesFailed": "Impossible de charger les comptes. Actualisez la page.",
   "ssoActionFailed": "Action impossible. Authentifiez-vous à nouveau dans les 5 minutes et réessayez.",
   "ssoReauthenticated": "Authentification confirmée. Vous pouvez associer ou dissocier un compte.",

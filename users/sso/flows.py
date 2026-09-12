@@ -132,6 +132,17 @@ def _finish_verified(request, provider, attempt, verified):
     if attempt.purpose == SSOAttempt.Purpose.LOGIN:
         if request.user.is_authenticated:
             raise PermissionDenied('로그인한 계정을 변경할 수 없습니다.')
+        if identity is None and verified.email_verified and verified.email:
+            matches = list(User.objects.select_for_update().filter(email__iexact=verified.email)[:2])
+            if len(matches) > 1:
+                raise PermissionDenied('이메일이 중복되어 자동 연결할 수 없습니다. 관리자에게 문의해 주세요.')
+            if matches:
+                user = matches[0]
+                if not user.is_active or ExternalIdentity.objects.filter(user=user, provider=provider).exists():
+                    raise PermissionDenied('비활성 계정이거나 기존 SSO 연결과 충돌합니다. 관리자에게 문의해 주세요.')
+                identity = ExternalIdentity.objects.create(
+                    user=user, provider=provider, issuer=verified.issuer, subject=verified.subject,
+                )
         if identity is None:
             if not provider.allow_signup:
                 raise PermissionDenied('연결된 계정이 없습니다. 기존 계정에서 먼저 연결해 주세요.')
