@@ -17,10 +17,6 @@ export default {
 <style lang="scss">
   @import "bulma/sass/utilities/_all";
   @import "bulma/bulma.sass";
-  html {
-    background-color: #F5F5EB;
-  }
-  .body {
-    font-family: 'Open Sans', sans-serif;
-  }
 </style>
+
+<style src="./assets/pinry-theme.css"></style>

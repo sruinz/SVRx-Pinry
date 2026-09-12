@@ -566,8 +566,8 @@ describe('Pins sorting', () => {
       fetchPinsImplementation: () => page([gif, webp, stillGif, stillWebp, jpg]),
     });
     await settle();
-    expect(wrapper.find('[data-test="pin-card-3"] .pin-animation-badge').text()).toBe('GIF ▶');
-    expect(wrapper.find('[data-test="pin-card-4"] .pin-animation-badge').text()).toBe('WEBP ▶');
+    expect(wrapper.find('[data-test="pin-card-3"] .pin-animation-badge').text()).toBe('GIF');
+    expect(wrapper.find('[data-test="pin-card-4"] .pin-animation-badge').text()).toBe('WEBP');
     [2, 5, 6].forEach((id) => {
       expect(wrapper.find(`[data-test="pin-card-${id}"] .pin-animation-badge`).exists()).toBe(false);
     });

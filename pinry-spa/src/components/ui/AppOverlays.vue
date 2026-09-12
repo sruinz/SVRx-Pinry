@@ -76,6 +76,14 @@ export default {
 .app-modal { max-width: calc(100vw - 48px); max-height: calc(100dvh - 48px); }
 .app-modal .modal-content { display: block; max-height: calc(100dvh - 48px); overflow: auto; margin: 0; }
 .app-modal .modal-card { max-width: 100%; margin: 0; }
+.app-modal.pin-preview-at-home { width: 900px; }
+.app-modal.pin-preview-at-home .modal-content { width: 100%; padding-inline: 72px; }
+@media screen and (max-width: 768px) {
+  .app-modal-mask { padding: 12px; }
+  .app-modal { max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px); }
+  .app-modal .modal-content { max-width: 100%; max-height: calc(100dvh - 24px); }
+  .app-modal.pin-preview-at-home .modal-content { padding-inline: 0; }
+}
 .app-toasts { position: fixed; top: 24px; right: 24px; z-index: 1300; max-width: min(400px, calc(100vw - 48px)); }
 .app-loading { position: fixed; inset: 0; z-index: 1400; display: grid; place-items: center; background: rgba(0, 0, 0, .35); }
 .app-loading-spinner { width: 40px; height: 40px; border: 4px solid #fff; border-top-color: transparent; border-radius: 50%; animation: app-spin .8s linear infinite; }

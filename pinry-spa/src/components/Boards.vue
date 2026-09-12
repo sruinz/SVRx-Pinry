@@ -195,8 +195,9 @@ function createBoardItem(board) {
     boardItem.preview_image_url = defaultPreviewImage;
   }
   boardItem.style = {
-    width: `${previewImage.image.thumbnail.width}px`,
-    height: `${previewImage.image.thumbnail.height}px`,
+    width: '100%',
+    height: 'auto',
+    aspectRatio: `${previewImage.image.thumbnail.width} / ${previewImage.image.thumbnail.height}`,
   };
   boardItem.class = {};
   boardItem.author = board.submitter.username;
@@ -753,14 +754,13 @@ export default {
 .grid-sizer,
 .grid-item { width: $pin-preview-width; }
 .grid-item {
-  margin-bottom: 15px;
+  margin-bottom: 20px;
 }
 .gutter-sizer {
-  width: 15px;
+  width: 20px;
 }
 
 /* card */
-$pin-footer-position-fix: -6px;
 $avatar-width: 30px;
 $avatar-height: 30px;
 @import './utils/fonts';
@@ -776,19 +776,23 @@ $avatar-height: 30px;
 }
 
 .board-card{
+  overflow: hidden;
+  border: 1px solid var(--pinry-border);
+  border-radius: 8px;
+  .preview-image { display: block; }
   .card-image > img {
     min-width: $pin-preview-width;
-    background-color: white;
+    background-color: var(--pinry-surface);
     border-radius: 3px 3px 0 0;
     @include loader('../assets/loader.gif');
   }
 }
 .board-footer {
   position: relative;
-  top: $pin-footer-position-fix;
-  background-color: white;
+  top: 0;
+  background-color: var(--pinry-surface);
   border-radius: 0 0 3px 3px ;
-  box-shadow: 0 1px 0 #bbb;
+  box-shadow: none;
   font-weight: bold;
   .description {
     @include secondary-font;
@@ -799,11 +803,11 @@ $avatar-height: 30px;
   }
   .board-info {
     padding: 10px;
-    color: $main-title-font-color;
+    color: var(--pinry-text);
   }
   .num-pins {
     font-size: 0.8rem;
-    color: $main-title-font-color;
+    color: var(--pinry-text);
   }
 }
 
@@ -814,17 +818,16 @@ $avatar-height: 30px;
   grid-template-columns: auto auto 1fr;
   align-items: center;
   gap: .45rem;
-  margin-top: -6px;
   padding: .55rem;
-  border-top: 1px solid #e7e8eb;
+  border-top: 1px solid var(--pinry-border);
   border-radius: 0 0 4px 4px;
-  background: #fff;
+  background: var(--pinry-surface);
   box-shadow: 0 1px 0 #bbb;
 }
 
 .board-order-card-controls__position {
   min-width: 2.8rem;
-  color: #666d78;
+  color: var(--pinry-muted);
   font-size: .75rem;
   font-variant-numeric: tabular-nums;
   text-align: center;
@@ -851,6 +854,11 @@ $avatar-height: 30px;
 }
 
 @import 'utils/grid-layout';
-@include screen-grid-layout("#boards-container")
+@include screen-grid-layout("#boards-container, .board-tools");
+
+@media screen and (max-width: 543px) {
+  .grid-item, .grid-sizer { width: 100%; }
+  #boards-container, .board-tools { max-width: 360px; }
+}
 
 </style>

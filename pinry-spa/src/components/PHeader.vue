@@ -4,11 +4,11 @@
       <div class="container">
         <div class="navbar-brand">
           <a class="navbar-item brand-lockup" data-test="brand-lockup" href="/">
-            <img src="../assets/svrx-pinry-light-ui.png" alt="" height="32">
+            <img src="../assets/svrx-pinry-dark-ui.png" alt="" height="32">
             <span class="brand-name" data-test="brand-name">SVRx Pinry</span>
           </a>
           <a role="button" class="navbar-burger burger"
-             aria-label="menu" aria-expanded="false"
+             aria-label="menu" :aria-expanded="String(active)"
              v-on:click="toggleMenu"
              data-target="PinryNav">
             <span aria-hidden="true"></span>
@@ -18,9 +18,6 @@
         </div>
         <div id="PinryNav" class="navbar-menu" :class="{ 'is-active': active}">
           <div class="navbar-start">
-            <a class="navbar-item" :href="bookmarklet">
-              {{ $t("bookmarkletLink") }}
-            </a>
             <div
               v-if="user.loggedIn"
               class="navbar-item has-dropdown is-hoverable">
@@ -80,6 +77,9 @@
               <div
                 class="navbar-dropdown"
                 data-test="browser-extension-menu">
+                <a class="navbar-item" :href="bookmarklet">
+                  {{ $t("bookmarkletLink") }}
+                </a>
                 <a
                   class="navbar-item"
                   data-test="custom-extension-github"
@@ -126,15 +126,16 @@
           <div class="navbar-end">
             <router-link
               :to="{ name: 'search' }"
-              class="navbar-item">
+              class="navbar-item" :aria-label="$t('searchButton')">
               <i aria-hidden="true" class="mdi mdi-magnify"
                 ></i>
             </router-link>
             <div
               class="navbar-item has-dropdown is-hoverable">
               <a class="navbar-link">
-                <i aria-hidden="true" class="mdi mdi-translate"
+                <i aria-hidden="true" class="mdi mdi-web"
                   ></i>
+                <span class="current-language">{{ langs[$i18n.locale] }}</span>
               </a>
               <div class="navbar-dropdown">
                 <a
@@ -147,7 +148,18 @@
                 </a>
               </div>
             </div>
-            <div class="navbar-item">
+            <div v-if="user.loggedIn" class="navbar-item has-dropdown is-hoverable user-menu">
+              <button type="button" class="navbar-link is-arrowless" :aria-label="user.meta.username">
+                <i aria-hidden="true" class="mdi mdi-account-circle"></i>
+              </button>
+              <div class="navbar-dropdown is-right">
+                <router-link
+                  :to="{ name: 'profile4user', params: {username: user.meta.username} }"
+                  class="navbar-item">{{ $t('profileLink') }}</router-link>
+                <button type="button" class="navbar-item" @click="logOut">{{ $t('logOutLink') }}</button>
+              </div>
+            </div>
+            <div v-else class="navbar-item">
               <div class="buttons">
                 <a
                   @click="signUp"
@@ -160,12 +172,6 @@
                   v-on:click="logIn"
                   class="button is-light">
                   {{ $t("logInLink") }}
-                </a>
-                <a
-                  v-show="user.loggedIn"
-                  v-on:click="logOut"
-                  class="button is-light">
-                  {{ $t("logOutLink") }}
                 </a>
               </div>
             </div>
@@ -265,12 +271,43 @@ export default {
 };
 </script>
 
-<style scoped>
+<style scoped lang="scss">
+.navbar { background: var(--pinry-surface); border-bottom: 1px solid var(--pinry-border); min-height: 56px; }
+.navbar > .container { width: calc(100% - 96px); max-width: none; flex-grow: 0; }
+.navbar > .container .navbar-brand { margin-left: 0; }
+.navbar > .container .navbar-menu { margin-right: 0; }
+.navbar-item, .navbar-link { color: var(--pinry-muted); font-size: 14px; }
+.navbar-link:not(.is-arrowless)::after { border-color: var(--pinry-muted); width: .45em; height: .45em; }
+.navbar-item img { max-height: 32px; }
+.navbar-item:hover, .navbar-link:hover,
+.navbar-item.has-dropdown:hover .navbar-link { background: #253135; color: var(--pinry-text); }
+.navbar-dropdown { background: var(--pinry-surface); border: 1px solid var(--pinry-border); }
+.navbar-dropdown .navbar-item:hover { background: #253135; color: var(--pinry-text); }
+.navbar-start { margin-left: 24px; gap: 8px; }
+.navbar-end { align-items: center; gap: 12px; }
+.navbar-end .mdi { font-size: 22px; }
+.navbar-end .user-menu .mdi { font-size: 34px; line-height: 1; }
+.user-menu button { border: 0; background: transparent; cursor: pointer; font: inherit; }
+.user-menu .navbar-dropdown button { width: 100%; text-align: left; }
+.user-menu:focus-within .navbar-dropdown { display: block; }
+.current-language { margin-left: 8px; }
 .brand-lockup {
   gap: .5rem;
+  padding-left: 0;
 }
 
 .brand-name {
   white-space: nowrap;
+  font-size: 18px;
+  color: var(--pinry-text);
+}
+@media screen and (max-width: 1023px) {
+  .navbar > .container { width: 100%; }
+  .brand-lockup { padding-left: 16px; }
+  .navbar-burger { color: var(--pinry-text); }
+  .navbar-menu { background: var(--pinry-surface); }
+  .navbar-start { margin-left: 0; }
+  .navbar-dropdown { border: 0; }
+  .navbar-end { display: block; }
 }
 </style>

@@ -295,7 +295,7 @@ describe('Pins board-cover selection mode', () => {
     });
     await settle();
     await wrapper.find('[data-test="board-cover-enter"]').trigger('click');
-    const links = wrapper.findAll('.pin-info a');
+    const links = wrapper.findAll('.pin-footer a');
 
     await links.at(0).trigger('click');
 

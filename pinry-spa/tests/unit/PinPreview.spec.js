@@ -59,6 +59,22 @@ describe('핀 상세 연속 감상', () => {
     expect(wrapper.find('[data-test="preview-navigation"]').exists()).toBe(false);
   });
 
+  it('이전다음 클릭은 바깥 닫기에 전파되지 않고 순번만 이동한다', async () => {
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    const outsideClick = jest.fn();
+    wrapper.element.addEventListener('click', outsideClick);
+    await wrapper.find('[data-test="preview-next"]').trigger('click');
+    expect(wrapper.find('.preview-position').text()).toBe('2 / 2');
+    expect(wrapper.emitted('close')).toBeUndefined();
+    expect(outsideClick).not.toHaveBeenCalled();
+    await wrapper.find('[data-test="preview-previous"]').trigger('click');
+    expect(wrapper.find('.preview-position').text()).toBe('1 / 2');
+    expect(wrapper.emitted('close')).toBeUndefined();
+    expect(outsideClick).not.toHaveBeenCalled();
+    await wrapper.find('[data-test="preview-close"]').trigger('click');
+    expect(wrapper.emitted('close')).toHaveLength(1);
+  });
+
   it('닫기 애니메이션 중에는 방향키로 추가 요청을 하지 않는다', async () => {
     const loadNext = jest.fn();
     open({ navigation: () => ({ items: [pin(3)], hasNext: true }), loadNext });

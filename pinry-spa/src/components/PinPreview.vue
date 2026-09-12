@@ -1,83 +1,65 @@
 <template>
   <div class="pin-preview-modal">
-    <button type="button" class="preview-close" data-test="preview-close"
-      :aria-label="$t('closeButton')" @click="closePreview">×</button>
-    <section>
+    <header class="preview-header">
+      <button type="button" class="preview-close" data-test="preview-close"
+        :aria-label="$t('closeButton')" @click="closePreview">×</button>
+      <span v-if="navigation" aria-live="polite" class="preview-position">
+        {{ currentIndex + 1 }} / {{ context.items.length }}{{ context.hasNext ? '+' : '' }}
+      </span>
+    </header>
+    <section class="card">
+      <p v-if="pageError" role="status" class="preview-message">{{ $t('previewPageError') }}</p>
+      <div class="card-image">
+        <figure class="image" :aria-busy="!imageReady && !imageError ? 'true' : 'false'">
+          <p v-if="!imageReady" role="status" class="preview-message">
+            {{ $t(imageError ? 'previewImageError' : 'previewImageLoading') }}
+          </p>
+          <img :key="currentPin.id" ref="previewImage" data-test="preview-image"
+               v-show="imageReady" :src="currentPin.large_image_url"
+               :alt="currentPin.description || $t('previewImage')"
+               @load="onImageLoaded" @error="onImageError">
+        </figure>
         <nav v-if="navigation" class="preview-navigation" data-test="preview-navigation"
              :aria-label="$t('previewNavigation')">
-          <button type="button" data-test="preview-previous" :disabled="busy || !hasPrevious"
+          <button type="button" class="preview-step preview-step--previous"
+                  data-test="preview-previous" :disabled="busy || !hasPrevious"
                   @click.stop="move(-1)" :aria-label="$t('previewPrevious')">
-            <span aria-hidden="true">‹</span> {{ $t('previewPrevious') }}
+            <span class="preview-step__circle"><i class="mdi mdi-chevron-left" aria-hidden="true"></i></span>
+            <span class="preview-step__label">{{ $t('previewPrevious') }}</span>
           </button>
-          <span aria-live="polite" class="preview-position">
-            {{ currentIndex + 1 }} / {{ context.items.length }}{{ context.hasNext ? '+' : '' }}
-          </span>
-          <button type="button" data-test="preview-next" :disabled="busy || !hasNext"
+          <button type="button" class="preview-step preview-step--next"
+                  data-test="preview-next" :disabled="busy || !hasNext"
                   @click.stop="move(1)" :aria-label="$t('previewNext')">
-            {{ $t('previewNext') }} <span aria-hidden="true">›</span>
+            <span class="preview-step__circle"><i class="mdi mdi-chevron-right" aria-hidden="true"></i></span>
+            <span class="preview-step__label">{{ $t('previewNext') }}</span>
           </button>
         </nav>
-        <p v-if="pageError" role="status" class="preview-message">{{ $t('previewPageError') }}</p>
-        <div class="card">
-          <div class="card-image">
-            <figure class="image" :aria-busy="!imageReady && !imageError ? 'true' : 'false'">
-              <p v-if="!imageReady" role="status" class="preview-message">
-                {{ $t(imageError ? 'previewImageError' : 'previewImageLoading') }}
-              </p>
-              <img :key="currentPin.id" ref="previewImage" data-test="preview-image"
-                   v-show="imageReady" :src="currentPin.large_image_url"
-                   :alt="currentPin.description || $t('previewImage')"
-                   @load="onImageLoaded" @error="onImageError">
-            </figure>
+      </div>
+      <div class="card-content">
+        <p class="description" v-html="niceLinks(currentPin.description)"></p>
+        <div class="preview-details">
+          <div class="preview-author">
+            <img :src="currentPin.avatar" alt="">
+            <span>{{ currentPin.author }}</span>
           </div>
-          <div class="card-content">
-            <div class="content">
-                <p class="description title" v-html="niceLinks(currentPin.description)"></p>
-            </div>
-            <div class="media">
-              <div class="media-left">
-                <figure class="image is-48x48">
-                  <img :src="currentPin.avatar" alt="Image">
-                </figure>
-              </div>
-              <div class="media-content">
-                <div class="is-pulled-left">
-                  <p class="title is-4 pin-meta-info"><span class="dim">{{ $t("pinnedByTitle") }}</span><span class="author">{{ currentPin.author }}</span></p>
-                  <p class="subtitle is-6" v-show="currentPin.tags.length > 0">
-                    <span class="subtitle dim">in&nbsp;</span>
-                    <template v-for="tag in currentPin.tags" :key="tag">
-                      <span class="tag pin-preview-tag is-info">{{ tag }}</span>
-                    </template>
-                  </p>
-                </div>
-                <div class="is-pulled-right">
-                  <a :href="currentPin.referer" target="_blank">
-                    <button type="button"
-                        v-show="currentPin.referer !== null"
-                        class="meta-link"
-                        >
-                      {{ $t("sourceButton") }}
-                    </button>
-                  </a>
-                  <a :href="currentPin.original_image_url" target="_blank">
-                    <button type="button"
-                        v-show="currentPin.original_image_url !== null"
-                        class="meta-link"
-                        >
-                        {{ $t("originalImageButton") }}
-                    </button>
-                  </a>
-                  <button type="button"
-                      @click="closeAndGoTo"
-                      class="meta-link"
-                      >
-                      {{ $t("permalinkButton") }}
-                  </button>
-                </div>
-              </div>
-            </div>
+          <div v-if="currentPin.tags.length" class="preview-tags">
+            <span v-for="tag in currentPin.tags" :key="tag" class="tag pin-preview-tag">{{ tag }}</span>
+          </div>
+          <div class="preview-links">
+            <a v-if="currentPin.referer !== null" :href="currentPin.referer"
+               target="_blank" rel="noopener noreferrer" class="meta-link">
+              {{ $t('sourceButton') }}
+            </a>
+            <a v-if="currentPin.original_image_url !== null" :href="currentPin.original_image_url"
+               target="_blank" rel="noopener noreferrer" class="meta-link">
+              {{ $t('originalImageButton') }}
+            </a>
+            <button type="button" @click="closeAndGoTo" class="meta-link">
+              {{ $t('permalinkButton') }}
+            </button>
           </div>
         </div>
+      </div>
     </section>
   </div>
 </template>
@@ -189,88 +171,98 @@ export default {
 };
 </script>
 
-<style lang="scss" scoped>
-@import './utils/fonts.scss';
-.preview-close { position: absolute; top: 8px; right: 8px; z-index: 3; width: 44px; height: 44px; border: 0; border-radius: 50%; background: #172126; color: white; font-size: 28px; cursor: pointer; }
-.pin-preview-modal { position: relative; padding-top: 56px; }
-
-.preview-navigation {
+<style scoped>
+.pin-preview-modal {
+  position: relative;
+  padding: 0 12px 12px;
+  border: 1px solid #526368;
+  border-radius: 9px;
+  background: var(--pinry-surface);
+  color: var(--pinry-text);
+  box-shadow: 0 18px 70px rgba(0, 0, 0, .35);
+}
+.preview-header { position: relative; display: flex; align-items: center; justify-content: center; min-height: 46px; }
+.preview-close {
+  position: absolute;
+  top: 0;
+  right: -6px;
+  z-index: 3;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--pinry-text);
+  font-size: 30px;
+  font-weight: 300;
+  cursor: pointer;
+}
+.preview-close:hover { background: #2c383c; }
+.preview-position { padding-inline: 44px; white-space: nowrap; font-size: 13px; font-variant-numeric: tabular-nums; }
+.card { background: transparent; color: inherit; box-shadow: none; }
+.card-image { position: relative; }
+.card-image .image { min-height: 96px; display: grid; align-items: center; }
+.card-image img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: calc(100dvh - 220px);
+  object-fit: contain;
+  border-radius: 5px;
+}
+.preview-step {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-24px);
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  padding: 8px;
-  background: #172126;
-  color: #fff;
-  button {
-    min-height: 44px;
-    min-width: 80px;
-    padding: 4px 12px;
-    border: 1px solid #6b828d;
-    border-radius: 6px;
-    background: #24353d;
-    color: #fff;
-    cursor: pointer;
-    font: inherit;
-    &:disabled { opacity: 0.45; cursor: default; }
-    &:focus-visible { outline: 3px solid #5ad2c7; outline-offset: 2px; }
-    span { font-size: 24px; vertical-align: middle; }
-  }
+  flex-direction: column;
+  gap: 5px;
+  width: 60px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--pinry-text);
+  font: inherit;
+  cursor: pointer;
 }
-.preview-position { white-space: nowrap; }
-.preview-message {
-  padding: 20px 12px;
-  background: #172126;
-  color: #fff;
-  text-align: center;
+.preview-step--previous { left: -84px; }
+.preview-step--next { right: -84px; }
+.preview-step__circle {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border: 1px solid #b3bec1;
+  border-radius: 50%;
+  background: rgba(17, 23, 24, .88);
+  font-size: 36px;
+  line-height: 1;
 }
-.card-image .image { min-height: 80px; }
-.meta-link {
-  margin-left: 0.3rem;
-}
-.dim {
-  @include secondary-font-color-in-dark;
-}
-.pin-meta-info {
-  line-height: 16px;
-}
-.card {
-  background-color: rgba(0, 0, 0, 0.6);
-  .content {
-    border-bottom: 1px solid #333;
-  }
-  .card-content {
-    .author {
-      @include title-font-color-in-dark;
-    }
-    padding: 0;
-    .content {
-      padding: 0.3rem;
-      margin-bottom: 0;
-    }
-    .media {
-      padding: 0.3rem;
-    }
-  }
-  .description {
-    @include title-font;
-    @include title-font-color-in-dark;
-    font-size: 16px;
-    padding: 8px;
-  }
-}
-.pin-preview-tag {
-  margin-right: 0.2rem;
-  margin-bottom: 2px;
-}
-/* preview size should always less then screen */
-.card-image img {
-  padding: 10px;
-  margin-left: auto;
-  margin-right: auto;
-  width: auto;
+.preview-step__label { font-size: 13px; text-shadow: 0 1px 4px #000; }
+.preview-step:hover .preview-step__circle { background: #2e4144; }
+.preview-step:disabled { opacity: .35; cursor: default; }
+.preview-message { padding: 20px 12px; color: var(--pinry-muted); text-align: center; }
+.card-content { padding: 12px 5px 0; }
+.description { color: var(--pinry-text); font-size: 18px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
+.preview-details { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; margin-top: 9px; }
+.preview-author { display: flex; align-items: center; gap: 8px; color: var(--pinry-muted); font-size: 12px; }
+.preview-author img { width: 26px; height: 26px; border-radius: 50%; }
+.preview-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.preview-links { display: flex; align-items: center; flex-wrap: wrap; gap: 0; margin-left: auto; }
+.meta-link { background: transparent; border: 0; color: var(--pinry-text); font: inherit; font-size: 12px; padding: 0 10px; cursor: pointer; }
+.meta-link + .meta-link { border-left: 1px solid var(--pinry-border); }
+.meta-link:hover { color: var(--pinry-accent); }
+
+@media screen and (max-width: 768px) {
+  .pin-preview-modal { padding: 0 8px 12px; }
+  .preview-step--previous { left: 6px; }
+  .preview-step--next { right: 6px; }
+  .preview-step { width: 48px; }
+  .preview-step__label { display: none; }
+  .card-image img { max-height: calc(100dvh - 200px); }
+  .description { font-size: 16px; }
+  .preview-links { margin-left: 0; flex-basis: 100%; min-height: 44px; }
+  .meta-link { min-height: 44px; display: inline-flex; align-items: center; padding-inline: 8px; }
 }
 </style>

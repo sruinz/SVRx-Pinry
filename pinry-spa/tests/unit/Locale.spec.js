@@ -561,7 +561,8 @@ describe('Header locale and extension menus', () => {
     const menu = wrapper.find('[data-test="browser-extension-menu"]');
 
     expect(menu.exists()).toBe(true);
-    expect([...menu.element.children].map(item => item.dataset.test)).toEqual([
+    expect(menu.find('a[href^="javascript:"]').text()).toBe(ko.bookmarkletLink);
+    expect([...menu.element.querySelectorAll('[data-test]')].map(item => item.dataset.test)).toEqual([
       'custom-extension-github',
       'custom-extension-chrome',
       'custom-extension-edge',

@@ -135,6 +135,27 @@ describe('Pins responsive tool area', () => {
     localStorage.clear();
   });
 
+  it('좁은 썸네일도 카드 폭을 채우며 로딩 전후 비율과 목록 순서를 유지한다', async () => {
+    const wrapper = mountPins();
+    const portrait = pin(41);
+    portrait.image.thumbnail.width = 120;
+    portrait.image.thumbnail.height = 240;
+    API.fetchPins.mockResolvedValue({ data: { results: [portrait, pin(40)], next: null } });
+    await settle();
+    wrapper.vm.reset();
+    await settle();
+
+    const image = wrapper.find('[data-test="pin-image-41"]');
+    expect(image.element.style.width).toBe('100%');
+    expect(image.element.style.height).toBe('auto');
+    expect(image.element.style.aspectRatio).toBe('120 / 240');
+    await image.trigger('load');
+    expect(image.element.style.width).toBe('100%');
+    expect(image.element.style.height).toBe('auto');
+    expect(wrapper.findAll('.pin-preview-image').map(item => item.attributes('data-test')))
+      .toEqual(['pin-image-41', 'pin-image-40']);
+  });
+
   it.each([
     ['main list', {}, 'owner', 'owner', true, false, false],
     ['another user list', { userFilter: 'other' }, 'owner', 'owner', true, false, false],

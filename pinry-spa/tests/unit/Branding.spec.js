@@ -121,7 +121,7 @@ describe('SVRx Pinry branding', () => {
     initializeUser.mockRestore();
   });
 
-  it('renders the graphite artwork for the light navbar in the home link', () => {
+  it('다크 헤더의 홈 링크에 밝은 은색 로고를 표시한다', () => {
     const wrapper = shallowMount(PHeader, {
       global: {
         directives: { masonry: {}, 'masonry-tile': {} },
@@ -137,7 +137,7 @@ describe('SVRx Pinry branding', () => {
       height: '32',
     });
     expect(lockup.find('picture').exists()).toBe(false);
-    expect(lockup.find('img').attributes('src')).toContain('svrx-pinry-light-ui.png');
+    expect(lockup.find('img').attributes('src')).toContain('svrx-pinry-dark-ui.png');
     expect(wrapper.find('[data-test="brand-name"]').text()).toBe('SVRx Pinry');
   });
 

@@ -217,7 +217,7 @@
                     aria-hidden="true"
                   >✓</span>
                   <span v-if="item.animation_format" class="pin-animation-badge">
-                    {{ item.animation_format }} ▶
+                    {{ item.animation_format }}
                   </span>
                   <img :src="item.url"
                      @load="onPinImageLoaded(item.id)"
@@ -230,30 +230,17 @@
                 <div class="pin-footer">
                   <div class="description" v-show="item.description" v-html="niceLinks(item.description)"></div>
                   <div class="details">
-                    <div class="is-pulled-left">
+                    <div class="pin-author">
                       <img class="avatar" :src="item.avatar" alt="">
+                      <router-link :to="{ name: 'user', params: {user: item.author} }">
+                        {{ item.author }}
+                      </router-link>
                     </div>
                     <div class="pin-info">
-                      <span class="dim">{{ $t("pinnedByInfo") }}&nbsp;
-                        <span>
-                          <router-link
-                            :to="{ name: 'user', params: {user: item.author} }">
-                            {{ item.author }}
-                          </router-link>
-                        </span>
-                        <template v-if="item.tags.length > 0">
-                          &nbsp;in&nbsp;
-                          <template v-for="tag in item.tags" :key="tag">
-                            <span class="pin-tag">
-                              <router-link :to="{ name: 'tag', params: {tag: tag} }"
-                                           params="{tag: tag}">{{ tag }}</router-link>
-                            </span>
-                          </template>
-                        </template>
-                        <span v-if="item.referer">• <a :href="item.referer" target="_blank">{{ $t("sourceLink") }}</a></span>
+                      <span v-for="tag in item.tags" :key="tag" class="pin-tag">
+                        <router-link :to="{ name: 'tag', params: {tag: tag} }">{{ tag }}</router-link>
                       </span>
                     </div>
-                    <div class="is-clearfix"></div>
                   </div>
                 </div>
               </div>
@@ -356,8 +343,9 @@ function createImageItem(pin) {
   image.referer = pin.referer;
   image.orgianl_width = pin.image.width;
   image.style = {
-    width: `${pin.image.thumbnail.width}px`,
-    height: `${pin.image.thumbnail.height}px`,
+    width: '100%',
+    height: 'auto',
+    aspectRatio: `${pin.image.thumbnail.width} / ${pin.image.thumbnail.height}`,
   };
   image.class = {};
   return image;
@@ -1474,170 +1462,85 @@ export default {
 </script>
 
 <style lang="scss" scoped>
-/* grid */
 @import 'utils/pin';
 
-.grid-sizer,
-.grid-item { width: $pin-preview-width; }
-.grid-item {
-  margin-bottom: 15px;
-}
-.gutter-sizer {
-  width: 15px;
-}
-
-.pin-image-container {
-  position: relative;
-}
+.grid-sizer, .grid-item { width: $pin-preview-width; }
+.grid-item { margin-bottom: 20px; }
+.gutter-sizer { width: 20px; }
+.pin-image-container { position: relative; }
 .pin-animation-badge {
   position: absolute;
-  bottom: 8px;
+  top: 8px;
   left: 8px;
   z-index: 1;
   padding: 2px 6px;
-  border-radius: 3px;
-  background: rgba(0, 0, 0, 0.8);
+  border: 1px solid #667276;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, .8);
   color: #fff;
   font-size: 12px;
   font-weight: 700;
   line-height: 20px;
   pointer-events: none;
 }
-
-/* pin-image transition */
-.pin-masonry.image-loaded{
-  opacity: 1;
-  transition: opacity .3s;
-}
-.pin-masonry {
-  opacity: 0;
-}
-
-/* card */
-$pin-footer-position-fix: -6px;
-$avatar-width: 30px;
-$avatar-height: 30px;
-@import './utils/fonts';
-@import './utils/loader.scss';
-
-.pin-tools {
-  margin-bottom: 1rem;
-}
-
-.pin-tools__primary,
-.pin-tools__management,
-.pin-tools__active {
+.pin-masonry.image-loaded { opacity: 1; transition: opacity .3s; }
+.pin-masonry { opacity: 0; }
+.pin-tools { margin-bottom: 12px; }
+.pin-tools__primary, .pin-tools__management, .pin-tools__active {
   display: flex;
   align-items: center;
   gap: .5rem;
 }
+.pin-tools__primary, .pin-tools__active { justify-content: space-between; }
+.pin-tools__management { flex-wrap: wrap; justify-content: flex-end; }
+.pin-tools__active { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--pinry-border); }
+.pin-tools__status { margin: 0; }
 
-.pin-tools__primary,
-.pin-tools__active {
-  justify-content: space-between;
-}
-
-.pin-tools__management {
-  flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
-.pin-tools__active {
-  margin-top: 1rem;
-  padding-top: 1rem;
-  border-top: 1px solid #dbdbdb;
-}
-
-.pin-tools__status {
-  margin: 0;
-}
-
-@media screen and (max-width: 768px) {
-  .pin-tools__primary,
-  .pin-tools__active {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .pin-tools__management {
-    justify-content: flex-start;
-  }
-}
-
-.pin-card{
+.pin-card {
   position: relative;
-
-  &.is-selected {
-    outline: 3px solid #3273dc;
-    outline-offset: 2px;
-  }
-
-  &[role="button"] .pin-preview-image {
-    cursor: pointer;
-  }
-
+  border: 1px solid #2d3b3f;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--pinry-surface);
+  &.is-selected { outline: 3px solid var(--pinry-accent); outline-offset: 2px; }
+  &[role="button"] .pin-preview-image { cursor: pointer; }
   &.is-cover-disabled {
     opacity: .6;
-
-    .pin-preview-image {
-      cursor: not-allowed;
-    }
+    .pin-preview-image { cursor: not-allowed; }
   }
-
-  .pin-selection-check {
-    position: absolute;
-    z-index: 2;
-    top: .5rem;
-    left: .5rem;
-  }
-
-  .pin-preview-image {
-    cursor: zoom-in;
-  }
-  > img {
-    min-width: $pin-preview-width;
-    background-color: white;
-    border-radius: 3px 3px 0 0;
-    @include loader('../assets/loader.gif');
-  }
-  .avatar {
-    height: $avatar-height;
-    width: $avatar-width;
-    border-radius: 3px;
-  }
-  .pin-tag {
-    margin-right: 0.2rem;
-  }
+  .pin-selection-check { position: absolute; z-index: 2; top: .5rem; left: .5rem; }
+  .pin-preview-image { display: block; cursor: zoom-in; }
+  .avatar { height: 18px; width: 18px; border-radius: 50%; }
+  .pin-tag { padding: 1px 7px; border: 1px solid var(--pinry-border); border-radius: 6px; background: #232f33; }
 }
 .pin-footer {
-  position: relative;
-  overflow-wrap: break-word;
-  top: $pin-footer-position-fix;
-  background-color: white;
-  border-radius: 0 0 3px 3px ;
-  box-shadow: 0 1px 0 #bbb;
-  .description {
-    @include description-font;
-    padding: 8px;
-    border-bottom: 1px solid #DDDDDD;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
+  overflow-wrap: anywhere;
+  padding: 10px 11px;
+  .description { color: var(--pinry-text); font-size: 13px; line-height: 1.5; margin-bottom: 8px; }
   .details {
-    @include secondary-font;
-    padding: 10px;
-    > .pin-info {
-      line-height: 16px;
-      width: 220px;
-      padding-left: $avatar-width + 5px;
-    }
-    .pin-info a {
-      font-weight: bold;
-    }
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 6px;
+    color: var(--pinry-muted);
+    font-size: 11px;
+    line-height: 18px;
   }
+  .pin-author, .pin-info { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .pin-info { flex-wrap: wrap; }
+  .pin-author a, .pin-info a { color: var(--pinry-muted); }
+  .pin-author a:hover, .pin-info a:hover { color: var(--pinry-accent); }
 }
-
 @import 'utils/grid-layout';
-@include screen-grid-layout("#pins-container")
+@include screen-grid-layout("#pins-container, .pin-tools");
 
+@media screen and (max-width: 768px) {
+  .pin-tools__primary, .pin-tools__active { align-items: stretch; flex-direction: column; }
+  .pin-tools__management { justify-content: flex-start; }
+}
+@media screen and (max-width: 543px) {
+  .grid-item, .grid-sizer { width: 100%; }
+  #pins-container, .pin-tools { max-width: 360px; }
+}
 </style>

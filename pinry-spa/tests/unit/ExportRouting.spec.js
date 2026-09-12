@@ -1,9 +1,11 @@
 /* eslint-env jest */
 
 import { shallowMount } from '@vue/test-utils';
+import { createI18n } from 'vue-i18n';
 
 import PHeader from '@/components/PHeader.vue';
 import router from '@/router';
+import ko from '@/components/utils/i18n/locales/ko.json';
 
 function mountHeader() {
   const initializeUser = jest.spyOn(PHeader.methods, 'initializeUser')
@@ -12,7 +14,7 @@ function mountHeader() {
   const wrapper = shallowMount(PHeader, {
     global: {
       directives: { masonry: {}, 'masonry-tile': {} },
-      mocks: { $t: key => key },
+      plugins: [createI18n({ legacy: true, locale: 'ko', messages: { ko } })],
       stubs: {
         'router-link': {
           name: 'RouterLinkStub',
