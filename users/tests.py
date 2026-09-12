@@ -44,6 +44,61 @@ class CombinedAuthBackendTest(TestCase):
     def test_authenticate_unknown_user(self):
         self.assertIsNone(self.backend.authenticate(username='wrong-username', password='wrong-password'))
 
+    def test_exact_email_shaped_username_wins_over_duplicate_email_aliases(self):
+        from django.contrib.auth import authenticate
+
+        exact = User.objects.create_user(
+            username='owner@example.com',
+            email='owner@example.com',
+            password='exact-password',
+        )
+        User.objects.create_user(
+            username='sso-account',
+            email='owner@example.com',
+        )
+
+        user = authenticate(username='owner@example.com', password='exact-password')
+
+        self.assertEqual(user.pk, exact.pk)
+
+    def test_ambiguous_email_alias_fails_authentication(self):
+        from django.contrib.auth import authenticate
+
+        User.objects.create_user(
+            username='first-account',
+            email='shared@example.com',
+            password='first-password',
+        )
+        User.objects.create_user(
+            username='second-account',
+            email='shared@example.com',
+        )
+
+        user = authenticate(username='shared@example.com', password='first-password')
+
+        self.assertIsNone(user)
+
+    @override_settings(PUBLIC=False)
+    def test_inactive_password_session_is_rejected_by_private_site(self):
+        from django.contrib.auth import BACKEND_SESSION_KEY
+
+        response = self.client.post(
+            '/api/v2/profile/login/',
+            {'username': self.username, 'password': self.password},
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            self.client.session[BACKEND_SESSION_KEY],
+            'users.auth.backends.CombinedAuthBackend',
+        )
+        self.assertEqual(self.client.get('/api/v2/pins/').status_code, 200)
+
+        User.objects.filter(username=self.username).update(is_active=False)
+        response = self.client.get('/api/v2/pins/')
+
+        self.assertEqual(response.status_code, 403)
+
 
 class CreateUserTest(TestCase):
     def register(self, username, **extra_data):

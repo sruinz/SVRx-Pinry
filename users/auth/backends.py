@@ -22,22 +22,21 @@ class CombinedAuthBackend(object):
             raise PermissionDenied('비밀번호 로그인이 비활성화되어 있습니다.')
         if not isinstance(username, str):
             return None
-        is_email = email_re.match(username)
-        if is_email:
-            qs = User.objects.filter(email=username)
-        else:
-            qs = User.objects.filter(username=username)
-
         try:
-            user = qs.get()
+            user = User.objects.get(username=username)
         except User.DoesNotExist:
-            return None
+            if not email_re.match(username):
+                return None
+            try:
+                user = User.objects.get(email=username)
+            except (User.DoesNotExist, User.MultipleObjectsReturned):
+                return None
         if user.is_active and user.check_password(password):
             return user
         return None
 
     def get_user(self, user_id):
         try:
-            return User.objects.get(pk=user_id)
+            return User.objects.get(pk=user_id, is_active=True)
         except User.DoesNotExist:
             return None
