@@ -1,4 +1,6 @@
 {
+  "switchToLightTheme": "Switch to light mode",
+  "switchToDarkTheme": "Switch to dark mode",
   "confirmButton": "Confirm",
   "loading": "Loading…",
   "loginSubtitle": "Choose an account to continue.",

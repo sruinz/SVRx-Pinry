@@ -1498,7 +1498,7 @@ export default {
 
 .pin-card {
   position: relative;
-  border: 1px solid #2d3b3f;
+  border: 1px solid var(--pinry-border);
   border-radius: 8px;
   overflow: hidden;
   background: var(--pinry-surface);
@@ -1511,7 +1511,7 @@ export default {
   .pin-selection-check { position: absolute; z-index: 2; top: .5rem; left: .5rem; }
   .pin-preview-image { display: block; cursor: zoom-in; }
   .avatar { height: 18px; width: 18px; border-radius: 50%; }
-  .pin-tag { padding: 1px 7px; border: 1px solid var(--pinry-border); border-radius: 6px; background: #232f33; }
+  .pin-tag { padding: 1px 7px; border: 1px solid var(--pinry-border); border-radius: 6px; background: var(--pinry-tag); }
 }
 .pin-footer {
   overflow-wrap: anywhere;

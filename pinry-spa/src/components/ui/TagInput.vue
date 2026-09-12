@@ -86,12 +86,12 @@ export default {
 
 <style scoped>
 .tag-input { position: relative; width: 100%; }
-.tag-input-control { min-height: 36px; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; border: 1px solid #b5b5b5; border-radius: 4px; padding: 4px; background: #fff; }
+.tag-input-control { min-height: 36px; display: flex; flex-wrap: wrap; align-items: center; gap: 4px; border: 1px solid var(--pinry-border); border-radius: 4px; padding: 4px; background: var(--pinry-background); }
 .tag-input-control input { flex: 1; min-width: 100px; border: 0; background: transparent; color: inherit; font: inherit; outline: none; }
-.tag-input-control:focus-within { outline: 2px solid #00c4a7; }
+.tag-input-control:focus-within { outline: 2px solid var(--pinry-accent); }
 .tag button { border: 0; background: transparent; cursor: pointer; margin-left: 4px; }
-.tag-input-options { position: absolute; z-index: 3; width: 100%; max-height: 200px; overflow: auto; margin: 0; background: #fff; border: 1px solid #b5b5b5; border-radius: 4px; list-style: none; }
+.tag-input-options { position: absolute; z-index: 3; width: 100%; max-height: 200px; overflow: auto; margin: 0; background: var(--pinry-background); border: 1px solid var(--pinry-border); border-radius: 4px; list-style: none; }
 .tag-input-options li { padding: 8px; cursor: pointer; }
-.tag-input-options li[aria-selected="true"], .tag-input-options li:hover { background: #e4f8f3; }
+.tag-input-options li[aria-selected="true"], .tag-input-options li:hover { background: var(--pinry-selection); }
 .is-disabled { opacity: .6; }
 </style>

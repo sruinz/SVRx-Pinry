@@ -22,7 +22,6 @@
         :aria-label="$t('selectBoardLabel')"
         class="select-list"
         multiple
-        expanded
         size="8"
         v-model="selectedOptions">
         <template v-for="option in availableOptions" :key="option.value">
@@ -128,3 +127,21 @@ export default {
   },
 };
 </script>
+
+<style scoped>
+.select-list {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 6px;
+  font: inherit;
+  color: var(--pinry-text);
+  background: var(--pinry-background);
+  border: 1px solid var(--pinry-border);
+  border-radius: 6px;
+}
+.select-list option { padding: 8px 10px; border-radius: 4px; }
+.select-list option:checked { background: var(--pinry-selection); color: var(--pinry-text); }
+.select-list:focus { border-color: var(--pinry-accent); }
+</style>

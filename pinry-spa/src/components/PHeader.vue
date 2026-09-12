@@ -7,6 +7,13 @@
             <img src="../assets/svrx-pinry-dark-ui.png" alt="" height="32">
             <span class="brand-name" data-test="brand-name">SVRx Pinry</span>
           </a>
+          <button type="button" class="theme-toggle" data-test="theme-toggle"
+            :aria-label="$t(theme === 'dark' ? 'switchToLightTheme' : 'switchToDarkTheme')"
+            :title="$t(theme === 'dark' ? 'switchToLightTheme' : 'switchToDarkTheme')"
+            @click="toggleTheme">
+            <i aria-hidden="true" class="mdi"
+              :class="theme === 'dark' ? 'mdi-white-balance-sunny' : 'mdi-weather-night'"></i>
+          </button>
           <a role="button" class="navbar-burger burger"
              aria-label="menu" :aria-expanded="String(active)"
              v-on:click="toggleMenu"
@@ -190,12 +197,14 @@ import localeUtils, {
 } from '@/components/utils/i18n';
 import api from './api';
 import modals from './modals';
+import { loadTheme, applyTheme } from './utils/theme';
 
 export default {
   name: 'p-header',
   data() {
     return {
       active: false,
+      theme: loadTheme(),
       passwordAllowed: false,
       user: {
         loggedIn: false,
@@ -213,6 +222,10 @@ export default {
     },
   },
   methods: {
+    toggleTheme() {
+      this.theme = this.theme === 'dark' ? 'light' : 'dark';
+      applyTheme(this.theme);
+    },
     setLocale(locale) {
       const persisted = persistLocale(localStorage, locale);
       this.$i18n.locale = syncDocumentLocale(document, persisted);
@@ -279,10 +292,12 @@ export default {
 .navbar-item, .navbar-link { color: var(--pinry-muted); font-size: 14px; }
 .navbar-link:not(.is-arrowless)::after { border-color: var(--pinry-muted); width: .45em; height: .45em; }
 .navbar-item img { max-height: 32px; }
+.theme-toggle { align-self: center; flex-shrink: 0; width: 44px; height: 44px; margin-left: 8px; border: 0; border-radius: 6px; background: transparent; color: var(--pinry-text); cursor: pointer; font-size: 22px; }
+.theme-toggle:hover { background: var(--pinry-hover); }
 .navbar-item:hover, .navbar-link:hover,
-.navbar-item.has-dropdown:hover .navbar-link { background: #253135; color: var(--pinry-text); }
+.navbar-item.has-dropdown:hover .navbar-link { background: var(--pinry-hover); color: var(--pinry-text); }
 .navbar-dropdown { background: var(--pinry-surface); border: 1px solid var(--pinry-border); }
-.navbar-dropdown .navbar-item:hover { background: #253135; color: var(--pinry-text); }
+.navbar-dropdown .navbar-item:hover { background: var(--pinry-hover); color: var(--pinry-text); }
 .navbar-start { margin-left: 24px; gap: 8px; }
 .navbar-end { align-items: center; gap: 12px; }
 .navbar-end .mdi { font-size: 22px; }

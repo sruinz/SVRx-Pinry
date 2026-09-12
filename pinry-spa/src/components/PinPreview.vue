@@ -197,7 +197,7 @@ export default {
   font-weight: 300;
   cursor: pointer;
 }
-.preview-close:hover { background: #2c383c; }
+.preview-close:hover { background: var(--pinry-hover); }
 .preview-position { padding-inline: 44px; white-space: nowrap; font-size: 13px; font-variant-numeric: tabular-nums; }
 .card { background: transparent; color: inherit; box-shadow: none; }
 .card-image { position: relative; }
@@ -222,7 +222,7 @@ export default {
   padding: 0;
   border: 0;
   background: transparent;
-  color: var(--pinry-text);
+  color: #edf1f1;
   font: inherit;
   cursor: pointer;
 }

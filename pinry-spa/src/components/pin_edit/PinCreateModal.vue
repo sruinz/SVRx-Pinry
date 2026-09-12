@@ -366,3 +366,7 @@ export default {
   },
 };
 </script>
+
+<style scoped>
+.columns > .column { min-width: 0; }
+</style>

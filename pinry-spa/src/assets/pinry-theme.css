@@ -6,12 +6,32 @@
   --pinry-muted: #aeb9bc;
   --pinry-accent: #00c4a7;
   --pinry-border: #344247;
+  --pinry-hover: #253135;
+  --pinry-tag: #232f33;
+  --pinry-selection: #253d3a;
+  --pinry-link-hover: #6de1cf;
+  --pinry-link: #00c4a7;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --pinry-background: #f3f6f6;
+  --pinry-surface: #ffffff;
+  --pinry-text: #203034;
+  --pinry-muted: #53666c;
+  --pinry-accent: #00c4a7;
+  --pinry-border: #c2ced1;
+  --pinry-hover: #e5eded;
+  --pinry-tag: #e9f0f0;
+  --pinry-selection: #c6eee6;
+  --pinry-link-hover: #006c5c;
+  --pinry-link: #007d6b;
 }
 
 html, body, #app { min-height: 100%; background: var(--pinry-background); }
 body { color: var(--pinry-text); font-family: 'Open Sans', sans-serif; }
-a { color: var(--pinry-accent); }
-a:hover { color: #6de1cf; }
+a { color: var(--pinry-link); }
+a:hover { color: var(--pinry-link-hover); }
 :focus-visible { outline: 2px solid var(--pinry-accent); outline-offset: 3px; }
 .title, .subtitle, .label, .card-header-title, .content h1, .content h2, .content h3 { color: var(--pinry-text); }
 .help, .has-text-grey { color: var(--pinry-muted) !important; }
@@ -35,7 +55,7 @@ a:hover { color: #6de1cf; }
   border-color: var(--pinry-border);
   border-radius: 6px;
 }
-.button:hover, .button.is-light:hover { background: #253135; color: var(--pinry-text); border-color: #61757c; }
+.button:hover, .button.is-light:hover { background: var(--pinry-hover); color: var(--pinry-text); border-color: #61757c; }
 .button.is-primary, .button.is-primary:hover {
   background: var(--pinry-accent);
   color: #092c27;
@@ -44,18 +64,18 @@ a:hover { color: #6de1cf; }
 .button.is-danger { background: #a6313b; color: #fff; border-color: #a6313b; }
 .button[disabled], .input[disabled], .textarea[disabled] { opacity: .5; }
 .tag:not(body), .tag:not(body).is-info {
-  background: #232f33;
+  background: var(--pinry-tag);
   color: var(--pinry-muted);
   border: 1px solid var(--pinry-border);
   border-radius: 6px;
 }
-.notification { background: #253135; color: var(--pinry-text); }
+.notification { background: var(--pinry-hover); color: var(--pinry-text); }
 .table { background: var(--pinry-surface); color: var(--pinry-text); }
 .table th, .table thead td, .table thead th { color: var(--pinry-text); }
 .table td, .table th { border-color: var(--pinry-border); }
 .tabs a { color: var(--pinry-muted); border-color: var(--pinry-border); }
 .tabs.is-toggle li.is-active a { background: var(--pinry-accent); color: #092c27; border-color: var(--pinry-accent); }
-.tabs a:hover { color: var(--pinry-text); background: #253135; }
+.tabs a:hover { color: var(--pinry-text); background: var(--pinry-hover); }
 .search-panel .filter-selector { background: var(--pinry-surface); }
 .tag-input .tag-input-control, .tag-input .tag-input-options {
   background: var(--pinry-background);
@@ -63,7 +83,7 @@ a:hover { color: #6de1cf; }
   border-color: var(--pinry-border);
 }
 .tag-input .tag-input-options li[aria-selected="true"], .tag-input .tag-input-options li:hover {
-  background: #253d3a;
+  background: var(--pinry-selection);
 }
 .pins > .section, .boards > .section { padding: 16px 24px 40px; }
 .pin-sort__buttons.buttons.has-addons { gap: 6px; }
@@ -76,7 +96,56 @@ a:hover { color: #6de1cf; }
   border-radius: 24px;
   padding-inline: 20px;
 }
-.pin-tools__management [data-test="pin-selection-enter"]:hover { background: #253135; }
+.pin-tools__management [data-test="pin-selection-enter"]:hover { background: var(--pinry-hover); }
+
+/* 독립적인 다크 스타일을 가진 로그인·프로필도 같은 테마 선택을 따른다. */
+:root[data-theme="light"] .login-card,
+:root[data-theme="light"] .sso-card,
+:root[data-theme="light"] .sso-card .card-header {
+  background: var(--pinry-surface);
+  color: var(--pinry-text);
+  border-color: var(--pinry-border);
+}
+:root[data-theme="light"] .login-card__brand,
+:root[data-theme="light"] .login-card__body h1,
+:root[data-theme="light"] .password-disclosure,
+:root[data-theme="light"] .password-form .label,
+:root[data-theme="light"] .sso-card .card-header-title,
+:root[data-theme="light"] .sso-manual-controls summary,
+:root[data-theme="light"] .sso-password-reauth label,
+:root[data-theme="light"] .sso-secondary-action {
+  color: var(--pinry-text);
+}
+:root[data-theme="light"] .login-card__subtitle,
+:root[data-theme="light"] .sso-auto-link-help,
+:root[data-theme="light"] .sso-manual-help,
+:root[data-theme="light"] .sso-provider-help,
+:root[data-theme="light"] .sso-provider-status { color: var(--pinry-muted); }
+:root[data-theme="light"] .password-form .input,
+:root[data-theme="light"] .login-card__status,
+:root[data-theme="light"] .sso-password-reauth input,
+:root[data-theme="light"] .sso-provider-row {
+  background: var(--pinry-background);
+  color: var(--pinry-text);
+  border-color: var(--pinry-border);
+}
+:root[data-theme="light"] .password-form .input::placeholder,
+:root[data-theme="light"] .sso-password-reauth input::placeholder { color: var(--pinry-muted); }
+:root[data-theme="light"] .password-disclosure,
+:root[data-theme="light"] .sso-manual-controls,
+:root[data-theme="light"] .sso-link-list { border-color: var(--pinry-border); }
+:root[data-theme="light"] .login-card__close:hover,
+:root[data-theme="light"] .login-card__close:focus-visible { background: var(--pinry-hover); }
+:root[data-theme="light"] .login-card__brand img,
+:root[data-theme="light"] .brand-lockup img,
+:root[data-theme="light"] .login-card__close img,
+:root[data-theme="light"] .password-disclosure img { filter: brightness(.35); }
+:root[data-theme="light"] .sso-provider-row__identity img {
+  background: #273337;
+  border-radius: 4px;
+  padding: 3px;
+}
+:root[data-theme="light"] .sso-card .sso-unlink-reason { color: #a12736; }
 
 @media screen and (max-width: 768px) {
   .pins > .section, .boards > .section { padding: 16px 16px 32px; }

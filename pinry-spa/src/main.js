@@ -10,9 +10,11 @@ import App from './App.vue';
 import router from './router';
 import setUpAxiosCsrfConfig from './components/utils/csrf';
 import './registerServiceWorker';
+import { loadTheme } from './components/utils/theme';
 
 
 setUpAxiosCsrfConfig();
+loadTheme();
 
 const i18n = createI18n({
   legacy: true,

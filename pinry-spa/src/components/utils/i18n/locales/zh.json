@@ -1,4 +1,6 @@
 {
+  "switchToLightTheme": "切换到浅色模式",
+  "switchToDarkTheme": "切换到深色模式",
   "confirmButton": "确认",
   "loading": "加载中…",
   "loginSubtitle": "选择要使用的账号。",

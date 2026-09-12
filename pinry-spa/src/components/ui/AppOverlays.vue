@@ -76,6 +76,8 @@ export default {
 .app-modal { max-width: calc(100vw - 48px); max-height: calc(100dvh - 48px); }
 .app-modal .modal-content { display: block; max-height: calc(100dvh - 48px); overflow: auto; margin: 0; }
 .app-modal .modal-card { max-width: 100%; margin: 0; }
+.app-modal.pin-editor-modal { width: 1080px; }
+.app-modal.pin-editor-modal .modal-content { width: 100%; }
 .app-modal.pin-preview-at-home { width: 900px; }
 .app-modal.pin-preview-at-home .modal-content { width: 100%; padding-inline: 72px; }
 @media screen and (max-width: 768px) {

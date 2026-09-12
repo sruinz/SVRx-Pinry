@@ -12,6 +12,7 @@ import ExportDialog from './export/ExportDialog.vue';
 function openPinEdit(vm, props = null, onCreated = null) {
   return overlays.openModal(vm, {
     component: PinCreateModal,
+    customClass: 'pin-editor-modal',
     props,
     canCancel: false,
     events: {

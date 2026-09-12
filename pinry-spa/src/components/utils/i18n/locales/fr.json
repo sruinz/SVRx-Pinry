@@ -1,4 +1,6 @@
 {
+  "switchToLightTheme": "Passer au thème clair",
+  "switchToDarkTheme": "Passer au thème sombre",
   "confirmButton": "Confirmer",
   "loading": "Chargement…",
   "loginSubtitle": "Choisissez un compte pour continuer.",
