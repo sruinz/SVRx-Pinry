@@ -14,7 +14,7 @@
       :pt="{ mask: { class: 'app-modal-mask' }, content: { class: 'modal-content' } }"
       @update:visible="entry.close()">
       <template #container>
-        <div class="modal-content">
+        <div class="modal-content" tabindex="-1" @vue:mounted="focusModal(entry, $event.el)">
           <ModalContent :entry="entry" />
         </div>
       </template>
@@ -47,6 +47,14 @@ export default {
     [...this.state.modals].reverse().forEach(entry => entry.close());
   },
   methods: {
+    focusModal(entry, content) {
+      if (entry !== this.state.modals[this.state.modals.length - 1]
+          || content.contains(document.activeElement)) return;
+      const target = content.querySelector('[autofocus]:not([disabled])')
+        || content.querySelector('button:not([disabled]), a[href], input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex="0"]')
+        || content;
+      target.focus({ preventScroll: true });
+    },
     canCancel(entry, action) {
       if (entry !== this.state.modals[this.state.modals.length - 1]) return false;
       return entry.canCancel === true

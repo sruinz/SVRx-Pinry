@@ -78,13 +78,23 @@ describe('실제 앱 모달 경계', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  it('확인 모달은 취소 버튼에 초점을 두고 닫으면 원래 실행 버튼으로 복원한다', async () => {
+    handles.push(overlays.confirm(wrapper.vm, { message: '삭제하시겠습니까?' }));
+    await nextTick();
+    expect(document.querySelector('[role="dialog"]').contains(document.activeElement)).toBe(true);
+    expect(document.activeElement.textContent).toBe('닫기');
+    document.activeElement.click();
+    await nextTick();
+    expect(document.activeElement).toBe(trigger);
+  });
+
   it('명시적 닫기는 한 번만 통지하고 내용·스크롤 잠금 해제와 초점을 복원한다', async () => {
     const onClose = jest.fn();
     open({ onClose });
     await nextTick();
     const close = document.querySelector('[data-test="close"]');
     expect(close).not.toBeNull();
-    close.focus();
+    expect(document.querySelector('[role="dialog"]').contains(document.activeElement)).toBe(true);
     close.click();
     await nextTick();
     await nextTick();
@@ -99,14 +109,20 @@ describe('실제 앱 모달 경계', () => {
     const upperClosed = jest.fn();
     open({ onClose: lowerClosed });
     await nextTick();
+    const lowerFocus = document.activeElement;
+    expect(document.querySelector('[role="dialog"]').contains(lowerFocus)).toBe(true);
     open({ onClose: upperClosed });
     await nextTick();
+    const dialogs = document.querySelectorAll('[role="dialog"]');
+    expect(dialogs[1].contains(document.activeElement)).toBe(true);
+    expect(dialogs[0].contains(document.activeElement)).toBe(false);
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     await nextTick();
     expect(upperClosed).toHaveBeenCalledTimes(1);
     expect(lowerClosed).not.toHaveBeenCalled();
     expect(document.querySelectorAll('[data-test="close"]')).toHaveLength(1);
     expect(document.body.style.overflow).toBe('hidden');
+    expect(document.activeElement).toBe(lowerFocus);
   });
 
   it('실제 상세보기의 다음 클릭은 모달을 유지하고 외부 닫기 직후 추가 요청을 막는다', async () => {
@@ -128,6 +144,7 @@ describe('실제 앱 모달 경계', () => {
       onClose,
     });
     await nextTick();
+    expect(document.activeElement).toBe(document.querySelector('[data-test="preview-close"]'));
     const next = document.querySelector('[data-test="preview-next"]');
     next.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     next.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
