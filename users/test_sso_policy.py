@@ -233,6 +233,6 @@ class SSOOnlyProofTests(TestCase):
             'internal_cidrs': '[]', 'expected_revision': 1, 'expected_policy_revision': 1,
         }, follow=True)
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, '허용 endpoint origin')
+        self.assertIn('allowed_endpoint_origins', response.context['adminform'].form.errors)
         self.provider.refresh_from_db()
         self.assertEqual(self.provider.allowed_endpoint_origins, ['https://accounts.google.com'])

@@ -376,8 +376,9 @@ class SSOConfigurationAdminTest(TestCase):
             self.provider_form_data(enabled="on"),
         )
 
-        self.assertEqual(response.status_code, 302)
-        self.assertContains(self.client.get(response['Location']), "HTTPS 기준 URL")
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "HTTPS 기준 URL")
+        self.assertIn('public_base_url', response.context['adminform'].form.errors)
         self.assertFalse(SSOProvider.objects.exists())
 
     def test_admin_save_uses_configuration_revision(self):

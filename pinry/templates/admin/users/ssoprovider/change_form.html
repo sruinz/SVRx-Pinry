@@ -1,0 +1,6 @@
+{% extends "admin/change_form.html" %}
+{% block form_top %}
+  <p><a href="{{ setup_guide_url }}" target="_blank" rel="noopener">SSO 설정 가이드 열기 ↗</a> — 제공자 등록 절차와 복사할 주소를 확인하세요. 새 설정은 비활성 상태로 먼저 저장하세요.</p>
+  {{ provider_guides|json_script:"sso-provider-guides" }}
+  {{ block.super }}
+{% endblock %}

@@ -52,8 +52,24 @@ Client ID·Client Secret, 필요한 issuer·Discovery URL을 입력한다. 활�
 관리자 화면에 표시된 **등록할 정확한 콜백 주소**를 IdP의 redirect URI로
 등록한다. 비표준 포트는 URL에 포함하고 프록시가 원래 Host를 보존하게 한다.
 
+새 제공자는 먼저 **비활성 상태로 저장**한다. 저장 후 고유 ID가 포함된 콜백
+주소를 IdP에 등록하고 나머지 필수 값을 채워 활성화한다. 저장 전 임시 ID를
+콜백으로 사용하지 않는다. 목록·편집 화면의 **SSO 설정 가이드**
+(`/admin/users/ssoprovider/setup-guide/`)는 활성 슈퍼 관리자만 열 수 있다.
+종류별 등록 절차·예시, 현재 접속 주소 기준 참고 URI, 저장된 공개 주소 기준
+확정 URI와 복사 버튼을 제공한다. 내부망에서 열었다고 공개 주소가 자동으로
+바뀌지는 않는다. Discovery는 Pinry가 아닌 IdP 주소이며, 제공자가 안내한
+실제 Well-known URL이 계산 예시보다 우선한다.
+
+Microsoft 테넌트 입력은 Microsoft에만, issuer·Discovery·내부 IdP 대역은
+Authentik·Synology·범용 OIDC에만 표시된다. Google·Microsoft의 Discovery는
+자동 결정되며 GitHub OAuth에는 해당 항목이 없다. origin과 허용/차단 CIDR은
+**한 줄에 하나씩** 입력한다. 예: `https://auth.example.com`, `192.168.0.0/24`.
+기존 JSON 배열 저장 형식은 유지하며 이전 JSON 입력도 호환한다. 잘못된 형식은
+입력한 내용을 유지한 채 해당 칸에 오류로 표시한다.
+
 제공자가 접속하는 모든 Discovery·authorization·token·JWKS·userinfo 주소의
-origin을 **허용 endpoint origin**에 HTTPS로 명시한다. Google·Microsoft·GitHub
+origin을 **허용 서버 주소 (origin)**에 HTTPS로 명시한다. Google·Microsoft·GitHub
 프리셋은 새 등록의 빈 목록에 안전한 기본 origin을 적용한다. Microsoft는
 `common`이나 `organizations`가 아닌 정확한 테넌트 UUID를 입력한다. 내부 IdP는
 해석된 IP가 속해야 하는 사설망 CIDR을 **내부 IdP 허용 CIDR**에 정확히
