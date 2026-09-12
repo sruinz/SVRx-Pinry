@@ -1,4 +1,4 @@
-# 로그인 화면 자산
+# 로그인 화면 자산 출처
 
 - `brand.png`: 기존 SVRx Pinry 다크 화면용 로고를 재사용한다.
 - `providers/*.svg`: 사용자 프로젝트 Dock마루의 `frontend/src/components/SSOButton.jsx`에서 제공자 아이콘을 추출했다. 모양은 변경하지 않았으며 독립 SVG로 저장하고 `currentColor`를 밝은 전경색으로 고정했다. `synology`와 `oidc`는 해당 프로젝트의 식별 아이콘이며 공식 로고라는 의미가 아니다.
