@@ -45,7 +45,7 @@ def _begin(request, provider_id, purpose):
 @require_GET
 def providers(request):
     response = JsonResponse({'providers': [
-        {'id': str(provider.pk), 'name': provider.name,
+        {'id': str(provider.pk), 'name': provider.name, 'kind': provider.kind,
          'login_url': reverse('sso:login', args=[provider.pk])}
         for provider in SSOProvider.objects.filter(enabled=True)
     ], 'password_login_enabled': password_login_allowed(request),

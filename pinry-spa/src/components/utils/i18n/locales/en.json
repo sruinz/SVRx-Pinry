@@ -1,4 +1,7 @@
 {
+  "loginSubtitle": "Choose an account to continue.",
+  "ssoLoginWithProvider": "Log in with {provider}",
+  "passwordLoginTitle": "Log in with username and password",
   "ssoSettingsFailed": "Unable to load login settings. Please retry.",
   "ssoLoading": "Loading login settings…",
   "ssoPasswordDisabled": "Password login and signup are disabled. Use SSO.",

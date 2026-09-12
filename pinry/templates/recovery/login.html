@@ -1,8 +1,38 @@
-<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>관리자 인증 복구</title></head>
-<body><main><h1>관리자 인증 복구</h1>
-<p>내부망에서 활성 슈퍼 관리자 계정과 비밀번호로 로그인하세요. 복구 세션은 15분 후 만료됩니다.</p>
-{% if error %}<p role="alert">{{ error }}</p>{% endif %}
-<form method="post">{% csrf_token %}
-<p><label>계정 <input name="username" maxlength="150" autocomplete="username" required></label></p>
-<p><label>비밀번호 <input type="password" name="password" autocomplete="current-password" required></label></p>
-<button type="submit">복구 로그인</button></form></main></body></html>
+{% load static %}
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>관리자 복구 로그인</title>
+  <link rel="stylesheet" href="{% static 'auth/login.css' %}">
+</head>
+<body class="auth-page recovery-page">
+  <main class="recovery-card" aria-labelledby="recovery-title">
+    <section class="recovery-intro">
+      <div class="auth-brand">
+        <img src="{% static 'auth/brand.png' %}" alt="" width="38" height="38">
+        <span>SVRx Pinry</span>
+      </div>
+      <h1 id="recovery-title">관리자 복구<br>로그인</h1>
+      <p>내부망에서 활성 슈퍼 관리자 계정으로 로그인하세요.</p>
+      <p class="recovery-expiry">복구 세션은 15분 후 만료됩니다.</p>
+    </section>
+
+    <section class="recovery-form-panel">
+      {% if error %}<p class="auth-alert" role="alert">{{ error }}</p>{% endif %}
+      <form method="post" class="recovery-form">
+        {% csrf_token %}
+        <label for="recovery-username">계정</label>
+        <input id="recovery-username" name="username" maxlength="150" autocomplete="username" placeholder="관리자 계정" required autofocus>
+        <label for="recovery-password">비밀번호</label>
+        <input id="recovery-password" type="password" name="password" autocomplete="current-password" placeholder="비밀번호" required>
+        <button type="submit">복구 로그인</button>
+      </form>
+      {% if not request.recovery_deployment.origin %}
+        <a class="return-link" href="/login/">로그인 화면으로 돌아가기</a>
+      {% endif %}
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,295 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, Pretendard, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #101416;
+  color: #f2f5f4;
+}
+
+* { box-sizing: border-box; }
+
+html,
+body {
+  min-width: 320px;
+  min-height: 100%;
+  margin: 0;
+}
+
+.auth-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px 20px;
+  background: radial-gradient(circle at 50% 45%, rgba(50, 59, 61, 0.24), transparent 48%), #101416;
+  color: #f2f5f4;
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  font-size: 24px;
+  letter-spacing: -0.02em;
+}
+
+.auth-brand img {
+  display: block;
+  object-fit: contain;
+}
+
+.recovery-card,
+.login-card {
+  width: 100%;
+  border: 1px solid #485157;
+  border-radius: 10px;
+  background: rgba(25, 30, 33, 0.76);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+}
+
+.recovery-card {
+  max-width: 900px;
+  display: grid;
+  grid-template-columns: 44% 56%;
+}
+
+.recovery-intro,
+.recovery-form-panel { padding: 52px 50px; }
+
+.recovery-intro {
+  border-right: 1px solid #485157;
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.recovery-intro h1 {
+  margin: 58px 0 28px;
+  font-size: clamp(38px, 4vw, 46px);
+  line-height: 1.25;
+  letter-spacing: -0.04em;
+}
+
+.recovery-intro p {
+  margin: 0;
+  color: #d3d8d7;
+  font-size: 18px;
+  line-height: 1.7;
+}
+
+.recovery-intro .recovery-expiry {
+  margin-top: 24px;
+  color: #afb6b7;
+  font-size: 16px;
+}
+
+.recovery-form-panel {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.recovery-form { display: grid; }
+
+.recovery-form label {
+  margin: 0 0 10px;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.recovery-form input {
+  width: 100%;
+  height: 52px;
+  margin: 0 0 28px;
+  padding: 0 16px;
+  border: 1px solid #657078;
+  border-radius: 7px;
+  outline: 0;
+  background: #111619;
+  color: #f2f5f4;
+  font: inherit;
+}
+
+.recovery-form input:focus {
+  border-color: #0dd8c2;
+  box-shadow: 0 0 0 3px rgba(13, 216, 194, 0.14);
+}
+
+.recovery-form input::placeholder { color: #8d979d; }
+
+.recovery-form button {
+  height: 52px;
+  border: 0;
+  border-radius: 7px;
+  background: #0dd8c2;
+  color: #071614;
+  font: inherit;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.recovery-form button:hover { background: #22e4cf; }
+
+.return-link,
+.recovery-link {
+  align-self: center;
+  margin-top: 25px;
+  color: #15d8c3;
+  text-underline-offset: 3px;
+}
+
+.auth-alert {
+  margin: 0 0 20px;
+  padding: 12px 14px;
+  border: 1px solid #925657;
+  border-radius: 7px;
+  background: rgba(157, 61, 63, 0.16);
+  color: #ffcccc;
+  line-height: 1.45;
+}
+
+.login-card {
+  max-width: 520px;
+  padding: 34px;
+}
+
+.login-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.close-link {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+}
+
+.close-link:hover { background: rgba(255, 255, 255, 0.07); }
+
+.login-card h1 {
+  margin: 52px 8px 8px;
+  font-size: 34px;
+  letter-spacing: -0.04em;
+}
+
+.login-lead {
+  margin: 0 8px 34px;
+  color: #aeb6b8;
+  font-size: 17px;
+}
+
+.provider-list {
+  display: grid;
+  gap: 14px;
+}
+
+.provider-button {
+  min-height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  padding: 12px 24px;
+  border: 1px solid #7c858b;
+  border-radius: 9px;
+  color: #f6f8f7;
+  font-size: 18px;
+  font-weight: 700;
+  text-align: center;
+  text-decoration: none;
+}
+
+.provider-authentik {
+  border-color: transparent;
+  background: linear-gradient(105deg, #f13e1f, #f14c28);
+}
+
+.provider-button:hover {
+  border-color: #c0c7c9;
+  filter: brightness(1.06);
+}
+
+.provider-button img {
+  width: 34px;
+  height: 34px;
+  object-fit: contain;
+}
+
+.empty-providers,
+.password-disabled {
+  color: #aeb6b8;
+  line-height: 1.55;
+}
+
+.login-options {
+  display: flex;
+  flex-direction: column;
+  margin-top: 36px;
+  padding-top: 22px;
+  border-top: 1px solid #485157;
+}
+
+.option-link {
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: #f2f5f4;
+  font-size: 18px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.option-icon {
+  width: 24px;
+  height: 24px;
+}
+
+.option-chevron {
+  width: 22px;
+  height: 22px;
+  margin-left: auto;
+}
+
+.login-options .recovery-link { margin-top: 14px; }
+
+@media (max-width: 640px) {
+  .auth-page {
+    display: block;
+    padding: 18px 14px;
+  }
+
+  .recovery-card { grid-template-columns: minmax(0, 1fr); }
+
+  .recovery-intro,
+  .recovery-form-panel { padding: 30px 24px; }
+
+  .recovery-intro {
+    border-right: 0;
+    border-bottom: 1px solid #485157;
+  }
+
+  .recovery-intro h1 {
+    margin: 34px 0 20px;
+    font-size: 34px;
+  }
+
+  .recovery-intro p { font-size: 16px; }
+  .recovery-form input { margin-bottom: 22px; }
+
+  .login-card { padding: 28px 22px; }
+
+  .login-card h1 {
+    margin-top: 38px;
+    font-size: 36px;
+  }
+
+  .login-lead { font-size: 18px; }
+
+  .provider-button {
+    min-height: 60px;
+    padding: 10px 16px;
+    gap: 14px;
+    font-size: 18px;
+  }
+}

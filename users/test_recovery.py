@@ -191,6 +191,20 @@ class RecoveryRequestTests(TestCase):
             html=True,
         )
 
+    def test_failed_dedicated_login_keeps_retry_form_without_public_login_link(self):
+        self.get()
+        response = self.post(data={'username': 'administrator', 'password': 'wrong'})
+
+        self.assertEqual(response.status_code, 403)
+        self.assertContains(response, '로그인할 수 없습니다.', status_code=403)
+        self.assertContains(response, 'name="csrfmiddlewaretoken"', status_code=403)
+        self.assertContains(response, 'name="username"', status_code=403)
+        self.assertContains(response, 'maxlength="150"', status_code=403)
+        self.assertContains(response, 'autocomplete="username"', status_code=403)
+        self.assertContains(response, 'name="password"', status_code=403)
+        self.assertContains(response, 'autocomplete="current-password"', status_code=403)
+        self.assertNotContains(response, 'href="/login/"', status_code=403)
+
     def test_recovery_origin_host_works_when_public_hosts_are_restricted(self):
         public_settings = types.ModuleType('pinry.settings.docker')
         public_settings.ALLOWED_HOSTS = ['public.example']

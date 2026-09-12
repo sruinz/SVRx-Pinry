@@ -100,6 +100,19 @@ class SSOPolicyTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, '로그인')
 
+    def test_provider_icons_use_kind_not_custom_name_and_expose_no_secrets(self):
+        providers = [SSOProvider.objects.create(
+            kind=kind, name='회사 계정', enabled=True, position=index,
+            client_id='private-client', encrypted_client_secret='private-secret',
+        ) for index, kind in enumerate(('authentik', 'synology', 'google', 'microsoft', 'github', 'oidc'))]
+        SSOProvider.objects.create(kind='google', name='숨김', enabled=False)
+        payload = self.client.get('/api/v2/sso/providers/').json()['providers']
+        self.assertEqual(payload, [
+            {'id': str(provider.pk), 'name': '회사 계정', 'kind': kind,
+             'login_url': f'/api/v2/sso/{provider.pk}/login/'}
+            for provider, kind in zip(providers, ('authentik', 'synology', 'google', 'microsoft', 'github', 'oidc'))
+        ])
+
     def test_missing_policy_and_database_failure_never_enable_password(self):
         from users.sso.policy import password_login_allowed, api_token_allowed
         AuthPolicy.objects.all().delete()

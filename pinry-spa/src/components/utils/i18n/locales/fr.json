@@ -1,4 +1,7 @@
 {
+  "loginSubtitle": "Choisissez un compte pour continuer.",
+  "ssoLoginWithProvider": "Se connecter avec {provider}",
+  "passwordLoginTitle": "Se connecter avec un identifiant et un mot de passe",
   "ssoSettingsFailed": "Impossible de charger les paramètres de connexion. Réessayez.",
   "ssoLoading": "Chargement des paramètres…",
   "ssoPasswordDisabled": "La connexion et l’inscription par mot de passe sont désactivées. Utilisez le SSO.",

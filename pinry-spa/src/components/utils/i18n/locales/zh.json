@@ -1,4 +1,7 @@
 {
+  "loginSubtitle": "选择要使用的账号。",
+  "ssoLoginWithProvider": "使用 {provider} 登录",
+  "passwordLoginTitle": "使用账号和密码登录",
   "ssoSettingsFailed": "无法加载登录设置，请重试。",
   "ssoLoading": "正在加载登录设置。",
   "ssoPasswordDisabled": "密码登录和注册已停用，请使用 SSO。",

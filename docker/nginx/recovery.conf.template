@@ -10,6 +10,9 @@ server {
     access_log off;
 
     location / { return 404; }
+    # 복구 폼의 공개 디자인 자산 두 개만 제공한다. 미디어·다른 정적 파일은 차단한다.
+    location = /static/auth/login.css { alias /data/static/auth/login.css; }
+    location = /static/auth/brand.png { alias /data/static/auth/brand.png; }
     location ^~ /recovery/ {
         proxy_pass http://unix:/run/pinry-auth-recovery/application.sock;
         # 임의 전달 헤더·Authorization을 전달하지 않는다. 필요한 값만 다시 설정한다.

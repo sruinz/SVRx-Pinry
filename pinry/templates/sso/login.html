@@ -1,8 +1,66 @@
+{% load static %}
 <!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SVRx Pinry 로그인</title></head>
-<body><main><h1>SVRx Pinry 로그인</h1>
-{% for message in messages %}<p role="alert">{{ message }}</p>{% endfor %}
-{% for provider in providers %}<p><a href="{% url 'sso:login' provider.pk %}">{{ provider.name }} 로그인</a></p>{% endfor %}
-{% if password_login_enabled %}<p><a href="/">홈에서 비밀번호 로그인</a></p>{% else %}<p>비밀번호 로그인이 비활성화되어 있습니다. SSO를 이용해 주세요.</p>{% endif %}
-{% if recovery_login_allowed %}<p><a href="{% url 'sso:lan-recovery' %}">관리자 복구 로그인</a></p>{% endif %}
-</main></body></html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SVRx Pinry 로그인</title>
+  <link rel="stylesheet" href="{% static 'auth/login.css' %}">
+</head>
+<body class="auth-page sso-page">
+  <main class="login-card" aria-labelledby="login-title">
+    <header class="login-header">
+      <div class="auth-brand">
+        <img src="{% static 'auth/brand.png' %}" alt="" width="38" height="38">
+        <span>SVRx Pinry</span>
+      </div>
+      <a class="close-link" href="/" aria-label="닫기">
+        <img src="{% static 'auth/icons/x.svg' %}" alt="" width="28" height="28">
+      </a>
+    </header>
+
+    <h1 id="login-title">로그인</h1>
+    <p class="login-lead">사용할 계정을 선택하세요.</p>
+
+    {% for message in messages %}<p class="auth-alert" role="alert">{{ message }}</p>{% endfor %}
+
+    <div class="provider-list">
+      {% for provider in providers %}
+        <a class="provider-button provider-{{ provider.kind }}" href="{% url 'sso:login' provider.pk %}">
+          {% if provider.kind == 'authentik' %}
+            <img src="{% static 'auth/providers/authentik.svg' %}" alt="">
+          {% elif provider.kind == 'synology' %}
+            <img src="{% static 'auth/providers/synology.svg' %}" alt="">
+          {% elif provider.kind == 'google' %}
+            <img src="{% static 'auth/providers/google.svg' %}" alt="">
+          {% elif provider.kind == 'microsoft' %}
+            <img src="{% static 'auth/providers/microsoft.svg' %}" alt="">
+          {% elif provider.kind == 'github' %}
+            <img src="{% static 'auth/providers/github.svg' %}" alt="">
+          {% else %}
+            <img src="{% static 'auth/providers/oidc.svg' %}" alt="">
+          {% endif %}
+          <span>{{ provider.name }}로 로그인</span>
+        </a>
+      {% empty %}
+        <p class="empty-providers">사용 가능한 SSO 계정이 없습니다.</p>
+      {% endfor %}
+    </div>
+
+    <div class="login-options">
+      {% if password_login_enabled %}
+        <a class="option-link" href="/">
+          <img class="option-icon" src="{% static 'auth/icons/lock-keyhole.svg' %}" alt="">
+          <span>홈에서 비밀번호 로그인</span>
+          <img class="option-chevron" src="{% static 'auth/icons/chevron-down.svg' %}" alt="">
+        </a>
+      {% else %}
+        <p class="password-disabled">비밀번호 로그인이 비활성화되어 있습니다. SSO를 이용해 주세요.</p>
+      {% endif %}
+      {% if recovery_login_allowed %}
+        <a class="recovery-link" href="{% url 'sso:lan-recovery' %}">관리자 복구 로그인</a>
+      {% endif %}
+    </div>
+  </main>
+</body>
+</html>
