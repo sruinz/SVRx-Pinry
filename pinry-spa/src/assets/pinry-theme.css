@@ -152,6 +152,10 @@ a:hover { color: var(--pinry-link-hover); }
   padding: 3px;
 }
 :root[data-theme="light"] .sso-card .sso-unlink-reason { color: #a12736; }
+:root[data-theme="light"] .sso-card .button.is-danger.is-outlined:not([disabled]) {
+  color: #a12736;
+  border-color: #a12736;
+}
 
 @media screen and (max-width: 768px) {
   .pins > .section, .boards > .section { padding: 16px 16px 32px; }
