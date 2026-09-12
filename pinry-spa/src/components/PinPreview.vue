@@ -80,6 +80,8 @@
 <script>
 import niceLinks from './utils/niceLinks';
 
+const SIZE_STORAGE_KEY = 'pinry-preview-size';
+
 export default {
   name: 'PinPreview',
   emits: ['close'],
@@ -90,13 +92,19 @@ export default {
     loadNext: { type: Function, default: null },
   },
   data() {
+    let originalSize = false;
+    try {
+      originalSize = window.localStorage.getItem(SIZE_STORAGE_KEY) === 'original';
+    } catch (_error) {
+      // 저장소를 읽을 수 없으면 화면 맞춤으로 시작한다.
+    }
     return {
       currentPin: this.pinItem,
       busy: false,
       pageError: false,
       imageReady: false,
       imageError: false,
-      originalSize: false,
+      originalSize,
     };
   },
   computed: {
@@ -126,6 +134,11 @@ export default {
     toggleOriginalSize() {
       if (!this.imageReady || this.imageError) return;
       this.originalSize = !this.originalSize;
+      try {
+        window.localStorage.setItem(SIZE_STORAGE_KEY, this.originalSize ? 'original' : 'fit');
+      } catch (_error) {
+        // 저장할 수 없어도 현재 상세보기에서는 선택을 유지한다.
+      }
       this.resetImageScroll();
     },
     resetImageScroll() {
@@ -160,7 +173,6 @@ export default {
       if (this.disposed || !this.isModalActive() || this.pageError) return;
       const item = this.context.items[index];
       if (item) {
-        this.originalSize = false;
         this.resetImageScroll();
         this.imageReady = false;
         this.imageError = false;
