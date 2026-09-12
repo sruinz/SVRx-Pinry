@@ -278,6 +278,84 @@ describe('SSO policy screens', () => {
     expect(rows.at(1).text()).toContain('ssoUnavailable');
   });
 
+  it('disables unlink and explains when the identity is the last usable login method', async () => {
+    axios.get.mockImplementation(url => Promise.resolve({
+      data: url.endsWith('/identities/')
+        ? [{
+          id: 4,
+          provider_id: 'one',
+          provider_name: 'SSO',
+          enabled: true,
+          unlink_allowed: false,
+          unlink_reason: 'last_login_method',
+        }]
+        : { providers: [], password_login_enabled: false, api_tokens_enabled: false },
+    }));
+    const wrapper = shallowMount(Profile, options);
+    await flushPromises();
+
+    const button = wrapper.find('[data-test="unlink-button"]');
+    expect(button.attributes('disabled')).toBe('disabled');
+    expect(button.attributes('aria-describedby')).toBe('sso-unlink-reason-4');
+    expect(wrapper.find('[data-test="unlink-reason"]').text())
+      .toBe('ssoUnlinkBlockedLastLoginMethod');
+
+    await button.trigger('click');
+    expect(axios.post).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['last_login_method', 'ssoUnlinkBlockedLastLoginMethod'],
+    ['recent_auth_required', 'ssoUnlinkRecentAuthRequired'],
+    ['identity_not_found', 'ssoUnlinkIdentityNotFound'],
+  ])('maps unlink error %s to its localized message', async (code, messageKey) => {
+    axios.get.mockImplementation(url => Promise.resolve({
+      data: url.endsWith('/identities/')
+        ? [{
+          id: 4,
+          provider_id: 'one',
+          provider_name: 'SSO',
+          enabled: true,
+          unlink_allowed: true,
+          unlink_reason: null,
+        }]
+        : { providers: [], password_login_enabled: false, api_tokens_enabled: false },
+    }));
+    axios.post.mockRejectedValue({ response: { data: { code, detail: 'server detail' } } });
+    const wrapper = shallowMount(Profile, options);
+    await flushPromises();
+
+    await wrapper.find('[data-test="unlink-button"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="sso-action-error"]').text()).toBe(messageKey);
+    expect(wrapper.text()).not.toContain('server detail');
+  });
+
+  it('falls back to the generic action error for an unknown unlink response', async () => {
+    axios.get.mockImplementation(url => Promise.resolve({
+      data: url.endsWith('/identities/')
+        ? [{
+          id: 4,
+          provider_id: 'one',
+          provider_name: 'SSO',
+          enabled: true,
+          unlink_allowed: true,
+          unlink_reason: null,
+        }]
+        : { providers: [], password_login_enabled: false, api_tokens_enabled: false },
+    }));
+    axios.post.mockRejectedValue({ response: { data: { code: 'unexpected', detail: '<b>unsafe</b>' } } });
+    const wrapper = shallowMount(Profile, options);
+    await flushPromises();
+
+    await wrapper.find('[data-test="unlink-button"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="sso-action-error"]').text()).toBe('ssoActionFailed');
+    expect(wrapper.html()).not.toContain('<b>unsafe</b>');
+  });
+
   it('explains SSO reauthentication when Pinry password login is unavailable', async () => {
     axios.get.mockImplementation(url => Promise.resolve({
       data: url.endsWith('/identities/')

@@ -25,8 +25,12 @@
         <p v-if="identityError" class="sso-message is-error" role="alert">
           {{ $t('ssoIdentitiesFailed') }}
         </p>
-        <p v-if="actionError" class="sso-message is-error" role="alert">
-          {{ $t('ssoActionFailed') }}
+        <p
+          v-if="actionError"
+          data-test="sso-action-error"
+          class="sso-message is-error"
+          role="alert">
+          {{ $t(actionError) }}
         </p>
         <p v-if="reauthenticated" class="sso-message is-success" role="status">
           {{ $t('ssoReauthenticated') }}
@@ -74,24 +78,36 @@
                     {{ $t('ssoUnavailable') }}
                   </span>
                 </div>
-                <div class="sso-provider-row__actions">
-                  <form
-                    v-if="identity.enabled"
-                    method="post"
-                    :action="`/api/v2/sso/${identity.provider_id}/reauth/`">
-                    <input type="hidden" name="csrfmiddlewaretoken" :value="csrfToken">
-                    <input type="hidden" name="next" :value="returnPath">
-                    <button class="button sso-secondary-action" type="submit">
-                      {{ $t('ssoReauth') }}
+                <div class="sso-provider-row__controls">
+                  <div class="sso-provider-row__actions">
+                    <form
+                      v-if="identity.enabled"
+                      method="post"
+                      :action="`/api/v2/sso/${identity.provider_id}/reauth/`">
+                      <input type="hidden" name="csrfmiddlewaretoken" :value="csrfToken">
+                      <input type="hidden" name="next" :value="returnPath">
+                      <button class="button sso-secondary-action" type="submit">
+                        {{ $t('ssoReauth') }}
+                      </button>
+                    </form>
+                    <button
+                      data-test="unlink-button"
+                      class="button is-danger is-outlined"
+                      type="button"
+                      :disabled="identity.unlink_allowed === false"
+                      :aria-describedby="identity.unlink_allowed === false
+                        ? `sso-unlink-reason-${identity.id}` : null"
+                      @click="unlink(identity)">
+                      {{ $t('ssoUnlink') }}
                     </button>
-                  </form>
-                  <button
-                    data-test="unlink-button"
-                    class="button is-danger is-outlined"
-                    type="button"
-                    @click="unlink(identity.id)">
-                    {{ $t('ssoUnlink') }}
-                  </button>
+                  </div>
+                  <p
+                    v-if="identity.unlink_allowed === false"
+                    :id="`sso-unlink-reason-${identity.id}`"
+                    data-test="unlink-reason"
+                    class="sso-unlink-reason">
+                    {{ $t(unlinkReasonKey(identity.unlink_reason)) }}
+                  </p>
                 </div>
               </div>
             </div>
@@ -193,6 +209,11 @@
 import API from '../api';
 
 const providerKinds = ['authentik', 'google', 'microsoft', 'github', 'synology', 'oidc'];
+const unlinkErrorKeys = {
+  last_login_method: 'ssoUnlinkBlockedLastLoginMethod',
+  recent_auth_required: 'ssoUnlinkRecentAuthRequired',
+  identity_not_found: 'ssoUnlinkIdentityNotFound',
+};
 
 export default {
   name: 'profile',
@@ -210,7 +231,7 @@ export default {
       policyError: false,
       identities: [],
       identityError: false,
-      actionError: false,
+      actionError: null,
       reauthenticated: false,
       password: '',
       csrfToken: API.SSO.csrfToken(),
@@ -251,16 +272,23 @@ export default {
       }).catch(() => { if (this.componentAlive) this.identityError = true; });
     },
     passwordReauth() {
-      this.actionError = false;
+      this.actionError = null;
       this.reauthenticated = false;
       API.SSO.passwordReauth(this.password).then(() => { this.reauthenticated = true; })
-        .catch(() => { this.actionError = true; });
+        .catch(() => { this.actionError = 'ssoActionFailed'; });
       this.password = '';
     },
-    unlink(id) {
-      this.actionError = false;
-      API.SSO.unlink(id).then(() => this.fetchIdentities())
-        .catch(() => { this.actionError = true; });
+    unlinkReasonKey(reason) {
+      return unlinkErrorKeys[reason] || 'ssoActionFailed';
+    },
+    unlink(identity) {
+      if (identity.unlink_allowed === false) return;
+      this.actionError = null;
+      API.SSO.unlink(identity.id).then(() => this.fetchIdentities())
+        .catch((error) => {
+          const data = error && error.response && error.response.data;
+          this.actionError = this.unlinkReasonKey(data && data.code);
+        });
     },
     fetchBuildVersion() {
       const requestSequence = this.versionRequestSequence + 1;
@@ -448,6 +476,12 @@ export default {
   gap: .75rem;
 }
 
+.sso-provider-row__controls {
+  display: grid;
+  justify-items: end;
+  gap: .5rem;
+}
+
 .sso-provider-row__identity {
   min-width: 0;
   font-weight: 600;
@@ -471,6 +505,15 @@ export default {
   font-weight: 400;
 }
 
+.sso-unlink-reason {
+  max-width: 24rem;
+  margin: 0;
+  color: #ffb3b3;
+  font-size: .875rem;
+  line-height: 1.4;
+  text-align: right;
+}
+
 .sso-provider-row__actions form {
   margin: 0;
 }
@@ -487,6 +530,14 @@ export default {
   border-color: #ff5c68;
 }
 
+.sso-card .button.is-danger.is-outlined[disabled] {
+  color: #9ca2a5;
+  background: #222729;
+  border-color: #555d61;
+  cursor: not-allowed;
+  opacity: 1;
+}
+
 @media (max-width: 600px) {
   .sso-password-reauth__row,
   .sso-provider-row {
@@ -495,6 +546,7 @@ export default {
   }
 
   .sso-password-reauth .button,
+  .sso-provider-row__controls,
   .sso-provider-row__actions,
   .sso-provider-row__actions .button,
   .sso-link-action {
@@ -508,6 +560,15 @@ export default {
 
   .sso-provider-row__actions form {
     width: 100%;
+  }
+
+  .sso-provider-row__controls {
+    justify-items: stretch;
+  }
+
+  .sso-unlink-reason {
+    max-width: none;
+    text-align: left;
   }
 }
 

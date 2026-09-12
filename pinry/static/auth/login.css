@@ -253,6 +253,49 @@ body {
 
 .login-options .recovery-link { margin-top: 14px; }
 
+.signup-card { max-width: 560px; }
+
+.signup-card h1 { margin-top: 38px; }
+
+.signup-lead { margin-bottom: 26px; }
+
+.signup-form { display: grid; gap: 20px; }
+
+.signup-field input { margin-bottom: 0; }
+
+.signup-help {
+  margin: 8px 0 0;
+  color: #aeb6b8;
+  font-size: 14px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  word-break: keep-all;
+}
+
+.signup-help p { margin: 0 0 5px; }
+
+.signup-help p:last-child { margin-bottom: 0; }
+
+.signup-password-rules ul {
+  margin: 8px 0 0;
+  padding-left: 20px;
+}
+
+.signup-error-slot:empty { display: none; }
+
+.signup-errors {
+  margin: 7px 0 0;
+  padding-left: 20px;
+  color: #ffb3b3;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.auth-alert.signup-errors {
+  margin: 0 0 20px;
+  padding-left: 34px;
+}
+
 @media (max-width: 640px) {
   .auth-page {
     display: block;
@@ -276,6 +319,7 @@ body {
 
   .recovery-intro p { font-size: 16px; }
   .recovery-form input { margin-bottom: 22px; }
+  .signup-field input { margin-bottom: 0; }
 
   .login-card { padding: 28px 22px; }
 
@@ -285,6 +329,15 @@ body {
   }
 
   .login-lead { font-size: 18px; }
+
+  .signup-card h1 { font-size: 32px; }
+
+  .signup-lead {
+    margin-bottom: 24px;
+    font-size: 16px;
+  }
+
+  .signup-form { gap: 18px; }
 
   .provider-button {
     min-height: 60px;

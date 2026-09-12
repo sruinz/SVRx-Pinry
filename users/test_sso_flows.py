@@ -198,14 +198,145 @@ class SSOFlowTests(TestCase):
         self.assertNotIn(SESSION_KEY, self.client.session)
         self.assertEqual(ExternalIdentity.objects.count(), 1)
 
-    def test_signup_creates_unprivileged_user_without_password(self):
+    def prepare_signup(self, browser=None):
         self.provider.allow_signup = True
         self.provider.save()
-        response = self.callback(self.start())
-        self.assertEqual(response['Location'], '/')
+        self.identity = VerifiedIdentity('https://idp.example', 'new-subject', 'new.person@example.com', '', True)
+        return self.callback(self.start(client=browser, next='/profile/'), client=browser)
+
+    def signup_data(self, **changes):
+        return dict({'username': 'new.person', 'password1': 'Pinry-only-secret-49!',
+                     'password2': 'Pinry-only-secret-49!',
+                     'signup_token': SSOAttempt.objects.latest('pk').state_digest}, **changes)
+
+    def test_old_signup_form_cannot_complete_another_tabs_identity(self):
+        self.prepare_signup()
+        old_form = self.signup_data()
+        self.identity = VerifiedIdentity('https://idp.example', 'another-subject', 'another@example.com', '', True)
+        self.callback(self.start())
+        response = self.client.post('/api/v2/sso/signup/', old_form)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(User.objects.count(), 1)
+        self.assertFalse(ExternalIdentity.objects.exists())
+        self.assertEqual(self.client.post('/api/v2/sso/signup/', self.signup_data())['Location'], '/')
+        self.assertEqual(ExternalIdentity.objects.get().subject, 'another-subject')
+
+    def test_signup_waits_for_required_account_details_before_creating_user(self):
+        response = self.prepare_signup()
+        self.assertEqual(response['Location'], '/api/v2/sso/signup/')
+        self.assertNotIn(SESSION_KEY, self.client.session)
+        self.assertEqual(User.objects.count(), 1)
+        self.assertFalse(ExternalIdentity.objects.exists())
+        page = self.client.get(response['Location'])
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(page.context['form']['username'].value(), 'new.person')
+        self.assertContains(page, 'csrfmiddlewaretoken')
+        self.assertEqual(page['Cache-Control'], 'no-store')
+
+    def test_signup_creates_unprivileged_user_with_chosen_password(self):
+        self.prepare_signup()
+        response = self.client.post('/api/v2/sso/signup/', self.signup_data())
+        self.assertEqual(response['Location'], '/profile/')
         user = User.objects.get(pk=self.client.session[SESSION_KEY])
-        self.assertFalse(user.is_superuser or user.is_staff or user.has_usable_password())
+        self.assertFalse(user.is_superuser or user.is_staff)
+        self.assertEqual(user.username, 'new.person')
+        self.assertTrue(user.check_password('Pinry-only-secret-49!'))
+        self.assertEqual(user.email, 'new.person@example.com')
+        self.assertEqual(self.client.session['auth_method'], 'sso')
+        self.assertEqual(ExternalIdentity.objects.get().user_id, user.pk)
         self.assertNotEqual(user.pk, self.user.pk)
+        self.client.logout()
+        self.assertEqual(self.callback(self.start())['Location'], '/')
+        self.assertEqual(self.client.session[SESSION_KEY], str(user.pk))
+        self.assertEqual(User.objects.count(), 2)
+
+    def test_signup_invalid_details_do_not_create_or_modify_accounts(self):
+        self.prepare_signup()
+        for changes, field in (({'password1': '', 'password2': ''}, 'password1'),
+                               ({'password2': 'different'}, 'password2'),
+                               ({'password1': '12345678', 'password2': '12345678'}, 'password2'),
+                               ({'username': 'Member'}, 'username'),
+                               ({'username': 'invalid/name'}, 'username')):
+            with self.subTest(changes=changes):
+                response = self.client.post('/api/v2/sso/signup/', self.signup_data(**changes))
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(field, response.context['form'].errors)
+                self.assertNotContains(response, 'value="Pinry-only-secret-49!"', status_code=400)
+                self.assertNotIn(SESSION_KEY, self.client.session)
+                self.assertEqual(User.objects.count(), 1)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password('member-password'))
+        self.assertEqual(self.client.post('/api/v2/sso/signup/', self.signup_data())['Location'], '/profile/')
+
+    def test_sso_only_signup_password_works_only_after_local_login_enabled(self):
+        AuthPolicy.objects.filter(pk=1).update(password_login_enabled=False)
+        self.prepare_signup()
+        response = self.client.post('/api/v2/sso/signup/', self.signup_data())
+        self.assertEqual(response['Location'], '/profile/')
+        user_id = self.client.session[SESSION_KEY]
+        self.client.logout()
+        credentials = {'username': 'new.person', 'password': 'Pinry-only-secret-49!'}
+        self.assertEqual(self.client.post('/api/v2/profile/login/', credentials,
+                                         content_type='application/json').status_code, 403)
+        AuthPolicy.objects.filter(pk=1).update(password_login_enabled=True)
+        SSOProvider.objects.filter(pk=self.provider.pk).update(enabled=False)
+        self.assertEqual(self.client.post('/api/v2/profile/login/', credentials,
+                                         content_type='application/json').status_code, 200)
+        self.assertEqual(self.client.session[SESSION_KEY], user_id)
+
+    def test_signup_requires_verified_browser_and_exact_route(self):
+        self.prepare_signup()
+        stranger = Client(HTTP_HOST='pinry.example')
+        self.assertEqual(stranger.post('/api/v2/sso/signup/', self.signup_data()).status_code, 400)
+        self.assertEqual(self.client.get('/api/v2/sso/signup/extra/').status_code, 403)
+        self.assertEqual(self.client.post('/api/v2/sso/signup/', self.signup_data(),
+                                         HTTP_HOST='192.168.0.45:2048').status_code, 400)
+        self.assertEqual(User.objects.count(), 1)
+
+    def test_signup_post_requires_csrf_and_cannot_be_replayed(self):
+        browser = Client(enforce_csrf_checks=True, HTTP_HOST='pinry.example')
+        self.prepare_signup(browser)
+        self.assertEqual(browser.post('/api/v2/sso/signup/', self.signup_data()).status_code, 403)
+        browser.get('/api/v2/sso/signup/')
+        data = self.signup_data(csrfmiddlewaretoken=browser.cookies['csrftoken'].value)
+        self.assertEqual(browser.post('/api/v2/sso/signup/', data).status_code, 302)
+        self.assertEqual(browser.post('/api/v2/sso/signup/', data).status_code, 403)
+        self.assertEqual(User.objects.count(), 2)
+        self.assertEqual(ExternalIdentity.objects.count(), 1)
+
+    def test_expired_signup_and_changed_provider_cannot_create_user(self):
+        for change in ('expiry', 'revision', 'disabled', 'signup_disabled'):
+            with self.subTest(change=change):
+                self.provider.enabled = True
+                self.provider.revision = 1
+                self.prepare_signup()
+                if change == 'expiry':
+                    SSOAttempt.objects.update(expires_at=timezone.now() - timedelta(seconds=1))
+                else:
+                    values = {'revision': {'revision': 2}, 'disabled': {'enabled': False},
+                              'signup_disabled': {'allow_signup': False}}
+                    SSOProvider.objects.filter(pk=self.provider.pk).update(**values[change])
+                self.assertEqual(self.client.post('/api/v2/sso/signup/', self.signup_data()).status_code, 400)
+                self.assertEqual(User.objects.count(), 1)
+
+    def test_signup_cannot_overwrite_account_created_while_form_was_open(self):
+        self.prepare_signup()
+        existing = User.objects.create_user('other-name', 'new.person@example.com', 'existing-password')
+        response = self.client.post('/api/v2/sso/signup/', self.signup_data())
+        self.assertEqual(response.status_code, 400)
+        existing.refresh_from_db()
+        self.assertTrue(existing.check_password('existing-password'))
+        self.assertFalse(ExternalIdentity.objects.exists())
+        self.assertNotIn(SESSION_KEY, self.client.session)
+
+    def test_unverified_signup_email_is_not_saved_for_future_automatic_linking(self):
+        self.provider.allow_signup = True
+        self.provider.save()
+        self.identity = VerifiedIdentity('https://idp.example', 'new-subject', 'claimed@example.com', '', False)
+        self.callback(self.start())
+        self.client.post('/api/v2/sso/signup/', self.signup_data())
+        user = User.objects.get(pk=self.client.session[SESSION_KEY])
+        self.assertEqual(user.email, '')
 
     def test_identity_subject_case_does_not_select_other_account(self):
         self.connect(subject='subject-a')
@@ -379,6 +510,24 @@ class SSOFlowTests(TestCase):
         self.assertEqual(response.status_code, 204)
         self.assertFalse(ExternalIdentity.objects.exists())
 
+    def test_unlink_reports_last_login_method_separately_from_recent_auth(self):
+        identity = self.connect()
+        self.callback(self.start())
+        AuthPolicy.objects.filter(pk=1).update(password_login_enabled=False)
+        listing = self.client.get('/api/v2/sso/identities/').json()[0]
+        self.assertFalse(listing['unlink_allowed'])
+        self.assertEqual(listing['unlink_reason'], 'last_login_method')
+        response = self.client.post(f'/api/v2/sso/identities/{identity.pk}/unlink/')
+        self.assertEqual(response.json()['code'], 'last_login_method')
+        AuthPolicy.objects.filter(pk=1).update(password_login_enabled=True)
+        session = self.client.session
+        session.pop('recent_auth')
+        session.save()
+        self.assertTrue(self.client.get('/api/v2/sso/identities/').json()[0]['unlink_allowed'])
+        response = self.client.post(f'/api/v2/sso/identities/{identity.pk}/unlink/')
+        self.assertEqual(response.json()['code'], 'recent_auth_required')
+        self.assertTrue(ExternalIdentity.objects.filter(pk=identity.pk).exists())
+
     def test_identity_list_and_unlink_are_owner_only(self):
         identity = self.connect()
         other = User.objects.create_user('other', password='other-password')
@@ -414,8 +563,10 @@ class SSOFlowTests(TestCase):
         self.provider.allow_signup = True
         self.provider.save()
         state = self.start()
+        self.callback(state)
         with patch('users.sso.flows.ExternalIdentity.objects.create', side_effect=IntegrityError):
-            self.callback(state)
+            response = self.client.post('/api/v2/sso/signup/', self.signup_data())
+        self.assertEqual(response.status_code, 400)
         self.assertEqual(User.objects.count(), 1)
         self.assertFalse(AuthVerification.objects.exists())
         self.assertNotIn(SESSION_KEY, self.client.session)
@@ -532,7 +683,7 @@ class SSOConcurrentAttemptTests(TransactionTestCase):
             callback_request.session = SessionStore(session_key=session_key)
             callback_request.user = AnonymousUser()
             try:
-                return finish_attempt(callback_request, provider, state, 'code').pk
+                return finish_attempt(callback_request, provider, state, 'code')
             finally:
                 close_old_connections()
 
@@ -546,7 +697,8 @@ class SSOConcurrentAttemptTests(TransactionTestCase):
                         second.result(timeout=10)
                 finally:
                     release.set()
-                user_id = first.result(timeout=10)
+                pending_user = first.result(timeout=10)
         self.assertEqual(network_transactions, [False])
-        self.assertEqual(ExternalIdentity.objects.get().user_id, user_id)
-        self.assertEqual(AuthVerification.objects.count(), 1)
+        self.assertIsNone(pending_user)
+        self.assertFalse(ExternalIdentity.objects.exists())
+        self.assertEqual(AuthVerification.objects.count(), 0)

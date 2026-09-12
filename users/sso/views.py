@@ -10,9 +10,9 @@ from django.urls import reverse
 from django.views.decorators.http import require_GET, require_POST
 
 from users.models import ExternalIdentity, SSOProvider
-from users.sso.policy import api_token_allowed, identity_is_usable, password_login_allowed
+from users.sso.policy import api_token_allowed, identity_is_usable, password_login_allowed, request_policy
 from users.sso.flows import (begin_attempt, callback_url, finish_attempt, mark_recent_auth,
-                            require_user, safe_next, unlink_identity)
+                            require_user, safe_next, unlink_identity, can_unlink_identity, SSOActionDenied)
 from users.sso.lan_recovery import direct_lan_allowed
 
 
@@ -156,14 +156,22 @@ def password_reauth(request):
 @require_GET
 def identities(request):
     require_user(request)
-    return JsonResponse([
-        {'id': identity.pk, 'provider_id': str(identity.provider_id),
-         'provider_name': identity.provider.name, 'enabled': identity_is_usable(identity)}
-        for identity in ExternalIdentity.objects.filter(user=request.user).select_related('provider')
-    ], safe=False)
+    result = []
+    policy = request_policy(request)
+    for identity in ExternalIdentity.objects.filter(user=request.user).select_related('provider'):
+        allowed = can_unlink_identity(request.user, identity, policy)
+        result.append({'id': identity.pk, 'provider_id': str(identity.provider_id),
+                       'provider_name': identity.provider.name, 'enabled': identity_is_usable(identity),
+                       'unlink_allowed': allowed, 'unlink_reason': None if allowed else 'last_login_method'})
+    response = JsonResponse(result, safe=False)
+    response['Cache-Control'] = 'no-store'
+    return response
 
 
 @require_POST
 def unlink(request, identity_id):
-    unlink_identity(request, identity_id)
+    try:
+        unlink_identity(request, identity_id)
+    except SSOActionDenied as error:
+        return JsonResponse({'code': error.code, 'detail': str(error)}, status=403)
     return HttpResponse(status=204)

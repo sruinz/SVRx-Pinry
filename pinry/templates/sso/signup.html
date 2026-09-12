@@ -1,0 +1,89 @@
+{% load static %}
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SVRx Pinry 계정 만들기</title>
+  <link rel="stylesheet" href="{% static 'auth/login.css' %}">
+</head>
+<body class="auth-page sso-page signup-page">
+  <main class="login-card signup-card" aria-labelledby="signup-title">
+    <header class="login-header">
+      <div class="auth-brand">
+        <img src="{% static 'auth/brand.png' %}" alt="" width="38" height="38">
+        <span>SVRx Pinry</span>
+      </div>
+      <a class="close-link" href="/login/" aria-label="닫기">
+        <img src="{% static 'auth/icons/x.svg' %}" alt="" width="28" height="28">
+      </a>
+    </header>
+
+    <h1 id="signup-title">Pinry 계정 만들기</h1>
+    <p class="login-lead signup-lead">
+      {{ provider.name }}에서 본인을 확인했습니다. Pinry에서 쓸 계정 정보를 마무리하세요.
+    </p>
+
+    {% if form.non_field_errors %}
+      <ul class="auth-alert signup-errors" role="alert">
+        {% for error in form.non_field_errors %}<li>{{ error }}</li>{% endfor %}
+      </ul>
+    {% endif %}
+
+    <form method="post" action="/api/v2/sso/signup/" class="recovery-form signup-form">
+      {% csrf_token %}
+      {{ form.signup_token }}
+
+      <div class="signup-field">
+        <label for="{{ form.username.id_for_label }}">{{ form.username.label }}</label>
+        {{ form.username }}
+        <p id="username-help" class="signup-help">
+          SSO 이메일을 바탕으로 제안했습니다. Pinry에서 사용할 고유한 아이디를 확인하세요.
+        </p>
+        <div id="username-errors" class="signup-error-slot">
+          {% if form.username.errors %}
+            <ul class="signup-errors" role="alert">
+              {% for error in form.username.errors %}<li>{{ error }}</li>{% endfor %}
+            </ul>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="signup-field">
+        <label for="{{ form.password1.id_for_label }}">{{ form.password1.label }}</label>
+        {{ form.password1 }}
+        <div id="password-help" class="signup-help">
+          <p>이 비밀번호는 {{ provider.name }} 비밀번호와 별개이며 SSO 제공자에게 전송되지 않습니다.</p>
+          {% if password_login_enabled %}
+            <p>Pinry 비밀번호 로그인에도 사용할 수 있습니다.</p>
+          {% else %}
+            <p>현재 로컬 비밀번호 로그인이 꺼져 있어 이 비밀번호로는 로그인할 수 없습니다. 나중에 관리자가 로컬 로그인을 켜면 사용할 수 있습니다.</p>
+          {% endif %}
+          {% if form.password1.help_text %}<div class="signup-password-rules">{{ form.password1.help_text|safe }}</div>{% endif %}
+        </div>
+        <div id="password1-errors" class="signup-error-slot">
+          {% if form.password1.errors %}
+            <ul class="signup-errors" role="alert">
+              {% for error in form.password1.errors %}<li>{{ error }}</li>{% endfor %}
+            </ul>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="signup-field">
+        <label for="{{ form.password2.id_for_label }}">{{ form.password2.label }}</label>
+        {{ form.password2 }}
+        <div id="password2-errors" class="signup-error-slot">
+          {% if form.password2.errors %}
+            <ul class="signup-errors" role="alert">
+              {% for error in form.password2.errors %}<li>{{ error }}</li>{% endfor %}
+            </ul>
+          {% endif %}
+        </div>
+      </div>
+
+      <button class="signup-submit" type="submit">계정 만들고 계속</button>
+    </form>
+  </main>
+</body>
+</html>
