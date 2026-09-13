@@ -64,6 +64,7 @@ function page(pins = [pin(41), pin(40), pin(39)]) {
 
 function mountPins({
   pinFilters = { userFilter: 'owner' },
+  searchMode = false,
   authenticatedUsername = 'owner',
   boardRequest = null,
   pins = [pin(41), pin(40), pin(39)],
@@ -100,7 +101,7 @@ function mountPins({
       },
     },
 
-    props: { pinFilters },
+    props: { pinFilters, searchMode },
   });
   mountedPinWrappers.push(wrapper);
   return wrapper;
@@ -170,6 +171,39 @@ describe('PinBulkToolbar', () => {
 });
 
 describe('Pins selection mode', () => {
+  it('preserves search sorting and density when tags and image filters change', async () => {
+    const wrapper = mountPins({ searchMode: true, pinFilters: { tagFilter: [], searchFilters: { animation: 'animated' } } });
+    await settle();
+    wrapper.vm.applySortMode('oldest');
+    wrapper.vm.applyDensity('small');
+    await settle();
+    await wrapper.setProps({ pinFilters: { tagFilter: ['even'], searchFilters: { aspect: 'square' } } });
+    await settle();
+    expect(wrapper.vm.sortState.mode).toBe('oldest');
+    expect(wrapper.vm.density).toBe('small');
+    expect(API.fetchPins.mock.calls.slice(-1)[0][4].mode).toBe('oldest');
+    expect(wrapper.vm.sortStorageKey).toBe('svrx.pinSort.v1:search');
+  });
+  it('keeps image filters on later pages and discards a previous filter response', async () => {
+    const oldRequest = deferred();
+    const wrapper = mountPins({
+      pinFilters: { tagFilter: [], searchFilters: { animation: 'animated' } },
+      fetchPinsImplementation: () => oldRequest.promise,
+    });
+    await wrapper.setProps({ pinFilters: { tagFilter: [], searchFilters: { aspect: 'portrait' } } });
+    API.fetchPins.mockResolvedValue({ data: { results: [pin(77)], next: '/next' } });
+    wrapper.vm.reset();
+    await settle();
+    oldRequest.resolve({ data: { results: [pin(12)], next: null } });
+    await settle();
+    expect(wrapper.vm.blocks.map(block => block.id)).toEqual([77]);
+    expect(API.fetchPins.mock.calls.slice(-1)[0][5]).toEqual({ aspect: 'portrait' });
+    API.fetchPins.mockResolvedValue({ data: { results: [pin(78)], next: null } });
+    await wrapper.vm.fetchMore(true);
+    await settle();
+    expect(API.fetchPins.mock.calls.slice(-1)[0][5]).toEqual({ aspect: 'portrait' });
+    expect(wrapper.vm.blocks.map(block => block.id)).toEqual([77, 78]);
+  });
   beforeEach(() => {
     jest.clearAllMocks();
     mountedPinWrappers = [];

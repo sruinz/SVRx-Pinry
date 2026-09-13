@@ -26,6 +26,7 @@ from core.models import Image, Pin, Board
 from core.board_sorting import BoardSortFilter
 from core.parsers import LimitedJSONParser
 from core.pin_sorting import PinSortFilter
+from core.pin_search import PinSearchFilter
 from core.tag_filtering import AllTagsFilter
 from core.permissions import IsOwnerOrReadOnly, OwnerOnlyIfPrivate
 from core.serializers import filter_private_pin, filter_private_board
@@ -82,6 +83,7 @@ class PinViewSet(viewsets.ModelViewSet):
     serializer_class = api.PinSerializer
     filter_backends = (
         AllTagsFilter,
+        PinSearchFilter,
         DjangoFilterBackend,
         SearchFilter,
         PinSortFilter,

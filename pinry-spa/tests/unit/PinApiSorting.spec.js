@@ -5,6 +5,13 @@ import API from '@/components/api';
 jest.mock('axios');
 
 describe('Pin list sorting query', () => {
+  it('sends only supported image filters with each page and tag query', async () => {
+    await API.fetchPins(30, ['alpha'], null, null, { mode: 'oldest' }, { animation: 'animated', min_width: '800', owner: 'ignored' });
+    const { params } = axios.get.mock.calls[0][1];
+    expect(params).toEqual({
+      format: 'json', limit: 30, offset: 30, sort: 'oldest', tags__name: ['alpha'], animation: 'animated', min_width: '800',
+    });
+  });
   beforeEach(() => {
     jest.clearAllMocks();
     axios.get.mockResolvedValue({ data: { results: [], next: null } });

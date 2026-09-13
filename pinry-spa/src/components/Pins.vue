@@ -448,6 +448,7 @@ export default {
     return { ...initialData(), density, densityOptions };
   },
   props: {
+    searchMode: { type: Boolean, default: false },
     pinFilters: {
       type: Object,
       default() {
@@ -559,7 +560,7 @@ export default {
       });
     },
     activateSortContext() {
-      this.sortStorageKey = pinSortStorageKey(this.pinFilters);
+      this.sortStorageKey = this.searchMode ? 'svrx.pinSort.v1:search' : pinSortStorageKey(this.pinFilters);
       this.sortState = readPinSortState(
         getPinSortStorage(), this.sortStorageKey, this.seedFactory,
       );
@@ -598,6 +599,7 @@ export default {
         userFilter: this.pinFilters.userFilter,
         boardFilter: this.pinFilters.boardFilter,
         idFilter: this.pinFilters.idFilter,
+        searchFilters: { ...this.pinFilters.searchFilters },
       };
     },
     isRequestCurrent(generation, filters) {
@@ -606,7 +608,8 @@ export default {
       return current.tagFilter === filters.tagFilter
         && current.userFilter === filters.userFilter
         && current.boardFilter === filters.boardFilter
-        && current.idFilter === filters.idFilter;
+        && current.idFilter === filters.idFilter
+        && JSON.stringify(current.searchFilters || {}) === JSON.stringify(filters.searchFilters);
     },
     invalidateSelectionRequest() {
       this.selectionRequestToken += 1;
@@ -1401,16 +1404,16 @@ export default {
       const { offset } = this.status;
       if (filters.tagFilter) {
         promise = API.fetchPins(
-          offset, filters.tagFilter, null, null, this.sortRequestState(),
+          offset, filters.tagFilter, null, null, this.sortRequestState(), filters.searchFilters,
         );
       } else if (filters.userFilter) {
         promise = API.fetchPins(
-          offset, null, filters.userFilter, null, this.sortRequestState(),
+          offset, null, filters.userFilter, null, this.sortRequestState(), filters.searchFilters,
         );
       } else if (filters.boardFilter) {
         if (this.metaReady.board) {
           promise = API.fetchPins(
-            offset, null, null, filters.boardFilter, this.sortRequestState(),
+            offset, null, null, filters.boardFilter, this.sortRequestState(), filters.searchFilters,
           );
         } else {
           const prevPromise = API.Board.get(filters.boardFilter);
@@ -1420,7 +1423,7 @@ export default {
               this.editorMeta.currentBoard = resp.data;
               this.metaReady.board = true;
               return API.fetchPins(
-                offset, null, null, filters.boardFilter, this.sortRequestState(),
+                offset, null, null, filters.boardFilter, this.sortRequestState(), filters.searchFilters,
               );
             },
           );
@@ -1428,7 +1431,7 @@ export default {
       } else if (filters.idFilter) {
         promise = API.fetchPin(filters.idFilter);
       } else {
-        promise = API.fetchPins(offset, null, null, null, this.sortRequestState());
+        promise = API.fetchPins(offset, null, null, null, this.sortRequestState(), filters.searchFilters);
       }
       this.pinPageRequest = promise.then(
         (resp) => {

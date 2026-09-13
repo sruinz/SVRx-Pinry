@@ -24,6 +24,12 @@ const LEGACY_CHROME_URL = 'https://chrome.google.com/webstore/detail/jmhdcnmfkgl
 const FIREFOX_URL = 'https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/';
 
 const EXPECTED_LOCALE_KEYS = [
+  'searchInvalidUrl',
+  'imageSearch_title', 'imageSearch_animation', 'imageSearch_aspect', 'imageSearch_all',
+  'imageSearch_static', 'imageSearch_animated', 'imageSearch_landscape', 'imageSearch_portrait',
+  'imageSearch_square', 'imageSearch_min_width', 'imageSearch_min_height', 'imageSearch_date_from',
+  'imageSearch_date_to', 'imageSearch_dateHint', 'imageSearch_animationHint', 'imageSearch_reset',
+  'imageSearch_invalid', 'imageSearch_dateOrder',
   'pinDensityLabel',
   'pinDensity_small',
   'pinDensity_normal',

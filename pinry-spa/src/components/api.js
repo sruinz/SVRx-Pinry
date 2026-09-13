@@ -139,7 +139,7 @@ function serializeQueryParams(params) {
   return pairs.join('&');
 }
 
-function fetchPins(offset, tagFilter, userFilter, boardFilter, sortState = null) {
+function fetchPins(offset, tagFilter, userFilter, boardFilter, sortState = null, searchFilters = {}) {
   const url = `${API_PREFIX}pins/`;
   const queryArgs = {
     format: 'json',
@@ -155,6 +155,11 @@ function fetchPins(offset, tagFilter, userFilter, boardFilter, sortState = null)
   if (tagFilter) queryArgs.tags__name = tagFilter;
   if (userFilter) queryArgs.submitter__username = userFilter;
   if (boardFilter) queryArgs.pins__id = boardFilter;
+  ['animation', 'aspect', 'min_width', 'min_height', 'date_from', 'date_to'].forEach((key) => {
+    if (searchFilters[key] !== undefined && searchFilters[key] !== '') {
+      queryArgs[key] = searchFilters[key];
+    }
+  });
   return axios.get(
     url,
     { params: queryArgs, paramsSerializer: serializeQueryParams },
