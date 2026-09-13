@@ -24,6 +24,10 @@ This is an unofficial modified distribution of Pinry.
 
 The server manages images and accounts; the Chrome/Edge extension collects web images and saves them to your server.
 
+![SVRx Pinry main screen in English with a dark theme and a six-column pin grid](docs/src/imgs/screenshots/svrx-pinry-main-en.png)
+
+*Dark-mode main screen with demo content. [Photo credits](docs/src/imgs/screenshots/CREDITS.md).*
+
 ## Features
 
 ### Browsing and viewing

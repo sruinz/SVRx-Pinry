@@ -28,6 +28,10 @@ Synology 전용이 아니며 Docker를 실행할 수 있는 서버·PC·NAS에�
 
 서버는 이미지와 계정을 관리하고, 확장 프로그램은 Chrome·Edge에서 웹 이미지를 수집해 서버에 저장합니다.
 
+![다크 테마와 6열 핀 목록을 보여주는 SVRx Pinry 한국어 메인 화면](docs/src/imgs/screenshots/svrx-pinry-main-ko.png)
+
+*데모 콘텐츠를 사용한 다크 모드 메인 화면입니다. [사진 출처](docs/src/imgs/screenshots/CREDITS.md).*
+
 ## 주요 기능
 
 ### 이미지 탐색과 감상
