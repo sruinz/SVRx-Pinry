@@ -46,7 +46,130 @@ describe('핀 상세 연속 감상', () => {
     jest.useRealTimers();
   });
 
-  it.each([3, 5, 10])('%s초 간격을 선택하면 저장하고 해당 시간 뒤 이동한다', async (seconds) => {
+  it('현재 원본을 유지하며 다음 1장만 준비하고 디코딩 후 이미지와 설명을 함께 바꾼다', async () => {
+    open({ navigation: () => ({ items: [pin(3), pin(8), pin(1)], hasNext: false }) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    const prepared = wrapper.find('[data-test="preview-preload"]');
+    expect(prepared.exists()).toBe(true);
+    expect(prepared.attributes('src')).toBe('/image-8.gif');
+    expect(wrapper.findAll('[data-test="preview-preload"]')).toHaveLength(1);
+    let decoded;
+    prepared.element.decode = () => new Promise((resolve) => { decoded = resolve; });
+    await wrapper.find('[data-test="preview-next"]').trigger('click');
+    expect(wrapper.find('[data-test="preview-image"]').attributes('src')).toBe('/image-3.gif');
+    expect(wrapper.find('[data-test="preview-image"]').isVisible()).toBe(true);
+    expect(wrapper.text()).toContain('Pin 3');
+    expect(wrapper.text()).not.toContain('previewImageLoading');
+    await prepared.trigger('load');
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    decoded();
+    await flushPromises();
+    expect(wrapper.find('[data-test="preview-image"]').element).toBe(prepared.element);
+    expect(wrapper.text()).toContain('Pin 8');
+    expect(wrapper.find('[data-test="preview-preload"]').attributes('src')).toBe('/image-1.gif');
+  });
+
+  it.each(['pause', 'scroll', 'close'])('원본 준비 중 %s 조작 뒤 늦은 로딩으로 넘어가지 않는다', async (action) => {
+    jest.useFakeTimers();
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    document.body.appendChild(wrapper.element);
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    const prepared = wrapper.find('[data-test="preview-preload"]');
+    expect(prepared.exists()).toBe(true);
+    await wrapper.find('[data-test="preview-play"]').trigger('click');
+    jest.advanceTimersByTime(5000);
+    await nextTick();
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    if (action === 'pause') await wrapper.find('[data-test="preview-play"]').trigger('click');
+    if (action === 'scroll') await wrapper.find('.preview-image-viewport').trigger('scroll');
+    if (action === 'close') await wrapper.find('[data-test="preview-close"]').trigger('click');
+    await prepared.trigger('load');
+    await flushPromises();
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    if (action === 'scroll') {
+      jest.advanceTimersByTime(4999);
+      expect(wrapper.vm.currentPin.id).toBe(3);
+      jest.advanceTimersByTime(1);
+      await nextTick();
+      expect(wrapper.vm.currentPin.id).toBe(8);
+    }
+    wrapper.element.remove();
+  });
+
+  it('다음 원본 로딩 실패는 현재 이미지를 보존하고 재생을 멈춘다', async () => {
+    jest.useFakeTimers();
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    const prepared = wrapper.find('[data-test="preview-preload"]');
+    expect(prepared.exists()).toBe(true);
+    await wrapper.find('[data-test="preview-play"]').trigger('click');
+    jest.advanceTimersByTime(5000);
+    await prepared.trigger('error');
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    expect(wrapper.find('[data-test="preview-image"]').isVisible()).toBe(true);
+    expect(wrapper.text()).toContain('previewImageError');
+    expect(wrapper.find('[data-test="preview-play"]').attributes('aria-pressed')).toBe('false');
+  });
+
+  it('미리 로딩 실패 후 자동 재요청하지 않고 사용자의 이동으로만 재시도한다', async () => {
+    jest.useFakeTimers();
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    const failed = wrapper.find('[data-test="preview-preload"]');
+    await failed.trigger('error');
+    await wrapper.find('[data-test="preview-play"]').trigger('click');
+    jest.advanceTimersByTime(5000);
+    await flushPromises();
+    expect(wrapper.find('[data-test="preview-play"]').attributes('aria-pressed')).toBe('false');
+    expect(wrapper.text()).toContain('previewImageError');
+    expect(wrapper.find('[data-test="preview-preload"]').element).toBe(failed.element);
+    await wrapper.find('[data-test="preview-next"]').trigger('click');
+    await flushPromises();
+    const retry = wrapper.find('[data-test="preview-preload"]');
+    expect(retry.element).not.toBe(failed.element);
+    await retry.trigger('load');
+    expect(wrapper.vm.currentPin.id).toBe(8);
+    expect(wrapper.text()).not.toContain('previewImageError');
+  });
+
+  it.each(['성공', '실패'])('같은 핀을 다시 준비해도 이전 DOM의 늦은 디코딩 %s는 무시한다', async (result) => {
+    const items = [pin(1), pin(3), pin(8)];
+    open({ navigation: () => ({ items, hasNext: false }) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    const oldPrepared = wrapper.find('[data-test="preview-preload"]');
+    let finish;
+    oldPrepared.element.decode = () => new Promise((resolve, reject) => {
+      finish = result === '성공' ? resolve : reject;
+    });
+    await oldPrepared.trigger('load');
+    await wrapper.find('[data-test="preview-previous"]').trigger('click');
+    await wrapper.find('[data-test="preview-next"]').trigger('click');
+    finish();
+    await flushPromises();
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    expect(wrapper.vm.preparedFailed).toBe(false);
+    expect(wrapper.vm.transitionError).toBe(false);
+    await wrapper.find('[data-test="preview-preload"]').trigger('load');
+    expect(wrapper.vm.currentPin.id).toBe(8);
+  });
+
+  it('비동기 디코딩은 이벤트 전달이 끝난 뒤에도 준비 이미지 DOM을 기억한다', async () => {
+    const items = [pin(3), pin(8)];
+    open({ navigation: () => ({ items, hasNext: false }) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    const image = wrapper.find('[data-test="preview-preload"]').element;
+    let finish;
+    image.decode = () => new Promise((resolve) => { finish = resolve; });
+    await wrapper.find('[data-test="preview-next"]').trigger('click');
+    const event = { target: image };
+    const loading = wrapper.vm.onImageLoaded(event, items[1]);
+    event.target = null;
+    finish();
+    await loading;
+    expect(wrapper.vm.currentPin.id).toBe(8);
+  });
+
+  it.each([1, 3, 5, 10])('%s초 간격을 선택하면 저장하고 해당 시간 뒤 이동한다', async (seconds) => {
     jest.useFakeTimers();
     open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
     const interval = wrapper.find('[data-test="preview-interval"]');
@@ -54,6 +177,7 @@ describe('핀 상세 연속 감상', () => {
     await interval.setValue(String(seconds));
     expect(window.localStorage.getItem('pinry-preview-interval')).toBe(String(seconds));
     await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-preload"]').trigger('load');
     await wrapper.find('[data-test="preview-play"]').trigger('click');
     jest.advanceTimersByTime(seconds * 1000 - 1);
     expect(wrapper.vm.currentPin.id).toBe(3);
@@ -62,7 +186,7 @@ describe('핀 상세 연속 감상', () => {
     expect(wrapper.vm.currentPin.id).toBe(8);
   });
 
-  it.each(['3', '10', 'invalid'])('저장된 간격 %s를 복원하고 잘못된 값은 5초를 사용한다', (stored) => {
+  it.each(['1', '3', '10', 'invalid'])('저장된 간격 %s를 복원하고 잘못된 값은 5초를 사용한다', (stored) => {
     window.localStorage.setItem('pinry-preview-interval', stored);
     open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
     expect(wrapper.find('[data-test="preview-interval"]').element.value).toBe(stored === 'invalid' ? '5' : stored);
@@ -72,6 +196,7 @@ describe('핀 상세 연속 감상', () => {
     jest.useFakeTimers();
     open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
     await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-preload"]').trigger('load');
     await wrapper.find('[data-test="preview-play"]').trigger('click');
     jest.advanceTimersByTime(4000);
     await wrapper.find('[data-test="preview-interval"]').setValue('10');
@@ -89,6 +214,7 @@ describe('핀 상세 연속 감상', () => {
     content.appendChild(wrapper.element);
     document.body.appendChild(content);
     await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-preload"]').trigger('load');
     const play = wrapper.find('[data-test="preview-play"]');
     await play.trigger('click');
     jest.advanceTimersByTime(4000);
@@ -126,6 +252,7 @@ describe('핀 상세 연속 감상', () => {
     expect(wrapper.vm.currentPin.id).toBe(3);
     jest.advanceTimersByTime(1);
     await nextTick();
+    await wrapper.find('[data-test="preview-preload"]').trigger('load');
     expect(wrapper.vm.currentPin.id).toBe(8);
     wrapper.element.remove();
   });
@@ -144,11 +271,13 @@ describe('핀 상세 연속 감상', () => {
     expect(wrapper.vm.currentPin.id).toBe(3);
     jest.advanceTimersByTime(1);
     await nextTick();
-    expect(wrapper.vm.currentPin.id).toBe(8);
+    expect(wrapper.vm.currentPin.id).toBe(3);
     jest.advanceTimersByTime(20000);
     await nextTick();
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    await wrapper.find('[data-test="preview-preload"]').trigger('load');
     expect(wrapper.vm.currentPin.id).toBe(8);
-    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-preload"]').trigger('load');
     jest.advanceTimersByTime(5000);
     await nextTick();
     expect(wrapper.vm.currentPin.id).toBe(1);
@@ -161,6 +290,7 @@ describe('핀 상세 연속 감상', () => {
     jest.useFakeTimers();
     open({ navigation: () => ({ items: [pin(3), pin(8), pin(1)], hasNext: false }) });
     await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-preload"]').trigger('load');
     const play = wrapper.find('[data-test="preview-play"]');
     expect(play.exists()).toBe(true);
     await play.trigger('click');
@@ -325,6 +455,7 @@ describe('핀 상세 연속 감상', () => {
   it('다음·이전 이동에서 확대 선택은 유지하고 이미지 스크롤만 초기화한다', async () => {
     open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
     await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-preload"]').trigger('load');
     expect(wrapper.find('[data-test="preview-zoom"]').exists()).toBe(true);
     await wrapper.find('[data-test="preview-zoom"]').trigger('click');
     const viewport = wrapper.find('.preview-image-viewport').element;

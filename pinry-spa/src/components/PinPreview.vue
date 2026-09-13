@@ -10,6 +10,7 @@
     <section class="card">
       <p v-if="fullscreenError" role="status" class="preview-message">{{ $t('previewFullscreenError') }}</p>
       <p v-if="pageError" role="status" class="preview-message">{{ $t('previewPageError') }}</p>
+      <p v-if="transitionError" role="status" class="preview-message">{{ $t('previewImageError') }}</p>
       <div class="card-image">
         <figure ref="imageViewport" class="image preview-image-viewport"
                 :class="{ 'is-original-size': originalSize }"
@@ -20,10 +21,12 @@
           <button v-show="imageReady" type="button" class="preview-image-toggle"
                   data-test="preview-image-toggle" @click.stop="toggleOriginalSize"
                   :aria-label="$t(originalSize ? 'previewFitScreen' : 'previewOriginalSize')">
-            <img :key="currentPin.id" ref="previewImage" data-test="preview-image"
-               v-show="imageReady" :src="currentPin.large_image_url"
-               :alt="currentPin.description || $t('previewImage')"
-               @load="onImageLoaded" @error="onImageError">
+            <img v-for="item in previewImages" :key="item.id"
+               :data-test="item.id === currentPin.id ? 'preview-image' : 'preview-preload'"
+               v-show="item.id === currentPin.id && imageReady" :src="item.large_image_url"
+               :aria-hidden="item.id !== currentPin.id ? 'true' : undefined"
+               :alt="item.id === currentPin.id ? (item.description || $t('previewImage')) : ''"
+               @load="onImageLoaded($event, item)" @error="onImageError($event, item)">
           </button>
         </figure>
         <nav v-if="navigation" class="preview-navigation" data-test="preview-navigation"
@@ -66,7 +69,7 @@
             </button>
             <select v-if="navigation" class="meta-link preview-interval" data-test="preview-interval"
                     :value="slideInterval" :aria-label="$t('previewInterval')" @change="changeInterval">
-              <option v-for="seconds in [3, 5, 10]" :key="seconds" :value="seconds">
+              <option v-for="seconds in [1, 3, 5, 10]" :key="seconds" :value="seconds">
                 {{ $t('previewSeconds', { seconds }) }}
               </option>
             </select>
@@ -116,7 +119,7 @@ export default {
     try {
       originalSize = window.localStorage.getItem(SIZE_STORAGE_KEY) === 'original';
       const storedInterval = Number(window.localStorage.getItem(INTERVAL_STORAGE_KEY));
-      if ([3, 5, 10].includes(storedInterval)) slideInterval = storedInterval;
+      if ([1, 3, 5, 10].includes(storedInterval)) slideInterval = storedInterval;
     } catch (_error) {
       // 저장소를 읽을 수 없으면 화면 맞춤으로 시작한다.
     }
@@ -126,6 +129,11 @@ export default {
       pageError: false,
       imageReady: false,
       imageError: false,
+      preparedPin: null,
+      preparedReady: false,
+      preparedFailed: false,
+      pendingMove: null,
+      transitionError: false,
       originalSize,
       slideInterval,
       playing: false,
@@ -136,6 +144,9 @@ export default {
     };
   },
   computed: {
+    previewImages() {
+      return this.preparedPin ? [this.currentPin, this.preparedPin] : [this.currentPin];
+    },
     context() {
       return this.navigation ? this.navigation() : { items: [this.currentPin], hasNext: false };
     },
@@ -167,24 +178,27 @@ export default {
   methods: {
     changeInterval(event) {
       const seconds = Number(event.target.value);
-      if (![3, 5, 10].includes(seconds)) return;
+      if (![1, 3, 5, 10].includes(seconds)) return;
       this.slideInterval = seconds;
       try {
         window.localStorage.setItem(INTERVAL_STORAGE_KEY, String(seconds));
       } catch (_error) {
         // 저장소가 차단되어도 현재 선택과 재생은 유지한다.
       }
+      if (this.pendingMove && this.pendingMove.automatic) this.pendingMove = null;
       this.scheduleSlide();
     },
     onPreviewScroll(event) {
       const content = this.$el.closest('.modal-content');
       if (this.playing && (this.$el.contains(event.target) || event.target === content)) {
         // 마지막 스크롤부터 감상 시간을 다시 주고 자동 재생 상태는 유지한다.
+        if (this.pendingMove && this.pendingMove.automatic) this.pendingMove = null;
         this.scheduleSlide();
       }
     },
     stopSlideshow() {
       this.playing = false;
+      if (this.pendingMove && this.pendingMove.automatic) this.pendingMove = null;
       clearTimeout(this.slideTimer);
       this.slideTimer = null;
     },
@@ -257,6 +271,8 @@ export default {
     deactivate() {
       this.disposed = true;
       this.stopSlideshow();
+      this.pendingMove = null;
+      this.preparedPin = null;
       document.removeEventListener('keydown', this.onKeydown);
       document.removeEventListener('visibilitychange', this.onVisibilityChange);
       document.removeEventListener('fullscreenchange', this.onFullscreenChange);
@@ -294,18 +310,64 @@ export default {
       }
       const item = this.context.items[index];
       if (item) {
-        this.resetImageScroll();
-        this.imageReady = false;
-        this.imageError = false;
-        this.currentPin = item;
-        // 상세 영역만 처음으로 이동하고 뒤쪽 목록의 스크롤은 유지한다.
-        this.$nextTick(() => {
-          if (document.fullscreenElement === this.$el) this.$el.scrollTop = 0;
-          const content = this.$el.closest('.modal-content');
-          if (content) content.scrollTop = 0;
-        });
+        this.transitionError = false;
+        if (this.imageReady && !this.imageError) {
+          // 실패한 준비 이미지는 사용자가 다시 이동을 요청할 때만 새로 요청한다.
+          if (this.preparedPin && this.preparedPin.id === item.id && this.preparedFailed) {
+            if (automatic) {
+              this.transitionError = true;
+              this.stopSlideshow();
+              return;
+            }
+            this.preparedPin = null;
+            await this.$nextTick();
+            if (this.disposed || (automatic && !this.playing)) return;
+          }
+          this.pendingMove = { id: item.id, automatic };
+          this.prepareImage(item);
+          this.commitPrepared();
+        } else this.activatePin(item, false);
       }
-      if (!item || !this.hasNext) this.stopSlideshow();
+      if (!item) this.stopSlideshow();
+    },
+    prepareImage(item) {
+      if (this.preparedPin && this.preparedPin.id === item.id) return;
+      this.preparedPin = item;
+      this.preparedReady = false;
+      this.preparedFailed = false;
+    },
+    prepareNext() {
+      if (this.disposed || this.pendingMove || !this.imageReady || document.hidden) return;
+      const item = this.context.items[this.currentIndex + 1];
+      if (item) this.prepareImage(item);
+    },
+    commitPrepared() {
+      const pending = this.pendingMove;
+      if (this.disposed || !this.isModalActive() || !pending || !this.preparedReady
+          || !this.preparedPin || pending.id !== this.preparedPin.id
+          || (pending.automatic && (!this.playing || document.hidden))) return;
+      this.activatePin(this.preparedPin, true);
+    },
+    activatePin(item, ready) {
+      this.currentPin = item;
+      this.imageReady = ready;
+      this.imageError = false;
+      this.pendingMove = null;
+      this.preparedPin = null;
+      this.preparedReady = false;
+      this.preparedFailed = false;
+      this.resetImageScroll();
+      if (!this.hasNext) this.stopSlideshow();
+      this.$nextTick(() => {
+        if (this.disposed) return;
+        if (document.fullscreenElement === this.$el) this.$el.scrollTop = 0;
+        const content = this.$el.closest('.modal-content');
+        if (content) content.scrollTop = 0;
+        if (ready) {
+          this.prepareNext();
+          this.scheduleSlide();
+        }
+      });
     },
     onKeydown(event) {
       const { target } = event;
@@ -315,16 +377,39 @@ export default {
       event.preventDefault();
       this.move(event.key === 'ArrowLeft' ? -1 : 1);
     },
-    onImageLoaded(event) {
-      if (event.target === this.$refs.previewImage) {
+    async onImageLoaded(event, item) {
+      const image = event.target;
+      if (this.disposed || !this.$el.contains(image)) return;
+      if (item.id === this.currentPin.id) {
         this.imageReady = true;
+        this.prepareNext();
         this.scheduleSlide();
+      } else if (this.preparedPin && item.id === this.preparedPin.id) {
+        const prepared = this.preparedPin;
+        try {
+          if (image.decode) await image.decode();
+        } catch (_error) {
+          if (this.preparedPin === prepared) this.onImageError({ target: image }, item);
+          return;
+        }
+        if (this.disposed || this.preparedPin !== prepared
+            || !this.$el.contains(image)) return;
+        this.preparedReady = true;
+        this.commitPrepared();
       }
     },
-    onImageError(event) {
-      if (event.target === this.$refs.previewImage) {
+    onImageError(event, item) {
+      if (this.disposed || !this.$el.contains(event.target)) return;
+      if (item.id === this.currentPin.id) {
         this.imageError = true;
         this.stopSlideshow();
+      } else if (this.preparedPin && item.id === this.preparedPin.id) {
+        this.preparedFailed = true;
+        if (this.pendingMove && this.pendingMove.id === item.id) {
+          this.transitionError = true;
+          this.pendingMove = null;
+          this.stopSlideshow();
+        }
       }
     },
     closeAndGoTo() {
