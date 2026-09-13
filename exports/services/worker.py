@@ -8,8 +8,14 @@ import time
 import uuid
 
 from django.conf import settings
-from django.db import DatabaseError, IntegrityError, close_old_connections
+from django.db import (
+    DatabaseError,
+    IntegrityError,
+    close_old_connections,
+    connections,
+)
 from django.db.models import Exists, OuterRef, Q
+from django.db.models.expressions import RawSQL
 from django.utils import timezone
 
 from core.services.database_fence import (
@@ -570,7 +576,7 @@ class LeaseHeartbeat(object):
                     self._stop_event.set()
                     return
         finally:
-            close_old_connections()
+            connections[self.using].close()
 
     def start(self):
         with self._mutex:
@@ -2808,6 +2814,7 @@ class ExportWorker(object):
         self.heartbeat_factory = heartbeat_factory or LeaseHeartbeat
         self.worker_token = None
         self.heartbeat = None
+        self._potential_work_sql = None
 
     def acquire_worker_lease(self, now):
         self.worker_token = acquire_worker_lease(
@@ -2907,11 +2914,11 @@ class ExportWorker(object):
             sleeper=self.sleeper,
         )
 
-    def has_runnable_work(self, stop_requested):
-        now = self.clock()
-
-        def potential_probe(operation_deadline):
-            operation_deadline.checkpoint()
+    def _has_potential_work(self, now):
+        database = connections[self.using]
+        if self._potential_work_sql is None:
+            # SQL 구조만 재사용합니다. 시각과 조회 결과는 매번 새로 확인합니다.
+            time_parameter = object()
             potential_work = (
                 Q(state__in=ACTIVE_STATES)
                 | Q(state="complete", staging_cleanup_state="pending")
@@ -2921,7 +2928,10 @@ class ExportWorker(object):
                 )
                 | (
                     Q(state="complete", ready_cleanup_state="retained")
-                    & (Q(expires_at__lte=now) | Q(owner_id__isnull=True))
+                    & (
+                        Q(expires_at__lte=RawSQL("%s", (time_parameter,)))
+                        | Q(owner_id__isnull=True)
+                    )
                 )
                 | Q(state="expired", ready_cleanup_state="pending")
                 | Q(
@@ -2938,9 +2948,30 @@ class ExportWorker(object):
                     ready_relative_path__isnull=True,
                 )
             )
-            return ExportJob.objects.using(self.using).filter(
+            query = ExportJob.objects.using(self.using).filter(
                 potential_work,
-            ).exists()
+            ).query.exists()
+            sql, params = query.get_compiler(using=self.using).as_sql()
+            self._potential_work_time_index = next(
+                index for index, value in enumerate(params)
+                if value is time_parameter
+            )
+            self._potential_work_params = params
+            self._potential_work_sql = sql
+        params = list(self._potential_work_params)
+        params[self._potential_work_time_index] = (
+            database.ops.adapt_datetimefield_value(now)
+        )
+        with database.cursor() as cursor:
+            cursor.execute(self._potential_work_sql, params)
+            return cursor.fetchone() is not None
+
+    def has_runnable_work(self, stop_requested):
+        now = self.clock()
+
+        def potential_probe(operation_deadline):
+            operation_deadline.checkpoint()
+            return self._has_potential_work(now)
 
         def probe(operation_deadline):
             operation_deadline.checkpoint()

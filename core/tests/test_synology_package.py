@@ -2206,7 +2206,7 @@ class SynologyPackageTests(unittest.TestCase):
             normalized_final.index(runtime_copy), probe_positions[0]
         )
 
-    def test_frontend_build_declares_async_runtime_and_pins_pnpm(self):
+    def test_frontend_build_uses_vite_and_pins_pnpm(self):
         package = json.loads(
             (self.repository_root / "pinry-spa/package.json").read_text()
         )
@@ -2218,7 +2218,14 @@ class SynologyPackageTests(unittest.TestCase):
         ).read_text()
 
         self.assertEqual(
-            package["dependencies"]["regenerator-runtime"], "^0.13.9"
+            package["scripts"]["build"],
+            "vite build && node scripts/verify-branding-build.js dist",
+        )
+        self.assertIn("vite", package["devDependencies"])
+        self.assertIn("@vitejs/plugin-vue", package["devDependencies"])
+        self.assertEqual(
+            package["devDependencies"]["@vue/compiler-sfc"],
+            package["dependencies"]["vue"],
         )
         self.assertEqual(package["packageManager"], "pnpm@9.15.9")
         self.assertIn("RUN npm install -g pnpm@9.15.9", dockerfile)

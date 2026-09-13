@@ -1001,6 +1001,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -1109,12 +1110,19 @@ try:
     with open(server_config, "w", encoding="utf-8") as stream:
         stream.write(image_config)
     nginx_config = os.path.join(root, "nginx.conf")
-    # 이미지의 서버 설정이 참조하는 요청 제한 영역도 함께 사용한다.
+    # 이미지의 서버 설정이 참조하는 요청 제한 영역과 프록시 판별 맵을 사용한다.
     with open("/etc/nginx/nginx.conf", encoding="utf-8") as stream:
-        rate_zones = "\n".join(
-            line.strip() for line in stream
-            if line.strip().startswith("limit_req_zone ")
-        )
+        main_config = stream.read()
+    rate_zones = "\n".join(
+        line.strip() for line in main_config.splitlines()
+        if line.strip().startswith("limit_req_zone ")
+    )
+    proxy_map = re.search(
+        r'(?m)^\s*map\s+"[^"\n]*"\s+\$pinry_proxied\s*\{[^{}]*\}',
+        main_config,
+    )
+    if proxy_map is None:
+        raise SystemExit("export_smoke_image_nginx_proxy_map_missing")
     with open(nginx_config, "w", encoding="utf-8") as stream:
         stream.write("""user root;
 worker_processes 1;
@@ -1123,11 +1131,15 @@ error_log stderr warn;
 events {{ worker_connections 64; }}
 http {{
     {rate_zones}
+    {proxy_map}
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
     include {server_config};
 }}
-""".format(root=root, server_config=server_config, rate_zones=rate_zones))
+""".format(
+            root=root, server_config=server_config,
+            rate_zones=rate_zones, proxy_map=proxy_map.group(0),
+        ))
     nginx = subprocess.Popen([
         nginx_binary,
         "-p", root + "/",

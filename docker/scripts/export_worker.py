@@ -73,10 +73,19 @@ def _run_worker_command():
     os.environ["DJANGO_SETTINGS_MODULE"] = "pinry.settings.docker"
 
     import django
+    from django.conf import settings
     from django.core.management import call_command
+    from django.db import connections
 
+    # 기본값을 채우기 전에 명시된 연결 수명과 다른 DB 설정은 보존합니다.
+    database = settings.DATABASES.get("default", {})
+    if database.get("ENGINE") == "django.db.backends.sqlite3":
+        database.setdefault("CONN_MAX_AGE", 60)
     django.setup()
-    call_command("run_export_worker")
+    try:
+        call_command("run_export_worker")
+    finally:
+        connections.close_all()
 
 
 def _write_error(code):

@@ -109,6 +109,7 @@ def _run_export_worker_launcher(arguments, **overrides):
         "stubborn_euid": False,
         "stubborn_egid": False,
         "stubborn_groups": False,
+        "databases": {"default": {"ENGINE": "django.db.backends.sqlite3"}},
     }
     configuration.update(overrides)
     environment = os.environ.copy()
@@ -208,6 +209,7 @@ django = types.ModuleType("django")
 
 
 def setup():
+    state["databases_at_setup"] = configuration["databases"]
     events.append("django.setup:{}".format(
         "after" if dropped() else "before"
     ))
@@ -231,7 +233,15 @@ def call_command(*arguments, **keyword_arguments):
 
 
 django_management.call_command = call_command
+django_conf = types.ModuleType("django.conf")
+django_conf.settings = types.SimpleNamespace(DATABASES=configuration["databases"])
+django_db = types.ModuleType("django.db")
+django_db.connections = types.SimpleNamespace(
+    close_all=lambda: events.append("connections_closed"),
+)
 sys.modules["django"] = django
+sys.modules["django.conf"] = django_conf
+sys.modules["django.db"] = django_db
 sys.modules["django.core"] = django_core
 sys.modules["django.core.management"] = django_management
 
@@ -288,6 +298,7 @@ print(json.dumps({
     "events": events,
     "identity": state.get("command_identity"),
     "command": state.get("command"),
+    "databases": state.get("databases_at_setup"),
     "django_imported_before_drop": django_imported_before_drop,
     "project_imported_before_drop": project_imported_before_drop,
     "harness_error": harness_error,
@@ -473,10 +484,13 @@ def _assert_nginx_contract(source):
         ("X-Forwarded-Host", '\"\"'),
         ("X-Real-IP", "$remote_addr"),
         ("X-Forwarded-For", "$remote_addr"),
+        ("X-Pinry-Direct-Peer", "$remote_addr"),
+        ("X-Pinry-Proxied", "$pinry_proxied"),
     }
     headers = _direct_values(batch, "proxy_set_header")
-    if len(headers) != 4 or {tuple(value) for value in headers} != (
-        expected_headers
+    if (
+        len(headers) != len(expected_headers)
+        or {tuple(value) for value in headers} != expected_headers
     ):
         raise AssertionError("batch proxy headers are incomplete or duplicated")
     if _direct_values(prefix[0], "client_max_body_size"):
@@ -606,6 +620,32 @@ def _assert_nginx_maintenance_contract(source):
 
 
 class ExportWorkerLauncherTests(unittest.TestCase):
+    def test_worker_defaults_sqlite_connection_lifetime_before_setup(self):
+        capture = _run_export_worker_launcher([
+            "--uid", "1000", "--gid", "1000",
+        ])
+        self.assertEqual(capture["code"], 0, capture)
+        self.assertEqual(capture["databases"]["default"].get("CONN_MAX_AGE"), 60)
+        self.assertIn("connections_closed", capture["events"])
+
+    def test_worker_preserves_explicit_lifetime_and_other_databases(self):
+        for default in (
+            {"ENGINE": "django.db.backends.sqlite3", "CONN_MAX_AGE": 0},
+            {"ENGINE": "django.db.backends.sqlite3", "CONN_MAX_AGE": 120},
+            {"ENGINE": "django.db.backends.sqlite3", "CONN_MAX_AGE": None},
+            {"ENGINE": "django.db.backends.postgresql"},
+        ):
+            with self.subTest(default=default):
+                databases = {
+                    "default": default,
+                    "secondary": {"ENGINE": "django.db.backends.sqlite3"},
+                }
+                capture = _run_export_worker_launcher(
+                    ["--uid", "1000", "--gid", "1000"], databases=databases,
+                )
+                self.assertEqual(capture["code"], 0, capture)
+                self.assertEqual(capture["databases"], databases)
+
     def test_worker_top_level_imports_only_required_standard_library(self):
         script = REPOSITORY_ROOT / "docker/scripts/export_worker.py"
         if not script.is_file():
@@ -2508,6 +2548,27 @@ class RuntimeConfigTests(unittest.TestCase):
 
         with self.assertRaises(AssertionError):
             _assert_nginx_contract(mutant)
+
+    def test_nginx_validator_rejects_missing_or_duplicate_recovery_headers(self):
+        source = (
+            REPOSITORY_ROOT / "docker/nginx/sites-enabled/default"
+        ).read_text()
+        start = source.index("    location = /api/v2/pins/batch/ {")
+        end = source.index("\n    }", start)
+        block = source[start:end]
+        _assert_nginx_contract(source)
+        for header, value in (
+            ("X-Pinry-Direct-Peer", "$remote_addr"),
+            ("X-Pinry-Proxied", "$pinry_proxied"),
+        ):
+            line = "        proxy_set_header {} {};\n".format(header, value)
+            for replacement in ("", line + line):
+                with self.subTest(header=header, replacement=replacement):
+                    mutant = (
+                        source[:start] + block.replace(line, replacement) + source[end:]
+                    )
+                    with self.assertRaises(AssertionError):
+                        _assert_nginx_contract(mutant)
 
     def test_nginx_validator_rejects_one_megabyte_in_third_location(self):
         source = (

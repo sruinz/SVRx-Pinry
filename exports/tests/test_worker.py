@@ -16,6 +16,7 @@ from django.db import (
     transaction,
 )
 from django.db.models.query import QuerySet
+from django.db.models.sql.query import Query
 from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -1362,6 +1363,63 @@ class WorkerLeaseTests(TransactionTestCase):
 
 
 class WorkerLockTests(ExportStorageMixin, TransactionTestCase):
+    def test_heartbeat_closes_reusable_connection_on_exit(self):
+        if connection.vendor == "sqlite" and connection.is_in_memory_db():
+            self.skipTest("실제 연결 종료는 파일 기반 SQLite 설정에서 검증합니다.")
+        token = acquire_worker_lease(timezone.now())
+        heartbeat = LeaseHeartbeat(token)
+        connection.close()
+        try:
+            with mock.patch.dict(connection.settings_dict, {"CONN_MAX_AGE": 60}):
+                with mock.patch.object(
+                    heartbeat._stop_event, "wait", side_effect=[False, True],
+                ):
+                    heartbeat._run()
+                self.assertIsNone(connection.connection)
+        finally:
+            connection.close()
+
+    def test_idle_preflight_compiles_once_but_reads_each_time(self):
+        worker = ExportWorker()
+        compilations = []
+        original = Query.get_compiler
+
+        def observe(query, *args, **kwargs):
+            compilations.append(query)
+            return original(query, *args, **kwargs)
+
+        with mock.patch.object(Query, "get_compiler", new=observe):
+            with CaptureQueriesContext(connection) as captured:
+                self.assertFalse(worker.has_runnable_work(lambda: False))
+                self.assertFalse(worker.has_runnable_work(lambda: False))
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(len(compilations), 1)
+
+    def test_warm_preflight_sees_new_jobs_and_updated_expiry(self):
+        clock = MutableClock(timezone.now())
+        worker = ExportWorker(clock=clock)
+        worker.worker_token = acquire_worker_lease(clock())
+        worker.heartbeat = LeaseHeartbeat(worker.worker_token, clock=clock)
+        self.assertFalse(worker.has_runnable_work(lambda: False))
+        job = ExportJob.objects.create(
+            owner=create_export_user("idle-fresh-job"), scope="pins", state="queued",
+        )
+        self.assertTrue(worker.has_runnable_work(lambda: False))
+        # 완료 자료가 만료되는 순간에도 최초 조회 시각을 재사용하면 안 됩니다.
+        ExportJob.objects.filter(pk=job.pk).update(
+            state="complete", completed_at=clock(),
+            expires_at=clock() + timedelta(seconds=10),
+            staging_cleanup_state="cleaned", ready_cleanup_state="retained",
+            ready_relative_path="ready/test.zip", ready_display_name="test.zip",
+            ready_size=1, ready_sha256="a" * 64, ready_dev=1, ready_ino=2,
+            ready_uid=os.getuid(), ready_gid=os.getgid(), ready_mode=0o600,
+            ready_nlink=1, ready_mtime_ns=3, ready_ctime_ns=4,
+        )
+        self.assertFalse(worker.has_runnable_work(lambda: False))
+        clock.value += timedelta(seconds=10)
+        connection.close()
+        self.assertTrue(worker.has_runnable_work(lambda: False))
+
     def _budget_exhaustion_fixture(self, suffix):
         now = timezone.now()
         owner = create_export_user("worker-budget-{}".format(suffix))
