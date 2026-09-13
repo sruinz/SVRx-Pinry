@@ -68,7 +68,7 @@ describe('multiple-tag search state', () => {
     expect(wrapper.find('[role="alert"]').exists()).toBe(true);
     wrapper.unmount();
   });
-  it('copies a non-empty tag selection and clears an empty selection', () => {
+  it('copies tags and searches all pins when the selection is cleared', () => {
     const wrapper = mountSearch();
     const selected = ['alpha', 'beta'];
 
@@ -83,7 +83,25 @@ describe('multiple-tag search state', () => {
     });
 
     wrapper.vm.doSearch({ filterType: 'Tag', selected: [] });
+    expect(wrapper.vm.pinFilters).toEqual({ tagFilter: [] });
+  });
+
+  it('restores an unfiltered search from the URL without requiring tags or dimensions', async () => {
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/search', component: Search }] });
+    await router.push('/search');
+    const wrapper = shallowMount(Search, {
+      global: { plugins: [router], mocks: { $t: key => key }, stubs: ['PHeader', 'SearchPanel', 'Pins', 'Boards'] },
+    });
     expect(wrapper.vm.pinFilters).toBeNull();
+    wrapper.vm.doSearch({ filterType: 'Tag', selected: [], filters: {} });
+    await flushPromises();
+    expect(router.currentRoute.value.query).toEqual({ mode: 'pins' });
+    expect(wrapper.vm.pinFilters).toEqual({ tagFilter: [] });
+    await router.push('/search?mode=pins&animation=static');
+    router.back();
+    await flushPromises();
+    expect(wrapper.vm.pinFilters).toEqual({ tagFilter: [] });
+    wrapper.unmount();
   });
 
   it('keeps the existing board search behavior', () => {

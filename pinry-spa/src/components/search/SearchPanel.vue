@@ -54,7 +54,7 @@
                   :type="key.startsWith('date_') ? 'date' : 'number'"
                   :min="key.startsWith('date_') ? '0002-01-01' : '1'"
                   :max="key.startsWith('date_') ? '9998-12-31' : '2147483647'"
-                  :placeholder="key.startsWith('date_') ? 'YYYY-MM-DD' : '800'"
+                  :placeholder="key.startsWith('date_') ? 'YYYY-MM-DD' : $t('imageSearch_dimensionExample')"
                   :aria-invalid="Boolean(errors[key])" :aria-describedby="errors[key] ? `search-error-${key}` : undefined">
                 </label>
                 <p v-if="errors[key]" :id="`search-error-${key}`" role="alert">{{ $t(errors[key] === 'before_start' ? 'imageSearch_dateOrder' : 'imageSearch_invalid') }}</p>

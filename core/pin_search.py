@@ -2,7 +2,7 @@ import re
 from datetime import date, datetime, time, timedelta
 
 from django.conf import settings
-from django.db.models import F
+from django.db.models import F, Q
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 from rest_framework.filters import BaseFilterBackend
@@ -52,9 +52,17 @@ class PinSearchFilter(BaseFilterBackend):
             raise ValidationError({"code": "pin_search_invalid", "fields": errors})
 
         animation = values.get("animation")
-        if animation:
-            states = ("gif", "webp") if animation == "animated" else ("static",)
-            queryset = queryset.filter(image__animation_status__in=states)
+        if animation == "animated":
+            queryset = queryset.filter(image__animation_status__in=("gif", "webp"))
+        elif animation == "static":
+            # 기존 판별 규칙처럼 GIF·WebP 외 저장 파일은 파일을 열지 않고 정지로 취급한다.
+            legacy_static = (
+                Q(image__animation_status__isnull=True)
+                & ~Q(image__image="")
+                & ~Q(image__image__iendswith=".gif")
+                & ~Q(image__image__iendswith=".webp")
+            )
+            queryset = queryset.filter(Q(image__animation_status="static") | legacy_static)
         aspect = values.get("aspect")
         if aspect:
             queryset = queryset.filter(image__width__gt=0, image__height__gt=0)

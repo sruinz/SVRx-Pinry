@@ -31,6 +31,16 @@ function mountPanel() {
 
 
 describe('multiple-tag search panel', () => {
+  it('submits all pins when controls are empty without sending placeholder dimensions', async () => {
+    const wrapper = mountPanel();
+    await wrapper.setProps({ query: { mode: 'pins' } });
+    await flushPromises();
+    await wrapper.find('[data-search-apply]').trigger('click');
+    expect(wrapper.emitted('selected').slice(-1)[0][0]).toEqual({ filterType: 'Tag', selected: [] });
+    expect(wrapper.find('input[name="min_width"]').element.value).toBe('');
+    expect(wrapper.find('input[name="min_height"]').element.value).toBe('');
+    wrapper.unmount();
+  });
   it('restores actual fields, tags and errors from URL query changes without submitting', async () => {
     const wrapper = mountPanel();
     await flushPromises();

@@ -29,7 +29,7 @@ const EXPECTED_LOCALE_KEYS = [
   'imageSearch_static', 'imageSearch_animated', 'imageSearch_landscape', 'imageSearch_portrait',
   'imageSearch_square', 'imageSearch_min_width', 'imageSearch_min_height', 'imageSearch_date_from',
   'imageSearch_date_to', 'imageSearch_dateHint', 'imageSearch_animationHint', 'imageSearch_reset',
-  'imageSearch_invalid', 'imageSearch_dateOrder',
+  'imageSearch_invalid', 'imageSearch_dateOrder', 'imageSearch_dimensionExample',
   'pinDensityLabel',
   'pinDensity_small',
   'pinDensity_normal',

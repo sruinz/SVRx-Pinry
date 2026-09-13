@@ -42,8 +42,54 @@ class PinSearchTests(TemporaryMediaMixin, APITestCase):
             self.assertEqual(set(self.ids(animation="animated")), {
                 self.pins["tall"].pk, self.pins["square"].pk,
             })
-            self.assertEqual(self.ids(animation="static"), [self.pins["wide"].pk])
+            self.assertEqual(set(self.ids(animation="static")), {
+                self.pins["wide"].pk, self.pins["unknown"].pk,
+            })
             self.assertEqual(len(self.ids()), 5)
+
+    def test_legacy_static_fallback_preserves_unknown_gif_webp_and_recorded_failures(self):
+        included = {self.pins["wide"].pk, self.pins["unknown"].pk}
+        legacy_images = []
+        for filename, status, expected in (
+            ("legacy.JPG", None, True), ("legacy.png", None, True),
+            ("legacy.JPEG", None, True), ("legacy.bmp", None, True),
+            ("legacy.GIF", None, False), ("legacy.WeBp", None, False),
+            (".gif", None, False), ("folder/.gif", None, False),
+            ("..gif", None, False), (".webp", None, False),
+            ("failed.jpg", "unreadable", False), ("", None, False),
+            ("known.gif", "static", True), ("known.png", "gif", False),
+        ):
+            image = create_image()
+            Image.objects.filter(pk=image.pk).update(image=filename, animation_status=status)
+            pin = Pin.objects.create(submitter=self.owner, image=image)
+            legacy_images.append((image.pk, status))
+            if expected:
+                included.add(pin.pk)
+        with mock.patch.object(Image, "_read_animation_status", side_effect=AssertionError("scan")):
+            self.assertEqual(set(self.ids(animation="static")), included)
+        self.assertEqual(
+            dict(Image.objects.filter(pk__in=[pk for pk, _ in legacy_images]).values_list("pk", "animation_status")),
+            dict(legacy_images),
+        )
+
+    def test_hundreds_of_legacy_pins_remain_searchable_across_pages_and_permissions(self):
+        Pin.objects.bulk_create([
+            Pin(submitter=self.owner, image=self.pins["unknown"].image)
+            for _ in range(300)
+        ])
+        private = Pin.objects.create(submitter=self.other, image=self.pins["unknown"].image, private=True)
+        with mock.patch.object(Image, "_read_animation_status", side_effect=AssertionError("scan")):
+            self.assertEqual(self.client.get(self.url).data["count"], 305)
+            self.assertEqual(self.client.get(self.url, {"animation": "static"}).data["count"], 302)
+            ids = []
+            for offset in (0, 100, 200, 300):
+                ids.extend(self.ids(animation="static", sort="oldest", limit=100, offset=offset))
+            self.assertEqual(len(ids), 302)
+            self.assertEqual(len(set(ids)), 302)
+            self.assertEqual(ids, sorted(ids))
+            self.assertNotIn(private.pk, ids)
+            self.client.force_authenticate(self.other)
+            self.assertIn(private.pk, self.ids(animation="static", sort="latest"))
 
     def test_aspect_and_minimum_dimensions_are_combined(self):
         self.assertEqual(self.ids(aspect="landscape", min_width="1000", min_height="600"), [self.pins["wide"].pk])

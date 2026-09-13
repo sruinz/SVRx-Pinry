@@ -51,8 +51,7 @@ export default {
       this.boardFilters = null;
       if (args.filterType === 'Tag') {
         const filters = args.filters || {};
-        if (Array.isArray(args.selected)
-          && (args.selected.length > 0 || Object.keys(filters).length > 0)) {
+        if (Array.isArray(args.selected)) {
           this.pinFilters = { tagFilter: args.selected.slice() };
           if (Object.keys(filters).length) this.pinFilters.searchFilters = { ...filters };
         }
