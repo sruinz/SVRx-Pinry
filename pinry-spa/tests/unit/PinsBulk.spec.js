@@ -112,6 +112,7 @@ async function settle() {
   await flushPromises();
 }
 
+
 function dispatchKey(target, key, options = {}) {
   const event = new KeyboardEvent('keydown', {
     key,
@@ -171,6 +172,27 @@ describe('PinBulkToolbar', () => {
 });
 
 describe('Pins selection mode', () => {
+  it('핀 이미지는 키보드로 열 수 있고 포커스가 있으면 편집 도구를 유지한다', async () => {
+    const wrapper = mountPins();
+    await settle();
+    const image = wrapper.find('[data-test="pin-image-41"]');
+    const container = wrapper.find('.pin-image-container');
+    expect(image.attributes('tabindex')).toBe('0');
+    await image.trigger('focusin');
+    expect(wrapper.findComponent({ name: 'EditorUI' }).isVisible()).toBe(true);
+    await container.trigger('mouseleave');
+    expect(wrapper.findComponent({ name: 'EditorUI' }).isVisible()).toBe(true);
+    const dialogInput = document.createElement('input');
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    dialog.appendChild(dialogInput);
+    await container.trigger('focusout', { relatedTarget: dialogInput });
+    expect(wrapper.findComponent({ name: 'EditorUI' }).isVisible()).toBe(true);
+    await image.trigger('keydown', { key: 'Enter' });
+    expect(overlays.openModal).toHaveBeenCalledTimes(1);
+    await container.trigger('focusout', { relatedTarget: null });
+    expect(wrapper.findComponent({ name: 'EditorUI' }).isVisible()).toBe(false);
+  });
   it('preserves search sorting and density when tags and image filters change', async () => {
     const wrapper = mountPins({ searchMode: true, pinFilters: { tagFilter: [], searchFilters: { animation: 'animated' } } });
     await settle();

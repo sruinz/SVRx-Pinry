@@ -13,6 +13,11 @@
 
   @include border-radius;
   .icon-container {
+    border: 0;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    line-height: inherit;
     @include border-radius;
     padding: 5px 2px 2px 2px;
     background-color: rgba(0, 0, 0, 0.8);

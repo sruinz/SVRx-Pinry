@@ -3,7 +3,7 @@
     <div
       v-show="previewImage !== null"
       class="has-text-centered is-center preview">
-      <img :src="previewImage">
+      <img :src="previewImage" :alt="$t('previewImage')">
     </div>
     <div v-show="previewImage === null">
       <FormField>

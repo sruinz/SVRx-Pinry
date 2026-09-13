@@ -1,4 +1,7 @@
 {
+  "pinEditAction": "Modifier le Pin",
+  "boardEditAction": "Modifier le tableau",
+  "pinRemoveFromBoardAction": "Retirer le Pin du tableau",
   "previewFullscreen": "Plein écran",
   "previewExitFullscreen": "Quitter le plein écran",
   "previewFullscreenError": "Le plein écran est indisponible. Vérifiez les réglages du navigateur.",

@@ -111,6 +111,24 @@ describe('Board custom ordering API', () => {
 });
 
 describe('accessible Board custom ordering', () => {
+  it('보드 링크 포커스 중에는 마우스가 떠나도 편집 도구를 유지한다', async () => {
+    const wrapper = mountBoards();
+    await settle();
+    const card = wrapper.find('.board-card');
+    const link = card.find('[data-test="board-link"]');
+    await link.trigger('focusin');
+    expect(card.find('[data-test="board-editor-stub"]').isVisible()).toBe(true);
+    await card.find(':scope > div').trigger('mouseleave');
+    expect(card.find('[data-test="board-editor-stub"]').isVisible()).toBe(true);
+    const dialogInput = document.createElement('input');
+    const dialog = document.createElement('div');
+    dialog.setAttribute('role', 'dialog');
+    dialog.appendChild(dialogInput);
+    await link.trigger('focusout', { relatedTarget: dialogInput });
+    expect(card.find('[data-test="board-editor-stub"]').isVisible()).toBe(true);
+    await link.trigger('focusout', { relatedTarget: null });
+    expect(card.find('[data-test="board-editor-stub"]').isVisible()).toBe(false);
+  });
   beforeEach(() => {
     jest.clearAllMocks();
     localStorage.clear();

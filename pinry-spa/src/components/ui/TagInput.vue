@@ -15,7 +15,7 @@
     </div>
     <ul v-if="showOptions" :id="listId" class="tag-input-options" role="listbox">
       <li v-for="(option, index) in options" :id="`${listId}-${index}`" :key="option"
-        role="option" :aria-selected="index === active" @mousedown.prevent="add(option)">
+        role="option" tabindex="-1" :aria-selected="index === active" @mousedown.prevent="add(option)">
         <slot :option="option">{{ option }}</slot>
       </li>
       <li v-if="!options.length" class="tag-input-empty"><slot name="empty" /></li>

@@ -204,15 +204,9 @@
               >
                 <div class="pin-image-container" @mouseenter="showEditButtons(item.id)"
                      @mouseleave="hideEditButtons(item.id)"
+                     @focusin="editorMeta.focusedEditId = item.id"
+                     @focusout="onEditorFocusOut($event)"
                 >
-                  <EditorUI
-                    v-show="interactionMode === 'browse' && shouldShowEdit(item.id)"
-                    :pin="item"
-                    :currentUsername="editorMeta.user.meta.username"
-                    :currentBoard="editorMeta.currentBoard"
-                    v-on:pin-delete-succeed="reset"
-                    v-on:pin-remove-from-board-succeed="reset"
-                  ></EditorUI>
                   <input
                     v-if="selection.active"
                     type="checkbox"
@@ -233,10 +227,23 @@
                   <img :src="item.url"
                      @load="onPinImageLoaded(item.id)"
                      @click.stop="onPinImageClick(item, $event)"
+                     :role="interactionMode === 'browse' ? 'button' : null"
+                     :tabindex="interactionMode === 'browse' ? 0 : -1"
+                     @keydown.enter.stop.prevent="onPinImageClick(item, $event)"
+                     @keydown.space.stop.prevent="onPinImageClick(item, $event)"
+                     :aria-label="item.description || $t('previewImage')"
                      :alt="item.description"
                      :style="item.style"
                      :data-test="`pin-image-${item.id}`"
                      class="pin-preview-image">
+                  <EditorUI
+                    v-show="interactionMode === 'browse' && shouldShowEdit(item.id)"
+                    :pin="item"
+                    :currentUsername="editorMeta.user.meta.username"
+                    :currentBoard="editorMeta.currentBoard"
+                    v-on:pin-delete-succeed="reset"
+                    v-on:pin-remove-from-board-succeed="reset"
+                  ></EditorUI>
                 </div>
                 <div class="pin-footer">
                   <div class="description" v-show="item.description" v-html="niceLinks(item.description)"></div>
@@ -373,6 +380,7 @@ function initialData() {
     },
     editorMeta: {
       currentEditId: null,
+      focusedEditId: null,
       currentBoard: {},
       user: {
         loggedIn: false,
@@ -1234,7 +1242,11 @@ export default {
       if (!this.editorMeta.user.loggedIn) {
         return false;
       }
-      return this.editorMeta.currentEditId === id;
+      return this.editorMeta.currentEditId === id || this.editorMeta.focusedEditId === id;
+    },
+    onEditorFocusOut(event) {
+      if (event.relatedTarget && event.relatedTarget.closest('[role="dialog"]')) return;
+      if (!event.currentTarget.contains(event.relatedTarget)) this.editorMeta.focusedEditId = null;
     },
     showEditButtons(id) {
       this.editorMeta.currentEditId = id;

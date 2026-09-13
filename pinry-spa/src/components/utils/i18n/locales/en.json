@@ -1,4 +1,7 @@
 {
+  "pinEditAction": "Edit Pin",
+  "boardEditAction": "Edit board",
+  "pinRemoveFromBoardAction": "Remove Pin from board",
   "previewFullscreen": "Fullscreen",
   "previewExitFullscreen": "Exit fullscreen",
   "previewFullscreenError": "Fullscreen is unavailable. Check your browser settings.",

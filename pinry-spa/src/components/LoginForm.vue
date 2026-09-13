@@ -77,7 +77,6 @@
               v-bind:placeholder="$t('usernamePlaceholder')"
               autocomplete="username"
               maxlength="30"
-              autofocus
               required>
           </FormField>
 

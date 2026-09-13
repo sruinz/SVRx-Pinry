@@ -44,14 +44,10 @@
               <div class="board-card grid-item">
                 <div @mouseenter="setCurrentEditBoard(item.id)"
                      @mouseleave="setCurrentEditBoard(null)"
+                     @focusin="focusedEditBoard = item.id"
+                     @focusout="onEditorFocusOut($event)"
                 >
                   <div class="card-image">
-                    <BoardEditorUI
-                      v-show="!ordering.editing && shouldShowEdit(item)"
-                      :board="item"
-                      v-on:board-delete-succeed="reset"
-                      v-on:board-save-succeed="reset"
-                    ></BoardEditorUI>
                     <router-link
                       v-if="!ordering.editing"
                       :to="{ name: 'board', params: { boardId: item.id } }"
@@ -71,6 +67,12 @@
                          v-show="item.preview_image_url"
                          class="preview-image">
                     </div>
+                    <BoardEditorUI
+                      v-show="!ordering.editing && shouldShowEdit(item)"
+                      :board="item"
+                      v-on:board-delete-succeed="reset"
+                      v-on:board-save-succeed="reset"
+                    ></BoardEditorUI>
                   </div>
                   <div class="board-footer">
                     <p class="sub-title board-info">{{ item.name }}</p>
@@ -207,6 +209,7 @@ function createBoardItem(board) {
 function initialData() {
   return {
     currentEditBoard: null,
+    focusedEditBoard: null,
     blocks: [],
     blocksMap: {},
     status: {
@@ -377,7 +380,11 @@ export default {
       if (this.editorMeta.user.meta.username !== board.author) {
         return false;
       }
-      return this.currentEditBoard === board.id;
+      return this.currentEditBoard === board.id || this.focusedEditBoard === board.id;
+    },
+    onEditorFocusOut(event) {
+      if (event.relatedTarget && event.relatedTarget.closest('[role="dialog"]')) return;
+      if (!event.currentTarget.contains(event.relatedTarget)) this.focusedEditBoard = null;
     },
     setCurrentEditBoard(boardId) {
       if (this.ordering.editing) return;

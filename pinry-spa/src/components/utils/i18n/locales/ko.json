@@ -1,4 +1,7 @@
 {
+  "pinEditAction": "Pin 수정",
+  "boardEditAction": "보드 수정",
+  "pinRemoveFromBoardAction": "보드에서 Pin 빼기",
   "previewFullscreen": "전체 화면",
   "previewExitFullscreen": "전체 화면 종료",
   "previewFullscreenError": "전체 화면을 사용할 수 없습니다. 브라우저 설정을 확인해 주세요.",

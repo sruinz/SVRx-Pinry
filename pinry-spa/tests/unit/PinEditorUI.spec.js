@@ -277,7 +277,7 @@ describe('BoardEditUI delete behavior', () => {
       dialog,
       modal,
       wrapper: shallowMount(BoardEditUI, {
-        global: { mocks: {}, stubs: [] },
+        global: { mocks: { $t: key => key }, stubs: [] },
         props: { board: { id: 7, name: 'Reference' } },
       }),
     };

@@ -7,42 +7,50 @@
             <img src="../assets/svrx-pinry-dark-ui.png" alt="" height="32">
             <span class="brand-name" data-test="brand-name">SVRx Pinry</span>
           </a>
-          <a role="button" class="navbar-burger burger"
+          <button type="button" class="navbar-burger burger"
              aria-label="menu" :aria-expanded="String(active)"
              v-on:click="toggleMenu"
              data-target="PinryNav">
             <span aria-hidden="true"></span>
             <span aria-hidden="true"></span>
             <span aria-hidden="true"></span>
-          </a>
+          </button>
         </div>
         <div id="PinryNav" class="navbar-menu" :class="{ 'is-active': active}">
           <div class="navbar-start">
             <div
               v-if="user.loggedIn"
-              class="navbar-item has-dropdown is-hoverable">
-              <a class="navbar-link">
+              class="navbar-item has-dropdown" :class="{ 'is-active': openMenu === 'create' }"
+              @pointerenter="showPointerMenu($event, 'create')" @pointerleave="leaveMenu($event)"
+              @focusout="leaveMenu($event)"
+              @keydown.esc.stop.prevent="dismissMenu($event)">
+              <button type="button" class="navbar-link" :aria-expanded="openMenu === 'create'"
+                @click="toggleDropdown('create')">
                 {{ $t("createLink") }}
-              </a>
+              </button>
               <div class="navbar-dropdown">
-                <a
+                <button type="button"
                   @click="createPin"
                   class="navbar-item">
                   {{ $t("pinLink") }}
-                </a>
-                <a
+                </button>
+                <button type="button"
                   @click="createBoard"
                   class="navbar-item">
                   {{ $t("boardLink") }}
-                </a>
+                </button>
               </div>
             </div>
             <div
               v-if="user.loggedIn"
-              class="navbar-item has-dropdown is-hoverable">
-              <a class="navbar-link">
+              class="navbar-item has-dropdown" :class="{ 'is-active': openMenu === 'my' }"
+              @pointerenter="showPointerMenu($event, 'my')" @pointerleave="leaveMenu($event)"
+              @focusout="leaveMenu($event)"
+              @keydown.esc.stop.prevent="dismissMenu($event)">
+              <button type="button" class="navbar-link" :aria-expanded="openMenu === 'my'"
+                @click="toggleDropdown('my')">
                 {{ $t("myLink") }}
-              </a>
+              </button>
               <div class="navbar-dropdown" data-test="my-menu">
                 <router-link
                   :to="{ name: 'user', params: {user: user.meta.username} }"
@@ -70,10 +78,14 @@
                 </router-link>
               </div>
             </div>
-            <div class="navbar-item has-dropdown is-hoverable">
-              <a class="navbar-link">
+            <div class="navbar-item has-dropdown" :class="{ 'is-active': openMenu === 'extensions' }"
+              @pointerenter="showPointerMenu($event, 'extensions')" @pointerleave="leaveMenu($event)"
+              @focusout="leaveMenu($event)"
+              @keydown.esc.stop.prevent="dismissMenu($event)">
+              <button type="button" class="navbar-link" :aria-expanded="openMenu === 'extensions'"
+                @click="toggleDropdown('extensions')">
                 {{ $t("browserExtensionsLink") }}
-              </a>
+              </button>
               <div
                 class="navbar-dropdown"
                 data-test="browser-extension-menu">
@@ -131,25 +143,34 @@
                 ></i>
             </router-link>
             <div
-              class="navbar-item has-dropdown is-hoverable">
-              <a class="navbar-link">
+              class="navbar-item has-dropdown" :class="{ 'is-active': openMenu === 'locale' }"
+              @pointerenter="showPointerMenu($event, 'locale')" @pointerleave="leaveMenu($event)"
+              @focusout="leaveMenu($event)"
+              @keydown.esc.stop.prevent="dismissMenu($event)">
+              <button type="button" class="navbar-link" :aria-expanded="openMenu === 'locale'"
+                @click="toggleDropdown('locale')">
                 <i aria-hidden="true" class="mdi mdi-web"
                   ></i>
                 <span class="current-language">{{ langs[$i18n.locale] }}</span>
-              </a>
+              </button>
               <div class="navbar-dropdown">
-                <a
+                <button type="button"
                   v-for="locale in locales"
                   :key="`locale-${locale}`"
                   @click="setLocale(locale)"
                   data-test="locale-option"
                   class="navbar-item">
                   {{ langs[locale] }}
-                </a>
+                </button>
               </div>
             </div>
-            <div v-if="user.loggedIn" class="navbar-item has-dropdown is-hoverable user-menu">
-              <button type="button" class="navbar-link is-arrowless" :aria-label="user.meta.username">
+            <div v-if="user.loggedIn" class="navbar-item has-dropdown user-menu"
+              :class="{ 'is-active': openMenu === 'user' }"
+              @pointerenter="showPointerMenu($event, 'user')" @pointerleave="leaveMenu($event)"
+              @focusout="leaveMenu($event)"
+              @keydown.esc.stop.prevent="dismissMenu($event)">
+              <button type="button" class="navbar-link is-arrowless" :aria-label="user.meta.username"
+                :aria-expanded="openMenu === 'user'" @click="toggleDropdown('user')">
                 <i aria-hidden="true" class="mdi mdi-account-circle"></i>
               </button>
               <div class="navbar-dropdown is-right">
@@ -161,18 +182,18 @@
             </div>
             <div v-else class="navbar-item">
               <div class="buttons">
-                <a
+                <button type="button"
                   @click="signUp"
                   v-show="!user.loggedIn && passwordAllowed"
                   class="button is-primary">
                   <strong>{{ $t("signUpLink") }}</strong>
-                </a>
-                <a
+                </button>
+                <button type="button"
                   v-show="!user.loggedIn"
                   v-on:click="logIn"
                   class="button is-light">
                   {{ $t("logInLink") }}
-                </a>
+                </button>
               </div>
             </div>
           </div>
@@ -204,6 +225,7 @@ export default {
   data() {
     return {
       active: false,
+      openMenu: null,
       theme: loadTheme(),
       passwordAllowed: false,
       user: {
@@ -222,6 +244,21 @@ export default {
     },
   },
   methods: {
+    showPointerMenu(event, menu) {
+      if (event.pointerType === 'mouse') this.openMenu = menu;
+    },
+    toggleDropdown(menu) {
+      this.openMenu = this.openMenu === menu ? null : menu;
+    },
+    leaveMenu(event) {
+      const target = event.type === 'focusout' ? event.relatedTarget : document.activeElement;
+      if (target && target.closest('[role="dialog"]')) return;
+      if (!event.currentTarget.contains(target)) this.openMenu = null;
+    },
+    dismissMenu(event) {
+      event.currentTarget.querySelector('.navbar-link').focus();
+      this.openMenu = null;
+    },
     toggleTheme() {
       this.theme = this.theme === 'dark' ? 'light' : 'dark';
       applyTheme(this.theme);
@@ -232,6 +269,7 @@ export default {
     },
     toggleMenu() {
       this.active = !this.active;
+      if (!this.active) this.openMenu = null;
     },
     onLoginSucceed() {
       this.initializeUser(true);
@@ -302,9 +340,12 @@ export default {
 .navbar-end { align-items: center; gap: 12px; }
 .navbar-end .mdi { font-size: 22px; }
 .navbar-end .user-menu .mdi { font-size: 34px; line-height: 1; }
-.user-menu button { border: 0; background: transparent; cursor: pointer; font: inherit; }
-.user-menu .navbar-dropdown button { width: 100%; text-align: left; }
-.user-menu:focus-within .navbar-dropdown { display: block; }
+button.navbar-link, button.navbar-item, .navbar-burger {
+  border: 0; background: transparent; cursor: pointer; font-family: inherit;
+}
+.navbar-dropdown button { width: 100%; text-align: left; }
+.navbar .has-dropdown:not(.is-active) .navbar-dropdown { display: none; }
+.navbar .has-dropdown.is-active .navbar-dropdown { display: block; }
 .current-language { margin-left: 8px; }
 .brand-lockup {
   gap: .5rem;
@@ -324,6 +365,7 @@ export default {
   .brand-lockup { padding-left: 16px; }
   .navbar-burger { color: var(--pinry-text); }
   .navbar-menu { background: var(--pinry-surface); }
+  button.navbar-link { width: 100%; text-align: left; }
   .navbar-start { margin-left: 0; }
   .navbar-dropdown { border: 0; }
   .navbar-end { display: block; }

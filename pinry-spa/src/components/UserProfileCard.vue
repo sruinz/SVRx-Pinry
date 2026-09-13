@@ -28,22 +28,22 @@
             <div class="tabs is-toggle">
               <ul>
                 <li :class="trueFalse2Class(inPins)">
-                  <a @click="go2UserPins">
+                  <router-link :to="{ name: 'user', params: { user: username } }">
                     <i aria-hidden="true" class="mdi mdi-image"></i>
                     <span>{{ $t("pinsUserProfileCardLink") }}</span>
-                  </a>
+                  </router-link>
                 </li>
                 <li :class="trueFalse2Class(inBoard)">
-                  <a @click="go2UserBoard">
+                  <router-link :to="{ name: 'boards4user', params: { username } }">
                     <i aria-hidden="true" class="mdi mdi-folder-multiple-image"></i>
                     <span>{{ $t("boardsUserProfileCardLink") }}</span>
-                  </a>
+                  </router-link>
                 </li>
                 <li :class="trueFalse2Class(inProfile)">
-                  <a @click="go2UserProfile">
+                  <router-link :to="{ name: 'profile4user', params: { username } }">
                     <i aria-hidden="true" class="mdi mdi-account"></i>
                     <span>{{ $t("profileUserProfileCardLink") }}</span>
-                  </a>
+                  </router-link>
                 </li>
               </ul>
             </div>
@@ -97,21 +97,6 @@ export default {
     },
   },
   methods: {
-    go2UserBoard() {
-      this.$router.push(
-        { name: 'boards4user', params: { username: this.username } },
-      );
-    },
-    go2UserProfile() {
-      this.$router.push(
-        { name: 'profile4user', params: { username: this.username } },
-      );
-    },
-    go2UserPins() {
-      this.$router.push(
-        { name: 'user', params: { user: this.username } },
-      );
-    },
     trueFalse2Class(boolValue) {
       if (boolValue) {
         return 'is-active';

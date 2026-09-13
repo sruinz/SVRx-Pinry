@@ -1,12 +1,14 @@
 <template>
   <div class="editor">
     <div class="editor-buttons">
-      <span class="icon-container" data-test="delete-board" @click="deleteBoard">
+      <button type="button" class="icon-container" data-test="delete-board" @click="deleteBoard"
+        :aria-label="$t('boardDeleteTitle')">
          <i aria-hidden="true" class="mdi mdi-delete"></i>
-      </span>
-      <span class="icon-container" @click="editBoard">
+      </button>
+      <button type="button" class="icon-container" @click="editBoard"
+        :aria-label="$t('boardEditAction')">
        <i aria-hidden="true" class="mdi mdi-pencil"></i>
-      </span>
+      </button>
     </div>
   </div>
 </template>

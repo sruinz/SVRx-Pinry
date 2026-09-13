@@ -1,4 +1,7 @@
 {
+  "pinEditAction": "编辑 Pin",
+  "boardEditAction": "编辑画板",
+  "pinRemoveFromBoardAction": "从画板移除 Pin",
   "previewFullscreen": "全屏",
   "previewExitFullscreen": "退出全屏",
   "previewFullscreenError": "无法使用全屏。请检查浏览器设置。",

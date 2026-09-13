@@ -1,22 +1,26 @@
 <template>
   <div class="editor">
     <div class="editor-buttons">
-      <span class="icon-container" v-if="inOwnedBoard" @click="removeFromBoard">
+      <button type="button" class="icon-container" v-if="inOwnedBoard" @click="removeFromBoard"
+        :aria-label="$t('pinRemoveFromBoardAction')">
           <i aria-hidden="true" class="mdi mdi-minus-box"></i>
-      </span>
-      <span class="icon-container" @click="addToBoard">
+      </button>
+      <button type="button" class="icon-container" @click="addToBoard"
+        :aria-label="$t('bulkPinAddToBoard')">
           <i aria-hidden="true" class="mdi mdi-plus-box"></i>
-      </span>
-      <span
+      </button>
+      <button type="button"
         class="icon-container"
+        :aria-label="$t('bulkPinDelete')"
         data-test="delete-pin"
         @click="deletePin"
         v-if="isOwner">
          <i aria-hidden="true" class="mdi mdi-delete"></i>
-      </span>
-      <span class="icon-container" v-if="isOwner" @click="editPin">
+      </button>
+      <button type="button" class="icon-container" v-if="isOwner" @click="editPin"
+        :aria-label="$t('pinEditAction')">
        <i aria-hidden="true" class="mdi mdi-pencil"></i>
-      </span>
+      </button>
     </div>
   </div>
 </template>

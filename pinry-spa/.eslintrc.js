@@ -35,7 +35,7 @@ module.exports = {
     'vuejs-accessibility/anchor-has-content': 'warn',
     'vuejs-accessibility/click-events-have-key-events': 'warn',
     'vuejs-accessibility/interactive-supports-focus': 'warn',
-    'vuejs-accessibility/label-has-for': 'warn',
+    'vuejs-accessibility/label-has-for': ['warn', { required: { some: ['nesting', 'id'] } }],
     'vuejs-accessibility/mouse-events-have-key-events': 'warn',
     'vuejs-accessibility/no-autofocus': 'warn',
   },
