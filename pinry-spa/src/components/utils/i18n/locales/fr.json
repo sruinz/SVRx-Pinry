@@ -1,4 +1,9 @@
 {
+  "previewFullscreen": "Plein écran",
+  "previewExitFullscreen": "Quitter le plein écran",
+  "previewFullscreenError": "Le plein écran est indisponible. Vérifiez les réglages du navigateur.",
+  "previewPlay": "Diaporama (5 s)",
+  "previewPause": "Pause",
   "searchInvalidUrl": "Les filtres de l’URL sont incorrects. Corrigez les valeurs et relancez la recherche.",
   "imageSearch_title": "Filtres d’image",
   "imageSearch_animation": "Type d’image",

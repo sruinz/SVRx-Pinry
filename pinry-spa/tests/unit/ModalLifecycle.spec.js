@@ -66,6 +66,23 @@ describe('실제 앱 모달 경계', () => {
     expect(completed).toHaveBeenCalledWith({ id: 17 });
   });
 
+  it('전체 화면의 Escape는 브라우저 종료에 맡기고 모달을 유지한다', async () => {
+    open();
+    await nextTick();
+    Object.defineProperty(document, 'fullscreenElement', {
+      configurable: true, value: document.querySelector('[data-test="close"]'),
+    });
+    try {
+      const event = new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true });
+      document.dispatchEvent(event);
+      await nextTick();
+      expect(document.querySelector('[data-test="close"]')).not.toBeNull();
+      expect(event.defaultPrevented).toBe(false);
+    } finally {
+      delete document.fullscreenElement;
+    }
+  });
+
   it('취소 금지 모달은 Escape와 바깥 클릭으로 닫히지 않는다', async () => {
     const onClose = jest.fn();
     open({ canCancel: false, onClose });

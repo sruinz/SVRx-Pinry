@@ -8,6 +8,7 @@
       </span>
     </header>
     <section class="card">
+      <p v-if="fullscreenError" role="status" class="preview-message">{{ $t('previewFullscreenError') }}</p>
       <p v-if="pageError" role="status" class="preview-message">{{ $t('previewPageError') }}</p>
       <div class="card-image">
         <figure ref="imageViewport" class="image preview-image-viewport"
@@ -52,6 +53,17 @@
             <span v-for="tag in currentPin.tags" :key="tag" class="tag pin-preview-tag">{{ tag }}</span>
           </div>
           <div class="preview-links">
+            <button v-if="fullscreenSupported" type="button" class="meta-link"
+                    data-test="preview-fullscreen" :disabled="fullscreenBusy" @click.stop="toggleFullscreen">
+              <i :class="['mdi', fullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen']" aria-hidden="true"></i>
+              {{ $t(fullscreen ? 'previewExitFullscreen' : 'previewFullscreen') }}
+            </button>
+            <button v-if="navigation" type="button" class="meta-link" data-test="preview-play"
+                    :disabled="!playing && (busy || !imageReady || imageError || !hasNext)"
+                    :aria-pressed="playing ? 'true' : 'false'" @click.stop="toggleSlideshow">
+              <i :class="['mdi', playing ? 'mdi-pause' : 'mdi-play']" aria-hidden="true"></i>
+              {{ $t(playing ? 'previewPause' : 'previewPlay') }}
+            </button>
             <button type="button" class="meta-link" data-test="preview-zoom"
                     :disabled="!imageReady || imageError"
                     :aria-pressed="originalSize ? 'true' : 'false'" @click.stop="toggleOriginalSize">
@@ -105,6 +117,11 @@ export default {
       imageReady: false,
       imageError: false,
       originalSize,
+      playing: false,
+      fullscreen: false,
+      fullscreenSupported: false,
+      fullscreenBusy: false,
+      fullscreenError: false,
     };
   },
   computed: {
@@ -125,12 +142,67 @@ export default {
   },
   mounted() {
     this.disposed = false;
+    this.fullscreenSupported = typeof this.$el.requestFullscreen === 'function'
+      && document.fullscreenEnabled !== false;
     document.addEventListener('keydown', this.onKeydown);
+    document.addEventListener('visibilitychange', this.onVisibilityChange);
+    document.addEventListener('fullscreenchange', this.onFullscreenChange);
   },
   beforeUnmount() {
     this.deactivate();
   },
   methods: {
+    stopSlideshow() {
+      this.playing = false;
+      clearTimeout(this.slideTimer);
+      this.slideTimer = null;
+    },
+    toggleSlideshow() {
+      if (this.playing) {
+        this.stopSlideshow();
+      } else if (!this.disposed && this.isModalActive() && !document.hidden
+          && this.imageReady && !this.imageError && !this.busy && this.hasNext) {
+        this.playing = true;
+        this.scheduleSlide();
+      }
+    },
+    scheduleSlide() {
+      clearTimeout(this.slideTimer);
+      if (!this.playing || !this.imageReady || this.imageError || this.busy) return;
+      if (!this.hasNext || this.disposed || !this.isModalActive() || document.hidden) {
+        this.stopSlideshow();
+        return;
+      }
+      this.slideTimer = setTimeout(() => {
+        this.slideTimer = null;
+        if (this.disposed || !this.isModalActive() || document.hidden) this.stopSlideshow();
+        else this.move(1, true);
+      }, 5000);
+    },
+    onVisibilityChange() {
+      if (document.hidden) this.stopSlideshow();
+    },
+    onFullscreenChange() {
+      const wasFullscreen = this.fullscreen;
+      this.fullscreen = document.fullscreenElement === this.$el;
+      if (wasFullscreen && !this.fullscreen) this.stopSlideshow();
+    },
+    async toggleFullscreen() {
+      if (this.disposed || !this.isModalActive() || this.fullscreenBusy) return;
+      this.fullscreenBusy = true;
+      this.fullscreenError = false;
+      const element = this.$el;
+      try {
+        if (document.fullscreenElement === element) await document.exitFullscreen();
+        else await element.requestFullscreen();
+        // 요청 도중 닫힌 상세보기가 전체 화면에 남지 않도록 한다.
+        if (this.disposed && document.fullscreenElement === element) await document.exitFullscreen();
+      } catch (_error) {
+        if (!this.disposed) this.fullscreenError = true;
+      } finally {
+        this.fullscreenBusy = false;
+      }
+    },
     toggleOriginalSize() {
       if (!this.imageReady || this.imageError) return;
       this.originalSize = !this.originalSize;
@@ -152,9 +224,16 @@ export default {
     },
     deactivate() {
       this.disposed = true;
+      this.stopSlideshow();
       document.removeEventListener('keydown', this.onKeydown);
+      document.removeEventListener('visibilitychange', this.onVisibilityChange);
+      document.removeEventListener('fullscreenchange', this.onFullscreenChange);
+      if (document.fullscreenElement === this.$el) {
+        Promise.resolve(document.exitFullscreen()).catch(() => {});
+      }
     },
-    async move(direction) {
+    async move(direction, automatic = false) {
+      if (!automatic) this.stopSlideshow();
       if (this.disposed || !this.isModalActive() || this.busy || !this.navigation
           || (direction < 0 ? !this.hasPrevious : !this.hasNext)) return;
       this.pageError = false;
@@ -170,7 +249,11 @@ export default {
           this.busy = false;
         }
       }
-      if (this.disposed || !this.isModalActive() || this.pageError) return;
+      if (this.disposed || !this.isModalActive() || this.pageError) {
+        this.stopSlideshow();
+        return;
+      }
+      if (automatic && !this.playing) return;
       const item = this.context.items[index];
       if (item) {
         this.resetImageScroll();
@@ -179,10 +262,12 @@ export default {
         this.currentPin = item;
         // 상세 영역만 처음으로 이동하고 뒤쪽 목록의 스크롤은 유지한다.
         this.$nextTick(() => {
+          if (document.fullscreenElement === this.$el) this.$el.scrollTop = 0;
           const content = this.$el.closest('.modal-content');
           if (content) content.scrollTop = 0;
         });
       }
+      if (!item || !this.hasNext) this.stopSlideshow();
     },
     onKeydown(event) {
       const { target } = event;
@@ -193,10 +278,16 @@ export default {
       this.move(event.key === 'ArrowLeft' ? -1 : 1);
     },
     onImageLoaded(event) {
-      if (event.target === this.$refs.previewImage) this.imageReady = true;
+      if (event.target === this.$refs.previewImage) {
+        this.imageReady = true;
+        this.scheduleSlide();
+      }
     },
     onImageError(event) {
-      if (event.target === this.$refs.previewImage) this.imageError = true;
+      if (event.target === this.$refs.previewImage) {
+        this.imageError = true;
+        this.stopSlideshow();
+      }
     },
     closeAndGoTo() {
       this.closePreview();
@@ -303,6 +394,13 @@ export default {
 .meta-link { background: transparent; border: 0; color: var(--pinry-text); font: inherit; font-size: 12px; padding: 0 10px; cursor: pointer; }
 .meta-link + .meta-link { border-left: 1px solid var(--pinry-border); }
 .meta-link:hover { color: var(--pinry-accent); }
+.pin-preview-modal:fullscreen {
+  width: 100%; height: 100%; max-height: none; overflow: auto;
+  padding: 0 24px 20px; border: 0; border-radius: 0;
+  background: var(--pinry-surface);
+}
+.pin-preview-modal:fullscreen .preview-step--previous { left: 12px; }
+.pin-preview-modal:fullscreen .preview-step--next { right: 12px; }
 
 @media screen and (max-width: 768px) {
   .pin-preview-modal { padding: 0 8px 12px; }

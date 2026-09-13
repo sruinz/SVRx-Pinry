@@ -1,4 +1,9 @@
 {
+  "previewFullscreen": "全屏",
+  "previewExitFullscreen": "退出全屏",
+  "previewFullscreenError": "无法使用全屏。请检查浏览器设置。",
+  "previewPlay": "幻灯片（5秒）",
+  "previewPause": "暂停",
   "searchInvalidUrl": "搜索地址中的条件无效，请修改后重新搜索。",
   "imageSearch_title": "图片筛选",
   "imageSearch_animation": "图片类型",

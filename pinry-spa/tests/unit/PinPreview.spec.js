@@ -43,6 +43,165 @@ describe('핀 상세 연속 감상', () => {
   afterEach(() => {
     if (wrapper) wrapper.unmount();
     jest.restoreAllMocks();
+    jest.useRealTimers();
+  });
+
+  it('슬라이드쇼는 로딩 완료 후 5초씩 이동하고 마지막에서 멈춘다', async () => {
+    jest.useFakeTimers();
+    window.localStorage.setItem('pinry-preview-size', 'original');
+    open({ navigation: () => ({ items: [pin(3), pin(8), pin(1)], hasNext: false }) });
+    const play = wrapper.find('[data-test="preview-play"]');
+    expect(play.exists()).toBe(true);
+    expect(play.attributes('disabled')).toBeDefined();
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await play.trigger('click');
+    jest.advanceTimersByTime(4999);
+    await nextTick();
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    jest.advanceTimersByTime(1);
+    await nextTick();
+    expect(wrapper.vm.currentPin.id).toBe(8);
+    jest.advanceTimersByTime(20000);
+    await nextTick();
+    expect(wrapper.vm.currentPin.id).toBe(8);
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    jest.advanceTimersByTime(5000);
+    await nextTick();
+    expect(wrapper.vm.currentPin.id).toBe(1);
+    expect(play.attributes('aria-pressed')).toBe('false');
+    expect(wrapper.find('[data-test="preview-zoom"]').attributes('aria-pressed')).toBe('true');
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it.each(['pause', 'manual', 'error', 'hidden', 'close'])('%s 동작은 예약된 자동 이동을 취소한다', async (action) => {
+    jest.useFakeTimers();
+    open({ navigation: () => ({ items: [pin(3), pin(8), pin(1)], hasNext: false }) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    const play = wrapper.find('[data-test="preview-play"]');
+    expect(play.exists()).toBe(true);
+    await play.trigger('click');
+    if (action === 'pause') await play.trigger('click');
+    if (action === 'manual') await wrapper.find('[data-test="preview-next"]').trigger('click');
+    if (action === 'error') await wrapper.find('[data-test="preview-image"]').trigger('error');
+    if (action === 'hidden') {
+      jest.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+      document.dispatchEvent(new Event('visibilitychange'));
+    }
+    if (action === 'close') await wrapper.find('[data-test="preview-close"]').trigger('click');
+    await nextTick();
+    jest.advanceTimersByTime(20000);
+    await nextTick();
+    expect(wrapper.vm.currentPin.id).toBe(action === 'manual' ? 8 : 3);
+    expect(play.attributes('aria-pressed')).toBe('false');
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('다음 페이지 실패 시 자동 재시도를 반복하지 않는다', async () => {
+    jest.useFakeTimers();
+    open({ navigation: () => ({ items: [pin(3)], hasNext: true }), loadNext: () => Promise.reject(new Error('offline')) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    expect(wrapper.find('[data-test="preview-play"]').exists()).toBe(true);
+    await wrapper.find('[data-test="preview-play"]').trigger('click');
+    jest.advanceTimersByTime(5000);
+    await Promise.resolve();
+    await nextTick();
+    expect(wrapper.text()).toContain('previewPageError');
+    expect(wrapper.find('[data-test="preview-play"]').attributes('aria-pressed')).toBe('false');
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('자동 페이지 로딩 도중 일시정지하면 늦은 응답으로 이동하지 않는다', async () => {
+    jest.useFakeTimers();
+    const state = reactive({ items: [pin(3)], hasNext: true });
+    let finish;
+    open({ navigation: () => state, loadNext: () => new Promise((resolve) => { finish = resolve; }) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-play"]').trigger('click');
+    jest.advanceTimersByTime(5000);
+    await nextTick();
+    await wrapper.find('[data-test="preview-play"]').trigger('click');
+    state.items.push(pin(8));
+    state.hasNext = false;
+    finish();
+    await Promise.resolve();
+    await nextTick();
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('상세보기 제거 시 타이머를 남기지 않는다', async () => {
+    jest.useFakeTimers();
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-play"]').trigger('click');
+    wrapper.unmount();
+    wrapper = null;
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('전체 화면에서 이동하면 설명까지 내린 스크롤을 이미지 상단으로 돌린다', async () => {
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: wrapper.element });
+    wrapper.element.scrollTop = 500;
+    try {
+      await wrapper.find('[data-test="preview-next"]').trigger('click');
+      expect(wrapper.element.scrollTop).toBe(0);
+    } finally {
+      delete document.fullscreenElement;
+    }
+  });
+
+  it('전체 화면 미지원 환경은 버튼을 숨기고 상세보기는 유지한다', () => {
+    open();
+    expect(wrapper.find('[data-test="preview-fullscreen"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="preview-image"]').exists()).toBe(true);
+  });
+
+  it('전체 화면 진입·종료 상태를 실제 이벤트로 반영하고 닫을 때 정리한다', async () => {
+    let fullscreen = null;
+    Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => fullscreen });
+    Element.prototype.requestFullscreen = async function enter() {
+      fullscreen = this;
+      document.dispatchEvent(new Event('fullscreenchange'));
+    };
+    document.exitFullscreen = async () => {
+      fullscreen = null;
+      document.dispatchEvent(new Event('fullscreenchange'));
+    };
+    try {
+      open();
+      await nextTick();
+      const button = wrapper.find('[data-test="preview-fullscreen"]');
+      expect(button.exists()).toBe(true);
+      await button.trigger('click');
+      expect(fullscreen).toBe(wrapper.element);
+      expect(button.text()).toContain('previewExitFullscreen');
+      await button.trigger('click');
+      expect(fullscreen).toBe(null);
+      expect(button.text()).toContain('previewFullscreen');
+      await button.trigger('click');
+      await wrapper.find('[data-test="preview-close"]').trigger('click');
+      expect(fullscreen).toBe(null);
+    } finally {
+      delete Element.prototype.requestFullscreen;
+      delete document.exitFullscreen;
+      delete document.fullscreenElement;
+    }
+  });
+
+  it('전체 화면 요청 거부를 안내하고 모달을 닫지 않는다', async () => {
+    Element.prototype.requestFullscreen = () => Promise.reject(new Error('denied'));
+    try {
+      open();
+      await nextTick();
+      expect(wrapper.find('[data-test="preview-fullscreen"]').exists()).toBe(true);
+      await wrapper.find('[data-test="preview-fullscreen"]').trigger('click');
+      await flushPromises();
+      expect(wrapper.text()).toContain('previewFullscreenError');
+      expect(wrapper.emitted('close')).toBeUndefined();
+    } finally {
+      delete Element.prototype.requestFullscreen;
+    }
   });
 
   it('목록의 순서로 이미지·설명·링크를 바꾸고 끝에서는 순환하지 않는다', async () => {

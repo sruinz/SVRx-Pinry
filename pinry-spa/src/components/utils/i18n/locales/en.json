@@ -1,4 +1,9 @@
 {
+  "previewFullscreen": "Fullscreen",
+  "previewExitFullscreen": "Exit fullscreen",
+  "previewFullscreenError": "Fullscreen is unavailable. Check your browser settings.",
+  "previewPlay": "Slideshow (5s)",
+  "previewPause": "Pause",
   "searchInvalidUrl": "The search URL contains invalid filters. Correct the values and search again.",
   "imageSearch_title": "Image filters",
   "imageSearch_animation": "Image type",

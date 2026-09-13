@@ -63,6 +63,8 @@ export default {
     onKeydown(event) {
       const top = this.state.modals[this.state.modals.length - 1];
       if (!top || event.key !== 'Escape') return;
+      // 전체 화면에서는 브라우저가 Escape로 전체 화면만 종료하게 한다.
+      if (document.fullscreenElement) return;
       event.preventDefault();
       event.stopImmediatePropagation();
       if (this.canCancel(top, 'escape')) top.close();

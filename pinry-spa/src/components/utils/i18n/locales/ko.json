@@ -1,4 +1,9 @@
 {
+  "previewFullscreen": "전체 화면",
+  "previewExitFullscreen": "전체 화면 종료",
+  "previewFullscreenError": "전체 화면을 사용할 수 없습니다. 브라우저 설정을 확인해 주세요.",
+  "previewPlay": "슬라이드쇼 (5초)",
+  "previewPause": "일시정지",
   "searchInvalidUrl": "검색 주소의 조건이 올바르지 않습니다. 입력값을 수정한 뒤 검색하세요.",
   "imageSearch_title": "이미지 상세 조건",
   "imageSearch_animation": "이미지 유형",
