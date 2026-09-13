@@ -1,4 +1,8 @@
 {
+  "pinDensityLabel": "Taille des images",
+  "pinDensity_small": "Petite",
+  "pinDensity_normal": "Moyenne",
+  "pinDensity_large": "Grande",
   "profileTokenTitle": "Jeton API",
   "profileTokenDescription": "Votre jeton personnel pour les intégrations API.",
   "profileTokenShow": "Afficher",

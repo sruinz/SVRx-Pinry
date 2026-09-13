@@ -135,6 +135,73 @@ describe('Pins responsive tool area', () => {
     localStorage.clear();
   });
 
+  it('밀도 변경은 핀·정렬·선택을 보존하고 다시 요청하지 않는다', async () => {
+    const wrapper = mountPins({ pinFilters: { userFilter: 'owner' } });
+    await settle();
+    expect(wrapper.attributes('data-density')).toBe('normal');
+    await wrapper.find('[data-test="pin-selection-enter"]').trigger('click');
+    await wrapper.find('[data-test="pin-selection-check-41"]').trigger('click');
+    expect(wrapper.vm.selection.selectedIds).toEqual([41]);
+    const requests = API.fetchPins.mock.calls.length;
+    const order = wrapper.vm.blocks.map(item => item.id);
+    const sort = { ...wrapper.vm.sortState };
+    await wrapper.find('[data-test="pin-density-small"]').trigger('click');
+    expect(wrapper.attributes('data-density')).toBe('small');
+    expect(wrapper.find('[data-test="pin-density-small"]').attributes('aria-pressed')).toBe('true');
+    expect(wrapper.vm.blocks.map(item => item.id)).toEqual(order);
+    expect(wrapper.vm.sortState).toEqual(sort);
+    expect(wrapper.vm.selection.selectedIds).toEqual([41]);
+    expect(API.fetchPins.mock.calls.length).toBe(requests);
+    await wrapper.find('[data-test="pin-density-large"]').trigger('click');
+    expect(wrapper.attributes('data-density')).toBe('large');
+  });
+
+  it('다른 목록을 열면 마지막 밀도를 복원한다', async () => {
+    const first = mountPins();
+    await settle();
+    await first.find('[data-test="pin-density-large"]').trigger('click');
+    const second = mountPins({ pinFilters: { boardFilter: 7 } });
+    await settle();
+    expect(second.attributes('data-density')).toBe('large');
+    expect(second.find('[data-test="pin-density-large"]').attributes('aria-pressed')).toBe('true');
+    second.vm.reset();
+    await settle();
+    expect(second.attributes('data-density')).toBe('large');
+  });
+
+  it('잘못된 저장 값은 보통으로 되돌리고 저장소가 차단되어도 크기를 바꾼다', async () => {
+    localStorage.setItem('pinry-pin-density', 'invalid');
+    const wrapper = mountPins();
+    await settle();
+    expect(wrapper.attributes('data-density')).toBe('normal');
+    const write = jest.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('blocked');
+    });
+    try {
+      await wrapper.find('[data-test="pin-density-small"]').trigger('click');
+      expect(wrapper.attributes('data-density')).toBe('small');
+      wrapper.vm.reset();
+      await settle();
+      expect(wrapper.attributes('data-density')).toBe('small');
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it('저장소 읽기가 차단된 경우에도 보통 크기로 목록을 연다', async () => {
+    const read = jest.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('blocked');
+    });
+    try {
+      const wrapper = mountPins();
+      await settle();
+      expect(wrapper.attributes('data-density')).toBe('normal');
+      expect(wrapper.find('[data-test="pin-image-41"]').exists()).toBe(true);
+    } finally {
+      read.mockRestore();
+    }
+  });
+
   it('좁은 썸네일도 카드 폭을 채우며 로딩 전후 비율과 목록 순서를 유지한다', async () => {
     const wrapper = mountPins();
     const portrait = pin(41);

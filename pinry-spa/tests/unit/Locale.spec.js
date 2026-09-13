@@ -24,6 +24,10 @@ const LEGACY_CHROME_URL = 'https://chrome.google.com/webstore/detail/jmhdcnmfkgl
 const FIREFOX_URL = 'https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/';
 
 const EXPECTED_LOCALE_KEYS = [
+  'pinDensityLabel',
+  'pinDensity_small',
+  'pinDensity_normal',
+  'pinDensity_large',
   'profileTokenTitle',
   'profileTokenDescription',
   'profileTokenShow',

@@ -1,7 +1,7 @@
 // 기존 240px 카드 밀도를 유지하면서 화면이 넓어질수록 열을 늘린다.
-@mixin screen-grid-layout($selector) {
+@mixin screen-grid-layout($selector, $card-width: 240px) {
   @for $columns from 1 through 20 {
-    $width: 240px * $columns + 20px * ($columns - 1);
+    $width: $card-width * $columns + 20px * ($columns - 1);
     @media screen and (min-width: $width + 48px) {
       #{$selector} { max-width: $width; }
     }

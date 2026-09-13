@@ -1,5 +1,5 @@
 <template>
-  <div class="pins">
+  <div class="pins" :data-density="density">
     <section class="section">
       <div
         v-if="!pinFilters.idFilter"
@@ -16,6 +16,17 @@
             :announcement="sortAnnouncement"
             @select="applySortMode"
           />
+          <div class="pin-density" role="group" :aria-label="$t('pinDensityLabel')">
+            <span>{{ $t('pinDensityLabel') }}</span>
+            <div class="buttons has-addons">
+              <button v-for="size in densityOptions" :key="size" type="button"
+                      class="button" :class="{ 'is-primary': density === size }"
+                      :data-test="`pin-density-${size}`" :aria-pressed="String(density === size)"
+                      @click="applyDensity(size)">
+                {{ $t(`pinDensity_${size}`) }}
+              </button>
+            </div>
+          </div>
           <div v-if="canSelectPins" class="pin-tools__management">
             <PinBulkToolbar
               :active="false"
@@ -426,7 +437,15 @@ export default {
     PinSortControls,
   },
   data() {
-    return initialData();
+    const densityOptions = ['small', 'normal', 'large'];
+    let density = 'normal';
+    try {
+      const stored = window.localStorage.getItem('pinry-pin-density');
+      if (densityOptions.includes(stored)) density = stored;
+    } catch (_error) {
+      // 브라우저 저장소가 차단되면 기존 카드 크기로 시작한다.
+    }
+    return { ...initialData(), density, densityOptions };
   },
   props: {
     pinFilters: {
@@ -525,6 +544,20 @@ export default {
     },
   },
   methods: {
+    applyDensity(size) {
+      if (!this.densityOptions.includes(size) || this.density === size) return;
+      this.density = size;
+      try {
+        window.localStorage.setItem('pinry-pin-density', size);
+      } catch (_error) {
+        // 저장하지 못해도 현재 목록의 크기 변경은 허용한다.
+      }
+      this.$nextTick(() => {
+        if (!this.isDestroyed && typeof this.$redrawVueMasonry === 'function') {
+          this.$redrawVueMasonry();
+        }
+      });
+    },
     activateSortContext() {
       this.sortStorageKey = pinSortStorageKey(this.pinFilters);
       this.sortState = readPinSortState(
@@ -1535,12 +1568,31 @@ export default {
 @import 'utils/grid-layout';
 @include screen-grid-layout("#pins-container, .pin-tools");
 
+.pin-density { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }
+.pin-density .buttons, .pin-density .button { margin-bottom: 0; }
+.pins[data-density="small"] {
+  .grid-item, .grid-sizer { width: 160px; }
+  @include screen-grid-layout("#pins-container, .pin-tools", 160px);
+}
+.pins[data-density="large"] {
+  .grid-item, .grid-sizer { width: 320px; }
+  @include screen-grid-layout("#pins-container, .pin-tools", 320px);
+}
+
 @media screen and (max-width: 768px) {
   .pin-tools__primary, .pin-tools__active { align-items: stretch; flex-direction: column; }
   .pin-tools__management { justify-content: flex-start; }
 }
 @media screen and (max-width: 543px) {
-  .grid-item, .grid-sizer { width: 100%; }
-  #pins-container, .pin-tools { max-width: 360px; }
+  .pins:not([data-density="small"]) {
+    .grid-item, .grid-sizer { width: 100%; }
+    #pins-container, .pin-tools { max-width: 360px; }
+  }
+}
+@media screen and (max-width: 387px) {
+  .pins[data-density="small"] {
+    .grid-item, .grid-sizer { width: 100%; }
+    #pins-container, .pin-tools { max-width: 360px; }
+  }
 }
 </style>

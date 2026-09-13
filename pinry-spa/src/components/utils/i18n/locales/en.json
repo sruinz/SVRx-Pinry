@@ -1,4 +1,8 @@
 {
+  "pinDensityLabel": "Image size",
+  "pinDensity_small": "Small",
+  "pinDensity_normal": "Medium",
+  "pinDensity_large": "Large",
   "profileTokenTitle": "API token",
   "profileTokenDescription": "Your personal token for API integrations.",
   "profileTokenShow": "Show",

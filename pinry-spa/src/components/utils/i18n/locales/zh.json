@@ -1,4 +1,8 @@
 {
+  "pinDensityLabel": "图片大小",
+  "pinDensity_small": "小",
+  "pinDensity_normal": "中",
+  "pinDensity_large": "大",
   "profileTokenTitle": "API 令牌",
   "profileTokenDescription": "用于 API 集成的个人令牌。",
   "profileTokenShow": "显示",
