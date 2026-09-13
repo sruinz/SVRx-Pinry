@@ -10,7 +10,7 @@ import PHeader from '../components/PHeader.vue';
 import Pins from '../components/Pins.vue';
 
 export default {
-  name: 'Home',
+  name: 'HomeView',
   components: {
     PHeader,
     Pins,

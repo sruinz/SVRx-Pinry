@@ -150,13 +150,13 @@ export default {
 </script>
 
 <style lang="scss" scoped>
+@use 'utils/grid-layout' as *;
 #user-home-container {
   margin-top: 2rem;
   margin-left: auto;
   margin-right: auto;
   box-shadow: 5px 5px 2px 1px rgba(0, 0, 255, .1);
 }
-@import '../components/utils/grid-layout';
 @include screen-grid-layout("#user-home-container");
 .user-profile-card--settings #user-home-container {
   width: calc(100% - 96px);

@@ -242,7 +242,7 @@ const unlinkErrorKeys = {
 };
 
 export default {
-  name: 'profile',
+  name: 'UserProfile',
   props: {
     token: String,
     canAccessAdmin: {

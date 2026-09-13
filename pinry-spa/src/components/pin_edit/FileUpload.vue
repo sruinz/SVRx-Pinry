@@ -84,8 +84,8 @@ export default {
 </script>
 
 <style lang="scss" scoped>
-@import '../utils/pin';
-@import '../utils/loader';
+@use '../utils/pin' as *;
+@use '../utils/loader' as *;
 
 .preview > img {
   width: $pin-preview-width;

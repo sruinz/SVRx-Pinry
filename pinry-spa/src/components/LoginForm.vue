@@ -368,23 +368,23 @@ export default {
   margin-top: 18px;
 }
 
-.password-form ::v-deep .label {
+.password-form :deep(.label) {
   color: #d9dcde;
 }
 
-.password-form ::v-deep .input {
+.password-form :deep(.input) {
   min-height: 48px;
   color: #f5f6f6;
   background: #121516;
   border-color: #4b5357;
 }
 
-.password-form ::v-deep .input::placeholder {
+.password-form :deep(.input::placeholder) {
   color: #aeb4b7;
   opacity: 1;
 }
 
-.password-form ::v-deep .input:focus {
+.password-form :deep(.input:focus) {
   border-color: #e86036;
   box-shadow: 0 0 0 1px #e86036;
 }

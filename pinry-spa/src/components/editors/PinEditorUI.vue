@@ -27,7 +27,7 @@ import API from '../api';
 import modals from '../modals';
 
 export default {
-  name: 'Editor',
+  name: 'PinEditorUI',
   props: {
     currentBoard: {
       type: Object,
@@ -147,5 +147,5 @@ export default {
 </script>
 
 <style lang="scss" scoped>
-@import './editor';
+@use './editor' as *;
 </style>

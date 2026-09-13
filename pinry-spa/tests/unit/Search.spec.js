@@ -4,6 +4,7 @@ import { createRouter, createMemoryHistory } from 'vue-router';
 import flushPromises from 'flush-promises';
 
 import Search from '@/views/Search.vue';
+import Pins from '@/components/Pins.vue';
 
 
 function mountSearch() {
@@ -46,7 +47,7 @@ describe('multiple-tag search state', () => {
     wrapper.vm.doSearch({ filterType: 'Tag', selected: [], filters: { animation: 'animated' } });
     expect(wrapper.vm.pinFilters).toEqual({ tagFilter: [], searchFilters: { animation: 'animated' } });
     await wrapper.vm.$nextTick();
-    expect(wrapper.findComponent({ name: 'pins' }).props('searchMode')).toBe(true);
+    expect(wrapper.findComponent(Pins).props('searchMode')).toBe(true);
   });
 
   it('restores filters and board mode from navigation and rejects invalid URLs', async () => {

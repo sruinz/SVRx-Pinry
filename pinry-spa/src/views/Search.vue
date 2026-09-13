@@ -16,7 +16,7 @@ import SearchPanel from '../components/search/SearchPanel.vue';
 import { readSearchQuery, writeSearchQuery } from '../components/search/searchQuery';
 
 export default {
-  name: 'Search',
+  name: 'SearchView',
   data() {
     return {
       pinFilters: null,

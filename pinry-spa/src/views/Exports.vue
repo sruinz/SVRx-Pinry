@@ -85,7 +85,7 @@ import { createExportPoller } from '@/components/export/exportPoller';
 const ACTIVE_STATES = ['queued', 'snapshotting', 'archiving', 'verifying'];
 
 export default {
-  name: 'Exports',
+  name: 'ExportsView',
   components: { ExportStatusPanel },
   data() {
     return {

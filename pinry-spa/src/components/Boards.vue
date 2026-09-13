@@ -234,7 +234,7 @@ function initialData() {
 }
 
 export default {
-  name: 'boards',
+  name: 'PinBoards',
   beforeCreate() {
     this.requestGeneration = 0;
     this.orderRequestToken = 0;
@@ -748,8 +748,11 @@ export default {
 </script>
 
 <style lang="scss" scoped>
+@use 'utils/pin' as *;
+@use 'utils/fonts' as *;
+@use 'utils/loader' as *;
+@use 'utils/grid-layout' as *;
 /* grid */
-@import 'utils/pin';
 
 .grid-sizer,
 .grid-item { width: $pin-preview-width; }
@@ -763,8 +766,6 @@ export default {
 /* card */
 $avatar-width: 30px;
 $avatar-height: 30px;
-@import './utils/fonts';
-@import './utils/loader.scss';
 
 .board-tools {
   display: flex;
@@ -853,7 +854,6 @@ $avatar-height: 30px;
   .board-order-card-controls__moves .button { flex: 1; }
 }
 
-@import 'utils/grid-layout';
 @include screen-grid-layout("#boards-container, .board-tools");
 
 @media screen and (max-width: 543px) {

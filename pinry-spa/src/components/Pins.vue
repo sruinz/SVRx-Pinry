@@ -416,7 +416,7 @@ function initialData() {
 }
 
 export default {
-  name: 'pins',
+  name: 'PinList',
   beforeCreate() {
     this.selectionModel = new PinSelection();
     this.requestGeneration = 0;
@@ -1498,7 +1498,8 @@ export default {
 </script>
 
 <style lang="scss" scoped>
-@import 'utils/pin';
+@use 'utils/pin' as *;
+@use 'utils/grid-layout' as *;
 
 .grid-sizer, .grid-item { width: $pin-preview-width; }
 .grid-item { margin-bottom: 20px; }
@@ -1569,7 +1570,6 @@ export default {
   .pin-author a, .pin-info a { color: var(--pinry-muted); }
   .pin-author a:hover, .pin-info a:hover { color: var(--pinry-accent); }
 }
-@import 'utils/grid-layout';
 @include screen-grid-layout("#pins-container, .pin-tools");
 
 .pin-density { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; }

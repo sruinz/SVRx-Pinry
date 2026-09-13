@@ -14,9 +14,6 @@ export default {
 };
 </script>
 
-<style lang="scss">
-  @import "bulma/sass/utilities/_all";
-  @import "bulma/bulma.sass";
-</style>
+<style src="bulma/css/bulma.css"></style>
 
 <style src="./assets/pinry-theme.css"></style>
