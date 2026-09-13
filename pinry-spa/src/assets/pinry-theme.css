@@ -94,7 +94,8 @@ a:hover { color: var(--pinry-link-hover); }
 .pins > .section, .boards > .section { padding: 16px 24px 40px; }
 .pin-sort__buttons.buttons.has-addons { gap: 6px; }
 .pin-sort__buttons.buttons.has-addons .button { min-width: 78px; border-radius: 6px; margin: 0; font-size: 13px; }
-.pin-sort__label { color: var(--pinry-muted); font-size: 13px; margin-right: 12px; }
+.pin-sort__label, .pin-density > span { color: var(--pinry-muted); font-size: 13px; margin-right: 12px; }
+.pin-density .button { font-size: 13px; }
 .pin-tools__management [data-test="pin-selection-enter"] {
   background: transparent;
   color: var(--pinry-text);

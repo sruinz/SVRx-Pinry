@@ -1524,8 +1524,9 @@ export default {
   align-items: center;
   gap: .5rem;
 }
-.pin-tools__primary, .pin-tools__active { justify-content: space-between; }
-.pin-tools__management { flex-wrap: wrap; justify-content: flex-end; }
+.pin-tools__primary { justify-content: flex-start; flex-wrap: wrap; column-gap: 1.5rem; }
+.pin-tools__active { justify-content: space-between; }
+.pin-tools__management { margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
 .pin-tools__active { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--pinry-border); }
 .pin-tools__status { margin: 0; }
 
@@ -1581,7 +1582,7 @@ export default {
 
 @media screen and (max-width: 768px) {
   .pin-tools__primary, .pin-tools__active { align-items: stretch; flex-direction: column; }
-  .pin-tools__management { justify-content: flex-start; }
+  .pin-tools__management { margin-left: 0; justify-content: flex-start; }
 }
 @media screen and (max-width: 543px) {
   .pins:not([data-density="small"]) {
