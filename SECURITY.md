@@ -1,5 +1,8 @@
-# Security Policy
+# 보안 안내
 
-## Reporting a Vulnerability
+일반적인 오류는 [SVRx Pinry 이슈](https://github.com/sruinz/SVRx-Pinry/issues)에 알려주세요.
+비밀번호·API 토큰·Client Secret·개인 데이터·악용 가능한 취약점 세부 내용은 공개 이슈에 올리지 마세요.
 
-Please report security issues to <winkidney@gmail.com>
+현재 별도의 비공개 취약점 신고 채널은 설정되어 있지 않습니다.
+보안 취약점은 세부 내용을 공개하기 전에 유지관리자에게 비공개 연락 방법을 요청하세요.
+원본 Pinry 유지관리자의 연락처는 이 수정 배포판의 지원 창구가 아닙니다.

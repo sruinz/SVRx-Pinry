@@ -1,0 +1,10 @@
+services:
+  pinry:
+    image: sruinz/svrx-pinry:latest
+    container_name: svrx-pinry
+    command: ["/pinry/docker/scripts/start.sh", "--migrate-legacy"]
+    ports:
+      - "2048:80"
+    volumes:
+      - ./data:/data:rw
+    restart: unless-stopped

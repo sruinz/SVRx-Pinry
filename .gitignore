@@ -52,6 +52,7 @@ docker-compose.yml
 
 # docker image data
 docker/data/*
+/data/
 
 # 생성된 로컬 산출물
 /output/
