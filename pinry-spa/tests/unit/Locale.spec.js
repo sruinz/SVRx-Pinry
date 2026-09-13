@@ -24,6 +24,7 @@ const LEGACY_CHROME_URL = 'https://chrome.google.com/webstore/detail/jmhdcnmfkgl
 const FIREFOX_URL = 'https://addons.mozilla.org/en-US/firefox/addon/add-to-pinry/';
 
 const EXPECTED_LOCALE_KEYS = [
+  'previewInterval', 'previewSeconds',
   'searchInvalidUrl',
   'imageSearch_title', 'imageSearch_animation', 'imageSearch_aspect', 'imageSearch_all',
   'imageSearch_static', 'imageSearch_animated', 'imageSearch_landscape', 'imageSearch_portrait',

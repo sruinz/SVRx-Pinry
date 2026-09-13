@@ -64,6 +64,12 @@
               <i :class="['mdi', playing ? 'mdi-pause' : 'mdi-play']" aria-hidden="true"></i>
               {{ $t(playing ? 'previewPause' : 'previewPlay') }}
             </button>
+            <select v-if="navigation" class="meta-link preview-interval" data-test="preview-interval"
+                    :value="slideInterval" :aria-label="$t('previewInterval')" @change="changeInterval">
+              <option v-for="seconds in [3, 5, 10]" :key="seconds" :value="seconds">
+                {{ $t('previewSeconds', { seconds }) }}
+              </option>
+            </select>
             <button type="button" class="meta-link" data-test="preview-zoom"
                     :disabled="!imageReady || imageError"
                     :aria-pressed="originalSize ? 'true' : 'false'" @click.stop="toggleOriginalSize">
@@ -93,6 +99,7 @@
 import niceLinks from './utils/niceLinks';
 
 const SIZE_STORAGE_KEY = 'pinry-preview-size';
+const INTERVAL_STORAGE_KEY = 'pinry-preview-interval';
 
 export default {
   name: 'PinPreview',
@@ -105,8 +112,11 @@ export default {
   },
   data() {
     let originalSize = false;
+    let slideInterval = 5;
     try {
       originalSize = window.localStorage.getItem(SIZE_STORAGE_KEY) === 'original';
+      const storedInterval = Number(window.localStorage.getItem(INTERVAL_STORAGE_KEY));
+      if ([3, 5, 10].includes(storedInterval)) slideInterval = storedInterval;
     } catch (_error) {
       // 저장소를 읽을 수 없으면 화면 맞춤으로 시작한다.
     }
@@ -117,6 +127,7 @@ export default {
       imageReady: false,
       imageError: false,
       originalSize,
+      slideInterval,
       playing: false,
       fullscreen: false,
       fullscreenSupported: false,
@@ -142,16 +153,36 @@ export default {
   },
   mounted() {
     this.disposed = false;
+    this.scheduleRevision = 0;
     this.fullscreenSupported = typeof this.$el.requestFullscreen === 'function'
       && document.fullscreenEnabled !== false;
     document.addEventListener('keydown', this.onKeydown);
     document.addEventListener('visibilitychange', this.onVisibilityChange);
     document.addEventListener('fullscreenchange', this.onFullscreenChange);
+    document.addEventListener('scroll', this.onPreviewScroll, { capture: true, passive: true });
   },
   beforeUnmount() {
     this.deactivate();
   },
   methods: {
+    changeInterval(event) {
+      const seconds = Number(event.target.value);
+      if (![3, 5, 10].includes(seconds)) return;
+      this.slideInterval = seconds;
+      try {
+        window.localStorage.setItem(INTERVAL_STORAGE_KEY, String(seconds));
+      } catch (_error) {
+        // 저장소가 차단되어도 현재 선택과 재생은 유지한다.
+      }
+      this.scheduleSlide();
+    },
+    onPreviewScroll(event) {
+      const content = this.$el.closest('.modal-content');
+      if (this.playing && (this.$el.contains(event.target) || event.target === content)) {
+        // 마지막 스크롤부터 감상 시간을 다시 주고 자동 재생 상태는 유지한다.
+        this.scheduleSlide();
+      }
+    },
     stopSlideshow() {
       this.playing = false;
       clearTimeout(this.slideTimer);
@@ -167,6 +198,7 @@ export default {
       }
     },
     scheduleSlide() {
+      this.scheduleRevision += 1;
       clearTimeout(this.slideTimer);
       if (!this.playing || !this.imageReady || this.imageError || this.busy) return;
       if (!this.hasNext || this.disposed || !this.isModalActive() || document.hidden) {
@@ -177,7 +209,7 @@ export default {
         this.slideTimer = null;
         if (this.disposed || !this.isModalActive() || document.hidden) this.stopSlideshow();
         else this.move(1, true);
-      }, 5000);
+      }, this.slideInterval * 1000);
     },
     onVisibilityChange() {
       if (document.hidden) this.stopSlideshow();
@@ -228,6 +260,7 @@ export default {
       document.removeEventListener('keydown', this.onKeydown);
       document.removeEventListener('visibilitychange', this.onVisibilityChange);
       document.removeEventListener('fullscreenchange', this.onFullscreenChange);
+      document.removeEventListener('scroll', this.onPreviewScroll, true);
       if (document.fullscreenElement === this.$el) {
         Promise.resolve(document.exitFullscreen()).catch(() => {});
       }
@@ -237,6 +270,7 @@ export default {
       if (this.disposed || !this.isModalActive() || this.busy || !this.navigation
           || (direction < 0 ? !this.hasPrevious : !this.hasNext)) return;
       this.pageError = false;
+      const { scheduleRevision } = this;
       const index = this.currentIndex + direction;
       if (index >= this.context.items.length && this.loadNext) {
         this.busy = true;
@@ -254,6 +288,10 @@ export default {
         return;
       }
       if (automatic && !this.playing) return;
+      if (automatic && scheduleRevision !== this.scheduleRevision) {
+        this.scheduleSlide();
+        return;
+      }
       const item = this.context.items[index];
       if (item) {
         this.resetImageScroll();
@@ -347,7 +385,7 @@ export default {
 .meta-link[aria-pressed="true"] { color: var(--pinry-accent); }
 .preview-image-toggle { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
 .preview-image-viewport.is-original-size { display: block; overflow: auto; max-height: calc(100dvh - 220px); }
-.is-original-size .preview-image-toggle { width: max-content; max-width: none; cursor: zoom-out; }
+.is-original-size .preview-image-toggle { width: max-content; max-width: none; margin-inline: auto; cursor: zoom-out; }
 .is-original-size .preview-image-toggle img { width: auto; max-width: none; max-height: none; }
 .meta-link:focus-visible,
 .preview-image-toggle:focus-visible { outline: 2px solid var(--pinry-accent); outline-offset: -2px; }
@@ -394,6 +432,8 @@ export default {
 .meta-link { background: transparent; border: 0; color: var(--pinry-text); font: inherit; font-size: 12px; padding: 0 10px; cursor: pointer; }
 .meta-link + .meta-link { border-left: 1px solid var(--pinry-border); }
 .meta-link:hover { color: var(--pinry-accent); }
+.preview-interval { width: auto; min-width: 64px; }
+.preview-interval option { background: var(--pinry-surface); color: var(--pinry-text); }
 .pin-preview-modal:fullscreen {
   width: 100%; height: 100%; max-height: none; overflow: auto;
   padding: 0 24px 20px; border: 0; border-radius: 0;

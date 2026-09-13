@@ -46,6 +46,90 @@ describe('핀 상세 연속 감상', () => {
     jest.useRealTimers();
   });
 
+  it.each([3, 5, 10])('%s초 간격을 선택하면 저장하고 해당 시간 뒤 이동한다', async (seconds) => {
+    jest.useFakeTimers();
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    const interval = wrapper.find('[data-test="preview-interval"]');
+    expect(interval.exists()).toBe(true);
+    await interval.setValue(String(seconds));
+    expect(window.localStorage.getItem('pinry-preview-interval')).toBe(String(seconds));
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-play"]').trigger('click');
+    jest.advanceTimersByTime(seconds * 1000 - 1);
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    jest.advanceTimersByTime(1);
+    await nextTick();
+    expect(wrapper.vm.currentPin.id).toBe(8);
+  });
+
+  it.each(['3', '10', 'invalid'])('저장된 간격 %s를 복원하고 잘못된 값은 5초를 사용한다', (stored) => {
+    window.localStorage.setItem('pinry-preview-interval', stored);
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    expect(wrapper.find('[data-test="preview-interval"]').element.value).toBe(stored === 'invalid' ? '5' : stored);
+  });
+
+  it('재생 중 간격 변경은 새 시간으로 다시 대기한다', async () => {
+    jest.useFakeTimers();
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-play"]').trigger('click');
+    jest.advanceTimersByTime(4000);
+    await wrapper.find('[data-test="preview-interval"]').setValue('10');
+    jest.advanceTimersByTime(9999);
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    jest.advanceTimersByTime(1);
+    expect(wrapper.vm.currentPin.id).toBe(8);
+  });
+
+  it('직접 스크롤하면 재생을 유지하며 마지막 스크롤부터 다시 대기한다', async () => {
+    jest.useFakeTimers();
+    open({ navigation: () => ({ items: [pin(3), pin(8)], hasNext: false }) });
+    const content = document.createElement('div');
+    content.className = 'modal-content';
+    content.appendChild(wrapper.element);
+    document.body.appendChild(content);
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    const play = wrapper.find('[data-test="preview-play"]');
+    await play.trigger('click');
+    jest.advanceTimersByTime(4000);
+    await wrapper.find('.preview-image-viewport').trigger('scroll');
+    jest.advanceTimersByTime(4000);
+    await wrapper.trigger('scroll');
+    jest.advanceTimersByTime(4000);
+    content.dispatchEvent(new Event('scroll'));
+    expect(play.attributes('aria-pressed')).toBe('true');
+    jest.advanceTimersByTime(4999);
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    jest.advanceTimersByTime(1);
+    expect(wrapper.vm.currentPin.id).toBe(8);
+    content.remove();
+  });
+
+  it.each(['scroll', 'interval'])('페이지 로딩 중 %s 조작은 응답 도착 후에도 대기 시간을 보장한다', async (action) => {
+    jest.useFakeTimers();
+    const context = reactive({ items: [pin(3)], hasNext: true });
+    let finish;
+    open({ navigation: () => context, loadNext: () => new Promise((resolve) => { finish = resolve; }) });
+    document.body.appendChild(wrapper.element);
+    await wrapper.find('[data-test="preview-image"]').trigger('load');
+    await wrapper.find('[data-test="preview-play"]').trigger('click');
+    jest.advanceTimersByTime(5000);
+    await nextTick();
+    if (action === 'scroll') await wrapper.find('.preview-image-viewport').trigger('scroll');
+    else await wrapper.find('[data-test="preview-interval"]').setValue('3');
+    context.items.push(pin(8));
+    context.hasNext = false;
+    finish(true);
+    await flushPromises();
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    jest.advanceTimersByTime(action === 'scroll' ? 4999 : 2999);
+    expect(wrapper.vm.currentPin.id).toBe(3);
+    jest.advanceTimersByTime(1);
+    await nextTick();
+    expect(wrapper.vm.currentPin.id).toBe(8);
+    wrapper.element.remove();
+  });
+
   it('슬라이드쇼는 로딩 완료 후 5초씩 이동하고 마지막에서 멈춘다', async () => {
     jest.useFakeTimers();
     window.localStorage.setItem('pinry-preview-size', 'original');
