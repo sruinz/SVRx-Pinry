@@ -126,7 +126,7 @@ describe('SVRx Pinry branding', () => {
       global: {
         directives: { masonry: {}, 'masonry-tile': {} },
         stubs: ['router-link'],
-        plugins: [createI18n({ legacy: true, locale: 'ko', messages: { ko } })],
+        plugins: [createI18n({ legacy: false, locale: 'ko', messages: { ko } })],
       },
     });
 

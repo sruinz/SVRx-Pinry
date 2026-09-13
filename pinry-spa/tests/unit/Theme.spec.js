@@ -24,7 +24,7 @@ describe('화면 테마 선택', () => {
     wrapper = shallowMount(PHeader, {
       global: {
         stubs: ['router-link'],
-        plugins: [createI18n({ legacy: true, locale: 'ko', messages: { ko } })],
+        plugins: [createI18n({ legacy: false, locale: 'ko', messages: { ko } })],
       },
     });
     return wrapper.find('[data-test="theme-toggle"]');

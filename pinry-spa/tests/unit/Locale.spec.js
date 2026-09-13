@@ -1,10 +1,10 @@
 /* eslint-env jest */
-import { createI18n } from 'vue-i18n';
 import { shallowMount } from '@vue/test-utils';
 
 import PHeader from '@/components/PHeader.vue';
 import localeUtils, {
   DEFAULT_LOCALE,
+  createAppI18n,
   SUPPORTED_LOCALES,
   loadAndSyncStoredLocale,
   loadStoredLocale,
@@ -533,12 +533,7 @@ describe('Header locale and extension menus', () => {
   });
 
   function mountHeader() {
-    const i18n = createI18n({
-      legacy: true,
-      locale: 'ko',
-      fallbackLocale: 'ko',
-      messages: localeUtils.messages,
-    });
+    const i18n = createAppI18n(localStorage, document);
     const wrapper = shallowMount(PHeader, {
       global: {
         directives: { masonry: {}, 'masonry-tile': {} },
@@ -557,6 +552,30 @@ describe('Header locale and extension menus', () => {
       wrapper,
     };
   }
+
+  it.each([
+    ['ko', '한국어'], ['en', 'English'], ['zh', '简体中文'], ['fr', 'Français'],
+  ])('restores %s in composition mode and updates visible translations', async (code, label) => {
+    localStorage.setItem('localeCode', code);
+    const { i18n, wrapper } = mountHeader();
+    expect(i18n.mode).toBe('composition');
+    expect(i18n.global.locale.value).toBe(code);
+    expect(document.documentElement.lang).toBe(code);
+    expect(wrapper.find('.current-language').text()).toBe(label);
+    expect(wrapper.text()).toContain(localeUtils.messages[code].logInLink);
+    await wrapper.findAll('[data-test="locale-option"]').at(1).trigger('click');
+    expect(wrapper.find('.current-language').text()).toBe('English');
+    expect(wrapper.text()).toContain(en.logInLink);
+    wrapper.unmount();
+  });
+
+  it('falls back to Korean when the stored language is unsupported', () => {
+    localStorage.setItem('localeCode', 'unsupported');
+    const { i18n, wrapper } = mountHeader();
+    expect(i18n.global.locale.value).toBe('ko');
+    expect(wrapper.find('.current-language').text()).toBe('한국어');
+    wrapper.unmount();
+  });
 
   it('renders My menu as Pin, boards, exports, and profile with exact route params', async () => {
     const { wrapper } = mountHeader();
@@ -592,7 +611,7 @@ describe('Header locale and extension menus', () => {
     expect(options.map(option => option.text()))
       .toEqual(['한국어', 'English', '简体中文', 'Français']);
     await options.at(1).trigger('click');
-    expect(i18n.global.locale).toBe('en');
+    expect(i18n.global.locale.value).toBe('en');
     expect(localStorage.getItem('localeCode')).toBe('en');
     expect(document.documentElement.lang).toBe('en');
   });
@@ -606,7 +625,7 @@ describe('Header locale and extension menus', () => {
 
     await wrapper.findAll('[data-test="locale-option"]').at(1).trigger('click');
 
-    expect(i18n.global.locale).toBe('en');
+    expect(i18n.global.locale.value).toBe('en');
     setItem.mockRestore();
   });
 

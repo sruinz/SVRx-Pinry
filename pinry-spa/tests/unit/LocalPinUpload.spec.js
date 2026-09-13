@@ -44,7 +44,7 @@ function mountFileUpload() {
     global: {
       directives: { masonry: {}, 'masonry-tile': {} },
       stubs: ['FormField'],
-      plugins: [createI18n({ legacy: true, locale: 'en', messages: { en } })],
+      plugins: [createI18n({ legacy: false, locale: 'en', messages: { en } })],
     },
   });
 }
@@ -58,7 +58,7 @@ function mountCreateModal() {
       directives: { masonry: {}, 'masonry-tile': {} },
       mocks: {},
       stubs: ['FormField', 'TagInput'],
-      plugins: [createI18n({ legacy: true, locale: 'en', messages: { en } })],
+      plugins: [createI18n({ legacy: false, locale: 'en', messages: { en } })],
     },
 
     props: { username: 'owner' },
@@ -83,7 +83,7 @@ function mountCreateModalWithFileUpload() {
         FormField: true,
         TagInput: true,
       },
-      plugins: [createI18n({ legacy: true, locale: 'en', messages: { en } })],
+      plugins: [createI18n({ legacy: false, locale: 'en', messages: { en } })],
     },
 
     props: { username: 'owner' },

@@ -72,7 +72,7 @@ describe('PinEditorUI delete behavior', () => {
           directives: { masonry: {}, 'masonry-tile': {} },
           mocks: {},
           stubs: [],
-          plugins: [createI18n({ legacy: true, locale: 'en', messages: { en } })],
+          plugins: [createI18n({ legacy: false, locale: 'en', messages: { en } })],
         },
 
         props: {

@@ -14,7 +14,7 @@ function mountHeader() {
   const wrapper = shallowMount(PHeader, {
     global: {
       directives: { masonry: {}, 'masonry-tile': {} },
-      plugins: [createI18n({ legacy: true, locale: 'ko', messages: { ko } })],
+      plugins: [createI18n({ legacy: false, locale: 'ko', messages: { ko } })],
       stubs: {
         'router-link': {
           name: 'RouterLinkStub',
@@ -29,6 +29,18 @@ function mountHeader() {
 }
 
 describe('export route and header entry point', () => {
+  it.each([
+    ['search', '/search', 'SearchView'],
+    ['profile4user', '/profile/owner', 'Profile4User'],
+    ['exports', '/exports', 'ExportsView'],
+  ])('%s loads its page on demand without changing its URL', async (name, url, componentName) => {
+    const route = router.options.routes.find(item => item.name === name);
+    expect(typeof route.component).toBe('function');
+    const loaded = await route.component();
+    expect(loaded.default.name).toBe(componentName);
+    expect(router.resolve(url).name).toBe(name);
+  });
+
   it('registers one exact named route before the wildcard', () => {
     const { routes } = router.options;
     expect(routes.filter(route => route.path === '/exports')).toHaveLength(1);

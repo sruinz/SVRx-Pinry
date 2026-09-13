@@ -24,7 +24,7 @@ function mountPanel() {
     global: {
       directives: { masonry: {}, 'masonry-tile': {} },
       stubs: ['FormField', 'TagInput'],
-      plugins: [createI18n({ legacy: true, locale: 'en', messages: { en } })],
+      plugins: [createI18n({ legacy: false, locale: 'en', messages: { en } })],
     },
   });
 }

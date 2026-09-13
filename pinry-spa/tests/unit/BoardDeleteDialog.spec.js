@@ -62,7 +62,7 @@ async function settle() {
 
 function mountDialog() {
   const i18n = createI18n({
-    legacy: true,
+    legacy: false,
     locale: 'ko',
     fallbackLocale: 'ko',
     messages: localeUtils.messages,

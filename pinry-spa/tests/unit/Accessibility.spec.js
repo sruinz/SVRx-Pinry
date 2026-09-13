@@ -27,7 +27,7 @@ describe('키보드와 입력 접근성', () => {
     const wrapper = mount(component, {
       attachTo: document.body,
       ...options,
-      global: { plugins: [router, createI18n({ legacy: true, locale: 'ko', messages: { ko } })] },
+      global: { plugins: [router, createI18n({ legacy: false, locale: 'ko', messages: { ko } })] },
     });
     wrappers.push(wrapper);
     return wrapper;

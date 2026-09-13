@@ -66,7 +66,7 @@ describe('SSO policy screens', () => {
     const wrapper = mount(LoginForm, {
       global: {
         directives: { masonry: {}, 'masonry-tile': {} },
-        plugins: [createI18n({ legacy: true, locale: 'ko', messages: { ko } })],
+        plugins: [createI18n({ legacy: false, locale: 'ko', messages: { ko } })],
       },
     });
     await flushPromises();

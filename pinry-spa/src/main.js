@@ -1,11 +1,7 @@
 import { createApp } from 'vue';
 import PrimeVue from 'primevue/config';
 import { VueMasonryPlugin } from 'vue-masonry';
-import { createI18n } from 'vue-i18n';
-import localeUtils, {
-  DEFAULT_LOCALE,
-  loadAndSyncStoredLocale,
-} from './components/utils/i18n';
+import { createAppI18n } from './components/utils/i18n';
 import App from './App.vue';
 import router from './router';
 import setUpAxiosCsrfConfig from './components/utils/csrf';
@@ -16,12 +12,7 @@ import { loadTheme } from './components/utils/theme';
 setUpAxiosCsrfConfig();
 loadTheme();
 
-const i18n = createI18n({
-  legacy: true,
-  locale: loadAndSyncStoredLocale(localStorage, document),
-  fallbackLocale: DEFAULT_LOCALE,
-  messages: localeUtils.messages,
-});
+const i18n = createAppI18n(localStorage, document);
 
 createApp(App)
   .use(router)

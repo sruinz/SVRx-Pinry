@@ -1,3 +1,4 @@
+import { createI18n } from 'vue-i18n';
 import en from './locales/en.json';
 import zh from './locales/zh.json';
 import fr from './locales/fr.json';
@@ -47,6 +48,16 @@ const messages = {
   zh,
   fr,
 };
+
+export function createAppI18n(storage, documentRef) {
+  return createI18n({
+    legacy: false,
+    globalInjection: true,
+    locale: loadAndSyncStoredLocale(storage, documentRef),
+    fallbackLocale: DEFAULT_LOCALE,
+    messages,
+  });
+}
 
 const langCode2Name = {
   ko: '한국어',

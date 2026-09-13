@@ -67,7 +67,7 @@ function mountDialog() {
   const wrapper = mount(Add2Board, {
     global: {
       directives: { masonry: {}, 'masonry-tile': {} },
-      plugins: [createI18n({ legacy: true, locale: 'ko', messages })],
+      plugins: [createI18n({ legacy: false, locale: 'ko', messages })],
     },
 
     props: {
@@ -84,7 +84,7 @@ function mountFilterSelect() {
   return mount(FilterSelect, {
     global: {
       directives: { masonry: {}, 'masonry-tile': {} },
-      plugins: [createI18n({ legacy: true, locale: 'ko', messages })],
+      plugins: [createI18n({ legacy: false, locale: 'ko', messages })],
     },
 
     props: { allOptions: [] },

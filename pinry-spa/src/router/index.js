@@ -1,15 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router';
 import Home from '../views/Home.vue';
-import Pins4Tag from '../views/Pins4Tag.vue';
-import Pins4User from '../views/Pins4User.vue';
-import Pins4Board from '../views/Pins4Board.vue';
-import Pins4Id from '../views/Pins4Id.vue';
-import Boards4User from '../views/Boards4User.vue';
-import Profile4User from '../views/Profile4User.vue';
-import PinCreate from '../views/PinCreate.vue';
-import Search from '../views/Search.vue';
-import PageNotFound from '../views/PageNotFound.vue';
-import Exports from '../views/Exports.vue';
 
 const routes = [
   {
@@ -20,52 +10,52 @@ const routes = [
   {
     path: '/pins/tags/:tag',
     name: 'tag',
-    component: Pins4Tag,
+    component: () => import('../views/Pins4Tag.vue'),
   },
   {
     path: '/pins/users/:user',
     name: 'user',
-    component: Pins4User,
+    component: () => import('../views/Pins4User.vue'),
   },
   {
     path: '/pins/boards/:boardId',
     name: 'board',
-    component: Pins4Board,
+    component: () => import('../views/Pins4Board.vue'),
   },
   {
     path: '/pins/:pinId',
     name: 'pin',
-    component: Pins4Id,
+    component: () => import('../views/Pins4Id.vue'),
   },
   {
     path: '/boards/users/:username',
     name: 'boards4user',
-    component: Boards4User,
+    component: () => import('../views/Boards4User.vue'),
   },
   {
     path: '/profile/:username',
     name: 'profile4user',
-    component: Profile4User,
+    component: () => import('../views/Profile4User.vue'),
   },
   {
     path: '/pin-creation/from-url',
     name: 'pin-creation-from-url',
-    component: PinCreate,
+    component: () => import('../views/PinCreate.vue'),
   },
   {
     path: '/search',
     name: 'search',
-    component: Search,
+    component: () => import('../views/Search.vue'),
   },
   {
     path: '/exports',
     name: 'exports',
-    component: Exports,
+    component: () => import('../views/Exports.vue'),
   },
   {
     path: '/:pathMatch(.*)*',
     name: 'PageNotFound',
-    component: PageNotFound,
+    component: () => import('../views/PageNotFound.vue'),
   },
 ];
 

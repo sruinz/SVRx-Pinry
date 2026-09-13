@@ -38,7 +38,7 @@ describe('Trash removal', () => {
       global: {
         directives: { masonry: {}, 'masonry-tile': {} },
         stubs: [],
-        plugins: [router, createI18n({ legacy: true, locale: 'en', messages: { en } })],
+        plugins: [router, createI18n({ legacy: false, locale: 'en', messages: { en } })],
       },
     });
 

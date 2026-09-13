@@ -27,7 +27,7 @@ function mountProfile() {
   return shallowMount(Profile, {
     global: {
       directives: { masonry: {}, 'masonry-tile': {} },
-      plugins: [createI18n({ legacy: true, locale: 'ko', messages: { ko } })],
+      plugins: [createI18n({ legacy: false, locale: 'ko', messages: { ko } })],
     },
 
     props: { token: 'secret-token' },

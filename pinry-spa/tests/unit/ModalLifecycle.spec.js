@@ -36,7 +36,7 @@ describe('실제 앱 모달 경계', () => {
         plugins: [
           [PrimeVue, { unstyled: true }],
           router,
-          createI18n({ legacy: true, locale: 'ko', messages: { ko: { ...ko, context: '전달된 문맥' } } }),
+          createI18n({ legacy: false, locale: 'ko', messages: { ko: { ...ko, context: '전달된 문맥' } } }),
         ],
       },
     });
