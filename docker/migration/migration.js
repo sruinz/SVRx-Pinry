@@ -428,15 +428,33 @@
     };
   }
 
+  var recoveryBlockedMessages = {
+    children_pending: "이전 앱 프로세스의 종료를 확인하고 있습니다. 종료가 확인되면 재시동할 수 있습니다. 오래 지속되면 컨테이너 로그를 확인하고 컨테이너를 재시작하세요.",
+    status_unverified: "기동 상태 기록을 검증하지 못해 재시동을 차단했습니다. 컨테이너 로그를 확인하고 컨테이너를 재시작하세요.",
+    identity_unverified: "프로세스 식별 정보를 검증하지 못해 재시동을 차단했습니다. 컨테이너 로그를 확인하고 컨테이너를 재시작하세요.",
+    lock_or_gate_unverified: "데이터 잠금 또는 보호 상태를 검증하지 못해 재시동을 차단했습니다. 컨테이너 로그를 확인하고 컨테이너를 재시작하세요.",
+    worker_incomplete: "데이터 이전 완료를 확인하지 못해 이 화면에서 재시동할 수 없습니다. 컨테이너 로그를 확인하세요.",
+    nginx_unavailable: "복구 웹 서버를 사용할 수 없습니다. 컨테이너 관리 도구에서 재시작하세요.",
+    shutting_down: "컨테이너가 종료 중이므로 재시동 요청을 받지 않습니다.",
+    failure_not_recoverable: "이 오류는 화면에서 재시동할 수 없습니다. 컨테이너 로그에서 원인을 확인한 뒤 조치하세요.",
+  };
+
   function validateRecovery(payload) {
     var fields = ["schema_version", "available", "reason", "remaining_attempts",
       "retry_after_seconds", "generation", "token"];
-    if (!payload || Object.keys(payload).length !== fields.length
+    var optionalFields = ["blocked_reason", "automatic_retry_after_seconds"];
+    if (!payload || !Object.keys(payload).every(function knownField(field) { return fields.includes(field) || optionalFields.includes(field); })
         || !fields.every(function hasField(field) { return Object.prototype.hasOwnProperty.call(payload, field); })
         || payload.schema_version !== 1 || typeof payload.available !== "boolean"
         || !["available", "cooldown", "exhausted", "unavailable", "unsafe_state", "accepted", "invalid_token"].includes(payload.reason)
         || !Number.isInteger(payload.remaining_attempts) || payload.remaining_attempts < 0 || payload.remaining_attempts > 3
         || !Number.isInteger(payload.retry_after_seconds) || payload.retry_after_seconds < 0
+        || (Object.prototype.hasOwnProperty.call(payload, "blocked_reason")
+          && (payload.available || !["unsafe_state", "unavailable"].includes(payload.reason)
+            || !Object.prototype.hasOwnProperty.call(recoveryBlockedMessages, payload.blocked_reason)))
+        || (Object.prototype.hasOwnProperty.call(payload, "automatic_retry_after_seconds")
+          && (!Number.isInteger(payload.automatic_retry_after_seconds) || payload.automatic_retry_after_seconds < 0
+            || payload.automatic_retry_after_seconds > 30 || !["available", "cooldown"].includes(payload.reason)))
         || ![payload.generation, payload.token].every(function validCredential(value) {
           return value === null || (typeof value === "string" && /^[A-Za-z0-9_-]{1,256}$/.test(value));
         })
@@ -594,12 +612,16 @@
   MigrationController.prototype._renderRecovery = function renderRecovery(snapshot, visible, message) {
     this.recovery = snapshot;
     var accepted = snapshot && snapshot.generation === this.submittedGeneration;
-    var text = message || "DSM Container Manager의 컨테이너 로그를 확인하세요.";
+    var text = message || "복구 상태를 확인하지 못했습니다. 상태를 다시 확인하거나 컨테이너 로그를 확인하세요.";
     if (!message && snapshot) {
       if (accepted) text = "재시동 요청을 접수했습니다.";
+      else if (snapshot.blocked_reason) text = recoveryBlockedMessages[snapshot.blocked_reason];
       else if (snapshot.reason === "exhausted") text = "재시도 한도에 도달했습니다. DSM에서 컨테이너 로그를 확인하세요.";
+      else if (Number.isInteger(snapshot.automatic_retry_after_seconds)) text = String(snapshot.automatic_retry_after_seconds) + "초 후 자동 재시도합니다. 남은 재시도 " + String(snapshot.remaining_attempts) + "회" + (snapshot.available ? " · 지금 재시동할 수도 있습니다." : "");
       else if (snapshot.reason === "cooldown") text = String(snapshot.retry_after_seconds) + "초 후 다시 시도할 수 있습니다. 남은 재시도 " + String(snapshot.remaining_attempts) + "회";
       else if (snapshot.available) text = "남은 재시도 " + String(snapshot.remaining_attempts) + "회";
+      else if (snapshot.reason === "unsafe_state") text = "안전한 재시동 조건을 확인하지 못했습니다. 컨테이너 로그를 확인하고, 계속되면 컨테이너 관리 도구에서 재시작하세요.";
+      else if (snapshot.reason === "unavailable") text = recoveryBlockedMessages.failure_not_recoverable;
     }
     this.adapter.renderRecovery({visible: visible, enabled: !!(snapshot && snapshot.available && !this.restarting && !accepted), message: text});
   };

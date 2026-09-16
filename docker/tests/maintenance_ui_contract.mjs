@@ -114,6 +114,42 @@ function recovery(overrides = {}) {
 
 const failedStatus = () => status({state: "failed", error_class: "retryable", error_code: "gunicorn_start_failed"});
 
+test("복구 대기와 수동 조치 사유를 구분하고 자동 재시도 시간을 표시한다", async () => {
+  let snapshot = recovery({available: false, reason: "unsafe_state", token: null, blocked_reason: "children_pending"});
+  const calls = [];
+  const h = controllerHarness(async url => {
+    calls.push(url);
+    return response(url === "/migration/recovery" ? snapshot : failedStatus());
+  });
+  await h.controller.pollNow();
+  assert.match(h.recoveryViews.at(-1).message, /프로세스.*종료/);
+  assert.equal(h.recoveryViews.at(-1).enabled, false);
+  await h.controller.restart();
+  assert.ok(!calls.includes("/migration/restart"));
+  snapshot = {...snapshot, blocked_reason: "status_unverified"};
+  await h.controller.pollNow();
+  assert.match(h.recoveryViews.at(-1).message, /상태.*검증/);
+  assert.match(h.recoveryViews.at(-1).message, /컨테이너.*재시작/);
+  snapshot = recovery({automatic_retry_after_seconds: 17});
+  await h.controller.pollNow();
+  assert.equal(h.recoveryViews.at(-1).enabled, true);
+  assert.match(h.recoveryViews.at(-1).message, /17초.*자동 재시도/);
+  assert.ok(!calls.includes("/migration/restart"));
+});
+
+test("알 수 없는 복구 세부 사유나 잘못된 자동 재시도 시간은 거부한다", async () => {
+  for (const snapshot of [
+    recovery({blocked_reason: "private-error"}),
+    recovery({blocked_reason: "children_pending"}),
+    recovery({automatic_retry_after_seconds: -1}),
+    recovery({automatic_retry_after_seconds: "30"}),
+  ]) {
+    const h = controllerHarness(async url => response(url === "/migration/recovery" ? snapshot : failedStatus()));
+    await h.controller.pollNow();
+    assert.equal(h.recoveryViews.at(-1).enabled, false);
+  }
+});
+
 test("실패만 조회하고 연속 클릭과 응답 유실에도 POST 하나만 보낸다", async () => {
   const calls = [];
   const post = deferred();

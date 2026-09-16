@@ -341,6 +341,7 @@ class RuntimeSupervisor(object):
         self._failure_published = False
         self._attempt_status_failed = False
         self._recovery_identity_failed = False
+        self._readiness_timed_out = False
 
     @staticmethod
     def _log(message):
@@ -950,6 +951,7 @@ class RuntimeSupervisor(object):
             return False
 
     def _wait_for_readiness(self):
+        self._readiness_timed_out = False
         deadline = self.clock() + _READINESS_SECONDS
         probe = self.readiness_probe or self._default_readiness_probe
         while self.clock() < deadline:
@@ -963,6 +965,14 @@ class RuntimeSupervisor(object):
             if probe():
                 return 0
             self.sleeper(_READINESS_INTERVAL_SECONDS)
+        if self._shutdown_signal is not None:
+            return _WORKER_SHUTDOWN
+        if self.nginx.process.poll() is not None:
+            return _NGINX_EXITED
+        if self.gunicorn.process.poll() is not None:
+            return 1
+        self._readiness_timed_out = True
+        self._log("앱 준비 확인 시간이 초과됐습니다: readiness_timeout (60초)")
         return 1
 
     def _default_quiescence_probe(self, record, deadline):
@@ -1285,42 +1295,74 @@ class RuntimeSupervisor(object):
         return 0
 
     def _recovery_eligible(self, code):
+        return self._recovery_blocked_reason(code) is None
+
+    def _recovery_blocked_reason(self, code):
         # HTTP 기한 안에서는 읽기 전용 확인만 한다. 종료 대기는 진입 시 수행한다.
-        if (
-            self._shutdown_signal is not None or self._failed_code != code
-            or code not in RECOVERABLE_CODES or not self._failure_published
-            or self._attempt_status_failed or self._recovery_identity_failed
-            or self._worker_terminal != "complete" or not self._worker_eof
-            or self.startup_lock is None or self.worker is None
-            or self.nginx is None or self.nginx.process.poll() is not None
-            or any(role != "nginx" for role in self.children)
-        ):
-            return False
+        if self._shutdown_signal is not None:
+            return "shutting_down"
+        if self._failed_code != code or code not in RECOVERABLE_CODES:
+            return "failure_not_recoverable"
+        if not self._failure_published or self._attempt_status_failed:
+            return "status_unverified"
+        if self._recovery_identity_failed:
+            return "identity_unverified"
+        if self._worker_terminal != "complete" or not self._worker_eof or self.worker is None:
+            return "worker_incomplete"
+        if self.startup_lock is None:
+            return "lock_or_gate_unverified"
+        if self.nginx is None or self.nginx.process.poll() is not None:
+            return "nginx_unavailable"
+        if any(role != "nginx" for role in self.children):
+            return "children_pending"
         for record in (self.worker, self.gunicorn, self.export_worker):
-            if record is not None and (
-                not record.master_reaped or record.starttime is None
-            ):
-                return False
+            if record is not None:
+                if record.starttime is None:
+                    return "identity_unverified"
+                if not record.master_reaped:
+                    return "children_pending"
         if code == "worker_exit_timeout" and not self._worker_exit_timed_out:
-            return False
+            return "worker_incomplete"
         if code == "gunicorn_start_failed" and not self._worker_succeeded:
-            return False
+            return "worker_incomplete"
         try:
             self.startup_lock.verify_held()
             self.status_store.verify_failed_gate()
         except (StartupLockError, StatusError, AttributeError,
                 OSError, ValueError):
-            return False
-        return (
-            self._shutdown_signal is None
-            and self.nginx.process.poll() is None
-        )
+            return "lock_or_gate_unverified"
+        if self._shutdown_signal is not None:
+            return "shutting_down"
+        if self.nginx.process.poll() is not None:
+            return "nginx_unavailable"
+        return None
+
+    def _refresh_failed_children(self):
+        # HTTP 요청 밖에서 비차단 회수한다. 확인되지 않은 PID는 건드리지 않는다.
+        for record in tuple(self.children.values()):
+            if record.role == "nginx":
+                continue
+            self._reap_record(record, timeout=0)
+            if not self._record_is_registered(record) or not record.master_reaped:
+                continue
+            try:
+                members = self._verified_group_members(record)
+            except SupervisorError:
+                continue
+            for pid, identity in members.items():
+                if pid != record.pid and identity.get("state") == "Z":
+                    try:
+                        self.waitpid(pid, os.WNOHANG)
+                    except OSError:
+                        pass
+            self._reap_record(record, timeout=0)
 
     def _hold_failed(self, code):
         self._terminate_record(self.auth_recovery)
         self.auth_recovery = None
         self._remove_auth_recovery_listener(reload_nginx=True)
         self._failed_code = code
+        self._log("기동 실패: {}".format(code))
         self._failure_published = False
         server = None
         try:
@@ -1329,7 +1371,9 @@ class RuntimeSupervisor(object):
             )
         except SupervisorError:
             pass
-        self.recovery_policy.enter_failure(code)
+        self.recovery_policy.enter_failure(
+            code, automatic=code == "gunicorn_start_failed" and self._readiness_timed_out,
+        )
         try:
             if code in RECOVERABLE_CODES:
                 self._terminate_records(
@@ -1339,7 +1383,7 @@ class RuntimeSupervisor(object):
                 server = self.recovery_server_factory(
                     self.status_store.status_directory,
                     os.geteuid(), self.service_gid,
-                    self.recovery_policy, lambda: self._recovery_eligible(code),
+                    self.recovery_policy, lambda: self._recovery_blocked_reason(code) or True,
                     clock=self.clock,
                 )
                 server.open()
@@ -1347,14 +1391,31 @@ class RuntimeSupervisor(object):
                 if server is not None:
                     server.close()
                 server = None
+            next_cleanup = self.clock()
+            last_blocked_reason = object()
             while self._shutdown_signal is None:
                 self._status_tick()
+                check_automatic = False
                 if self.nginx is None or self.nginx.process.poll() is not None:
                     if self.nginx is not None:
                         self._reap_record(self.nginx)
                         self._terminate_record(self.nginx)
                     return 1
+                if self.clock() >= next_cleanup:
+                    self._refresh_failed_children()
+                    next_cleanup = self.clock() + _POLL_SECONDS
+                    check_automatic = self._readiness_timed_out
+                    blocked_reason = self._recovery_blocked_reason(code)
+                    recovery_reason = blocked_reason or self.recovery_policy.snapshot(True)["reason"]
+                    if recovery_reason != last_blocked_reason:
+                        self._log("기동 복구 상태: {}".format(recovery_reason))
+                        last_blocked_reason = recovery_reason
                 if server is not None and server.poll_once():
+                    return _RETRY_STARTUP
+                if check_automatic and self.recovery_policy.accept_automatic(self._recovery_eligible(code)):
+                    self._log("앱 준비 시간 초과 후 자동 재시도: {}/3".format(
+                        self.recovery_policy.accepted_count,
+                    ))
                     return _RETRY_STARTUP
                 self.sleeper(
                     _RECOVERY_POLL_SECONDS if server is not None else _POLL_SECONDS
@@ -1373,6 +1434,7 @@ class RuntimeSupervisor(object):
             os.close(self.progress_reader)
             self.progress_reader = None
         self.worker = self.gunicorn = self.export_worker = None
+        self._readiness_timed_out = False
         self.auth_recovery = None
         self.export_started_at = self.export_restart_at = None
         self.export_restart_delay = 1.0

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import signal
 import socket
 import sqlite3
@@ -71,6 +72,7 @@ class Scenario:
         self.store = migration_status.MigrationStatusStore(
             str(self.runtime_dir), lambda: datetime.now(timezone.utc), self.uid, self.gid)
         self.runtime = supervisor.RuntimeSupervisor([], str(self.data), self.uid, self.gid, self.store)
+        self.runtime.auth_recovery_config_path = root / "auth-recovery.conf"
         self.attempts = []
         self.children = []
         self.errors = []
@@ -138,6 +140,7 @@ http {
  scgi_temp_path ROOT/scgi;
  include /etc/nginx/mime.types;
  RATE_ZONE
+ PROXY_MAP
  include ROOT/server.conf;
  server {
   listen 127.0.0.1:8443 ssl;
@@ -153,10 +156,16 @@ http {
  }
 }
 """.replace("ROOT", str(self.root))
-        zones = [line.strip() for line in (ROOT / "docker/nginx/nginx.conf").read_text().splitlines()
+        main_config = (ROOT / "docker/nginx/nginx.conf").read_text()
+        zones = [line.strip() for line in main_config.splitlines()
                  if "limit_req_zone" in line and "startup_recovery:" in line]
         check(len(zones) == 1, "제품 Nginx 공유 제한 설정 누락")
+        proxy_map = re.search(
+            r'(?m)^\s*map\s+"[^"\n]*"\s+\$pinry_proxied\s*\{[^{}]*\}', main_config,
+        )
+        check(proxy_map is not None, "제품 Nginx 프록시 경계 설정 누락")
         config = config.replace("RATE_ZONE", zones[0])
+        config = config.replace("PROXY_MAP", proxy_map.group(0))
         (self.root / "nginx.conf").write_text(config)
 
     def run(self):

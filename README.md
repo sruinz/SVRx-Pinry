@@ -498,6 +498,13 @@ The repository's `main` revision and the running container's revision may differ
 
 When startup fails, the recovery page preserves originals and backups and shows error codes and retry eligibility.
 **Restart server** retries Pinry startup; it does not reboot the host.
+If application readiness times out after 60 seconds following migration, startup retries automatically
+after a 30-second wait once safety checks pass. No browser needs to remain open. Automatic and manual
+retries share a limit of three accepted retries per supervisor run; a manual retry cancels the pending
+automatic attempt. Cleanup rechecks children that exit late. The page explains blocked recovery,
+including pending process exit and failed state or lock verification. If the limit is exhausted or
+verification keeps failing, inspect the logs and restart the container using your container manager;
+rebooting the host is not required.
 Not every failure is recoverable automatically. Follow the logs and setup guide when configuration or data checks are required.
 
 To roll back, stop the container first and preserve the failed state separately.

@@ -17,6 +17,11 @@ from urllib.parse import urlsplit
 COOLDOWN_SECONDS = 30
 MAX_ACCEPTED_ATTEMPTS = 3
 RECOVERABLE_CODES = frozenset(("worker_exit_timeout", "gunicorn_start_failed"))
+BLOCKED_REASONS = frozenset((
+    "shutting_down", "failure_not_recoverable", "status_unverified",
+    "identity_unverified", "worker_incomplete", "nginx_unavailable",
+    "children_pending", "lock_or_gate_unverified",
+))
 
 
 class RecoveryPolicy:
@@ -28,30 +33,48 @@ class RecoveryPolicy:
         self._failure_code = None
         self._generation = None
         self._token = None
+        self._automatic_at = None
 
     @property
     def accepted_count(self):
         return self._accepted_count
 
-    def enter_failure(self, code):
+    def enter_failure(self, code, automatic=False):
         self._failure_code = code
         self._generation = self._token_factory(32)
         self._token = self._token_factory(32)
+        self._automatic_at = self._clock() + COOLDOWN_SECONDS if automatic else None
 
     def leave_failure(self):
         self._failure_code = None
         self._generation = None
         self._token = None
+        self._automatic_at = None
 
     def snapshot(self, eligible):
         reason, retry_after = self._availability(eligible)
         available = reason == "available"
-        return self._payload(
+        payload = self._payload(
             available=available,
             reason=reason,
             retry_after=retry_after,
             disclose_token=reason in ("available", "cooldown"),
         )
+        if isinstance(eligible, str) and eligible in BLOCKED_REASONS:
+            payload["blocked_reason"] = eligible
+        if self._automatic_at is not None and reason in ("available", "cooldown"):
+            payload["automatic_retry_after_seconds"] = max(
+                retry_after, 0, int(math.ceil(self._automatic_at - self._clock())),
+            )
+        return payload
+
+    def accept_automatic(self, eligible):
+        if self._automatic_at is None or self._clock() < self._automatic_at:
+            return False
+        if self._availability(eligible)[0] != "available":
+            return False
+        status, _ = self.accept(self._token, self._generation, eligible)
+        return status == 202
 
     def accept(self, token, generation, eligible):
         reason = self._base_unavailability(eligible)
@@ -90,6 +113,7 @@ class RecoveryPolicy:
         self._accepted_count += 1
         self._last_accepted_at = self._clock()
         self._token = None
+        self._automatic_at = None
         return 202, self._payload(
             available=False,
             reason="accepted",
@@ -255,7 +279,10 @@ class RecoveryServer:
 
     def _eligible(self):
         try:
-            return self.eligibility_check() is True
+            result = self.eligibility_check()
+            if isinstance(result, str) and result in BLOCKED_REASONS:
+                return result
+            return result is True
         except Exception:
             return False
 

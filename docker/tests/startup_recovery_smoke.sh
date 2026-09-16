@@ -50,6 +50,7 @@ paths = [
     "docker/scripts/supervisor.py", "docker/scripts/startup_recovery.py",
     "docker/scripts/migration_status.py", "django_images/__init__.py",
     "django_images/file_ops.py", "django_images/services/__init__.py",
+    "pinry/__init__.py", "pinry/recovery_config.py",
     "django_images/services/startup_lock.py", "docker/nginx/nginx.conf",
     "docker/nginx/sites-enabled/default",
     "docker/tests/fixtures/startup_recovery_fixture.py",

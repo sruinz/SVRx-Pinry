@@ -20,6 +20,54 @@ RecoveryPolicy = startup_recovery.RecoveryPolicy
 
 
 class RecoveryPolicyTests(unittest.TestCase):
+    def test_automatic_retry_waits_and_shares_single_use_manual_budget(self):
+        now = [0.0]
+        policy = RecoveryPolicy(clock=lambda: now[0])
+        for attempt in range(3):
+            policy.enter_failure("gunicorn_start_failed", automatic=True)
+            state = policy.snapshot(True)
+            self.assertEqual(state["automatic_retry_after_seconds"], 30)
+            now[0] += 29.9
+            self.assertFalse(policy.accept_automatic(True))
+            now[0] += 0.1
+            self.assertFalse(policy.accept_automatic(False))
+            self.assertEqual(policy.accepted_count, attempt)
+            self.assertTrue(policy.accept_automatic(True))
+            self.assertFalse(policy.accept_automatic(True))
+            self.assertNotEqual(policy.accept(state["token"], state["generation"], True)[0], 202)
+        policy.enter_failure("gunicorn_start_failed", automatic=True)
+        now[0] += 300
+        self.assertFalse(policy.accept_automatic(True))
+        self.assertEqual(policy.snapshot(True)["reason"], "exhausted")
+        self.assertNotIn("automatic_retry_after_seconds", policy.snapshot(True))
+
+    def test_manual_acceptance_cancels_scheduled_automatic_retry(self):
+        now = [0.0]
+        policy = RecoveryPolicy(clock=lambda: now[0])
+        policy.enter_failure("gunicorn_start_failed", automatic=True)
+        state = policy.snapshot(True)
+        self.assertEqual(policy.accept(state["token"], state["generation"], True)[0], 202)
+        now[0] = 60
+        self.assertFalse(policy.accept_automatic(True))
+        self.assertEqual(policy.accepted_count, 1)
+
+    def test_automatic_retry_is_not_enabled_for_unclassified_failure(self):
+        now = [0.0]
+        policy = RecoveryPolicy(clock=lambda: now[0])
+        policy.enter_failure("gunicorn_start_failed")
+        now[0] = 300
+        self.assertFalse(policy.accept_automatic(True))
+        self.assertTrue(policy.snapshot(True)["available"])
+
+    def test_snapshot_exposes_only_allowlisted_blocking_reason(self):
+        policy, _ = self.make_policy()
+        policy.enter_failure("gunicorn_start_failed")
+        snapshot = policy.snapshot("children_pending")
+        self.assertFalse(snapshot["available"])
+        self.assertEqual(snapshot["blocked_reason"], "children_pending")
+        self.assertIsNone(snapshot["token"])
+        self.assertNotIn("blocked_reason", policy.snapshot("private exception text"))
+
     def make_policy(self, now=None, tokens=None):
         if now is None:
             now = [100.0]

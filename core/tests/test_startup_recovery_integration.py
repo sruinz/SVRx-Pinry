@@ -223,6 +223,162 @@ class RecoveryIntegrationTests(unittest.TestCase):
                 self.assertEqual(sleeps, [0.1 if opened else 1.0])
                 self.assertEqual(server.poll_once.call_count, 1 if opened else 0)
 
+    def test_failed_loop_recovers_when_group_exits_after_cleanup_deadline(self):
+        self._check_late_cleanup(zombie=False)
+
+    def test_failed_loop_reaps_verified_orphan_zombie_before_acceptance(self):
+        self._check_late_cleanup(zombie=True)
+
+    def _check_late_cleanup(self, zombie):
+        self.prepare_failure()
+        runtime = self.runtime
+        now = [0.0]
+        runtime.clock = lambda: now[0]
+        runtime.recovery_policy = supervisor.RecoveryPolicy(clock=runtime.clock)
+        process = mock.Mock(pid=3456)
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        runtime.gunicorn = supervisor._ChildRecord("gunicorn", process, {
+            "pid": 3456, "pgid": 3456, "session": 3456,
+            "starttime": "2", "state": "S",
+        })
+        runtime.children["gunicorn"] = runtime.gunicorn
+        reaped = []
+        runtime.group_reader = lambda pgid: ({4567: {
+            "pid": 4567, "pgid": 3456, "session": 3456,
+            "starttime": "3", "state": "S" if now[0] < 20 else "Z",
+        }} if now[0] < 20 or (zombie and not reaped) else {})
+
+        def reap(pid, flags):
+            self.assertEqual(pid, 4567)
+            self.assertEqual(flags, os.WNOHANG)
+            self.assertGreaterEqual(now[0], 20)
+            reaped.append(pid)
+            return pid, 0
+
+        runtime.waitpid = reap
+        runtime.group_signaler = lambda pgid, signum: None
+        observed = []
+
+        class AcceptWhenSafe:
+            def __init__(self, directory, uid, gid, policy, eligibility_check, clock):
+                self.policy, self.eligible = policy, eligibility_check
+
+            def open(self):
+                pass
+
+            def poll_once(self):
+                state = self.policy.snapshot(self.eligible())
+                observed.append(state["reason"])
+                if not state["available"]:
+                    return False
+                status, _ = self.policy.accept(state["token"], state["generation"], self.eligible())
+                return status == 202
+
+            def close(self):
+                pass
+
+        def sleep(seconds):
+            now[0] += seconds
+            if now[0] > 22:
+                runtime.handle_signal(signal.SIGTERM, None)
+
+        runtime.sleeper = sleep
+        runtime.recovery_server_factory = AcceptWhenSafe
+        self.assertIs(runtime._hold_failed("gunicorn_start_failed"), supervisor._RETRY_STARTUP)
+        self.assertIn("unsafe_state", observed)
+        self.assertEqual(observed[-1], "available")
+        self.assertNotIn("gunicorn", runtime.children)
+        self.assertEqual(runtime.recovery_policy.accepted_count, 1)
+        self.assertEqual(reaped, [4567] if zombie else [])
+
+    def test_readiness_timeout_retries_without_browser_and_stops_at_shared_limit(self):
+        self.prepare_failure()
+        runtime = self.runtime
+        now = [0.0]
+        runtime.clock = lambda: now[0]
+        runtime.recovery_policy = supervisor.RecoveryPolicy(clock=runtime.clock)
+        runtime.readiness_probe = lambda: False
+        process = mock.Mock(pid=3456)
+        process.poll.return_value = None
+        runtime.gunicorn = supervisor._ChildRecord("gunicorn", process, {
+            "pid": 3456, "pgid": 3456, "session": 3456,
+            "starttime": "2", "state": "S",
+        })
+        runtime.sleeper = lambda seconds: now.__setitem__(0, now[0] + seconds)
+        self.assertEqual(runtime._wait_for_readiness(), 1)
+        self.assertEqual(now[0], 60)
+        runtime.gunicorn.master_reaped = True
+        server = mock.Mock()
+        server.poll_once.return_value = False
+        runtime.recovery_server_factory = mock.Mock(return_value=server)
+        deadline = [now[0] + 35]
+
+        def sleep(seconds):
+            now[0] += seconds
+            if now[0] >= deadline[0]:
+                runtime.handle_signal(signal.SIGTERM, None)
+
+        runtime.sleeper = sleep
+        for attempt in range(3):
+            started = now[0]
+            deadline[0] = started + 35
+            self.assertIs(runtime._hold_failed("gunicorn_start_failed"), supervisor._RETRY_STARTUP)
+            self.assertGreaterEqual(now[0] - started, 30)
+            self.assertEqual(runtime.recovery_policy.accepted_count, attempt + 1)
+        deadline[0] = now[0] + 35
+        self.assertEqual(runtime._hold_failed("gunicorn_start_failed"), 0)
+        self.assertEqual(runtime.recovery_policy.accepted_count, 3)
+        self.assertTrue(os.path.exists(self.store.marker_path))
+
+    def test_exit_or_shutdown_at_readiness_deadline_is_not_automatically_retried(self):
+        for boundary in ("gunicorn", "nginx", "shutdown"):
+            with self.subTest(boundary=boundary):
+                self.prepare_failure()
+                runtime = self.runtime
+                runtime._shutdown_signal = None
+                now = [0.0]
+                runtime.clock = lambda: now[0]
+                runtime.readiness_probe = lambda: False
+                runtime.gunicorn = mock.Mock()
+                runtime.gunicorn.process.poll.side_effect = lambda: 1 if boundary == "gunicorn" and now[0] >= 60 else None
+                runtime.nginx.process.poll.side_effect = lambda: 1 if boundary == "nginx" and now[0] >= 60 else None
+
+                def sleep(seconds):
+                    now[0] += seconds
+                    if boundary == "shutdown" and now[0] >= 60:
+                        runtime.handle_signal(signal.SIGTERM, None)
+
+                runtime.sleeper = sleep
+                result = runtime._wait_for_readiness()
+                self.assertFalse(runtime._readiness_timed_out)
+                self.assertEqual(result, {"gunicorn": 1, "nginx": supervisor._NGINX_EXITED,
+                                          "shutdown": supervisor._WORKER_SHUTDOWN}[boundary])
+
+    def test_failed_cleanup_preserves_unverified_group_and_does_not_reap_nginx(self):
+        self.prepare_failure()
+        runtime = self.runtime
+        runtime.children["migration"] = runtime.worker
+        runtime.children["nginx"] = runtime.nginx
+        runtime.group_reader = lambda pgid: {9876: {
+            "pid": 9876, "pgid": pgid, "session": 9999,
+            "starttime": "2", "state": "Z",
+        }}
+        runtime.waitpid = mock.Mock()
+        runtime._refresh_failed_children()
+        self.assertIn("migration", runtime.children)
+        self.assertIn("nginx", runtime.children)
+        runtime.waitpid.assert_not_called()
+        self.assertFalse(runtime._recovery_eligible("gunicorn_start_failed"))
+
+    def test_blocking_reason_distinguishes_cleanup_from_manual_operator_action(self):
+        self.prepare_failure()
+        self.runtime.children["migration"] = self.runtime.worker
+        self.assertEqual(self.runtime._recovery_blocked_reason("gunicorn_start_failed"), "children_pending")
+        self.runtime.children.clear()
+        self.runtime._attempt_status_failed = True
+        self.assertEqual(self.runtime._recovery_blocked_reason("gunicorn_start_failed"), "status_unverified")
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux 잠금·프로세스군 시험")
     def test_real_worker_timeout_http_accept_then_success_reuses_lock_and_gate(self):
         runtime = self.runtime
