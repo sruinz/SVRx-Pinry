@@ -55,6 +55,7 @@ function openBoardEdit(vm, board, onSaved) {
 function openLogin(vm, onSucceed) {
   return overlays.openModal(vm, {
     component: LoginForm,
+    width: '640px',
     canCancel: ['escape', 'outside'],
     events: {
       'login.succeed': onSucceed,

@@ -17,13 +17,16 @@ describe('modal sizing', () => {
     [...overlayState.modals].reverse().forEach(entry => entry.close());
   });
 
-  it('uses a compact width for account and board forms', () => {
+  it('uses a compact width for board forms', () => {
     modals.openAdd2Board({}, { id: 1 }, 'owner');
     expect(lastWidth()).toBe('400px');
     modals.openBoardCreate({});
     expect(lastWidth()).toBe('400px');
+  });
+
+  it('keeps the login form wide enough for authentication choices', () => {
     modals.openLogin({}, jest.fn());
-    expect(lastWidth()).toBe('400px');
+    expect(lastWidth()).toBe('640px');
   });
 
   it('keeps Pin creation wider than Pin editing', () => {
