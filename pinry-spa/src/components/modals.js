@@ -89,7 +89,7 @@ function bulkModalEvents(onCompleted, lifecycle) {
 export function openPinBulkBoard(vm, props, onCompleted = null, lifecycle = null) {
   const config = {
     component: PinBulkBoardDialog,
-    width: '560px',
+    width: '440px',
     props: {
       ...props,
       selectedIds: [...props.selectedIds],
@@ -104,7 +104,7 @@ export function openPinBulkBoard(vm, props, onCompleted = null, lifecycle = null
 export function openPinBulkEdit(vm, props, onCompleted = null, lifecycle = null) {
   const config = {
     component: PinBulkEdit,
-    width: '560px',
+    width: '440px',
     props: {
       ...props,
       selectedIds: [...props.selectedIds],
@@ -119,7 +119,7 @@ export function openPinBulkEdit(vm, props, onCompleted = null, lifecycle = null)
 export function openBoardDelete(vm, props, onCompleted = null, onClosed = null) {
   const config = {
     component: BoardDeleteDialog,
-    width: '560px',
+    width: '440px',
     props: {
       ...props,
       board: { ...props.board },

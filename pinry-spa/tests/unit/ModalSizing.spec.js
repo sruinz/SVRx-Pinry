@@ -19,11 +19,11 @@ describe('modal sizing', () => {
 
   it('uses a compact width for account and board forms', () => {
     modals.openAdd2Board({}, { id: 1 }, 'owner');
-    expect(lastWidth()).toBe('480px');
+    expect(lastWidth()).toBe('400px');
     modals.openBoardCreate({});
-    expect(lastWidth()).toBe('480px');
+    expect(lastWidth()).toBe('400px');
     modals.openLogin({}, jest.fn());
-    expect(lastWidth()).toBe('480px');
+    expect(lastWidth()).toBe('400px');
   });
 
   it('keeps Pin creation wider than Pin editing', () => {
@@ -36,11 +36,11 @@ describe('modal sizing', () => {
   it('uses a medium width for bulk, deletion, and export dialogs', () => {
     const props = { selectedIds: [1, 2] };
     openPinBulkBoard({}, { ...props, mode: 'add' });
-    expect(lastWidth()).toBe('560px');
+    expect(lastWidth()).toBe('440px');
     openPinBulkEdit({}, props);
-    expect(lastWidth()).toBe('560px');
+    expect(lastWidth()).toBe('440px');
     openBoardDelete({}, { board: { id: 3 } });
-    expect(lastWidth()).toBe('560px');
+    expect(lastWidth()).toBe('440px');
     openExport({}, { pinIds: [1] });
     expect(lastWidth()).toBe('560px');
   });

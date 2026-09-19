@@ -29,7 +29,7 @@ function unlockScroll() {
 
 function openModal(vm, {
   component, props = {}, events = {}, canCancel = true, onClose, customClass = '',
-  width = '480px',
+  width = '400px',
 }) {
   const focused = document.activeElement;
   const entry = {
@@ -73,7 +73,7 @@ function confirm(vm, { message, onConfirm, onCancel }) {
   let confirmed = false;
   return openModal(vm, {
     component: ConfirmDialog,
-    width: '400px',
+    width: '320px',
     props: { message },
     events: { confirm: () => { confirmed = true; if (onConfirm) onConfirm(); } },
     onClose: () => { if (!confirmed && onCancel) onCancel(); },
