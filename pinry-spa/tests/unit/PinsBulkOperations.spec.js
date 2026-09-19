@@ -617,7 +617,7 @@ describe('bulk operation dialogs', () => {
       component: ExportDialog,
       props: expectedProps,
       canCancel: true,
-      width: '760px',
+      width: '560px',
     });
   });
 

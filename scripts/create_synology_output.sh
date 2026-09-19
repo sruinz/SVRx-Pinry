@@ -27,6 +27,17 @@ case "${source_commit}" in
         exit 1
         ;;
 esac
+public_source_commit="${PINRY_PUBLIC_SOURCE_COMMIT:-${source_commit}}"
+if [ "${#public_source_commit}" -ne 40 ]; then
+    echo "invalid_public_source_commit" >&2
+    exit 1
+fi
+case "${public_source_commit}" in
+    *[!0123456789abcdef]*)
+        echo "invalid_public_source_commit" >&2
+        exit 1
+        ;;
+esac
 package_control_paths=(
     scripts/create_synology_output.sh
     deploy/synology/build-image.sh
@@ -730,7 +741,7 @@ for legal_document in LICENSE.md NOTICE.md UPSTREAM.md; do
         "${temporary_directory}/${legal_document}" 0644
 done
 printf 'source_commit=%s\ndefault_image=svrx-pinry:latest\n' \
-    "${source_commit}" \
+    "${public_source_commit}" \
     > "${temporary_directory}/BUILD_INFO"
 install -m 0644 \
     "${temporary_directory}/BUILD_INFO" \

@@ -29,7 +29,7 @@ function unlockScroll() {
 
 function openModal(vm, {
   component, props = {}, events = {}, canCancel = true, onClose, customClass = '',
-  width = '640px',
+  width = '480px',
 }) {
   const focused = document.activeElement;
   const entry = {
