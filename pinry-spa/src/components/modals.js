@@ -13,6 +13,7 @@ function openPinEdit(vm, props = null, onCreated = null) {
   return overlays.openModal(vm, {
     component: PinCreateModal,
     customClass: 'pin-editor-modal',
+    width: props && props.isEdit ? '920px' : '1080px',
     props,
     canCancel: false,
     events: {
@@ -88,6 +89,7 @@ function bulkModalEvents(onCompleted, lifecycle) {
 export function openPinBulkBoard(vm, props, onCompleted = null, lifecycle = null) {
   const config = {
     component: PinBulkBoardDialog,
+    width: '760px',
     props: {
       ...props,
       selectedIds: [...props.selectedIds],
@@ -102,6 +104,7 @@ export function openPinBulkBoard(vm, props, onCompleted = null, lifecycle = null
 export function openPinBulkEdit(vm, props, onCompleted = null, lifecycle = null) {
   const config = {
     component: PinBulkEdit,
+    width: '760px',
     props: {
       ...props,
       selectedIds: [...props.selectedIds],
@@ -116,6 +119,7 @@ export function openPinBulkEdit(vm, props, onCompleted = null, lifecycle = null)
 export function openBoardDelete(vm, props, onCompleted = null, onClosed = null) {
   const config = {
     component: BoardDeleteDialog,
+    width: '760px',
     props: {
       ...props,
       board: { ...props.board },
@@ -146,6 +150,7 @@ export function openExport(vm, props) {
   }
   return overlays.openModal(vm, {
     component: ExportDialog,
+    width: '760px',
     props: hasBoard ? { boardId: props.boardId } : { pinIds: props.pinIds.slice() },
     canCancel: true,
   });

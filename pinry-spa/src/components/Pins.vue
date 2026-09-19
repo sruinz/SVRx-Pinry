@@ -1298,6 +1298,7 @@ export default {
             loadNext: () => this.fetchMore(),
           },
           customClass: 'pin-preview-at-home',
+          width: '900px',
           onClose: () => {
             if (this.previewModalHandle === modal) this.previewModalHandle = null;
           },

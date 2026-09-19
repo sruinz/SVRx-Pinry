@@ -29,6 +29,7 @@ function unlockScroll() {
 
 function openModal(vm, {
   component, props = {}, events = {}, canCancel = true, onClose, customClass = '',
+  width = '640px',
 }) {
   const focused = document.activeElement;
   const entry = {
@@ -38,6 +39,7 @@ function openModal(vm, {
     events,
     canCancel,
     customClass,
+    width,
     provides: vm && vm.$ ? vm.$.provides : null,
     closed: false,
     close() {

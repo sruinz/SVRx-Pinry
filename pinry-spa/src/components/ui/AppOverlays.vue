@@ -11,6 +11,7 @@
       :dismissable-mask="canCancel(entry, 'outside')"
       :draggable="false"
       :class="['app-modal', entry.customClass]"
+      :style="{ width: entry.width }"
       :pt="{ mask: { class: 'app-modal-mask' }, content: { class: 'modal-content' } }"
       @update:visible="entry.close()">
       <template #container>
@@ -78,9 +79,7 @@ export default {
 .app-modal { max-width: calc(100vw - 48px); max-height: calc(100dvh - 48px); }
 .app-modal .modal-content { display: block; max-height: calc(100dvh - 48px); overflow: auto; margin: 0; }
 .app-modal .modal-card { max-width: 100%; margin: 0; }
-.app-modal.pin-editor-modal { width: 1080px; }
 .app-modal.pin-editor-modal .modal-content { width: 100%; }
-.app-modal.pin-preview-at-home { width: 900px; }
 .app-modal.pin-preview-at-home .modal-content { width: 100%; padding-inline: 72px; }
 @media screen and (max-width: 768px) {
   .app-modal-mask { padding: 12px; }
