@@ -15,7 +15,12 @@
       :pt="{ mask: { class: 'app-modal-mask' }, content: { class: 'modal-content' } }"
       @update:visible="entry.close()">
       <template #container>
-        <div class="modal-content" tabindex="-1" @vue:mounted="focusModal(entry, $event.el)">
+        <div
+          class="modal-content"
+          :style="{ width: entry.width }"
+          tabindex="-1"
+          @vue:mounted="focusModal(entry, $event.el)"
+        >
           <ModalContent :entry="entry" />
         </div>
       </template>
@@ -77,7 +82,7 @@ export default {
 <style>
 .app-modal-mask { background: rgba(0, 0, 0, .7); padding: 24px; }
 .app-modal { max-width: calc(100vw - 48px); max-height: calc(100dvh - 48px); }
-.app-modal .modal-content { display: block; max-height: calc(100dvh - 48px); overflow: auto; margin: 0; }
+.app-modal .modal-content { display: block; max-width: calc(100vw - 48px); max-height: calc(100dvh - 48px); overflow: auto; margin: 0; }
 .app-modal .modal-card { max-width: 100%; margin: 0; }
 .app-modal.pin-editor-modal .modal-content { width: 100%; }
 .app-modal.pin-preview-at-home .modal-content { width: 100%; padding-inline: 72px; }
