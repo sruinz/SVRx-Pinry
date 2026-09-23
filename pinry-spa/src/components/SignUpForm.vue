@@ -6,6 +6,7 @@
           <p class="modal-card-title">{{ $t("signUpTitle") }}</p>
         </header>
         <p v-if="policyError" role="alert">{{ $t('ssoSettingsFailed') }}</p>
+        <p v-else-if="!policyLoaded">{{ $t('ssoLoading') }}</p>
         <p v-else-if="!registrationAllowed">{{ $t('ssoRegistrationDisabled') }}</p>
         <p v-else-if="!passwordAllowed">{{ $t('ssoPasswordDisabled') }}</p>
         <section v-if="canRegister" class="modal-card-body">
@@ -84,6 +85,7 @@ export default {
       helper: model,
       passwordAllowed: false,
       registrationAllowed: false,
+      policyLoaded: false,
       policyError: false,
     };
   },
@@ -91,6 +93,7 @@ export default {
     api.SSO.policy().then((policy) => {
       this.passwordAllowed = policy.password_login_enabled;
       this.registrationAllowed = policy.allow_new_registrations;
+      this.policyLoaded = true;
     })
       .catch(() => { this.policyError = true; });
   },

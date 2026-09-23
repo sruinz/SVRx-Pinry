@@ -97,6 +97,27 @@ describe('SSO policy screens', () => {
     policy.mockRestore();
   });
 
+  it('shows a loading state instead of disabled registration before policy loads', async () => {
+    let resolvePolicy;
+    const policy = jest.spyOn(API.SSO, 'policy').mockReturnValue(new Promise((resolve) => {
+      resolvePolicy = resolve;
+    }));
+    const wrapper = shallowMount(SignUpForm, options);
+
+    expect(wrapper.text()).toContain('ssoLoading');
+    expect(wrapper.text()).not.toContain('ssoRegistrationDisabled');
+
+    resolvePolicy({
+      providers: [], password_login_enabled: true, api_tokens_enabled: false,
+      allow_new_registrations: true,
+    });
+    await flushPromises();
+
+    expect(wrapper.find('.modal-card-body').exists()).toBe(true);
+    wrapper.unmount();
+    policy.mockRestore();
+  });
+
   it('associates visible password login labels with the real inputs', async () => {
     axios.get.mockResolvedValue({
       data: { providers: [], password_login_enabled: true, api_tokens_enabled: false },
