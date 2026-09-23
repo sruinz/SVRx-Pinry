@@ -39,7 +39,8 @@ The server manages images and accounts; the Chrome/Edge extension collects web i
 - Multi-tag AND search, search filters stored in the URL, and unfiltered searches
 - Previous/next navigation, original-size and fit-to-screen viewing, and remembered viewing preferences
 - Fullscreen and slideshows with 1, 3, 5, or 10-second intervals; next-image preloading to reduce transition delays
-- Light/dark themes, Korean/English/Chinese/French localization, keyboard navigation, and visible focus indicators
+- Light/dark themes; SPA and Django administration localization in Korean, English, Chinese, and French with a shared language selection; keyboard navigation and visible focus indicators
+- Circular Gravatar display in the header account menu, with the standard account icon as the fallback
 
 ### Boards and bulk management
 
@@ -54,10 +55,11 @@ The server manages images and accounts; the Chrome/Edge extension collects web i
 
 - Authentik, Synology, Google, Microsoft, GitHub, and generic OIDC sign-in with provider-specific setup guides
 - Link existing accounts by verified email; choose a username and local password when signing up through SSO
+- Administrator site-access controls for new registrations and logged-out public Pin viewing
 - Separate password-login and API-token policies, with administrator recovery login through direct internal-network access
 - Unified profile, token, SSO, and administration cards; tokens masked by default with explicit reveal/copy controls
 - Profile badges showing the running source revision and backend/frontend dependency versions
-- Automatic backup and migration of legacy Pinry data, legacy configuration compatibility, and migration/recovery status pages
+- Automatic backup and migration of legacy Pinry data, legacy configuration compatibility, migration/recovery status pages, and bounded automatic retry after startup-readiness timeout
 - Docker Hub images, local source builds, and upgrades that preserve persistent data
 
 ## Modernized runtime
@@ -93,6 +95,9 @@ Preserve HTTPS enforcement and the original Host when configuring the public rev
 
 Password login and API tokens are enabled by default, with no active SSO providers.
 An upgrade alone does not disable existing accounts or tokens.
+Site-access policy controls new web sign-ups and logged-out public Pin viewing in Django administration.
+An upgrade preserves the legacy `ALLOW_NEW_REGISTRATIONS` and `PUBLIC` values as the initial policy.
+The sign-up interface follows the loaded registration policy. Disabling public Pin viewing blocks unauthenticated Pin, board, and tag APIs while sign-in and administrator settings remain available.
 A super administrator can configure multiple providers in Django administration.
 Register the exact callback URL shown by the application with the identity provider.
 For Microsoft, use a tenant UUID rather than `common`.
