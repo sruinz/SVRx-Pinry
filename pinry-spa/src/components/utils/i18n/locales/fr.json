@@ -59,6 +59,7 @@
   "ssoSettingsFailed": "Impossible de charger les paramètres de connexion. Réessayez.",
   "ssoLoading": "Chargement des paramètres…",
   "ssoPasswordDisabled": "La connexion et l’inscription par mot de passe sont désactivées. Utilisez le SSO.",
+  "ssoRegistrationDisabled": "L’inscription est désactivée.",
   "ssoTokensDisabled": "Les jetons API ne sont pas disponibles.",
   "ssoAccounts": "Comptes SSO associés",
   "ssoAutoLinkHelp": "Si l’adresse SSO vérifiée correspond à un compte Pinry existant, l’association est automatique et aucune action manuelle n’est requise. Les mots de passe Pinry et du fournisseur n’ont pas besoin d’être identiques.",

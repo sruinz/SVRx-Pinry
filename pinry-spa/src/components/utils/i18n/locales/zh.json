@@ -59,6 +59,7 @@
   "ssoSettingsFailed": "无法加载登录设置，请重试。",
   "ssoLoading": "正在加载登录设置。",
   "ssoPasswordDisabled": "密码登录和注册已停用，请使用 SSO。",
+  "ssoRegistrationDisabled": "注册已停用。",
   "ssoTokensDisabled": "API 令牌不可用。",
   "ssoAccounts": "已关联的 SSO 账号",
   "ssoAutoLinkHelp": "SSO 验证邮箱与现有 Pinry 账号一致时会自动关联，无需手动操作。Pinry 密码与身份提供商密码无需相同。",

@@ -59,6 +59,7 @@
   "ssoSettingsFailed": "로그인 설정을 불러오지 못했습니다. 다시 시도해 주세요.",
   "ssoLoading": "로그인 설정을 불러오는 중입니다.",
   "ssoPasswordDisabled": "비밀번호 로그인과 가입이 비활성화되어 있습니다. SSO를 이용해 주세요.",
+  "ssoRegistrationDisabled": "회원 가입이 비활성화되어 있습니다.",
   "ssoTokensDisabled": "API 토큰을 사용할 수 없습니다.",
   "ssoAccounts": "연결된 SSO 계정",
   "ssoAutoLinkHelp": "SSO에서 확인된 이메일이 기존 Pinry 계정과 같으면 자동으로 연결되므로 수동 연결은 필요하지 않습니다. Pinry 비밀번호와 SSO 제공자 비밀번호는 같을 필요가 없습니다.",

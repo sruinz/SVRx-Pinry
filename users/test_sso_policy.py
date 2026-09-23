@@ -93,6 +93,7 @@ class SSOPolicyTests(TestCase):
         response = self.client.get('/api/v2/sso/providers/')
         self.assertEqual(response.json(), {
             'providers': [], 'password_login_enabled': True, 'api_tokens_enabled': True,
+            'allow_new_registrations': True,
             'recent_auth_remaining_seconds': 0,
         })
 

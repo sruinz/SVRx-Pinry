@@ -4,7 +4,9 @@ import flushPromises from 'flush-promises';
 import { createI18n } from 'vue-i18n';
 import { mount, shallowMount } from '@vue/test-utils';
 import LoginForm from '@/components/LoginForm.vue';
+import PHeader from '@/components/PHeader.vue';
 import Profile from '@/components/user/profile.vue';
+import SignUpForm from '@/components/SignUpForm.vue';
 import API from '@/components/api';
 import modals from '@/components/modals';
 import ko from '@/components/utils/i18n/locales/ko.json';
@@ -21,6 +23,9 @@ beforeEach(() => {
   overlays.confirm.mockReset();
   overlays.toast.mockReset();
   overlays.openLoading.mockReset().mockReturnValue({ close: jest.fn() });
+});
+afterEach(() => {
+  jest.restoreAllMocks();
 });
 
 jest.mock('axios');
@@ -55,6 +60,41 @@ describe('SSO policy screens', () => {
 
     expect(brand.text()).toBe('SVRx Pinry');
     expect(brand.find('img').attributes('alt')).toBe('');
+  });
+
+  it('hides the header signup action when registration is disabled', async () => {
+    const fetchUserInfo = jest.spyOn(API.User, 'fetchUserInfo').mockResolvedValue(null);
+    const policy = jest.spyOn(API.SSO, 'policy').mockResolvedValue({
+      providers: [], password_login_enabled: true, api_tokens_enabled: false,
+      allow_new_registrations: false,
+    });
+    const wrapper = shallowMount(PHeader, {
+      global: {
+        plugins: [createI18n({ legacy: false, locale: 'ko', messages: { ko } })],
+      },
+    });
+
+    await flushPromises();
+
+    expect(wrapper.find('.buttons .button.is-primary').exists()).toBe(false);
+    wrapper.unmount();
+    fetchUserInfo.mockRestore();
+    policy.mockRestore();
+  });
+
+  it('does not render a registration form when registration is disabled', async () => {
+    const policy = jest.spyOn(API.SSO, 'policy').mockResolvedValue({
+      providers: [], password_login_enabled: true, api_tokens_enabled: false,
+      allow_new_registrations: false,
+    });
+    const wrapper = shallowMount(SignUpForm, options);
+
+    await flushPromises();
+
+    expect(wrapper.find('.modal-card-body').exists()).toBe(false);
+    expect(wrapper.text()).toContain('ssoRegistrationDisabled');
+    wrapper.unmount();
+    policy.mockRestore();
   });
 
   it('associates visible password login labels with the real inputs', async () => {

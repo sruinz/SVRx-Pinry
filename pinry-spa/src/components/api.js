@@ -313,6 +313,7 @@ const SSO = {
         && data.recent_auth_remaining_seconds >= 0 ? data.recent_auth_remaining_seconds : 0;
       return {
         ...data,
+        allow_new_registrations: data.allow_new_registrations === true,
         recent_auth_remaining_seconds: recentAuthRemaining,
         providers: data.providers.filter(provider => provider.enabled !== false),
       };

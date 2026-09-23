@@ -20,7 +20,9 @@ describe('실제 입력 경계', () => {
   });
 
   it('가입 이메일은 이메일 검증을 유지하고 비밀번호 표시 전환과 분리된다', async () => {
-    jest.spyOn(api.SSO, 'policy').mockResolvedValue({ password_login_enabled: true });
+    jest.spyOn(api.SSO, 'policy').mockResolvedValue({
+      password_login_enabled: true, allow_new_registrations: true,
+    });
     const wrapper = render(SignUpForm);
     await flushPromises();
     const email = wrapper.find('input[type="email"]');
