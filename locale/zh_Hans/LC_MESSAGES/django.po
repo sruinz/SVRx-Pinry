@@ -1,6 +1,8 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: SVRx Pinry\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-09-23 22:36+0900\n"
 "PO-Revision-Date: 2026-09-23 00:00+0900\n"
 "Last-Translator: SVRx Pinry\n"
 "Language-Team: SVRx Pinry\n"
@@ -9,54 +11,820 @@ msgstr ""
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=1; plural=0;\n"
-
+#: core/admin.py:65
 msgid "핀 수"
 msgstr "Pin 数量"
 
+
+#: core/admin.py:81 core/services/tag_management.py:27
 msgid "최소 두 개의 태그를 선택하세요."
 msgstr "请至少选择两个标签。"
 
+
+#: core/admin.py:89 core/tests/test_admin_i18n.py:189
 msgid "태그 병합"
 msgstr "合并标签"
 
+
+#: core/admin.py:106
 msgid "대표 태그를 선택하세요."
 msgstr "请选择一个主要标签。"
 
+
+#: core/admin.py:122
+#, python-brace-format
 msgid "{}개 태그를 {} 태그로 병합했습니다."
 msgstr "已将 {} 个标签合并到 {}。"
 
+
+#: core/admin.py:131
 msgid "선택한 태그 병합"
 msgstr "合并所选标签"
 
-msgid "대표 태그가 선택 범위에 없습니다."
-msgstr "所选主要标签不在选择范围内。"
 
-msgid "선택한 태그가 변경되었습니다. 다시 시도하세요."
-msgstr "所选标签已变化，请重试。"
+#: core/apps.py:9
+msgid "코어"
+msgstr "核心"
 
-msgid "대표 태그 선택"
-msgstr "选择主要标签"
 
-msgid "선택한 태그의 핀 연결을 대표 태그 하나로 합칩니다. 나머지 태그는 삭제됩니다."
-msgstr "所选标签的 Pin 关联将合并到一个主要标签，其余标签将被删除。"
-
-msgid "병합"
-msgstr "合并"
-
-msgid "취소"
-msgstr "取消"
-
-msgid "Pin"
-msgstr "Pin"
-
+#: core/models.py:87 core/models.py:88
 msgid "보드"
 msgstr "画板"
 
+
+#: core/models.py:204 core/models.py:205
+msgid "Pin"
+msgstr "Pin"
+
+
+#: core/services/tag_management.py:29
+msgid "대표 태그가 선택 범위에 없습니다."
+msgstr "所选主要标签不在选择范围内。"
+
+
+#: core/services/tag_management.py:40
+msgid "선택한 태그가 변경되었습니다. 다시 시도하세요."
+msgstr "所选标签已变化，请重试。"
+
+
+#: core/templates/admin/taggit/tag/merge_confirmation.html:7
+msgid "대표 태그 선택"
+msgstr "选择主要标签"
+
+
+#: core/templates/admin/taggit/tag/merge_confirmation.html:8
+msgid "선택한 태그의 핀 연결을 대표 태그 하나로 합칩니다. 나머지 태그는 삭제됩니다."
+msgstr "所选标签的 Pin 关联将合并到一个主要标签，其余标签将被删除。"
+
+
+#: core/templates/admin/taggit/tag/merge_confirmation.html:26
+
+#: core/tests/test_admin_i18n.py:191
+msgid "병합"
+msgstr "合并"
+
+
+#: core/templates/admin/taggit/tag/merge_confirmation.html:27
+
+#: core/tests/test_admin_i18n.py:192
+msgid "취소"
+msgstr "取消"
+
+
+#: django_images/apps.py:9 django_images/models.py:52
+
+#: django_images/models.py:53
 msgid "이미지"
 msgstr "图片"
 
+
+#: django_images/models.py:164 django_images/models.py:165
 msgid "썸네일"
 msgstr "缩略图"
 
-msgid "코어"
-msgstr "核心"
+
+#: pinry/settings/base.py:108
+msgid "한국어"
+msgstr "韩语"
+
+
+#: pinry/settings/base.py:109
+msgid "English"
+msgstr "英语"
+
+
+#: pinry/settings/base.py:110
+msgid "중국어 간체"
+msgstr "简体中文"
+
+
+#: pinry/settings/base.py:111
+msgid "Français"
+msgstr "法语"
+
+
+#: pinry/templates/admin/users/ssoprovider/change_form.html:4
+msgid "SSO 설정 가이드 열기 ↗"
+msgstr "打开 SSO 设置指南 ↗"
+
+
+#: pinry/templates/admin/users/ssoprovider/change_form.html:4
+msgid "제공자 등록 절차와 복사할 주소를 확인하세요. 새 설정은 비활성 상태로 먼저 저장하세요."
+msgstr "查看提供商标注册步骤和需要复制的地址。新设置请先以停用状态保存。"
+
+
+#: pinry/templates/admin/users/ssoprovider/change_list.html:4
+
+#: users/admin.py:363
+msgid "SSO 설정 가이드"
+msgstr "SSO 设置指南"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:8
+msgid "← SSO 설정 목록"
+msgstr "← SSO 设置列表"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:9
+#, python-format
+msgid "%(provider_name)s 설정으로 돌아가기"
+msgstr "返回 %(provider_name)s 设置"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:11
+msgid "1. 접속 주소와 등록할 리디렉션 URI"
+msgstr "1. 访问地址与要注册的重定向 URI"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:12
+msgid "현재 접속 주소:"
+msgstr "当前访问地址："
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:13
+msgid "현재 접속 경로 기준 미리보기 (설정은 변경하지 않음):"
+msgstr "基于当前访问路径的预览（不会更改设置）："
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:14
+msgid "제공자 저장 후 고유 ID가 포함된 주소를 확인할 수 있습니다."
+msgstr "保存提供者后即可查看包含唯一 ID 的地址。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:15
+msgid "실제 제공자에 등록할 확정 리디렉션 URI"
+msgstr "要注册到提供者的最终重定向 URI"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:15
+msgid "저장된 공개 서비스 기준 URL을 사용합니다."
+msgstr "它使用已保存的公共服务基准 URL。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:16
+msgid "공개 서비스 HTTPS 주소를 입력하고 비활성 상태로 저장 후 확인하세요."
+msgstr "请输入公共服务 HTTPS 地址，并以停用状态保存后再确认。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:17
+msgid "리디렉션 URI 복사"
+msgstr "复制重定向 URI"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:19
+msgid "현재 접속 주소와 공개 서비스 주소가 다릅니다. 제공자에는 위의 확정 URI를 등록하세요."
+msgstr "当前访问地址与公共服务地址不同。请在提供者中注册上方的最终 URI。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:21
+msgid "HTTP 내부망 주소는 참고용입니다. 현재 Pinry의 SSO 공개 서비스 주소는 HTTPS가 필요합니다. 프록시의 외부 도메인·포트를 확인하세요."
+msgstr "HTTP 内网地址仅作参考。Pinry 的公开 SSO 服务地址需要 HTTPS。请确认代理的外部域名和端口。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:24
+msgid "2. 제공자별 설정"
+msgstr "2. 各提供者设置"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:25
+
+#: users/admin.py:126 users/models.py:152
+msgid "제공자 종류"
+msgstr "提供者类型"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:29
+msgid "아래 값은 가이드 계산용입니다. 실제 설정에 자동 저장되지 않습니다."
+msgstr "以下值仅用于计算指南，不会自动保存到实际设置。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:30
+msgid "발급자 (issuer)"
+msgstr "颁发者（issuer）"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:32
+msgid "Discovery 문서의 issuer와 정확히 일치해야 합니다. Pinry 접속 주소가 아닌 IdP 주소입니다."
+msgstr "它必须与 Discovery 文档中的 issuer 完全一致。这是 IdP 地址，不是 Pinry 访问地址。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:33
+
+#: users/admin.py:128 users/models.py:159
+msgid "Microsoft 테넌트 UUID"
+msgstr "Microsoft 租户 UUID"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:35
+msgid "Discovery URL 직접 지정 (선택)"
+msgstr "手动指定 Discovery URL（可选）"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:37
+msgid "IdP가 안내하는 Well-known URL을 우선 사용하세요. 전역 issuer를 쓰는 Authentik 등은 직접 지정이 필요할 수 있습니다."
+msgstr "请优先使用 IdP 提供的 Well-known URL。使用全局 issuer 的 Authentik 等可能需要手动指定。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:38
+msgid "Discovery URL"
+msgstr "Discovery URL"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:40
+msgid "Discovery URL 복사"
+msgstr "复制 Discovery URL"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:43
+msgid "제공자 공식 설정 문서 ↗"
+msgstr "提供者官方设置文档 ↗"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:46
+msgid "3. 입력과 연결 확인"
+msgstr "3. 输入与连接确认"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:47
+msgid "필요한 입력란만 표시됩니다. 예시는 참고용이며 자동 저장되지 않습니다. Client Secret은 제공자가 발급한 비밀 값을 입력하고, 변경하지 않을 때는 비워두세요."
+msgstr "仅显示必要的输入项。示例仅供参考，不会自动保存。Client Secret 请输入提供者颁发的密钥值；不变更时请留空。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:48
+msgid "허용 서버 주소에는 HTTPS 도메인과 포트만 한 줄씩 입력하세요. 예:"
+msgstr "允许的服务器地址每行只能输入 HTTPS 域名和端口。示例："
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:48
+msgid "인증·토큰·서명키 서버가 서로 다르면 각각 등록해야 합니다."
+msgstr "如果授权、令牌和签名密钥服务器不同，请分别注册。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:49
+msgid "내부 IdP 허용 CIDR과 복구 로그인 CIDR은 별개입니다. 대괄호·따옴표 없이 한 줄에 하나씩 입력하세요. 예:"
+msgstr "内部 IdP 允许的 CIDR 与恢复登录 CIDR 是独立的。请每行输入一个，不要使用括号或引号。示例："
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:49
+msgid "단일 서버는"
+msgstr "单一服务器："
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:49
+msgid "환경에 맞는 최소 대역만 허용하세요."
+msgstr "仅允许符合环境需求的最小网段。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:50
+msgid "비활성 상태로 저장 → 확정 URI를 IdP에 등록 → 필수 값을 채우고 활성화 → 관리자 계정 연결·SSO 로그인 확인 순서로 진행하세요. 비밀번호 로그인은 관리자 SSO와 복구 로그인을 검증하기 전에는 끄지 마세요."
+msgstr "按以下顺序操作：停用保存 → 在 IdP 注册最终 URI → 填写必填值并启用 → 连接管理员账户并确认 SSO 登录。在验证管理员 SSO 和恢复登录之前，不要关闭密码登录。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:53
+msgid "해당 없음 — GitHub OAuth는 Discovery URL을 사용하지 않습니다."
+msgstr "不适用 — GitHub OAuth 不使用 Discovery URL。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:54
+msgid "올바른 HTTPS 주소 또는 테넌트 UUID를 입력하세요."
+msgstr "请输入有效的 HTTPS 地址或租户 UUID。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:55
+msgid "Discovery URL 예시 (실제 IdP 주소로 바꾸세요)"
+msgstr "Discovery URL 示例（请替换为实际 IdP 地址）"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:56
+msgid "Discovery URL (입력값 기준)"
+msgstr "Discovery URL（基于输入值）"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:57
+msgid "복사했습니다."
+msgstr "已复制。"
+
+
+#: pinry/templates/admin/users/ssoprovider/setup_guide.html:58
+msgid "자동 복사를 사용할 수 없습니다. 선택된 주소를 직접 복사하세요."
+msgstr "无法自动复制。请手动复制选中的地址。"
+
+
+#: users/admin.py:68
+msgid "대괄호와 따옴표 없이 한 줄에 하나씩 입력하세요."
+msgstr "请每行输入一项，不要使用括号或引号。"
+
+
+#: users/admin.py:72
+msgid "한 줄에 하나의 문자열을 입력하세요."
+msgstr "请每行输入一个字符串。"
+
+
+#: users/admin.py:79 users/admin.py:93 users/models.py:104
+msgid "복구 허용 CIDR"
+msgstr "恢复允许的 CIDR"
+
+
+#: users/admin.py:80
+msgid "선택 · 한 줄에 하나씩 입력하세요. 예: 192.168.0.0/24 또는 10.0.0.0/8. 자신의 내부망만 허용하세요. 비우면 허용 대역이 없습니다."
+msgstr "可选。每行一个，例如 192.168.0.0/24 或 10.0.0.0/8。仅允许自己的内网。留空表示没有允许网段。"
+
+
+#: users/admin.py:82 users/admin.py:94 users/models.py:106
+msgid "복구 차단 CIDR"
+msgstr "恢复拒绝的 CIDR"
+
+
+#: users/admin.py:83
+msgid "선택 · 한 줄에 하나씩 입력하세요. 예: 192.168.0.45/32. 허용 대역에 포함되어도 차단이 우선합니다."
+msgstr "可选。每行一个，例如 192.168.0.45/32。即使位于允许网段，拒绝规则也优先。"
+
+
+#: users/admin.py:89 users/models.py:96
+msgid "회원 가입 허용"
+msgstr "允许注册"
+
+
+#: users/admin.py:90 users/models.py:98
+msgid "비로그인 Pin 보기"
+msgstr "允许未登录查看 Pin"
+
+
+#: users/admin.py:91 users/models.py:100
+msgid "비밀번호 로그인 허용"
+msgstr "允许密码登录"
+
+
+#: users/admin.py:92 users/models.py:102
+msgid "API 토큰 인증 허용"
+msgstr "允许 API 令牌认证"
+
+
+#: users/admin.py:95
+msgid "끄면 관리자나 기존 SSO 계정 연결로만 계정을 만들 수 있습니다."
+msgstr "关闭后，只能由管理员或通过既有 SSO 账户关联创建账户。"
+
+
+#: users/admin.py:96
+msgid "끄면 로그인하지 않은 사용자는 Pin·보드·태그 API를 볼 수 없습니다. 로그인과 관리자 설정은 계속 사용할 수 있습니다."
+msgstr "关闭后，未登录用户无法查看 Pin、看板或标签 API。登录和管理员设置仍可使用。"
+
+
+#: users/admin.py:97
+msgid "끄기 전에 관리자 SSO 로그인을 확인하세요. 내부망 IP 직접 접속에서는 관리자 복구 로그인을 사용할 수 있습니다."
+msgstr "关闭前请确认管理员 SSO 登录。内网 IP 直接访问时可使用管理员恢复登录。"
+
+
+#: users/admin.py:98
+msgid "끄면 기존 토큰을 보존하면서 인증·노출·발급을 모두 차단합니다."
+msgstr "关闭后会保留既有令牌，但会阻止认证、暴露和签发。"
+
+
+#: users/admin.py:109
+msgid "입력·교체만 가능합니다. 비워두면 기존 비밀을 유지합니다."
+msgstr "仅用于输入或替换。留空则保留既有密钥。"
+
+
+#: users/admin.py:113
+msgid "허용 서버 주소 (origin)"
+msgstr "允许的服务器地址（origin）"
+
+
+#: users/admin.py:114
+msgid "한 줄에 하나씩 HTTPS 서버 주소만 입력하세요(경로 제외). 예: https://auth.example.com. 기본 제공자는 신규 등록 시 기본값을 사용합니다."
+msgstr "每行仅输入 HTTPS 服务器地址，不含路径。示例：https://auth.example.com。内置提供者新建时使用默认值。"
+
+
+#: users/admin.py:116 users/admin.py:129 users/models.py:165
+msgid "내부 IdP 허용 CIDR"
+msgstr "内部 IdP 允许的 CIDR"
+
+
+#: users/admin.py:117
+msgid "선택 · IdP가 내부망에 있을 때만 필요한 대역을 한 줄씩 입력하세요. 예: 192.168.0.45/32. 복구 로그인 허용 대역과는 별개입니다."
+msgstr "可选。仅当 IdP 位于内网时按行输入所需网段。示例：192.168.0.45/32。它与恢复登录允许网段无关。"
+
+
+#: users/admin.py:126 users/models.py:153
+msgid "표시 이름"
+msgstr "显示名称"
+
+
+#: users/admin.py:126 users/models.py:154
+msgid "표시 순서"
+msgstr "显示顺序"
+
+
+#: users/admin.py:127 users/models.py:155
+msgid "활성화"
+msgstr "启用"
+
+
+#: users/admin.py:127 users/models.py:156
+msgid "공개 서비스 기준 URL"
+msgstr "公共服务基准 URL"
+
+
+#: users/admin.py:127 users/models.py:157
+msgid "발급자"
+msgstr "颁发者"
+
+
+#: users/admin.py:129 users/models.py:163
+msgid "허용 endpoint origin"
+msgstr "允许的 endpoint origin"
+
+
+#: users/admin.py:130 users/models.py:167
+msgid "신규 SSO 사용자 가입 허용"
+msgstr "允许新 SSO 用户注册"
+
+
+#: users/admin.py:132
+msgid "발급자·Client ID·비밀 변경 후 기존 연결과 관리자 로그인 확인을 재검증하세요."
+msgstr "更改颁发者、Client ID 或密钥后，请重新确认既有关联和管理员登录。"
+
+
+#: users/admin.py:133
+msgid "Google·Microsoft·GitHub 신규 등록은 빈 목록에 기본 origin을 적용합니다."
+msgstr "新建 Google、Microsoft 和 GitHub 时，空列表会应用默认 origin。"
+
+
+#: users/admin.py:134
+msgid "기본은 기존 사용자 연결만 허용합니다. 신규 계정에는 관리자 권한을 부여하지 않습니다."
+msgstr "默认仅允许关联既有用户。新账户不会被授予管理员权限。"
+
+
+#: users/admin.py:143
+msgid "활성화 시 필수 · 사용자가 로그인할 Pinry의 HTTPS 주소입니다. 내부망 접속 주소와 다를 수 있습니다. 경로는 넣지 마세요."
+msgstr "启用时必填。这是用户登录 Pinry 的 HTTPS 地址，可能与内网访问地址不同。请不要包含路径。"
+
+
+#: users/admin.py:145
+msgid "필수 · 로그인 버튼에 표시할 이름입니다. 예: 회사 계정"
+msgstr "必填。显示在登录按钮上的名称。示例：公司账户"
+
+
+#: users/admin.py:146
+msgid "회사 계정"
+msgstr "公司账户"
+
+
+#: users/admin.py:147
+msgid "필수 · 작은 숫자가 먼저 표시됩니다. 예: 0, 10, 20"
+msgstr "必填。数字越小越靠前。示例：0、10、20"
+
+
+#: users/admin.py:148
+msgid "처음에는 끈 상태로 저장해 확정 콜백 URI를 발급받고, 제공자 등록을 마친 후 활성화하세요."
+msgstr "先以停用状态保存以取得最终回调 URI，完成提供者注册后再启用。"
+
+
+#: users/admin.py:149
+msgid "Discovery에서 자동 확인합니다. 수동 설정 시 문서의 issuer 값과 마지막 슬래시까지 일치해야 합니다."
+msgstr "由 Discovery 自动确认。手动设置时必须与文档中的 issuer 一致到末尾斜杠。"
+
+
+#: users/admin.py:150
+msgid "제공자의 OpenID 구성 URL을 붙여넣으세요. 발급자와 서버 주소는 자동 확인합니다."
+msgstr "请粘贴提供者的 OpenID 配置 URL。颁发者和服务器地址会自动确认。"
+
+
+#: users/admin.py:151
+msgid "활성화 시 필수 · Entra의 디렉터리(테넌트) ID입니다. UUID만 허용하며 common은 사용할 수 없습니다."
+msgstr "启用时必填。这是 Entra 目录（租户）ID。仅接受 UUID，不能使用 common。"
+
+
+#: users/admin.py:153
+msgid "활성화 시 필수 · 제공자의 앱 등록 화면에서 발급받은 클라이언트 ID입니다."
+msgstr "启用时必填。这是在提供者应用注册页面取得的客户端 ID。"
+
+
+#: users/admin.py:154
+msgid "제공자에서 발급한 비밀 값 (저장된 값은 표시하지 않음)"
+msgstr "提供者颁发的密钥值（不显示已保存值）"
+
+
+#: users/admin.py:167
+msgid "이 항목을 입력하세요."
+msgstr "请填写此项。"
+
+
+#: users/admin.py:169
+msgid "https://로 시작하는 올바른 URL을 입력하세요."
+msgstr "请输入以 https:// 开头的有效 URL。"
+
+
+#: users/admin.py:189
+msgid "11111111-2222-4333-8444-555555555555 형식의 테넌트 UUID를 입력하세요."
+msgstr "请输入形如 11111111-2222-4333-8444-555555555555 的租户 UUID。"
+
+
+#: users/admin.py:192
+msgid "활성화하려면 Client ID가 필요합니다."
+msgstr "启用需要 Client ID。"
+
+
+#: users/admin.py:194
+msgid "활성화하려면 Client Secret이 필요합니다."
+msgstr "启用需要 Client Secret。"
+
+
+#: users/admin.py:196
+msgid "활성화하려면 허용 서버 주소가 필요합니다."
+msgstr "启用需要允许的服务器地址。"
+
+
+#: users/admin.py:213
+msgid "Discovery 서버가 고급 설정의 허용 주소에 없습니다. 허용 주소를 비워 자동 설정하거나 수정하세요."
+msgstr "Discovery 服务器不在高级设置的允许地址中。请清空允许地址以自动设置，或进行修正。"
+
+
+#: users/admin.py:220
+msgid "입력한 발급자가 Discovery 문서와 다릅니다. 발급자를 비워 자동 확인하세요."
+msgstr "输入的颁发者与 Discovery 文档不同。请将颁发者留空以自动确认。"
+
+
+#: users/admin.py:222
+msgid "Discovery 발급자 서버가 허용 주소에 없습니다."
+msgstr "Discovery 颁发者服务器不在允许地址中。"
+
+
+#: users/admin.py:226
+msgid "다른 서버의 인증 주소는 고급 설정에서 발급자와 허용 서버 주소를 확인하세요."
+msgstr "如果授权地址位于其他服务器，请在高级设置中确认颁发者和允许的服务器地址。"
+
+
+#: users/admin.py:240
+msgid "활성화하려면 HTTPS 기준 URL을 입력하세요."
+msgstr "启用前请输入 HTTPS 基准 URL。"
+
+
+#: users/admin.py:250
+msgid "사용자 정보·쿼리 없는 HTTPS URL을 입력하세요. 공개 서비스 주소에는 경로를 넣지 마세요."
+msgstr "请输入不含用户信息或查询字符串的 HTTPS URL。公共服务地址不要包含路径。"
+
+
+#: users/admin.py:261
+msgid "경로 없이 HTTPS 서버 주소를 한 줄에 하나씩 입력하세요."
+msgstr "请每行输入一个不含路径的 HTTPS 服务器地址。"
+
+
+#: users/admin.py:293
+msgid "사이트 접근"
+msgstr "站点访问"
+
+
+#: users/admin.py:295
+msgid "기존 전용 복구 포트 고급 설정 (내부망 직접 복구에는 불필요)"
+msgstr "旧专用恢复端口高级设置（内网直接恢复无需设置）"
+
+
+#: users/admin.py:324
+msgid "고급 설정 (일반적으로 변경할 필요 없음)"
+msgstr "高级设置（通常无需更改）"
+
+
+#: users/admin.py:375
+msgid "등록할 정확한 콜백 주소"
+msgstr "要注册的精确回调地址"
+
+
+#: users/admin.py:378
+msgid "비활성 상태로 저장 후 확정 콜백 주소를 확인하세요."
+msgstr "请以停用状态保存后确认最终回调地址。"
+
+
+#: users/admin.py:383
+msgid "공개 서비스 HTTPS URL을 저장하면 복사할 콜백 주소가 표시됩니다."
+msgstr "保存公共服务 HTTPS URL 后，会显示可复制的回调地址。"
+
+
+#: users/apps.py:9
+msgid "사용자와 인증"
+msgstr "用户与认证"
+
+
+#: users/forms.py:12
+msgid "A user with that username already exists."
+msgstr "已存在使用该用户名的用户。"
+
+
+#: users/forms.py:15
+msgid "Username"
+msgstr "用户名"
+
+
+#: users/forms.py:19
+msgid "Password"
+msgstr "密码"
+
+
+#: users/models.py:27
+msgid "CIDR 목록은 배열이어야 합니다."
+msgstr "CIDR 列表必须是数组。"
+
+
+#: users/models.py:32
+msgid "빈 CIDR 값은 허용되지 않습니다."
+msgstr "不允许空的 CIDR 值。"
+
+
+#: users/models.py:36
+msgid "올바른 CIDR 또는 IP 주소가 아닙니다."
+msgstr "这不是有效的 CIDR 或 IP 地址。"
+
+
+#: users/models.py:39
+msgid "전체 주소 대역은 허용되지 않습니다."
+msgstr "不允许整个地址范围。"
+
+
+#: users/models.py:44
+msgid "RFC1918 또는 IPv6 ULA 대역만 허용됩니다."
+msgstr "仅允许 RFC1918 或 IPv6 ULA 网段。"
+
+
+#: users/models.py:110 users/models.py:111 users/models.py:135
+msgid "인증 정책"
+msgstr "认证策略"
+
+
+#: users/models.py:145 users/sso/admin_guide.py:35
+msgid "범용 OIDC"
+msgstr "通用 OIDC"
+
+
+#: users/models.py:172 users/models.py:173
+msgid "SSO 제공자"
+msgstr "SSO 提供者"
+
+
+#: users/models.py:231
+msgid "로그인"
+msgstr "登录"
+
+
+#: users/models.py:232
+msgid "연결"
+msgstr "关联"
+
+
+#: users/models.py:233
+msgid "재인증"
+msgstr "重新认证"
+
+
+#: users/models.py:259
+msgid "복구"
+msgstr "恢复"
+
+
+#: users/sso/admin_guide.py:17
+msgid "Authentik에서 발급한 Client ID"
+msgstr "Authentik 颁发的 Client ID"
+
+
+#: users/sso/admin_guide.py:18
+msgid "Applications에서 OAuth2/OpenID 제공자와 애플리케이션을 만드세요."
+msgstr "在 Applications 中创建 OAuth2/OpenID 提供者和应用程序。"
+
+
+#: users/sso/admin_guide.py:19
+msgid "Confidential 클라이언트를 사용하고 아래 확정 리디렉션 URI를 정확히 등록하세요."
+msgstr "使用 confidential 客户端，并精确注册下方的最终重定向 URI。"
+
+
+#: users/sso/admin_guide.py:20
+msgid "Client ID·Client Secret·Discovery URL을 입력하세요. 발급자는 자동 확인합니다."
+msgstr "请输入 Client ID、Client Secret 和 Discovery URL。颁发者会自动确认。"
+
+
+#: users/sso/admin_guide.py:21
+msgid "전역 issuer 모드에서는 발급자와 Discovery 경로가 다릅니다. 애플리케이션의 Discovery URL을 직접 입력하세요."
+msgstr "在全局 issuer 模式下，颁发者与 Discovery 路径不同。请直接输入应用程序的 Discovery URL。"
+
+
+#: users/sso/admin_guide.py:27
+msgid "SSO Server의 응용 프로그램 ID"
+msgstr "SSO Server 的应用程序 ID"
+
+
+#: users/sso/admin_guide.py:28
+msgid "SSO Server에서 OIDC 서버를 활성화하세요."
+msgstr "请在 SSO Server 中启用 OIDC 服务器。"
+
+
+#: users/sso/admin_guide.py:29
+msgid "OIDC 응용 프로그램을 추가하고 아래 확정 리디렉션 URI를 등록하세요."
+msgstr "请添加 OIDC 应用程序并注册下方的最终重定向 URI。"
+
+
+#: users/sso/admin_guide.py:30
+msgid "응용 프로그램 ID·비밀·Well-known URL을 입력하세요. 발급자는 자동 확인합니다."
+msgstr "请输入应用程序 ID、密钥和 Well-known URL。颁发者会自动确认。"
+
+
+#: users/sso/admin_guide.py:31
+msgid "주소 예시는 설치 환경에 따라 다릅니다. SSO Server가 표시하는 실제 Well-known URL을 우선 사용하세요."
+msgstr "地址示例因安装环境而异。请优先使用 SSO Server 显示的实际 Well-known URL。"
+
+
+#: users/sso/admin_guide.py:38
+msgid "제공자에서 서버용 OIDC 클라이언트를 만드세요."
+msgstr "请在提供者中创建服务器端 OIDC 客户端。"
+
+
+#: users/sso/admin_guide.py:39
+msgid "아래 확정 리디렉션 URI와 openid profile email 범위를 등록하세요."
+msgstr "请注册下方的最终重定向 URI 以及 openid profile email 权限范围。"
+
+
+#: users/sso/admin_guide.py:40
+msgid "Client ID·비밀·Discovery URL을 입력하세요. 발급자는 자동 확인합니다."
+msgstr "请输入 Client ID、密钥和 Discovery URL。颁发者会自动确认。"
+
+
+#: users/sso/admin_guide.py:41
+msgid "현재 Pinry는 PKCE S256을 지원하는 제공자가 필요합니다. issuer는 문서와 마지막 슬래시까지 같아야 합니다."
+msgstr "Pinry 目前需要支持 PKCE S256 的提供者。issuer 必须与文档一致到末尾斜杠。"
+
+
+#: users/sso/admin_guide.py:46
+msgid "Google Cloud에서 OAuth 동의 화면과 웹 애플리케이션 클라이언트를 설정하세요."
+msgstr "请在 Google Cloud 中配置 OAuth 同意画面和 Web 应用客户端。"
+
+
+#: users/sso/admin_guide.py:47
+msgid "승인된 리디렉션 URI에 아래 확정 주소를 등록하세요."
+msgstr "请将下方的最终地址注册为已授权重定向 URI。"
+
+
+#: users/sso/admin_guide.py:48
+msgid "Client ID와 Client Secret을 입력하세요. 테스트 모드라면 테스트 사용자도 등록하세요."
+msgstr "请输入 Client ID 和 Client Secret。测试模式下也请注册测试用户。"
+
+
+#: users/sso/admin_guide.py:49
+msgid "발급자와 Discovery URL은 자동 적용됩니다."
+msgstr "颁发者和 Discovery URL 会自动应用。"
+
+
+#: users/sso/admin_guide.py:54
+msgid "Entra 관리 센터에서 앱을 등록하고 웹 플랫폼을 선택하세요."
+msgstr "请在 Entra 管理中心注册应用并选择 Web 平台。"
+
+
+#: users/sso/admin_guide.py:55
+msgid "아래 확정 리디렉션 URI와 애플리케이션(클라이언트) ID, 디렉터리(테넌트) ID를 확인하세요."
+msgstr "请记录下方的最终重定向 URI、应用程序（客户端）ID 和目录（租户）ID。"
+
+
+#: users/sso/admin_guide.py:56
+msgid "클라이언트 비밀을 만들고 비밀 ID가 아닌 비밀 값을 입력하세요."
+msgstr "请创建客户端密钥，并输入密钥值而不是密钥 ID。"
+
+
+#: users/sso/admin_guide.py:57
+msgid "현재 Pinry는 명시적인 테넌트 UUID를 사용합니다. common·organizations·도메인 이름은 입력하지 마세요."
+msgstr "Pinry 目前使用显式租户 UUID。请不要输入 common、organizations 或域名。"
+
+
+#: users/sso/admin_guide.py:62
+msgid "GitHub Settings → Developer settings → OAuth Apps에서 앱을 만드세요."
+msgstr "请在 GitHub Settings → Developer settings → OAuth Apps 中创建应用。"
+
+
+#: users/sso/admin_guide.py:63
+msgid "Homepage URL에는 Pinry 공개 주소, Authorization callback URL에는 아래 확정 주소를 등록하세요."
+msgstr "Homepage URL 请填写 Pinry 公开地址，Authorization callback URL 请注册下方的最终地址。"
+
+
+#: users/sso/admin_guide.py:64
+msgid "Client ID와 생성한 Client Secret을 입력하세요."
+msgstr "请输入 Client ID 和生成的 Client Secret。"
+
+
+#: users/sso/admin_guide.py:65
+msgid "GitHub OAuth 로그인에는 Discovery URL이 없습니다. read:user user:email 범위를 사용합니다."
+msgstr "GitHub OAuth 登录没有 Discovery URL。它使用 read:user 和 user:email 权限范围。"

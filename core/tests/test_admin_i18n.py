@@ -1,3 +1,6 @@
+import json
+from html import unescape
+
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.test import TestCase
@@ -227,6 +230,83 @@ class AdminModelLabelTranslationTest(TestCase):
 
         call_command("makemigrations", "core", "django_images",
                      check_changes=True, dry_run=True)
+
+
+class AuthAdministrationTranslationTest(TestCase):
+    """새로 추가한 인증 정책·SSO 관리자 화면도 네 언어로 표시되는지 검증한다."""
+
+    def setUp(self):
+        self.admin = User.objects.create_superuser(
+            username="auth-i18n-admin",
+            email="auth-i18n-admin@example.com",
+            password="password",
+        )
+        self.client.force_login(self.admin)
+
+    def test_auth_policy_screen_translates_custom_labels(self):
+        cases = [
+            ("ko", ("인증 정책", "사이트 접근", "회원 가입 허용")),
+            ("en", ("Authentication policy", "Site access", "Allow new registrations")),
+            ("zh-hans", ("认证策略", "站点访问", "允许注册")),
+            ("fr", ("Politique d'authentification", "Accès au site", "Autoriser les nouvelles inscriptions")),
+        ]
+        for language, expected in cases:
+            with self.subTest(language=language):
+                self.client.cookies["django_language"] = language
+
+                response = self.client.get("/admin/users/authpolicy/1/change/")
+
+                self.assertEqual(response.status_code, 200)
+                rendered = unescape(response.content.decode("utf-8"))
+                for text in expected:
+                    self.assertIn(text, rendered)
+
+    def test_admin_index_translates_auth_model_names(self):
+        cases = [
+            ("ko", ("사용자와 인증", "인증 정책", "SSO 제공자")),
+            ("en", ("Users and authentication", "Authentication policy", "SSO provider")),
+            ("zh-hans", ("用户与认证", "认证策略", "SSO 提供者")),
+            ("fr", ("Utilisateurs et authentification", "Politique d'authentification", "Fournisseur SSO")),
+        ]
+        for language, expected in cases:
+            with self.subTest(language=language):
+                self.client.cookies["django_language"] = language
+
+                response = self.client.get("/admin/")
+
+                self.assertEqual(response.status_code, 200)
+                rendered = unescape(response.content.decode("utf-8"))
+                for text in expected:
+                    self.assertIn(text, rendered)
+
+    def test_sso_setup_guide_translates_static_and_provider_steps(self):
+        cases = [
+            ("ko", ("1. 접속 주소와 등록할 리디렉션 URI", "Discovery URL 복사",
+                    "Applications에서 OAuth2/OpenID 제공자와 애플리케이션을 만드세요.")),
+            ("en", ("1. Access address and redirect URI to register", "Copy Discovery URL",
+                    "In Applications, create an OAuth2/OpenID provider and an application.")),
+            ("zh-hans", ("1. 访问地址与要注册的重定向 URI", "复制 Discovery URL",
+                         "在 Applications 中创建 OAuth2/OpenID 提供者和应用程序。")),
+            ("fr", (
+                "1. Adresse d'accès et URI de redirection à enregistrer",
+                "Copier l'URL Discovery",
+                "Dans Applications, créez un fournisseur OAuth2/OpenID et une application.",
+            )),
+        ]
+        for language, expected in cases:
+            with self.subTest(language=language):
+                self.client.cookies["django_language"] = language
+
+                response = self.client.get("/admin/users/ssoprovider/setup-guide/")
+
+                self.assertEqual(response.status_code, 200)
+                rendered = unescape(response.content.decode("utf-8"))
+                self.assertIn(expected[0], rendered)
+                self.assertIn(expected[1], rendered)
+                marker = '<script id="sso-provider-guides" type="application/json">'
+                encoded_guides = rendered.split(marker, 1)[1].split("</script>", 1)[0]
+                guides = json.loads(encoded_guides)
+                self.assertIn(expected[2], guides["authentik"]["steps"])
 
 
 class ApiLanguageInvarianceTest(TestCase):

@@ -36,6 +36,7 @@
     const tenant = document.getElementById('guide-tenant');
     const discoveryInput = document.getElementById('guide-discovery-input');
     const discovery = document.getElementById('guide-discovery');
+    const messages = document.getElementById('sso-guide-messages');
     function updateGuide() {
       const info = guides[kind.value];
       const hosted = selfHosted.includes(kind.value);
@@ -60,8 +61,8 @@
         const parsed = new URL(address);
         valid = parsed.protocol === 'https:' && !parsed.username && !parsed.password && !parsed.search && !parsed.hash;
       } catch (_) { /* 미완성 입력은 복사하지 않는다. */ }
-      discovery.textContent = valid ? address : (kind.value === 'github' ? '해당 없음 — GitHub OAuth는 Discovery URL을 사용하지 않습니다.' : '올바른 HTTPS 주소 또는 테넌트 UUID를 입력하세요.');
-      document.getElementById('guide-discovery-label').textContent = example ? 'Discovery URL 예시 (실제 IdP 주소로 바꾸세요)' : 'Discovery URL (입력값 기준)';
+      discovery.textContent = valid ? address : (kind.value === 'github' ? messages.dataset.githubDiscovery : messages.dataset.invalidDiscovery);
+      document.getElementById('guide-discovery-label').textContent = example ? messages.dataset.exampleDiscovery : messages.dataset.inputDiscovery;
       document.getElementById('guide-discovery-copy').hidden = !valid || example;
       document.getElementById('guide-note').textContent = info.note;
       const list = document.getElementById('guide-steps');
@@ -77,11 +78,11 @@
         const status = document.getElementById('guide-copy-status');
         try {
           await navigator.clipboard.writeText(output.textContent);
-          status.textContent = '복사했습니다.';
+          status.textContent = messages.dataset.copied;
         } catch (_) {
           const range = document.createRange(); range.selectNodeContents(output);
           const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
-          status.textContent = '자동 복사를 사용할 수 없습니다. 선택된 주소를 직접 복사하세요.';
+          status.textContent = messages.dataset.copyFailed;
         }
       });
     });

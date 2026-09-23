@@ -23,7 +23,7 @@ INSTALLED_APPS = [
     'django_images.apps.DjangoImagesConfig',
     'core.apps.CoreConfig',
     'exports.apps.ExportsConfig',
-    'users',
+    'users.apps.UsersConfig',
     'pinry_plugins.apps.PinryPluginsConfig',
 ]
 

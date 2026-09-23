@@ -10,6 +10,8 @@ from django.db import models
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.utils import timezone
+from django.utils.translation import gettext
+from django.utils.translation import gettext_lazy
 
 
 PRIVATE_NETWORKS = (
@@ -22,24 +24,24 @@ PRIVATE_NETWORKS = (
 
 def normalize_cidrs(values, private_only):
     if not isinstance(values, list):
-        raise ValidationError('CIDR 목록은 배열이어야 합니다.')
+        raise ValidationError(gettext('CIDR 목록은 배열이어야 합니다.'))
 
     normalized = []
     for value in values:
         if not isinstance(value, str) or not value.strip():
-            raise ValidationError('빈 CIDR 값은 허용되지 않습니다.')
+            raise ValidationError(gettext('빈 CIDR 값은 허용되지 않습니다.'))
         try:
             network = ipaddress.ip_network(value.strip(), strict=True)
         except ValueError as error:
-            raise ValidationError('올바른 CIDR 또는 IP 주소가 아닙니다.') from error
+            raise ValidationError(gettext('올바른 CIDR 또는 IP 주소가 아닙니다.')) from error
 
         if network.prefixlen == 0:
-            raise ValidationError('전체 주소 대역은 허용되지 않습니다.')
+            raise ValidationError(gettext('전체 주소 대역은 허용되지 않습니다.'))
         if private_only and not any(
             network.version == private.version and network.subnet_of(private)
             for private in PRIVATE_NETWORKS
         ):
-            raise ValidationError('RFC1918 또는 IPv6 ULA 대역만 허용됩니다.')
+            raise ValidationError(gettext('RFC1918 또는 IPv6 ULA 대역만 허용됩니다.'))
         normalized.append(str(network))
     return normalized
 
@@ -90,13 +92,23 @@ class AdminBootstrapState(models.Model):
 
 
 class AuthPolicy(models.Model):
-    allow_new_registrations = models.BooleanField(default=True)
-    public_pins_enabled = models.BooleanField(default=True)
-    password_login_enabled = models.BooleanField(default=True)
-    api_tokens_enabled = models.BooleanField(default=True)
-    recovery_allowed_cidrs = models.JSONField(default=list, blank=True)
-    recovery_denied_cidrs = models.JSONField(default=list, blank=True)
+    allow_new_registrations = models.BooleanField(
+        default=True, verbose_name=gettext_lazy('회원 가입 허용'))
+    public_pins_enabled = models.BooleanField(
+        default=True, verbose_name=gettext_lazy('비로그인 Pin 보기'))
+    password_login_enabled = models.BooleanField(
+        default=True, verbose_name=gettext_lazy('비밀번호 로그인 허용'))
+    api_tokens_enabled = models.BooleanField(
+        default=True, verbose_name=gettext_lazy('API 토큰 인증 허용'))
+    recovery_allowed_cidrs = models.JSONField(
+        default=list, blank=True, verbose_name=gettext_lazy('복구 허용 CIDR'))
+    recovery_denied_cidrs = models.JSONField(
+        default=list, blank=True, verbose_name=gettext_lazy('복구 차단 CIDR'))
     revision = models.PositiveIntegerField(default=1, editable=False)
+
+    class Meta:
+        verbose_name = gettext_lazy('인증 정책')
+        verbose_name_plural = gettext_lazy('인증 정책')
 
     def clean(self):
         super().clean()
@@ -120,7 +132,7 @@ class AuthPolicy(models.Model):
             ) from error
 
     def __str__(self):
-        return '인증 정책'
+        return gettext('인증 정책')
 
 
 class SSOProvider(models.Model):
@@ -130,30 +142,35 @@ class SSOProvider(models.Model):
         GOOGLE = 'google', 'Google'
         MICROSOFT = 'microsoft', 'Microsoft'
         GITHUB = 'github', 'GitHub'
-        OIDC = 'oidc', '범용 OIDC'
+        OIDC = 'oidc', gettext_lazy('범용 OIDC')
 
     id = models.UUIDField(
         primary_key=True,
         default=uuid.uuid4,
         editable=False,
     )
-    kind = models.CharField(max_length=20, choices=Kind.choices)
-    name = models.CharField(max_length=150)
-    position = models.PositiveIntegerField(default=0)
-    enabled = models.BooleanField(default=False)
-    public_base_url = models.URLField(max_length=2048, blank=True)
-    issuer = models.URLField(max_length=2048, blank=True)
-    discovery_url = models.URLField(max_length=2048, blank=True)
-    tenant_id = models.CharField(max_length=255, blank=True)
-    client_id = models.CharField(max_length=255, blank=True)
+    kind = models.CharField(max_length=20, choices=Kind.choices, verbose_name=gettext_lazy('제공자 종류'))
+    name = models.CharField(max_length=150, verbose_name=gettext_lazy('표시 이름'))
+    position = models.PositiveIntegerField(default=0, verbose_name=gettext_lazy('표시 순서'))
+    enabled = models.BooleanField(default=False, verbose_name=gettext_lazy('활성화'))
+    public_base_url = models.URLField(max_length=2048, blank=True, verbose_name=gettext_lazy('공개 서비스 기준 URL'))
+    issuer = models.URLField(max_length=2048, blank=True, verbose_name=gettext_lazy('발급자'))
+    discovery_url = models.URLField(max_length=2048, blank=True, verbose_name='Discovery URL')
+    tenant_id = models.CharField(max_length=255, blank=True, verbose_name=gettext_lazy('Microsoft 테넌트 UUID'))
+    client_id = models.CharField(max_length=255, blank=True, verbose_name='Client ID')
     encrypted_client_secret = models.TextField(blank=True, editable=False)
-    allowed_endpoint_origins = models.JSONField(default=list, blank=True)
-    internal_cidrs = models.JSONField(default=list, blank=True)
-    allow_signup = models.BooleanField(default=False)
+    allowed_endpoint_origins = models.JSONField(
+        default=list, blank=True, verbose_name=gettext_lazy('허용 endpoint origin'))
+    internal_cidrs = models.JSONField(
+        default=list, blank=True, verbose_name=gettext_lazy('내부 IdP 허용 CIDR'))
+    allow_signup = models.BooleanField(
+        default=False, verbose_name=gettext_lazy('신규 SSO 사용자 가입 허용'))
     revision = models.PositiveIntegerField(default=1, editable=False)
 
     class Meta:
         ordering = ('position', 'id')
+        verbose_name = gettext_lazy('SSO 제공자')
+        verbose_name_plural = gettext_lazy('SSO 제공자')
 
     def clean(self):
         super().clean()
@@ -211,9 +228,9 @@ class ExternalIdentity(models.Model):
 
 class SSOAttempt(models.Model):
     class Purpose(models.TextChoices):
-        LOGIN = 'login', '로그인'
-        LINK = 'link', '연결'
-        REAUTH = 'reauth', '재인증'
+        LOGIN = 'login', gettext_lazy('로그인')
+        LINK = 'link', gettext_lazy('연결')
+        REAUTH = 'reauth', gettext_lazy('재인증')
 
     state_digest = models.CharField(max_length=64, unique=True)
     browser_digest = models.CharField(max_length=64)
@@ -239,7 +256,7 @@ class SSOAttempt(models.Model):
 class AuthVerification(models.Model):
     class Kind(models.TextChoices):
         SSO = 'sso', 'SSO'
-        RECOVERY = 'recovery', '복구'
+        RECOVERY = 'recovery', gettext_lazy('복구')
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
