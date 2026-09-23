@@ -82,7 +82,7 @@ def require_recent_auth(request):
 def recent_auth_remaining_seconds(request):
     try:
         require_recent_auth(request)
-    except SSOActionDenied:
+    except PermissionDenied:
         return 0
     timestamp = request.session['recent_auth']['verified_at']
     return max(0, min(300, ceil(300 - (timezone.now().timestamp() - timestamp))))

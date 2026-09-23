@@ -76,6 +76,7 @@
   "ssoUnlinkIdentityNotFound": "该 SSO 关联已不存在。请刷新页面后重试。",
   "ssoUnlinkRecentAuthRequired": "请重新验证身份，然后在 5 分钟内重试。",
   "ssoLink": "关联账号",
+  "ssoLinkRequiresReauth": "需重新验证",
   "previewNavigation": "浏览图钉",
   "previewPrevious": "上一张",
   "previewNext": "下一张",

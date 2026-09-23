@@ -98,7 +98,9 @@ describe('SSO policy screens', () => {
     const wrapper = shallowMount(Profile, options);
     await flushPromises();
 
-    expect(wrapper.findAll('[data-test="provider-link-row"]')).toHaveLength(0);
+    expect(wrapper.findAll('[data-test="provider-link-row"]')).toHaveLength(1);
+    expect(wrapper.findAll('[data-test="provider-link-pending"]')).toHaveLength(1);
+    expect(wrapper.findAll('[data-test="provider-link-action"]')).toHaveLength(0);
   });
 
   it('shows manual account linking during the recent reauthentication window', async () => {
@@ -114,6 +116,7 @@ describe('SSO policy screens', () => {
     await flushPromises();
 
     expect(wrapper.findAll('[data-test="provider-link-row"]')).toHaveLength(1);
+    expect(wrapper.findAll('[data-test="provider-link-action"]')).toHaveLength(1);
     wrapper.unmount();
   });
 

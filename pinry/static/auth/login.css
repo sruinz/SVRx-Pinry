@@ -163,7 +163,20 @@ body {
   margin: 0;
 }
 
-.sso-error-actions a { color: #15d8c3; text-underline-offset: 3px; }
+.sso-error-action {
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 9px 16px;
+  border: 1px solid #15d8c3;
+  border-radius: 7px;
+  color: #15d8c3;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.sso-error-action:hover { background: rgba(21, 216, 195, 0.12); }
 
 .login-header {
   display: flex;

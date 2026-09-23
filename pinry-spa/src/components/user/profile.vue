@@ -126,7 +126,7 @@
                 </div>
               </div>
             </div>
-            <div v-if="canLinkAccounts && !identityError" class="sso-provider-list sso-link-list">
+            <div v-if="!identityError" class="sso-provider-list sso-link-list">
               <form
                 v-for="provider in availableProviders"
                 :key="provider.id"
@@ -143,7 +143,19 @@
                 </div>
                 <input type="hidden" name="csrfmiddlewaretoken" :value="csrfToken">
                 <input type="hidden" name="next" :value="returnPath">
-                <button class="button sso-link-action" type="submit">{{ $t('ssoLink') }}</button>
+                <button
+                  v-if="canLinkAccounts"
+                  data-test="provider-link-action"
+                  class="button sso-link-action"
+                  type="submit">
+                  {{ $t('ssoLink') }}
+                </button>
+                <span
+                  v-else
+                  data-test="provider-link-pending"
+                  class="sso-link-pending">
+                  {{ $t('ssoLinkRequiresReauth') }}
+                </span>
               </form>
             </div>
           </div>
@@ -575,6 +587,13 @@ export default {
   background: transparent;
   border-color: var(--pinry-accent);
   font-weight: 600;
+}
+
+.sso-link-pending {
+  color: var(--pinry-muted);
+  font-size: .875rem;
+  font-weight: 500;
+  text-align: right;
 }
 
 .sso-provider-list {

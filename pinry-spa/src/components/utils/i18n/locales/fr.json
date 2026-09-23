@@ -76,6 +76,7 @@
   "ssoUnlinkIdentityNotFound": "Ce compte SSO associé n’existe plus. Actualisez la page et réessayez.",
   "ssoUnlinkRecentAuthRequired": "Vérifiez de nouveau votre identité, puis réessayez dans les 5 minutes.",
   "ssoLink": "Associer un compte",
+  "ssoLinkRequiresReauth": "Réauthentification requise",
   "previewNavigation": "Navigation des épingles",
   "previewPrevious": "Précédente",
   "previewNext": "Suivante",

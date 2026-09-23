@@ -76,6 +76,7 @@
   "ssoUnlinkIdentityNotFound": "이 SSO 연결이 더 이상 존재하지 않습니다. 페이지를 새로고침한 뒤 다시 시도해 주세요.",
   "ssoUnlinkRecentAuthRequired": "본인을 다시 인증한 뒤 5분 안에 재시도해 주세요.",
   "ssoLink": "계정 연결",
+  "ssoLinkRequiresReauth": "연결하려면 다시 인증",
   "previewNavigation": "핀 감상 이동",
   "previewPrevious": "이전 핀",
   "previewNext": "다음 핀",

@@ -76,6 +76,7 @@
   "ssoUnlinkIdentityNotFound": "This connected SSO account no longer exists. Refresh the page and try again.",
   "ssoUnlinkRecentAuthRequired": "Verify your identity again, then retry within 5 minutes.",
   "ssoLink": "Connect account",
+  "ssoLinkRequiresReauth": "Reauthentication required",
   "previewNavigation": "Pin navigation",
   "previewPrevious": "Previous",
   "previewNext": "Next",

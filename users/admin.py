@@ -84,7 +84,7 @@ class AuthPolicyAdminForm(forms.ModelForm):
         model = AuthPolicy
         fields = POLICY_FIELDS
 
-        labels = {'allow_new_registrations': '회원 가입 허용', 'public_pins_enabled': '비로그인 공개 Pin 보기 허용',
+        labels = {'allow_new_registrations': '회원 가입 허용', 'public_pins_enabled': '비로그인 Pin 보기',
                   'password_login_enabled': '비밀번호 로그인 허용', 'api_tokens_enabled': 'API 토큰 인증 허용',
                   'recovery_allowed_cidrs': '복구 허용 CIDR', 'recovery_denied_cidrs': '복구 차단 CIDR'}
         help_texts = {'allow_new_registrations': '끄면 관리자나 기존 SSO 계정 연결로만 계정을 만들 수 있습니다.',
