@@ -171,7 +171,20 @@
               @keydown.esc.stop.prevent="dismissMenu($event)">
               <button type="button" class="navbar-link is-arrowless" :aria-label="user.meta.username"
                 :aria-expanded="openMenu === 'user'" @click="toggleDropdown('user')">
-                <i aria-hidden="true" class="mdi mdi-account-circle"></i>
+                <img
+                  v-if="headerAvatarUrl"
+                  class="user-avatar"
+                  data-test="header-avatar"
+                  :src="headerAvatarUrl"
+                  alt=""
+                  @error="userAvatarFailed = true"
+                >
+                <i
+                  v-else
+                  aria-hidden="true"
+                  class="mdi mdi-account-circle"
+                  data-test="header-account-icon"
+                ></i>
               </button>
               <div class="navbar-dropdown is-right">
                 <router-link
@@ -232,6 +245,7 @@ export default {
         loggedIn: false,
         meta: {},
       },
+      userAvatarFailed: false,
       langs: localeUtils.langCode2Name,
       locales: SUPPORTED_LOCALES,
     };
@@ -241,6 +255,11 @@ export default {
       const url = new URL(window.location);
       const host = url.origin;
       return `javascript:void((function(d){var s=d.createElement('script');s.id='pinry-bookmarklet';s.src='${host}/static/js/bookmarklet.js?'+Math.random()*10000000000000000;d.body.appendChild(s)})(document));`;
+    },
+    headerAvatarUrl() {
+      const { gravatar } = this.user.meta;
+      if (!this.user.loggedIn || !gravatar || this.userAvatarFailed) return '';
+      return `https://www.gravatar.com/avatar/${gravatar}?d=404&s=64`;
     },
   },
   methods: {
@@ -306,9 +325,11 @@ export default {
           if (user === null) {
             self.user.loggedIn = false;
             self.user.meta = {};
+            self.userAvatarFailed = false;
           } else {
             self.user.meta = user;
             self.user.loggedIn = true;
+            self.userAvatarFailed = false;
           }
         },
       );
@@ -342,6 +363,14 @@ export default {
 .navbar-end { align-items: center; gap: 12px; }
 .navbar-end .mdi { font-size: 22px; }
 .navbar-end .user-menu .mdi { font-size: 34px; line-height: 1; }
+.navbar-end .user-menu .user-avatar {
+  display: block;
+  width: 34px;
+  height: 34px;
+  max-height: 34px;
+  border-radius: 50%;
+  object-fit: cover;
+}
 button.navbar-link, button.navbar-item, .navbar-burger {
   border: 0; background: transparent; cursor: pointer; font-family: inherit;
 }
