@@ -8,6 +8,8 @@ from users.models import AuthPolicy, AuthVerification, ExternalIdentity, SSOProv
 
 
 POLICY_FIELDS = {
+    'allow_new_registrations',
+    'public_pins_enabled',
     'password_login_enabled',
     'api_tokens_enabled',
     'recovery_allowed_cidrs',

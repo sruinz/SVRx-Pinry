@@ -90,6 +90,8 @@ class AdminBootstrapState(models.Model):
 
 
 class AuthPolicy(models.Model):
+    allow_new_registrations = models.BooleanField(default=True)
+    public_pins_enabled = models.BooleanField(default=True)
     password_login_enabled = models.BooleanField(default=True)
     api_tokens_enabled = models.BooleanField(default=True)
     recovery_allowed_cidrs = models.JSONField(default=list, blank=True)

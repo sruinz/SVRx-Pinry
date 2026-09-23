@@ -309,7 +309,13 @@ const SSO = {
       if (!data || !Array.isArray(data.providers)
         || typeof data.password_login_enabled !== 'boolean'
         || typeof data.api_tokens_enabled !== 'boolean') throw new Error('invalid SSO policy');
-      return { ...data, providers: data.providers.filter(provider => provider.enabled !== false) };
+      const recentAuthRemaining = Number.isSafeInteger(data.recent_auth_remaining_seconds)
+        && data.recent_auth_remaining_seconds >= 0 ? data.recent_auth_remaining_seconds : 0;
+      return {
+        ...data,
+        recent_auth_remaining_seconds: recentAuthRemaining,
+        providers: data.providers.filter(provider => provider.enabled !== false),
+      };
     });
   },
   identities() {

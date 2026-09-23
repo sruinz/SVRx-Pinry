@@ -1,6 +1,5 @@
 import json
 
-from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
@@ -16,7 +15,7 @@ from rest_framework.viewsets import GenericViewSet
 
 from users.models import User
 from users.serializers import CurrentUserSerializer, PublicUserSerializer
-from users.sso.policy import password_login_allowed
+from users.sso.policy import password_login_allowed, registration_allowed
 from users.sso.flows import mark_recent_auth
 
 
@@ -51,7 +50,7 @@ class UserViewSet(
         def has_permission(self, request, view):
             if not request.method == "POST":
                 return True
-            return settings.ALLOW_NEW_REGISTRATIONS
+            return registration_allowed(request)
 
         def has_object_permission(self, request, view, obj):
             return request.user == obj

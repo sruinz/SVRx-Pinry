@@ -93,7 +93,14 @@ class SSOPolicyTests(TestCase):
         response = self.client.get('/api/v2/sso/providers/')
         self.assertEqual(response.json(), {
             'providers': [], 'password_login_enabled': True, 'api_tokens_enabled': True,
+            'recent_auth_remaining_seconds': 0,
         })
+
+    def test_private_site_policy_blocks_anonymous_pin_access(self):
+        AuthPolicy.objects.filter(pk=1).update(public_pins_enabled=False)
+
+        self.assertEqual(self.client.get('/api/v2/pins/').status_code, 403)
+        self.assertEqual(self.client.get('/login/').status_code, 200)
 
     def test_login_error_destination_exists(self):
         response = self.client.get('/login/')
@@ -158,6 +165,7 @@ class SSOPolicyTests(TestCase):
         self.client.force_login(self.user)
         AuthPolicy.objects.filter(pk=1).update(revision=2, api_tokens_enabled=False)
         response = self.client.post('/admin/users/authpolicy/1/change/', {
+            'allow_new_registrations': 'on', 'public_pins_enabled': 'on',
             'password_login_enabled': 'on', 'api_tokens_enabled': 'on',
             'recovery_allowed_cidrs': '[]', 'recovery_denied_cidrs': '[]', 'expected_revision': 1,
         }, follow=True)

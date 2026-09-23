@@ -1,5 +1,6 @@
-<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SSO 연결 확인</title></head>
-<body><main><h1>SSO 연결을 시작하지 못했습니다</h1><p role="alert">{{ reason }}</p>
-{% if public_home %}<p><a href="{{ public_home }}">공개 주소에서 계속하기</a></p>{% endif %}
-<p>SSO에서 확인된 이메일이 기존 계정과 일치하면 별도 연결 없이 SSO 로그인으로 자동 연결됩니다.</p>
-<p><a href="/">홈으로 돌아가기</a> · <a href="/login/">로그인 화면</a></p></main></body></html>
+{% load static %}
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>SSO 연결 확인</title><link rel="stylesheet" href="{% static 'auth/login.css' %}"></head>
+<body class="auth-page sso-error-page"><main class="login-card sso-error-card"><h1>SSO 연결을 시작하지 못했습니다</h1><p class="auth-alert" role="alert">{{ reason }}</p>
+{% if public_home %}<p><a class="provider-button" href="{{ public_home }}">공개 주소에서 계속하기</a></p>{% endif %}
+<p class="login-lead">SSO에서 확인된 이메일이 기존 계정과 일치하면 별도 연결 없이 SSO 로그인으로 자동 연결됩니다.</p>
+<p class="sso-error-actions"><a href="/">홈으로 돌아가기</a><a href="/login/">로그인 화면</a></p></main></body></html>

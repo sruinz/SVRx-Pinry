@@ -30,6 +30,16 @@ def password_login_allowed(request=None):
     return bool(policy and policy.password_login_enabled)
 
 
+def registration_allowed(request=None):
+    policy = request_policy(request)
+    return bool(policy and policy.allow_new_registrations)
+
+
+def public_pins_allowed(request=None):
+    policy = request_policy(request)
+    return bool(policy and policy.public_pins_enabled)
+
+
 def api_token_allowed(request=None):
     if request is None:
         request = policy_request.get()

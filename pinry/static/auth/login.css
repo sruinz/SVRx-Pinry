@@ -150,6 +150,21 @@ body {
   padding: 34px;
 }
 
+.sso-error-card { max-width: 560px; }
+
+.sso-error-card h1 { margin-top: 0; }
+
+.sso-error-card .login-lead { margin: 24px 0; }
+
+.sso-error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: 0;
+}
+
+.sso-error-actions a { color: #15d8c3; text-underline-offset: 3px; }
+
 .login-header {
   display: flex;
   align-items: center;

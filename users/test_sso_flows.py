@@ -81,7 +81,16 @@ class SSOFlowTests(TestCase):
         self.assertEqual(response.json(), {'providers': [{'id': str(self.provider.pk), 'name': '시험',
                                            'kind': 'oidc',
                                            'login_url': f'/api/v2/sso/{self.provider.pk}/login/'}],
-                                           'password_login_enabled': True, 'api_tokens_enabled': True})
+                                           'password_login_enabled': True, 'api_tokens_enabled': True,
+                                           'recent_auth_remaining_seconds': 0})
+
+    def test_provider_list_exposes_recent_reauthentication_window(self):
+        self.reauthenticate()
+
+        response = self.client.get('/api/v2/sso/providers/')
+
+        self.assertGreater(response.json()['recent_auth_remaining_seconds'], 0)
+        self.assertLessEqual(response.json()['recent_auth_remaining_seconds'], 300)
 
     def test_lan_login_moves_to_public_host_before_creating_attempt(self):
         self.connect()
@@ -131,6 +140,7 @@ class SSOFlowTests(TestCase):
                 self.assertEqual(response.status_code, 400)
                 self.assertContains(response, '공개 주소', status_code=400)
                 self.assertContains(response, 'href="https://pinry.example/"', status_code=400)
+                self.assertContains(response, 'class="auth-page sso-error-page"', status_code=400)
                 self.assertNotIn('Location', response)
         self.assertFalse(SSOAttempt.objects.exists())
         self.assertNotIn('sso_browser', self.client.session)

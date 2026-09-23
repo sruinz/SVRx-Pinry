@@ -126,7 +126,7 @@
                 </div>
               </div>
             </div>
-            <div v-if="policy && !identityError" class="sso-provider-list sso-link-list">
+            <div v-if="canLinkAccounts && !identityError" class="sso-provider-list sso-link-list">
               <form
                 v-for="provider in availableProviders"
                 :key="provider.id"
@@ -262,6 +262,7 @@ export default {
       identityError: false,
       actionError: null,
       reauthenticated: false,
+      reauthTimer: null,
       password: '',
       csrfToken: API.SSO.csrfToken(),
       returnPath: window.location.pathname,
@@ -281,6 +282,9 @@ export default {
       return ((this.policy && this.policy.providers) || [])
         .filter(provider => !connected.has(provider.id));
     },
+    canLinkAccounts() {
+      return Boolean(this.policy && this.policy.recent_auth_remaining_seconds > 0);
+    },
     dependencyGroups() {
       return [
         { key: 'backend', title: 'profileBackend', items: this.dependencies },
@@ -294,13 +298,13 @@ export default {
   },
   created() {
     this.fetchBuildVersion();
-    API.SSO.policy().then((policy) => { if (this.componentAlive) this.policy = policy; })
-      .catch(() => { if (this.componentAlive) this.policyError = true; });
+    this.fetchPolicy();
     this.fetchIdentities();
   },
   beforeUnmount() {
     this.componentAlive = false;
     this.versionRequestSequence += 1;
+    clearTimeout(this.reauthTimer);
   },
   methods: {
     async copyToken() {
@@ -345,10 +349,28 @@ export default {
         if (this.componentAlive) { this.identities = identities; this.identityError = false; }
       }).catch(() => { if (this.componentAlive) this.identityError = true; });
     },
+    fetchPolicy() {
+      return API.SSO.policy().then((policy) => {
+        if (!this.componentAlive) return;
+        clearTimeout(this.reauthTimer);
+        this.policy = policy;
+        this.policyError = false;
+        if (policy.recent_auth_remaining_seconds > 0) {
+          this.reauthTimer = setTimeout(() => {
+            if (this.componentAlive && this.policy) {
+              this.policy = { ...this.policy, recent_auth_remaining_seconds: 0 };
+            }
+          }, policy.recent_auth_remaining_seconds * 1000);
+        }
+      }).catch(() => { if (this.componentAlive) this.policyError = true; });
+    },
     passwordReauth() {
       this.actionError = null;
       this.reauthenticated = false;
-      API.SSO.passwordReauth(this.password).then(() => { this.reauthenticated = true; })
+      API.SSO.passwordReauth(this.password).then(() => {
+        this.reauthenticated = true;
+        this.fetchPolicy();
+      })
         .catch(() => { this.actionError = 'ssoActionFailed'; });
       this.password = '';
     },

@@ -21,6 +21,8 @@ from .sso.transport import _origin, _parse_url
 
 
 POLICY_FIELDS = (
+    'allow_new_registrations',
+    'public_pins_enabled',
     'password_login_enabled',
     'api_tokens_enabled',
     'recovery_allowed_cidrs',
@@ -82,9 +84,12 @@ class AuthPolicyAdminForm(forms.ModelForm):
         model = AuthPolicy
         fields = POLICY_FIELDS
 
-        labels = {'password_login_enabled': '비밀번호 로그인 허용', 'api_tokens_enabled': 'API 토큰 인증 허용',
+        labels = {'allow_new_registrations': '회원 가입 허용', 'public_pins_enabled': '비로그인 공개 Pin 보기 허용',
+                  'password_login_enabled': '비밀번호 로그인 허용', 'api_tokens_enabled': 'API 토큰 인증 허용',
                   'recovery_allowed_cidrs': '복구 허용 CIDR', 'recovery_denied_cidrs': '복구 차단 CIDR'}
-        help_texts = {'password_login_enabled': '끄기 전에 관리자 SSO 로그인을 확인하세요. 내부망 IP 직접 접속에서는 관리자 복구 로그인을 사용할 수 있습니다.',
+        help_texts = {'allow_new_registrations': '끄면 관리자나 기존 SSO 계정 연결로만 계정을 만들 수 있습니다.',
+                      'public_pins_enabled': '끄면 로그인하지 않은 사용자는 Pin·보드·태그 API를 볼 수 없습니다. 로그인과 관리자 설정은 계속 사용할 수 있습니다.',
+                      'password_login_enabled': '끄기 전에 관리자 SSO 로그인을 확인하세요. 내부망 IP 직접 접속에서는 관리자 복구 로그인을 사용할 수 있습니다.',
                       'api_tokens_enabled': '끄면 기존 토큰을 보존하면서 인증·노출·발급을 모두 차단합니다.'}
 
     def __init__(self, *args, **kwargs):
@@ -278,6 +283,7 @@ class ActiveSuperuserAdminMixin:
 class AuthPolicyAdmin(ActiveSuperuserAdminMixin, admin.ModelAdmin):
     form = AuthPolicyAdminForm
     fieldsets = (
+        ('사이트 접근', {'fields': ('allow_new_registrations', 'public_pins_enabled')}),
         (None, {'fields': ('password_login_enabled', 'api_tokens_enabled', 'expected_revision')}),
         ('기존 전용 복구 포트 고급 설정 (내부망 직접 복구에는 불필요)', {
             'classes': ('collapse',), 'fields': ('recovery_allowed_cidrs', 'recovery_denied_cidrs', 'revision')}),

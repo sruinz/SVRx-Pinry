@@ -37,7 +37,7 @@ describe('SSO policy screens', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     localStorage.clear();
-    axios.get.mockResolvedValue({ data: { providers: [], password_login_enabled: false, api_tokens_enabled: false } });
+    axios.get.mockResolvedValue({ data: { providers: [], password_login_enabled: false, api_tokens_enabled: false, recent_auth_remaining_seconds: 0 } });
   });
 
   it('keeps Escape and outside cancellation without rendering Buefy close X', () => {
@@ -84,6 +84,37 @@ describe('SSO policy screens', () => {
     expect(wrapper.text()).toContain('ssoAutoLinkHelp');
     expect(wrapper.find('details').exists()).toBe(true);
     expect(wrapper.find('details').attributes('open')).toBeUndefined();
+  });
+
+  it('hides manual account linking until recent reauthentication is valid', async () => {
+    axios.get.mockImplementation(url => Promise.resolve({
+      data: url.endsWith('/identities/') ? [] : {
+        providers: [{ id: 'one', kind: 'oidc', name: 'SSO', login_url: '/login' }],
+        password_login_enabled: true,
+        api_tokens_enabled: false,
+        recent_auth_remaining_seconds: 0,
+      },
+    }));
+    const wrapper = shallowMount(Profile, options);
+    await flushPromises();
+
+    expect(wrapper.findAll('[data-test="provider-link-row"]')).toHaveLength(0);
+  });
+
+  it('shows manual account linking during the recent reauthentication window', async () => {
+    axios.get.mockImplementation(url => Promise.resolve({
+      data: url.endsWith('/identities/') ? [] : {
+        providers: [{ id: 'one', kind: 'oidc', name: 'SSO', login_url: '/login' }],
+        password_login_enabled: true,
+        api_tokens_enabled: false,
+        recent_auth_remaining_seconds: 300,
+      },
+    }));
+    const wrapper = shallowMount(Profile, options);
+    await flushPromises();
+
+    expect(wrapper.findAll('[data-test="provider-link-row"]')).toHaveLength(1);
+    wrapper.unmount();
   });
 
   it('shows enabled provider login buttons and hides the password form', async () => {

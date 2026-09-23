@@ -15,7 +15,7 @@ from django.urls import reverse
 from rest_framework.reverse import reverse as drf_reverse
 
 from .auth.backends import CombinedAuthBackend
-from .models import AdminBootstrapState, User
+from .models import AdminBootstrapState, AuthPolicy, User
 from .serializers import CurrentUserSerializer
 
 
@@ -118,6 +118,13 @@ class CreateUserTest(TestCase):
         response = self.register('jdoe')
         self.assertEqual(response.status_code, 201)
 
+    def test_registration_follows_the_persisted_policy(self):
+        AuthPolicy.objects.filter(pk=1).update(allow_new_registrations=False)
+
+        response = self.register('blocked')
+
+        self.assertEqual(response.status_code, 403)
+
     def test_first_registered_user_becomes_admin(self):
         response = self.register('first')
         first_user = User.objects.get(username='first')
@@ -200,8 +207,8 @@ class CreateUserTest(TestCase):
         )
         self.assertFalse(User.objects.exists())
 
-    @override_settings(ALLOW_NEW_REGISTRATIONS=False)
     def test_create_post_not_allowed(self):
+        AuthPolicy.objects.update_or_create(pk=1, defaults={'allow_new_registrations': False})
         data = {
             'username': 'jdoe',
             'email': 'jdoe@example.com',

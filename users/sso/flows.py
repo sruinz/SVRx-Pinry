@@ -2,6 +2,7 @@ import hashlib
 import json
 import secrets
 from datetime import timedelta
+from math import ceil
 from urllib.parse import unquote, urlsplit
 
 from django.contrib.auth import SESSION_KEY, login
@@ -76,6 +77,15 @@ def require_recent_auth(request):
         if sso_session_usable(request.user, value.get('provider_id'), value.get('provider_revision')):
             return
     raise SSOActionDenied('recent_auth_required', '사용할 수 있는 인증 수단으로 다시 인증해 주세요.')
+
+
+def recent_auth_remaining_seconds(request):
+    try:
+        require_recent_auth(request)
+    except SSOActionDenied:
+        return 0
+    timestamp = request.session['recent_auth']['verified_at']
+    return max(0, min(300, ceil(300 - (timezone.now().timestamp() - timestamp))))
 
 
 def begin_attempt(request, provider, purpose, next_path):

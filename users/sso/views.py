@@ -12,7 +12,8 @@ from django.views.decorators.http import require_GET, require_POST
 from users.models import ExternalIdentity, SSOProvider
 from users.sso.policy import api_token_allowed, identity_is_usable, password_login_allowed, request_policy
 from users.sso.flows import (begin_attempt, callback_url, finish_attempt, mark_recent_auth,
-                            require_user, safe_next, unlink_identity, can_unlink_identity, SSOActionDenied)
+                            require_user, safe_next, unlink_identity, can_unlink_identity, SSOActionDenied,
+                            recent_auth_remaining_seconds)
 from users.sso.lan_recovery import direct_lan_allowed
 
 
@@ -78,7 +79,8 @@ def providers(request):
          'login_url': reverse('sso:login', args=[provider.pk])}
         for provider in SSOProvider.objects.filter(enabled=True)
     ], 'password_login_enabled': password_login_allowed(request),
-        'api_tokens_enabled': api_token_allowed(request)})
+        'api_tokens_enabled': api_token_allowed(request),
+        'recent_auth_remaining_seconds': recent_auth_remaining_seconds(request)})
     response['Cache-Control'] = 'no-store'
     if not request.user.is_authenticated and direct_lan_allowed(request):
         data = json.loads(response.content)

@@ -5,6 +5,7 @@ from django.contrib.auth.models import User
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
+from django.test.utils import override_settings
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
@@ -191,3 +192,29 @@ class SSOModelsMigrationTest(TransactionTestCase):
         self.assertTrue(digest_field.unique)
         self.assertFalse(digest_field.editable)
         self.assertEqual(Identity._meta.constraints, [])
+
+
+@override_settings(ALLOW_NEW_REGISTRATIONS=False, PUBLIC=False)
+class AuthPolicySiteAccessMigrationTest(TransactionTestCase):
+    migrate_from = [('users', '0003_sso_models')]
+    migrate_to = [('users', '0004_auth_policy_site_access')]
+
+    def setUp(self):
+        super().setUp()
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.migrate_from)
+
+    def tearDown(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_preserves_legacy_site_access_settings(self):
+        self.executor = MigrationExecutor(connection)
+        self.executor.migrate(self.migrate_to)
+        apps = self.executor.loader.project_state(self.migrate_to).apps
+
+        policy = apps.get_model('users', 'AuthPolicy').objects.get(pk=1)
+
+        self.assertFalse(policy.allow_new_registrations)
+        self.assertFalse(policy.public_pins_enabled)

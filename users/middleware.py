@@ -1,11 +1,11 @@
-from django.conf import settings
 from django.http import HttpResponseForbidden, HttpResponseNotFound
 from django.urls import Resolver404, resolve
 from django.utils.deprecation import MiddlewareMixin
 from rest_framework.exceptions import AuthenticationFailed
 
 from users.sso.authentication import PolicyTokenAuthentication
-from users.sso.policy import enforce_session_policy, password_login_allowed, policy_request
+from users.sso.policy import (enforce_session_policy, password_login_allowed, policy_request,
+                              public_pins_allowed)
 
 
 class SSOSessionMiddleware(MiddlewareMixin):
@@ -50,7 +50,8 @@ class Public(MiddlewareMixin):
         return True
 
     def process_request(self, request):
-        if settings.PUBLIC is False and not request.user.is_authenticated:
+        if (not public_pins_allowed(request) and not request.user.is_authenticated
+                and request.path.startswith('/api/v2/')):
             try:
                 public_sso = resolve(request.path_info).view_name in {
                     'sso:providers', 'sso:login', 'sso:callback', 'sso:signup', 'sso:lan-recovery', 'login-page',
