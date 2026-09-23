@@ -1,6 +1,7 @@
 from collections import namedtuple
 
 from django.db import DEFAULT_DB_ALIAS, transaction
+from django.utils.translation import gettext
 
 from taggit.models import Tag, TaggedItem
 
@@ -23,9 +24,9 @@ class TagMergeError(Exception):
 def merge_tags(target_tag_id, selected_tag_ids, using=DEFAULT_DB_ALIAS):
     selected_ids = sorted(set(selected_tag_ids))
     if len(selected_ids) < 2:
-        raise TagMergeError("최소 두 개의 태그를 선택하세요.")
+        raise TagMergeError(gettext("최소 두 개의 태그를 선택하세요."))
     if target_tag_id not in selected_ids:
-        raise TagMergeError("대표 태그가 선택 범위에 없습니다.")
+        raise TagMergeError(gettext("대표 태그가 선택 범위에 없습니다."))
 
     with transaction.atomic(using=using):
         tags = list(
@@ -36,7 +37,7 @@ def merge_tags(target_tag_id, selected_tag_ids, using=DEFAULT_DB_ALIAS):
         )
         if [tag.pk for tag in tags] != selected_ids:
             raise TagMergeError(
-                "선택한 태그가 변경되었습니다. 다시 시도하세요."
+                gettext("선택한 태그가 변경되었습니다. 다시 시도하세요.")
             )
 
         target = next(tag for tag in tags if tag.pk == target_tag_id)

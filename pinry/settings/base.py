@@ -1,6 +1,7 @@
 import os
 
 from django.contrib.messages import constants as messages
+from django.utils.translation import gettext_lazy
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,8 +20,8 @@ INSTALLED_APPS = [
     'django_filters',
     'taggit',
     'compressor',
-    'django_images',
-    'core',
+    'django_images.apps.DjangoImagesConfig',
+    'core.apps.CoreConfig',
     'exports.apps.ExportsConfig',
     'users',
     'pinry_plugins.apps.PinryPluginsConfig',
@@ -33,6 +34,7 @@ MIDDLEWARE = [
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.locale.LocaleMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'users.middleware.SSOSessionMiddleware',
@@ -100,7 +102,20 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/1.10/topics/i18n/
 
-LANGUAGE_CODE = 'en-us'
+LANGUAGE_CODE = 'ko'
+
+LANGUAGES = [
+    ('ko', gettext_lazy('한국어')),
+    ('en', gettext_lazy('English')),
+    ('zh-hans', gettext_lazy('중국어 간체')),
+    ('fr', gettext_lazy('Français')),
+]
+
+LOCALE_PATHS = [os.path.join(BASE_DIR, 'locale')]
+
+LANGUAGE_COOKIE_AGE = 60 * 60 * 24 * 365
+
+LANGUAGE_COOKIE_PATH = '/'
 
 TIME_ZONE = 'UTC'
 

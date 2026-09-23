@@ -2,6 +2,7 @@ from django.contrib.auth.models import Permission
 from django.contrib.contenttypes.models import ContentType
 from django.test import TestCase
 from django.urls import reverse
+from django.utils.translation import override
 
 from taggit.models import Tag, TaggedItem
 
@@ -19,6 +20,11 @@ class TagAdminTest(TestCase):
         self.client.force_login(self.admin)
         self.url = reverse("admin:taggit_tag_changelist")
         self.pin_content_type = ContentType.objects.get_for_model(Pin)
+        # Django 2.2의 override는 enable()/disable() 대신
+        # __enter__/__exit__만 제공하므로 진입 시점과 정리를 직접 연결한다.
+        language_override = override("ko")
+        language_override.__enter__()
+        self.addCleanup(language_override.__exit__, None, None, None)
 
     def create_tag(self, name):
         return Tag.objects.create(name=name, slug=name)

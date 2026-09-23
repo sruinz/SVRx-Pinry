@@ -17,6 +17,8 @@ The companion browser extension lets you select multiple images from a webpage a
 It is not Synology-only: it can run on servers, PCs, and NAS devices capable of running Docker.
 The installation examples use Docker Engine or Docker Desktop with Docker Compose v2.
 Check that the published image supports your device's CPU architecture before installing.
+The main interface and Django administration support Korean, English, Chinese, and French,
+with Korean as the default server language and the SPA language selection shared with administration.
 
 This is an unofficial modified distribution of Pinry.
 

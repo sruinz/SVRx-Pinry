@@ -64,6 +64,7 @@ package_source_paths=(
     pinry
     pinry_plugins
     users
+    locale
     pinry-spa
     docker/nginx
     docker/scripts
@@ -626,6 +627,7 @@ git archive --format=tar "${source_commit}" -- \
     pinry \
     pinry_plugins \
     users \
+    locale \
     pinry-spa \
     docker/nginx \
     docker/scripts \

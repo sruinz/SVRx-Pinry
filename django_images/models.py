@@ -9,6 +9,7 @@ from django.dispatch import receiver
 from importlib import import_module
 
 from django.urls import reverse
+from django.utils.translation import gettext_lazy
 
 from . import utils
 from .animation import inspect_animation
@@ -47,6 +48,10 @@ else:
 
 
 class Image(models.Model):
+    class Meta:
+        verbose_name = gettext_lazy("이미지")
+        verbose_name_plural = gettext_lazy("이미지")
+
     image = models.ImageField(upload_to=upload_to,
                               height_field='height', width_field='width',
                               max_length=255)
@@ -156,6 +161,8 @@ class Thumbnail(models.Model):
     objects = ThumbnailManager()
 
     class Meta:
+        verbose_name = gettext_lazy("썸네일")
+        verbose_name_plural = gettext_lazy("썸네일")
         unique_together = ('original', 'size')
 
     def get_absolute_url(self):

@@ -6,6 +6,7 @@ import time
 from django.conf import settings
 from django.db import connections, models, router, transaction
 from django.dispatch import receiver
+from django.utils.translation import gettext_lazy
 
 from django_images.models import Image as BaseImage, Thumbnail
 from django_images.file_ops import (
@@ -83,6 +84,8 @@ class MediaAsset(models.Model):
 
 class Board(models.Model):
     class Meta:
+        verbose_name = gettext_lazy("보드")
+        verbose_name_plural = gettext_lazy("보드")
         unique_together = ("submitter", "name")
         indexes = [
             models.Index(fields=["submitter", "name"], name="board_owner_name_idx"),
@@ -197,6 +200,10 @@ class PinQuerySet(models.QuerySet):
 
 
 class Pin(models.Model):
+    class Meta:
+        verbose_name = gettext_lazy("Pin")
+        verbose_name_plural = gettext_lazy("Pin")
+
     submitter = models.ForeignKey(User, on_delete=models.CASCADE)
     private = models.BooleanField(default=False, blank=False)
     url = models.CharField(null=True, blank=True, max_length=2048)

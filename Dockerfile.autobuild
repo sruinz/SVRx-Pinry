@@ -84,6 +84,7 @@ COPY django_images ./django_images
 COPY pinry ./pinry
 COPY pinry_plugins ./pinry_plugins
 COPY users ./users
+COPY locale ./locale
 COPY docker/scripts ./docker/scripts
 COPY docker/migration ./docker/migration
 COPY LICENSE.md NOTICE.md UPSTREAM.md /usr/share/licenses/svrx-pinry/

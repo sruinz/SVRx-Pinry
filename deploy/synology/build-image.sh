@@ -69,6 +69,7 @@ for required_path in \
     manage.py \
     pinry \
     exports \
+    locale \
     docker/scripts/start.sh \
     docker/scripts/startup.py \
     docker/scripts/bootstrap.sh \
@@ -80,7 +81,8 @@ for required_path in \
 do
     required_type=regular
     if [ "${required_path}" = pinry ] \
-        || [ "${required_path}" = exports ];
+        || [ "${required_path}" = exports ] \
+        || [ "${required_path}" = locale ];
     then
         required_type=directory
     fi

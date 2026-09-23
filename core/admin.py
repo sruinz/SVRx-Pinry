@@ -4,6 +4,8 @@ from django.contrib.admin import helpers
 from django.db.models import Count
 from django.db import transaction
 from django.template.response import TemplateResponse
+from django.utils.translation import gettext
+from django.utils.translation import gettext_lazy
 
 from taggit.models import Tag
 
@@ -60,7 +62,7 @@ class SVRxTagAdmin(admin.ModelAdmin):
         return obj.pin_usage_total
 
     pin_usage_count.admin_order_field = "pin_usage_total"
-    pin_usage_count.short_description = "핀 수"
+    pin_usage_count.short_description = gettext_lazy("핀 수")
 
     def get_actions(self, request):
         actions = super(SVRxTagAdmin, self).get_actions(request)
@@ -76,7 +78,7 @@ class SVRxTagAdmin(admin.ModelAdmin):
         if len(selected_tags) < 2:
             self.message_user(
                 request,
-                "최소 두 개의 태그를 선택하세요.",
+                gettext("최소 두 개의 태그를 선택하세요."),
                 level=messages.ERROR,
             )
             return None
@@ -84,7 +86,7 @@ class SVRxTagAdmin(admin.ModelAdmin):
         if "apply" not in request.POST:
             context = {
                 **self.admin_site.each_context(request),
-                "title": "태그 병합",
+                "title": gettext("태그 병합"),
                 "opts": self.model._meta,
                 "action_checkbox_name": helpers.ACTION_CHECKBOX_NAME,
                 "action_name": "merge_selected_tags",
@@ -101,7 +103,7 @@ class SVRxTagAdmin(admin.ModelAdmin):
         except (TypeError, ValueError):
             self.message_user(
                 request,
-                "대표 태그를 선택하세요.",
+                gettext("대표 태그를 선택하세요."),
                 level=messages.ERROR,
             )
             return None
@@ -117,7 +119,7 @@ class SVRxTagAdmin(admin.ModelAdmin):
 
         self.message_user(
             request,
-            "{}개 태그를 {} 태그로 병합했습니다.".format(
+            gettext("{}개 태그를 {} 태그로 병합했습니다.").format(
                 result.selected_count,
                 result.target_name,
             ),
@@ -126,7 +128,7 @@ class SVRxTagAdmin(admin.ModelAdmin):
         return None
 
     merge_selected_tags.allowed_permissions = ("change",)
-    merge_selected_tags.short_description = "선택한 태그 병합"
+    merge_selected_tags.short_description = gettext_lazy("선택한 태그 병합")
 
 
 admin.site.register(Pin, PinAdmin)

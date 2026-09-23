@@ -35,6 +35,14 @@ REQUIRED_SYNOLOGY_CONTEXT_PATHS = (
     "docker/migration/svrx-pinry-light-ui.png",
 )
 SERVICE_WORKER_PATH = "pinry-spa/src/service-worker.js"
+LOCALE_CATALOG_PATHS = (
+    "locale/en/LC_MESSAGES/django.po",
+    "locale/en/LC_MESSAGES/django.mo",
+    "locale/fr/LC_MESSAGES/django.po",
+    "locale/fr/LC_MESSAGES/django.mo",
+    "locale/zh_Hans/LC_MESSAGES/django.po",
+    "locale/zh_Hans/LC_MESSAGES/django.mo",
+)
 TRANSITION_COMPOSE_SOURCE_PATH = (
     "deploy/synology/docker-compose.sw-transition.yml"
 )
@@ -93,6 +101,7 @@ TASK_PRODUCTION_PATHS = (
     *REQUIRED_STARTUP_PATHS,
     *REQUIRED_SYNOLOGY_CONTEXT_PATHS,
     *SW_TRANSITION_PATHS,
+    *LOCALE_CATALOG_PATHS,
     "pinry-spa/package.json",
     "pinry-spa/pnpm-lock.yaml",
     "scripts/create_synology_output.sh",
@@ -132,6 +141,24 @@ PACKAGE_TOP_LEVEL_ENTRIES = {
     "build-image.sh",
     "context",
     "docker-compose.yml",
+}
+MINIMAL_BUILD_CONTEXT_TOP_LEVEL = {
+    ".dockerignore",
+    "Dockerfile.autobuild",
+    "LICENSE.md",
+    "NOTICE.md",
+    "UPSTREAM.md",
+    "requirements.txt",
+    "manage.py",
+    "core",
+    "exports",
+    "django_images",
+    "pinry",
+    "pinry_plugins",
+    "users",
+    "locale",
+    "pinry-spa",
+    "docker",
 }
 
 
@@ -1455,23 +1482,7 @@ class SynologyPackageTests(unittest.TestCase):
                 self.assertNotIn(unsafe_compose_value, compose)
         self.assertEqual(
             {path.name for path in self.context_directory.iterdir()},
-            {
-                ".dockerignore",
-                "Dockerfile.autobuild",
-                "LICENSE.md",
-                "NOTICE.md",
-                "UPSTREAM.md",
-                "requirements.txt",
-                "manage.py",
-                "core",
-                "exports",
-                "django_images",
-                "pinry",
-                "pinry_plugins",
-                "users",
-                "pinry-spa",
-                "docker",
-            },
+            MINIMAL_BUILD_CONTEXT_TOP_LEVEL,
         )
         self.assertEqual(
             {
@@ -2092,6 +2103,7 @@ class SynologyPackageTests(unittest.TestCase):
                 "pinry",
                 "pinry_plugins",
                 "users",
+                "locale",
                 "docker/scripts",
                 "docker/migration",
                 "LICENSE.md",
@@ -2100,6 +2112,19 @@ class SynologyPackageTests(unittest.TestCase):
                 "docker/nginx/recovery.conf.template",
             ],
         )
+
+    def test_final_image_copy_sources_stay_within_minimal_context(self):
+        sources = _final_stage_copy_sources(
+            (self.repository_root / "Dockerfile.autobuild").read_text()
+        )
+
+        self.assertTrue(sources)
+        for source in sources:
+            with self.subTest(copy_source=source):
+                self.assertIn(
+                    Path(source).parts[0],
+                    MINIMAL_BUILD_CONTEXT_TOP_LEVEL,
+                )
 
     def test_root_docker_context_keeps_required_license_files(self):
         ignored = {

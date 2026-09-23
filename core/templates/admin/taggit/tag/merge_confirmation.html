@@ -1,10 +1,11 @@
 {% extends "admin/base_site.html" %}
+{% load i18n %}
 
 {% block content %}
   <form method="post">
     {% csrf_token %}
-    <h2>대표 태그 선택</h2>
-    <p>선택한 태그의 핀 연결을 대표 태그 하나로 합칩니다. 나머지 태그는 삭제됩니다.</p>
+    <h2>{% trans "대표 태그 선택" %}</h2>
+    <p>{% trans "선택한 태그의 핀 연결을 대표 태그 하나로 합칩니다. 나머지 태그는 삭제됩니다." %}</p>
     <fieldset class="module aligned">
       {% for tag in selected_tags %}
         <div class="form-row">
@@ -22,8 +23,8 @@
     <input type="hidden" name="action" value="{{ action_name }}">
     <input type="hidden" name="select_across" value="0">
     <div class="submit-row">
-      <input type="submit" name="apply" value="병합">
-      <a href="{% url 'admin:taggit_tag_changelist' %}" class="button cancel-link">취소</a>
+      <input type="submit" name="apply" value="{% trans "병합" %}">
+      <a href="{% url 'admin:taggit_tag_changelist' %}" class="button cancel-link">{% trans "취소" %}</a>
     </div>
   </form>
 {% endblock %}

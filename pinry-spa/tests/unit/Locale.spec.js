@@ -11,6 +11,8 @@ import localeUtils, {
   persistLocale,
   resolveLocale,
   syncDocumentLocale,
+  syncServerLocaleCookie,
+  toDjangoLanguage,
 } from '@/components/utils/i18n';
 import en from '@/components/utils/i18n/locales/en.json';
 import fr from '@/components/utils/i18n/locales/fr.json';
@@ -670,5 +672,46 @@ describe('Header locale and extension menus', () => {
       expect(items.at(index).attributes('aria-disabled')).toBeUndefined();
       expect(items.at(index).classes()).not.toContain('is-disabled');
     });
+  });
+});
+
+
+describe('관리자 언어 쿠키 동기화', () => {
+  it('SPA 로케일을 Django 언어 코드로 매핑한다', () => {
+    expect(toDjangoLanguage('ko')).toBe('ko');
+    expect(toDjangoLanguage('en')).toBe('en');
+    expect(toDjangoLanguage('zh')).toBe('zh-hans');
+    expect(toDjangoLanguage('fr')).toBe('fr');
+    expect(toDjangoLanguage('ja')).toBe(toDjangoLanguage(DEFAULT_LOCALE));
+  });
+
+  it('django_language 쿠키를 1년 유효로 설정한다', () => {
+    const documentRef = { documentElement: { lang: '' }, cookie: '' };
+
+    syncServerLocaleCookie(documentRef, 'zh');
+
+    expect(documentRef.cookie).toBe(
+      'django_language=zh-hans; path=/; max-age=31536000; SameSite=Lax',
+    );
+  });
+
+  it('쿠키 쓰기 실패를 무시한다', () => {
+    const documentRef = {
+      documentElement: {},
+      get cookie() {
+        throw new Error('blocked');
+      },
+    };
+
+    expect(() => syncServerLocaleCookie(documentRef, 'ko')).not.toThrow();
+  });
+
+  it('문서 로케일 동기화 시 관리자 쿠키도 갱신한다', () => {
+    const documentRef = { documentElement: { lang: '' }, cookie: '' };
+
+    syncDocumentLocale(documentRef, 'fr');
+
+    expect(documentRef.documentElement.lang).toBe('fr');
+    expect(documentRef.cookie).toContain('django_language=fr');
   });
 });

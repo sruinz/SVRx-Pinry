@@ -13,6 +13,29 @@ export function resolveLocale(storedLocale) {
     : DEFAULT_LOCALE;
 }
 
+const DJANGO_LANGUAGE_COOKIE = 'django_language';
+const LOCALE_TO_DJANGO_LANGUAGE = Object.freeze({
+  ko: 'ko',
+  en: 'en',
+  zh: 'zh-hans',
+  fr: 'fr',
+});
+
+export function toDjangoLanguage(locale) {
+  return LOCALE_TO_DJANGO_LANGUAGE[resolveLocale(locale)];
+}
+
+export function syncServerLocaleCookie(documentRef, locale) {
+  const djangoLanguage = toDjangoLanguage(locale);
+  try {
+    // eslint-disable-next-line no-param-reassign
+    documentRef.cookie = `${DJANGO_LANGUAGE_COOKIE}=${djangoLanguage}; path=/; max-age=31536000; SameSite=Lax`;
+  } catch (_error) {
+    // 쿠키 접근이 차단되어도 화면 언어 선택은 유지한다.
+  }
+  return djangoLanguage;
+}
+
 export function loadStoredLocale(storage) {
   try {
     return resolveLocale(storage.getItem('localeCode'));
@@ -25,6 +48,7 @@ export function syncDocumentLocale(documentRef, locale) {
   const resolved = resolveLocale(locale);
   const rootElement = documentRef.documentElement;
   rootElement.lang = resolved;
+  syncServerLocaleCookie(documentRef, resolved);
   return resolved;
 }
 
