@@ -403,8 +403,10 @@ describe('SSO policy screens', () => {
     const button = wrapper.find('[data-test="unlink-button"]');
     expect(button.attributes('disabled')).toBeDefined();
     expect(button.attributes('aria-describedby')).toBe('sso-unlink-reason-4');
-    expect(wrapper.find('[data-test="unlink-reason"]').text())
+    const reason = wrapper.find('[data-test="unlink-reason"]');
+    expect(reason.text())
       .toBe('ssoUnlinkBlockedLastLoginMethod');
+    expect(reason.element.parentElement.classList).toContain('sso-provider-row');
 
     await button.trigger('click');
     expect(axios.post).not.toHaveBeenCalled();

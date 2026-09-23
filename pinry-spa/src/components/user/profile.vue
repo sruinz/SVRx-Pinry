@@ -116,14 +116,14 @@
                       {{ $t('ssoUnlink') }}
                     </button>
                   </div>
-                  <p
-                    v-if="identity.unlink_allowed === false"
-                    :id="`sso-unlink-reason-${identity.id}`"
-                    data-test="unlink-reason"
-                    class="sso-unlink-reason">
-                    {{ $t(unlinkReasonKey(identity.unlink_reason)) }}
-                  </p>
                 </div>
+                <p
+                  v-if="identity.unlink_allowed === false"
+                  :id="`sso-unlink-reason-${identity.id}`"
+                  data-test="unlink-reason"
+                  class="sso-unlink-reason">
+                  {{ $t(unlinkReasonKey(identity.unlink_reason)) }}
+                </p>
               </div>
             </div>
             <div v-if="!identityError" class="sso-provider-list sso-link-list">
@@ -609,6 +609,7 @@ export default {
 
 .sso-provider-row {
   display: flex;
+  flex-wrap: wrap;
   min-height: 58px;
   padding: .75rem 0;
   align-items: center;
@@ -654,7 +655,7 @@ export default {
 }
 
 .sso-unlink-reason {
-  max-width: 24rem;
+  flex-basis: 100%;
   margin: 0;
   color: #ffb3b3;
   font-size: .875rem;
@@ -715,7 +716,7 @@ export default {
   }
 
   .sso-unlink-reason {
-    max-width: none;
+    width: 100%;
     text-align: left;
   }
 }
